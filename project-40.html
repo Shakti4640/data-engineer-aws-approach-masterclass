@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 40: THE DEVOPS TEAM THAT MANAGED 5 AWS ACCOUNTS — Cross-Account IAM Role — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 40: THE DEVOPS TEAM THAT MANAGED 5 AWS ACCOUNTS — Cross-Account IAM Role Assumption (STS)</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow has grown from 2 accounts (Project 39) to 5 accounts<br>
+→ The DevOps team manages all infrastructure across all accounts<br>
+→ The account landscape now looks like this:</p>
+<table><thead><tr><th>Account</th><th>Account ID</th><th>Purpose</th><th>Region</th><th>Owner</th></tr></thead><tbody><tr><td>HQ India</td><td><code>111111111111</code></td><td>Production data lake, Redshift, primary RDS</td><td><code>ap-south-1</code></td><td>Data Engineering</td></tr><tr><td>Europe</td><td><code>222222222222</code></td><td>European storefront, local analytics</td><td><code>eu-west-1</code></td><td>Europe Team</td></tr><tr><td>US</td><td><code>333333333333</code></td><td>US storefront, US customer data</td><td><code>us-east-1</code></td><td>US Team</td></tr><tr><td>Japan</td><td><code>444444444444</code></td><td>Japan storefront, local compliance data</td><td><code>ap-northeast-1</code></td><td>Japan Team</td></tr><tr><td>Shared Services</td><td><code>555555555555</code></td><td>CI/CD pipelines, monitoring, centralized logging, shared tools</td><td><code>ap-south-1</code></td><td>DevOps Team</td></tr></tbody></table>
+<p><strong>The Problems That Have Emerged:</strong></p>
+<p><strong>Problem 1 — Manual Role Pair Explosion:</strong><br>
+→ Project 39 created ONE cross-account role (HQ → Europe)<br>
+→ Now the team needs:</p>
+<table><thead><tr><th>Source Account</th><th>Destination Account</th><th>Access Type</th></tr></thead><tbody><tr><td>Europe → HQ</td><td>Read data lake (Project 39 — done)</td><td></td></tr><tr><td>US → HQ</td><td>Read data lake (same pattern as Europe)</td><td></td></tr><tr><td>Japan → HQ</td><td>Read data lake (same pattern as Europe)</td><td></td></tr><tr><td>Shared Services → HQ</td><td>Deploy infrastructure, read/write S3, manage Glue</td><td></td></tr><tr><td>Shared Services → Europe</td><td>Deploy infrastructure, manage resources</td><td></td></tr><tr><td>Shared Services → US</td><td>Deploy infrastructure, manage resources</td><td></td></tr><tr><td>Shared Services → Japan</td><td>Deploy infrastructure, manage resources</td><td></td></tr><tr><td>HQ → Shared Services</td><td>Push logs, push metrics</td><td></td></tr><tr><td>Europe → Shared Services</td><td>Push logs, push metrics</td><td></td></tr><tr><td>US → Shared Services</td><td>Push logs, push metrics</td><td></td></tr><tr><td>Japan → Shared Services</td><td>Push logs, push metrics</td><td></td></tr></tbody></table>
+<p>→ That's 11 cross-account role pairs — each requiring trust policy + IAM policy + KMS key policy<br>
+→ Managing these individually is error-prone and unscalable</p>
+<p><strong>Problem 2 — Different Permission Levels Per Account:</strong><br>
+→ The Shared Services account needs DIFFERENT permission levels depending on which account it accesses:</p>
+<ul>
+<li>In HQ → Deploy Glue jobs, manage S3, but NOT access Redshift directly</li>
+<li>In Europe → Full infrastructure deployment, but NOT read customer data</li>
+<li>In US → Full infrastructure deployment, but NOT read PII data</li>
+<li>In Japan → Read-only monitoring, NO deployment (Japan team manages their own infra)</li>
+</ul>
+<p>→ Creating one role per permission level per account = more role explosion</p>
+<p><strong>Problem 3 — Session Duration Mismatches:</strong><br>
+→ DevOps engineer doing a 5-minute configuration check → needs 15-minute session<br>
+→ CI/CD pipeline running 4-hour deployment → needs extended session<br>
+→ Overnight batch job running 8 hours → needs maximum session duration<br>
+→ All three use the same cross-account role → but need different durations</p>
+<p><strong>Problem 4 — Role Chaining for Transitive Access:</strong><br>
+→ A CI/CD pipeline in Shared Services needs to:</p>
+<ol>
+<li>Read source code configuration from HQ's S3</li>
+<li>Deploy the processed artifact to Europe's S3</li>
+<li>Trigger Europe's Glue job<br>
+→ This requires: Shared Services → HQ role → read S3 → then Shared Services → Europe role → deploy<br>
+→ But what if the pipeline needs to access BOTH accounts in the SAME operation?<br>
+→ Can the HQ role then assume the Europe role? (Role chaining)</li>
+</ol>
+<p><strong>Problem 5 — Audit Confusion:</strong><br>
+→ 15 DevOps engineers all assume the same cross-account role<br>
+→ CloudTrail shows <code>assumed-role/SharedServicesDeploy/session-name</code><br>
+→ Without meaningful session names → impossible to tell WHICH engineer performed WHICH action<br>
+→ Compliance audit requires individual accountability</p>
+<p><strong>Problem 6 — Credential Leak Risk:</strong><br>
+→ A junior engineer accidentally prints temporary credentials in CI/CD logs<br>
+→ Those credentials are valid for 1 hour with full deployment permissions<br>
+→ How to minimize blast radius?</p>
+<p><strong>The DevOps Lead asks:</strong></p>
+<blockquote>
+<p>"I need a systematic cross-account role architecture that:<br>
+handles different permission levels cleanly,<br>
+supports both short and long sessions,<br>
+provides individual accountability,<br>
+minimizes blast radius of credential exposure,<br>
+and scales to 20+ accounts without exponential complexity."</p>
+</blockquote>
+<p>→ This requires mastering STS (Security Token Service) in depth — beyond the basics of Project 39</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what STS actually is and its full capability set</p>
+<p><strong>STS is NOT just AssumeRole:</strong></p>
+<table><thead><tr><th>STS API</th><th>Purpose</th><th>When Used</th></tr></thead><tbody><tr><td><code>AssumeRole</code></td><td>Assume a role in same or different account</td><td>Cross-account access, privilege escalation within account</td></tr><tr><td><code>AssumeRoleWithSAML</code></td><td>Assume a role using SAML assertion from IdP</td><td>Federated login from corporate Active Directory</td></tr><tr><td><code>AssumeRoleWithWebIdentity</code></td><td>Assume a role using web identity token (OIDC)</td><td>Mobile apps, web apps using Google/Facebook/Cognito</td></tr><tr><td><code>GetSessionToken</code></td><td>Get temporary credentials for IAM user with MFA</td><td>MFA-protected API calls</td></tr><tr><td><code>GetFederationToken</code></td><td>Get temporary credentials with inline policy</td><td>Legacy federation (prefer AssumeRole)</td></tr><tr><td><code>GetCallerIdentity</code></td><td>Return the identity of the caller</td><td>Debugging — "who am I right now?"</td></tr><tr><td><code>DecodeAuthorizationMessage</code></td><td>Decode encoded authorization failure messages</td><td>Debugging Access Denied errors</td></tr></tbody></table>
+<p>→ This project focuses on <code>AssumeRole</code> mastery — the foundation of multi-account architecture</p>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Design the multi-account role architecture</li>
+<li>Step 2 — Implement the role hierarchy with tiered permissions</li>
+<li>Step 3 — Configure session duration management</li>
+<li>Step 4 — Implement role chaining for transitive access</li>
+<li>Step 5 — Implement session policies for scoped-down access</li>
+<li>Step 6 — Enforce individual accountability via session naming</li>
+<li>Step 7 — Implement confused deputy prevention at scale</li>
+<li>Step 8 — Configure MFA enforcement for sensitive cross-account roles</li>
+<li>Step 9 — Implement emergency access break-glass pattern</li>
+<li>Step 10 — Centralize audit trail across all accounts</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — DESIGN THE MULTI-ACCOUNT ROLE ARCHITECTURE</h3>
+<p><strong>Role Naming Convention:</strong></p>
+<p>→ Before creating roles — establish a naming standard that scales</p>
+<code>{purpose}-{source-account-alias}-{permission-level}</code>
+<table><thead><tr><th>Pattern Component</th><th>Values</th></tr></thead><tbody><tr><td>Purpose</td><td><code>CrossAccount</code>, <code>Deploy</code>, <code>ReadOnly</code>, <code>Monitor</code>, <code>Emergency</code></td></tr><tr><td>Source Account Alias</td><td><code>europe</code>, <code>us</code>, <code>japan</code>, <code>shared</code>, <code>hq</code></td></tr><tr><td>Permission Level</td><td><code>admin</code>, <code>deploy</code>, <code>readonly</code>, <code>dataread</code>, <code>monitor</code></td></tr></tbody></table>
+<p><strong>Example Role Names:</strong></p>
+<table><thead><tr><th>Role Name (in HQ Account)</th><th>Who Assumes It</th><th>What They Can Do</th></tr></thead><tbody><tr><td><code>CrossAccount-Europe-DataRead</code></td><td>Europe's Glue/Athena roles</td><td>Read products/ and pricing/ (Project 39)</td></tr><tr><td><code>CrossAccount-US-DataRead</code></td><td>US Glue/Athena roles</td><td>Read products/ and pricing/</td></tr><tr><td><code>CrossAccount-Japan-DataRead</code></td><td>Japan's Athena role</td><td>Read products/ only (no pricing for Japan)</td></tr><tr><td><code>CrossAccount-Shared-Deploy</code></td><td>Shared Services CI/CD role</td><td>Deploy Glue jobs, manage S3 objects, trigger workflows</td></tr><tr><td><code>CrossAccount-Shared-Monitor</code></td><td>Shared Services monitoring role</td><td>CloudWatch read-only, S3 list-only</td></tr><tr><td><code>CrossAccount-Emergency-Admin</code></td><td>Break-glass role from Shared Services</td><td>Full admin — MFA required, heavily audited</td></tr></tbody></table>
+<p><strong>Architecture Diagram:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────┐
+</span>│                SHARED SERVICES (555555555555)                  │
+│                                                                │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐              │
+│  │ CI/CD Role │  │ Monitor    │  │ BreakGlass │              │
+│  │            │  │ Role       │  │ Role       │              │
+│  └──┬───┬───┬─┘  └──┬───┬───┬┘  └──┬───┬───┬┘              │
+│     │   │   │        │   │   │       │   │   │               │
+└─────┼───┼───┼────────┼───┼───┼───────┼───┼───┼───────────────┘
+      │   │   │        │   │   │       │   │   │
+      ▼   │   │        ▼   │   │       ▼   │   │
+┌─────────┤   │   ┌────────┤   │  ┌────────┤   │
+│HQ       │   │   │HQ      │   │  │HQ      │   │
+│Deploy   │   │   │Monitor │   │  │Emergency│   │
+│Role     │   │   │Role    │   │  │Admin    │   │
+└─────────┘   │   └────────┘   │  └─────────┘  │
+              ▼                ▼                 ▼
+         ┌─────────┐    ┌─────────┐       ┌─────────┐
+         │Europe   │    │Europe   │       │Europe   │
+         │Deploy   │    │Monitor  │       │Emergency│
+         │Role     │    │Role     │       │Admin    │
+         └─────────┘    └─────────┘       └─────────┘
+              ... same pattern for US, Japan</code></pre></div>
+<p><strong>Key Design Principle — Tiered Permission Model:</strong></p>
+<table><thead><tr><th>Tier</th><th>Permission Level</th><th>Use Case</th><th>MFA Required</th><th>Session Duration</th></tr></thead><tbody><tr><td>Tier 1 — ReadOnly</td><td><code>s3:Get*</code>, <code>s3:List*</code>, <code>cloudwatch:Get*</code>, <code>cloudwatch:Describe*</code></td><td>Monitoring, analytics, debugging</td><td>❌ No</td><td>1 hour</td></tr><tr><td>Tier 2 — DataRead</td><td><code>s3:GetObject</code> on specific prefixes + <code>kms:Decrypt</code></td><td>Cross-account data lake access (Project 39)</td><td>❌ No</td><td>1 hour</td></tr><tr><td>Tier 3 — Deploy</td><td><code>s3:PutObject</code>, <code>glue:*</code>, <code>lambda:Update*</code>, <code>events:*</code></td><td>CI/CD deployment</td><td>❌ No</td><td>4 hours</td></tr><tr><td>Tier 4 — Admin</td><td><code>*</code> (all actions)</td><td>Emergency break-glass only</td><td>✅ Yes</td><td>15 minutes</td></tr></tbody></table>
+<p>→ Lower tiers have broader availability, higher tiers have stricter controls<br>
+→ This is DEFENSE IN DEPTH applied to cross-account access</p>
+<hr>
+<h3>STEP 2 — IMPLEMENT THE ROLE HIERARCHY</h3>
+<p>→ Sign into each destination account and create the appropriate roles</p>
+<hr>
+<p><strong>In Account <code>111111111111</code> (HQ) — Create Multiple Tiered Roles:</strong></p>
+<p><strong>Role 1: <code>CrossAccount-Shared-Monitor</code> (Tier 1)</strong></p>
+<p>→ IAM → Create Role → Trusted Entity: AWS Account → <code>555555555555</code></p>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>arn:aws:iam::555555555555:role/SharedServices-MonitorRole</code></td></tr><tr><td>Action</td><td><code>sts:AssumeRole</code></td></tr><tr><td>Condition — <code>sts:ExternalId</code></td><td><code>shopnow-shared-monitor-2025</code></td></tr></tbody></table>
+<p><strong>IAM Policy: <code>HQ-MonitorReadOnly</code></strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>cloudwatch:GetMetricData</code></td><td><code>*</code></td><td>Read CloudWatch metrics</td></tr><tr><td><code>cloudwatch:DescribeAlarms</code></td><td><code>*</code></td><td>View alarm configurations</td></tr><tr><td><code>cloudwatch:ListMetrics</code></td><td><code>*</code></td><td>List available metrics</td></tr><tr><td><code>logs:GetLogEvents</code></td><td>Specific log group ARNs</td><td>Read application logs</td></tr><tr><td><code>logs:DescribeLogGroups</code></td><td><code>*</code></td><td>List log groups</td></tr><tr><td><code>s3:ListAllMyBuckets</code></td><td><code>*</code></td><td>List bucket names (metadata only)</td></tr><tr><td><code>s3:GetBucketLocation</code></td><td><code>*</code></td><td>Check bucket regions</td></tr><tr><td><code>tag:GetResources</code></td><td><code>*</code></td><td>Read resource tags</td></tr></tbody></table>
+<p>→ This role CANNOT read S3 objects, cannot modify any resource, cannot access databases<br>
+→ Pure observability access</p>
+<p><strong>Maximum Session Duration Setting:</strong></p>
+<p>→ IAM → Role → Edit → Maximum session duration</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Maximum session duration</td><td>1 hour (3600 seconds)</td></tr></tbody></table>
+<p>→ This is set ON THE ROLE — it's the CEILING<br>
+→ Even if the caller requests <code>DurationSeconds = 43200</code> (12 hours) → STS caps it at 1 hour<br>
+→ Different from the default session duration — this is the MAXIMUM allowed</p>
+<hr>
+<p><strong>Role 2: <code>CrossAccount-Shared-Deploy</code> (Tier 3)</strong></p>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>arn:aws:iam::555555555555:role/SharedServices-CICDRole</code></td></tr><tr><td>Action</td><td><code>sts:AssumeRole</code></td></tr><tr><td>Condition — <code>sts:ExternalId</code></td><td><code>shopnow-shared-deploy-2025</code></td></tr></tbody></table>
+<p><strong>IAM Policy: <code>HQ-DeploymentAccess</code></strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::shopnow-deployment-artifacts/*</code></td><td>Upload deployment packages</td></tr><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-deployment-artifacts/*</code></td><td>Read deployment configs</td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-deployment-artifacts</code></td><td>List artifacts</td></tr><tr><td><code>glue:CreateJob</code>, <code>glue:UpdateJob</code>, <code>glue:DeleteJob</code></td><td><code>*</code></td><td>Manage Glue ETL jobs</td></tr><tr><td><code>glue:StartJobRun</code>, <code>glue:GetJobRun</code></td><td><code>*</code></td><td>Execute and monitor Glue jobs</td></tr><tr><td><code>glue:CreateCrawler</code>, <code>glue:UpdateCrawler</code></td><td><code>*</code></td><td>Manage crawlers</td></tr><tr><td><code>lambda:UpdateFunctionCode</code>, <code>lambda:UpdateFunctionConfiguration</code></td><td>Specific function ARNs</td><td>Deploy Lambda updates</td></tr><tr><td><code>events:PutRule</code>, <code>events:PutTargets</code></td><td><code>*</code></td><td>Manage EventBridge rules (Project 38)</td></tr><tr><td><code>kms:Decrypt</code>, <code>kms:GenerateDataKey</code></td><td>Deployment KMS key ARN</td><td>Encrypt/decrypt deployment artifacts</td></tr></tbody></table>
+<p><strong>What this role CANNOT do:</strong></p>
+<table><thead><tr><th>Explicitly Excluded</th><th>Why</th></tr></thead><tbody><tr><td><code>s3:*</code> on <code>shopnow-datalake-curated</code></td><td>No access to data lake — that's DataRead tier</td></tr><tr><td><code>rds:*</code></td><td>No direct database access — prevents accidental schema changes</td></tr><tr><td><code>redshift:*</code></td><td>No warehouse access — prevents data exposure</td></tr><tr><td><code>iam:*</code></td><td>No IAM modification — prevents privilege escalation</td></tr><tr><td><code>kms:CreateKey</code>, <code>kms:ScheduleKeyDeletion</code></td><td>No key management — prevents encryption sabotage</td></tr></tbody></table>
+<p><strong>Maximum Session Duration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Maximum session duration</td><td>4 hours (14400 seconds)</td></tr></tbody></table>
+<p>→ CI/CD deployments can take up to 4 hours for complex multi-service rollouts</p>
+<hr>
+<p><strong>Role 3: <code>CrossAccount-Emergency-Admin</code> (Tier 4 — Break Glass)</strong></p>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>arn:aws:iam::555555555555:role/SharedServices-BreakGlassRole</code></td></tr><tr><td>Action</td><td><code>sts:AssumeRole</code></td></tr><tr><td>Condition — <code>sts:ExternalId</code></td><td><code>shopnow-emergency-2025-BG</code></td></tr><tr><td>Condition — <code>aws:MultiFactorAuthPresent</code></td><td><code>true</code></td></tr><tr><td>Condition — <code>aws:MultiFactorAuthAge</code></td><td><code>NumericLessThan: 300</code> (MFA within last 5 minutes)</td></tr></tbody></table>
+<p><strong>IAM Policy:</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>*</code></td><td><code>*</code></td></tr></tbody></table>
+<p>→ Full administrator access — ONLY for emergencies<br>
+→ Protected by MFA requirement AND short session AND heavy auditing</p>
+<p><strong>Maximum Session Duration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Maximum session duration</td><td>15 minutes (900 seconds)</td></tr></tbody></table>
+<p>→ Deliberately SHORT — emergency access should be brief<br>
+→ If engineer needs more time → must re-authenticate with MFA and assume again<br>
+→ This creates an audit trail entry every 15 minutes during extended emergency work</p>
+<p><strong>MFA Condition Explained:</strong></p>
+<table><thead><tr><th>Condition Key</th><th>Operator</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td><code>aws:MultiFactorAuthPresent</code></td><td><code>Bool: true</code></td><td><code>true</code></td><td>Caller MUST have authenticated with MFA</td></tr><tr><td><code>aws:MultiFactorAuthAge</code></td><td><code>NumericLessThan</code></td><td><code>300</code></td><td>MFA authentication must have happened within last 5 minutes (300 seconds)</td></tr></tbody></table>
+<p>→ This means:</p>
+<ul>
+<li>The calling engineer must have an MFA device configured on their IAM user</li>
+<li>They must have called <code>GetSessionToken</code> with their MFA code FIRST</li>
+<li>Then use those MFA-validated temporary credentials to call <code>AssumeRole</code></li>
+<li>If MFA was done more than 5 minutes ago → must re-authenticate</li>
+<li>Service roles (Glue, Lambda, EC2) CANNOT satisfy MFA conditions → they cannot assume this role</li>
+<li>ONLY human engineers with MFA devices can assume the break-glass role</li>
+</ul>
+<hr>
+<p><strong>Repeat for Other Accounts:</strong></p>
+<p>→ Create equivalent tiered roles in Europe (<code>222222222222</code>), US (<code>333333333333</code>), and Japan (<code>444444444444</code>)<br>
+→ Each account gets:</p>
+<ul>
+<li><code>CrossAccount-Shared-Monitor</code> (Tier 1)</li>
+<li><code>CrossAccount-Shared-Deploy</code> (Tier 3) — except Japan (read-only monitoring only)</li>
+<li><code>CrossAccount-Emergency-Admin</code> (Tier 4)</li>
+</ul>
+<p><strong>Complete Role Matrix:</strong></p>
+<table><thead><tr><th>Destination Account</th><th>Monitor Role</th><th>Deploy Role</th><th>Emergency Role</th><th>DataRead Role</th></tr></thead><tbody><tr><td>HQ (111)</td><td>✅</td><td>✅</td><td>✅</td><td>✅ (for EU, US, JP)</td></tr><tr><td>Europe (222)</td><td>✅</td><td>✅</td><td>✅</td><td>N/A</td></tr><tr><td>US (333)</td><td>✅</td><td>✅</td><td>✅</td><td>N/A</td></tr><tr><td>Japan (444)</td><td>✅</td><td>❌ (Japan self-manages)</td><td>✅</td><td>N/A</td></tr><tr><td>Shared (555)</td><td>N/A (this IS the source)</td><td>N/A</td><td>N/A</td><td>N/A</td></tr></tbody></table>
+<p>→ Total roles across all accounts: ~15 cross-account roles<br>
+→ Each with specific trust policy, permission policy, session duration, and MFA requirements</p>
+<hr>
+<h3>STEP 3 — CONFIGURE SESSION DURATION MANAGEMENT</h3>
+<p>→ Session duration is controlled at THREE levels — understanding precedence is critical</p>
+<p><strong>Duration Hierarchy:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Level 1: ROLE MAXIMUM (set on the role in Account A)
+</span>  ↓ caps
+Level 2: CALLER REQUEST (DurationSeconds in AssumeRole call)
+  ↓ defaults to
+Level 3: DEFAULT (1 hour if not specified)</code></pre></div>
+<p><strong>How it works:</strong></p>
+<table><thead><tr><th>Role Maximum</th><th>Caller Requests</th><th>Actual Duration</th><th>Why</th></tr></thead><tbody><tr><td>4 hours</td><td>2 hours</td><td>2 hours</td><td>Caller request within maximum</td></tr><tr><td>4 hours</td><td>8 hours</td><td>❌ Error</td><td>Caller request exceeds maximum → API returns error</td></tr><tr><td>4 hours</td><td>(not specified)</td><td>1 hour</td><td>Default is 1 hour when not specified</td></tr><tr><td>1 hour</td><td>30 minutes</td><td>30 minutes</td><td>Caller request within maximum</td></tr><tr><td>15 minutes</td><td>1 hour</td><td>❌ Error</td><td>Cannot exceed role's maximum</td></tr></tbody></table>
+<p><strong>Configuration per tier:</strong></p>
+<table><thead><tr><th>Tier</th><th>Role Maximum Session Duration</th><th>Typical Caller Request</th><th>Rationale</th></tr></thead><tbody><tr><td>Tier 1 — Monitor</td><td>1 hour (3600s)</td><td>1 hour</td><td>Quick observability checks</td></tr><tr><td>Tier 2 — DataRead</td><td>1 hour (3600s)</td><td>1 hour</td><td>Analytics queries</td></tr><tr><td>Tier 3 — Deploy</td><td>4 hours (14400s)</td><td>2-4 hours</td><td>CI/CD pipeline duration</td></tr><tr><td>Tier 4 — Emergency</td><td>15 minutes (900s)</td><td>15 minutes</td><td>Minimum blast radius</td></tr></tbody></table>
+<p><strong>Setting Maximum Session Duration on a Role:</strong></p>
+<p>→ Navigate to IAM → Roles → Select role → "Edit"<br>
+→ Scroll to "Maximum session duration"<br>
+→ Select from dropdown: 1 hour, 2 hours, 4 hours, 8 hours, 12 hours<br>
+→ Default is 1 hour</p>
+<p><strong>Duration Limits by STS API:</strong></p>
+<table><thead><tr><th>STS API</th><th>Minimum</th><th>Maximum</th><th>Default</th></tr></thead><tbody><tr><td><code>AssumeRole</code></td><td>15 minutes (900s)</td><td>12 hours (43200s) — capped by role's maximum</td><td>1 hour (3600s)</td></tr><tr><td><code>AssumeRole</code> with role chaining</td><td>15 minutes (900s)</td><td>1 hour (3600s) — HARD LIMIT</td><td>1 hour (3600s)</td></tr><tr><td><code>AssumeRoleWithSAML</code></td><td>15 minutes (900s)</td><td>12 hours (43200s)</td><td>1 hour (3600s)</td></tr><tr><td><code>AssumeRoleWithWebIdentity</code></td><td>15 minutes (900s)</td><td>12 hours (43200s)</td><td>1 hour (3600s)</td></tr><tr><td><code>GetSessionToken</code></td><td>15 minutes (900s)</td><td>36 hours (129600s)</td><td>12 hours (43200s)</td></tr></tbody></table>
+<p><strong>CRITICAL: Role Chaining Duration Limit:</strong><br>
+→ When Role A assumes Role B which then assumes Role C (chaining)<br>
+→ The CHAINED session (Role B → Role C) is HARD LIMITED to 1 hour<br>
+→ Cannot be extended regardless of role maximum setting<br>
+→ This is an AWS security constraint — prevents indefinite credential chains</p>
+<hr>
+<h3>STEP 4 — IMPLEMENT ROLE CHAINING FOR TRANSITIVE ACCESS</h3>
+<p>→ This addresses Problem 4 — CI/CD pipeline needing access to multiple accounts</p>
+<p><strong>Scenario:</strong><br>
+→ CI/CD pipeline in Shared Services needs to:</p>
+<ol>
+<li>Read deployment config from HQ's S3</li>
+<li>Deploy Lambda function to Europe's account</li>
+</ol>
+<p><strong>Without Role Chaining (Recommended Approach):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SharedServices-CICDRole
+</span>    │
+    ├── AssumeRole → CrossAccount-Shared-Deploy (in HQ Account)
+    │       └── Read config from HQ's S3
+    │       └── Release credentials
+    │
+    ├── AssumeRole → CrossAccount-Shared-Deploy (in Europe Account)
+    │       └── Deploy Lambda to Europe
+    │       └── Release credentials
+    │
+    (Two SEPARATE AssumeRole calls — NOT chained)</code></pre></div>
+<p>→ This is the PREFERRED approach — each assumption is independent<br>
+→ No chaining limitations apply<br>
+→ Each session can have full duration (up to role maximum)<br>
+→ Clear audit trail — two separate AssumeRole events in CloudTrail</p>
+<p><strong>With Role Chaining (When Needed):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SharedServices-CICDRole
+</span>    │
+    └── AssumeRole → CrossAccount-Shared-Deploy (in HQ Account)
+            │
+            └── AssumeRole → CrossAccount-HQ-To-Europe-Deploy (in Europe Account)
+                    │
+                    └── Deploy to Europe using HQ's role as intermediary</code></pre></div>
+<p>→ This creates a chain: Shared → HQ → Europe<br>
+→ The SECOND assumption (HQ → Europe) is limited to 1 hour maximum<br>
+→ Europe's trust policy must trust HQ's deploy role (not Shared Services directly)</p>
+<p><strong>When Role Chaining is Actually Needed:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Chain Required?</th><th>Better Alternative</th></tr></thead><tbody><tr><td>Pipeline needs access to 2 accounts sequentially</td><td>❌ No — use separate AssumeRole calls</td><td>Two independent sessions</td></tr><tr><td>Account A can only reach Account C through Account B</td><td>✅ Yes — if direct trust doesn't exist</td><td>Create direct trust (preferred)</td></tr><tr><td>Temporary delegation — Account A delegates its permissions to Account B</td><td>✅ Yes — Account B acts as Account A</td><td>Direct cross-account role (preferred)</td></tr><tr><td>Hub-and-spoke model — central account mediates all access</td><td>⚠️ Possible but limits duration to 1 hour</td><td>Direct trust from spoke to spoke</td></tr></tbody></table>
+<p>→ For ShopNow → Use SEPARATE AssumeRole calls (no chaining)<br>
+→ Each destination account trusts the Shared Services account directly<br>
+→ No need for transitive trust through HQ</p>
+<hr>
+<h3>STEP 5 — IMPLEMENT SESSION POLICIES FOR SCOPED-DOWN ACCESS</h3>
+<p>→ This addresses Problem 6 — minimizing blast radius</p>
+<p><strong>What Session Policies Do:</strong><br>
+→ When calling <code>AssumeRole</code>, the caller can pass an INLINE session policy<br>
+→ This policy FURTHER RESTRICTS the assumed role's permissions for THIS session only<br>
+→ The effective permissions are the INTERSECTION of the role policy and the session policy</p>
+<code>Effective Permissions = Role IAM Policy ∩ Session Policy</code>
+<p><strong>Example — Scoping Down Deploy Role for Specific Deployment:</strong></p>
+<p>→ <code>CrossAccount-Shared-Deploy</code> in HQ allows:</p>
+<ul>
+<li><code>s3:PutObject</code> on <code>shopnow-deployment-artifacts/*</code></li>
+<li><code>glue:*</code> on all Glue resources</li>
+<li><code>lambda:UpdateFunctionCode</code> on specific functions</li>
+<li><code>events:*</code> on all EventBridge resources</li>
+</ul>
+<p>→ But THIS specific deployment ONLY needs to update one Lambda function<br>
+→ Pass a session policy that ONLY allows:</p>
+<p><strong>Session Policy:</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>lambda:UpdateFunctionCode</code></td><td><code>arn:aws:lambda:ap-south-1:111111111111:function:shopnow-orders-processor</code></td></tr><tr><td><code>lambda:GetFunction</code></td><td>Same function ARN</td></tr></tbody></table>
+<p>→ Even though the role allows <code>glue:*</code>, <code>s3:PutObject</code>, <code>events:*</code> → this session CANNOT access them<br>
+→ If these temporary credentials are leaked → attacker can ONLY update one specific Lambda function<br>
+→ Blast radius: Full role permissions → narrowed to one function</p>
+<p><strong>Session Policy Configuration (in AssumeRole call):</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td><code>RoleArn</code></td><td><code>arn:aws:iam::111111111111:role/CrossAccount-Shared-Deploy</code></td></tr><tr><td><code>RoleSessionName</code></td><td><code>cicd-deploy-orders-processor-20250115</code></td></tr><tr><td><code>ExternalId</code></td><td><code>shopnow-shared-deploy-2025</code></td></tr><tr><td><code>DurationSeconds</code></td><td><code>1800</code> (30 minutes — only need 30 min for this deployment)</td></tr><tr><td><code>Policy</code></td><td>Session policy JSON (inline — max 2048 chars URL-encoded)</td></tr><tr><td><code>PolicyArns</code></td><td>OR reference up to 10 managed policy ARNs</td></tr></tbody></table>
+<p><strong>Two Ways to Pass Session Policies:</strong></p>
+<table><thead><tr><th>Method</th><th>Limit</th><th>Use Case</th></tr></thead><tbody><tr><td>Inline <code>Policy</code> (JSON string)</td><td>2048 characters (URL-encoded)</td><td>Simple, one-off restrictions</td></tr><tr><td><code>PolicyArns</code> (managed policy ARNs)</td><td>Up to 10 managed policies, total 2048 chars packed</td><td>Reusable, standardized restrictions</td></tr></tbody></table>
+<p><strong>Session Policy Best Practices:</strong></p>
+<table><thead><tr><th>Practice</th><th>Why</th></tr></thead><tbody><tr><td>Always scope to specific resources</td><td><code>arn:aws:lambda:...:function:specific-function</code> not <code>*</code></td></tr><tr><td>Include only necessary actions</td><td>Don't include <code>lambda:*</code> if only <code>UpdateFunctionCode</code> is needed</td></tr><tr><td>Keep it small</td><td>2048 char limit — focus on the specific task</td></tr><tr><td>Use PolicyArns for repeated patterns</td><td>Create managed policies for common scoped-down patterns</td></tr></tbody></table>
+<hr>
+<h3>STEP 6 — ENFORCE INDIVIDUAL ACCOUNTABILITY VIA SESSION NAMING</h3>
+<p>→ This addresses Problem 5 — knowing WHICH engineer did WHAT</p>
+<p><strong>RoleSessionName is the key:</strong><br>
+→ When calling <code>AssumeRole</code>, the <code>RoleSessionName</code> parameter is REQUIRED<br>
+→ It becomes part of the assumed role's ARN in CloudTrail:</p>
+<code>arn:aws:sts::111111111111:assumed-role/CrossAccount-Shared-Deploy/{RoleSessionName}</code>
+<p><strong>Without Meaningful Session Names:</strong></p>
+<table><thead><tr><th>CloudTrail Entry</th><th>Who Did It?</th></tr></thead><tbody><tr><td><code>assumed-role/CrossAccount-Shared-Deploy/session1</code></td><td>Unknown</td></tr><tr><td><code>assumed-role/CrossAccount-Shared-Deploy/botocore-session-123</code></td><td>Unknown (SDK default)</td></tr></tbody></table>
+<p><strong>With Meaningful Session Names:</strong></p>
+<table><thead><tr><th>CloudTrail Entry</th><th>Who Did It?</th></tr></thead><tbody><tr><td><code>assumed-role/CrossAccount-Shared-Deploy/engineer-priya-20250115-deploy-glue</code></td><td>Priya deploying Glue job</td></tr><tr><td><code>assumed-role/CrossAccount-Shared-Deploy/cicd-pipeline-orders-build-4521</code></td><td>CI/CD pipeline build #4521</td></tr><tr><td><code>assumed-role/CrossAccount-Shared-Deploy/engineer-david-20250115-hotfix-lambda</code></td><td>David applying Lambda hotfix</td></tr></tbody></table>
+<p><strong>Session Naming Convention:</strong></p>
+<code>{type}-{identifier}-{date}-{purpose}</code>
+<table><thead><tr><th>Type</th><th>Identifier</th><th>Date</th><th>Purpose</th></tr></thead><tbody><tr><td><code>engineer</code></td><td>Employee name or ID</td><td><code>YYYYMMDD</code></td><td>Brief description</td></tr><tr><td><code>cicd</code></td><td>Pipeline name</td><td><code>YYYYMMDD</code></td><td>Build number or deployment ID</td></tr><tr><td><code>service</code></td><td>Service name</td><td><code>YYYYMMDD</code></td><td>Automated task description</td></tr><tr><td><code>emergency</code></td><td>Engineer name</td><td><code>YYYYMMDD-HHMM</code></td><td>Incident ID</td></tr></tbody></table>
+<p><strong>Enforcing Session Name Standards:</strong></p>
+<p>→ The trust policy CAN enforce session name patterns using conditions:</p>
+<table><thead><tr><th>Condition Key</th><th>Operator</th><th>Value</th><th>Effect</th></tr></thead><tbody><tr><td><code>sts:RoleSessionName</code></td><td><code>StringLike</code></td><td><code>engineer-*</code> OR <code>cicd-*</code> OR <code>service-*</code></td><td>Only allow sessions with approved prefixes</td></tr></tbody></table>
+<p>→ Adding this condition to the trust policy:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Condition — <code>sts:RoleSessionName</code></td><td><code>StringLike</code>: <code>["engineer-*", "cicd-*", "service-*", "emergency-*"]</code></td></tr></tbody></table>
+<p>→ Now:</p>
+<ul>
+<li><code>RoleSessionName = "engineer-priya-20250115"</code> → ✅ Allowed</li>
+<li><code>RoleSessionName = "botocore-session-123"</code> → ❌ Denied (doesn't match any pattern)</li>
+<li><code>RoleSessionName = "test"</code> → ❌ Denied<br>
+→ Forces callers to use meaningful, traceable session names</li>
+</ul>
+<p><strong>Session Name Restrictions:</strong></p>
+<table><thead><tr><th>Restriction</th><th>Limit</th></tr></thead><tbody><tr><td>Minimum length</td><td>2 characters</td></tr><tr><td>Maximum length</td><td>64 characters</td></tr><tr><td>Allowed characters</td><td><code>[a-zA-Z0-9=,.@-]</code></td></tr><tr><td>NOT allowed</td><td>Spaces, slashes, colons, semicolons</td></tr></tbody></table>
+<hr>
+<h3>STEP 7 — CONFUSED DEPUTY PREVENTION AT SCALE</h3>
+<p>→ Project 39 introduced External ID for one role pair<br>
+→ With 15+ cross-account roles → External ID management becomes important</p>
+<p><strong>External ID Management Strategy:</strong></p>
+<table><thead><tr><th>Approach</th><th>How</th><th>When</th></tr></thead><tbody><tr><td>One External ID per partner account</td><td><code>shopnow-europe-2025</code> for all Europe roles</td><td>Simplest — sufficient for trusted subsidiaries</td></tr><tr><td>One External ID per role</td><td><code>shopnow-europe-monitor-2025</code>, <code>shopnow-europe-deploy-2025</code></td><td>More granular — recommended</td></tr><tr><td>External ID with rotation</td><td>Change External ID annually: <code>shopnow-europe-2025</code> → <code>shopnow-europe-2026</code></td><td>Best practice for long-lived relationships</td></tr></tbody></table>
+<p><strong>External ID Rotation Process:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Create new External ID: "shopnow-europe-2026"
+</span>Step 2: Update trust policy to accept BOTH old and new:
+        Condition: sts:ExternalId = ["shopnow-europe-2025", "shopnow-europe-2026"]
+Step 3: Update all callers in Account B to use new External ID
+Step 4: Verify all callers use new External ID (monitor CloudTrail)
+Step 5: Remove old External ID from trust policy:
+        Condition: sts:ExternalId = "shopnow-europe-2026"
+Step 6: Document new External ID securely</code></pre></div>
+<p>→ Dual-ID window allows zero-downtime rotation<br>
+→ Similar to Secrets Manager credential rotation concept (Project 37)</p>
+<p><strong>Storing External IDs Securely:</strong></p>
+<table><thead><tr><th>Storage Location</th><th>Suitability</th></tr></thead><tbody><tr><td>Secrets Manager (Project 37)</td><td>✅ Best — encrypted, audited, rotatable</td></tr><tr><td>SSM Parameter Store (SecureString)</td><td>✅ Good — encrypted, cheaper</td></tr><tr><td>Plain text in wiki/Confluence</td><td>❌ Never — visible to everyone</td></tr><tr><td>Hardcoded in application</td><td>❌ Never — survives in version control</td></tr><tr><td>Environment variables</td><td>⚠️ Acceptable for CI/CD with proper access controls</td></tr></tbody></table>
+<p>→ For ShopNow → Store External IDs in Secrets Manager in the Shared Services account<br>
+→ CI/CD pipeline fetches External ID from Secrets Manager before calling AssumeRole</p>
+<hr>
+<h3>STEP 8 — IMPLEMENT SOURCE IDENTITY FOR DEEP TRACEABILITY</h3>
+<p>→ AWS introduced <code>SourceIdentity</code> — a stronger version of session naming</p>
+<p><strong>What SourceIdentity Does:</strong></p>
+<table><thead><tr><th>Feature</th><th>RoleSessionName</th><th>SourceIdentity</th></tr></thead><tbody><tr><td>Set by caller</td><td>✅ Yes</td><td>✅ Yes</td></tr><tr><td>Persists through role chaining</td><td>❌ No — each hop has its own session name</td><td>✅ Yes — propagates through ALL chained roles</td></tr><tr><td>Immutable once set</td><td>❌ No — each hop can set a new session name</td><td>✅ Yes — cannot be changed once set</td></tr><tr><td>CloudTrail visibility</td><td>In assumed role ARN</td><td>In <code>sourceIdentity</code> field of CloudTrail event</td></tr></tbody></table>
+<p><strong>Why SourceIdentity Matters:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Without SourceIdentity:
+</span>  Priya assumes Role A (session: "priya-session")
+    → Role A assumes Role B (session: "roleA-session")
+      → Role B accesses S3
+      → CloudTrail shows: assumed-role/RoleB/roleA-session
+      → WHO IS "roleA-session"? Is it Priya or David? → UNKNOWN
+
+With SourceIdentity:
+  Priya assumes Role A (sourceIdentity: "priya@shopnow.com")
+    → Role A assumes Role B (sourceIdentity PROPAGATES automatically)
+      → Role B accesses S3
+      → CloudTrail shows: sourceIdentity = "priya@shopnow.com"
+      → CLEAR: Priya performed this action through role chain</code></pre></div>
+<p><strong>Configuring SourceIdentity:</strong></p>
+<p>→ In the AssumeRole call:</p>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td><code>SourceIdentity</code></td><td><code>priya@shopnow.com</code> (or employee ID)</td></tr></tbody></table>
+<p>→ In the trust policy — enforce SourceIdentity must be set:</p>
+<table><thead><tr><th>Condition Key</th><th>Operator</th><th>Value</th></tr></thead><tbody><tr><td><code>sts:SourceIdentity</code></td><td><code>StringLike</code></td><td><code>*@shopnow.com</code></td></tr></tbody></table>
+<p>→ In the role's PERMISSION policy — allow setting SourceIdentity:</p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>sts:SetSourceIdentity</code></td><td><code>*</code></td></tr></tbody></table>
+<p>→ Without this permission in the role's policy → AssumeRole with SourceIdentity fails</p>
+<p><strong>SourceIdentity Restrictions:</strong></p>
+<table><thead><tr><th>Restriction</th><th>Limit</th></tr></thead><tbody><tr><td>Minimum length</td><td>2 characters</td></tr><tr><td>Maximum length</td><td>64 characters</td></tr><tr><td>Allowed characters</td><td><code>[a-zA-Z0-9=,.@-]</code></td></tr><tr><td>Immutability</td><td>Once set → cannot be changed in chained role assumptions</td></tr><tr><td>Propagation</td><td>Automatically propagates through ALL role chains</td></tr></tbody></table>
+<hr>
+<h3>STEP 9 — IMPLEMENT EMERGENCY ACCESS BREAK-GLASS PATTERN</h3>
+<p>→ For situations where normal access paths are broken or insufficient</p>
+<p><strong>Break-Glass Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Normal Operations:
+</span>  Engineer → Shared Services → Cross-Account Deploy Role → Deploy
+  (Automated, audited, session-policy scoped)
+
+Emergency (Production Down):
+  Engineer → MFA Authentication → Shared Services → Emergency Admin Role → Full Access
+  (Manual, heavily audited, 15-minute sessions, requires justification)</code></pre></div>
+<p><strong>Break-Glass Role Configuration in Each Account:</strong></p>
+<p>→ Already created in Step 2 as <code>CrossAccount-Emergency-Admin</code> (Tier 4)</p>
+<p><strong>Additional Safeguards:</strong></p>
+<p><strong>Safeguard 1 — EventBridge Alert on Emergency Role Assumption:</strong></p>
+<p>→ In each destination account → EventBridge rule (Project 38):</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>shopnow-emergency-access-alert</code></td></tr><tr><td>Event pattern source</td><td><code>aws.sts</code> (via CloudTrail)</td></tr><tr><td>detail-type</td><td><code>AWS API Call via CloudTrail</code></td></tr><tr><td>detail.eventName</td><td><code>AssumeRole</code></td></tr><tr><td>detail.requestParameters.roleArn</td><td>Contains <code>Emergency-Admin</code></td></tr><tr><td>Target 1</td><td>SNS → <code>shopnow-security-critical-alerts</code> (pages security team)</td></tr><tr><td>Target 2</td><td>CloudWatch Log → <code>/shopnow/security/emergency-access</code></td></tr></tbody></table>
+<p>→ EVERY emergency role assumption triggers an immediate page to the security team<br>
+→ This ensures accountability even during emergencies</p>
+<p><strong>Safeguard 2 — CloudTrail Insight for Anomaly Detection:</strong></p>
+<p>→ Enable CloudTrail Insights in each account<br>
+→ Insights automatically detect unusual API activity<br>
+→ Emergency admin performing unusual volume of API calls → automatic alert</p>
+<p><strong>Safeguard 3 — Session Duration Enforcement:</strong></p>
+<p>→ Maximum session: 15 minutes<br>
+→ Engineer must re-authenticate with MFA every 15 minutes<br>
+→ Each re-authentication creates a new CloudTrail event<br>
+→ Creates a detailed timeline of emergency access</p>
+<p><strong>Safeguard 4 — Post-Incident Review:</strong></p>
+<p>→ After every emergency access:</p>
+<ul>
+<li>CloudTrail logs reviewed for all actions taken</li>
+<li>Security team verifies actions were necessary</li>
+<li>Incident report documents why emergency access was needed</li>
+<li>Process improvements identified to prevent future emergencies</li>
+</ul>
+<hr>
+<h3>STEP 10 — CENTRALIZE AUDIT TRAIL ACROSS ALL ACCOUNTS</h3>
+<p>→ With 5 accounts → CloudTrail events are spread across 5 separate trails<br>
+→ Security team needs ONE place to see all cross-account activity</p>
+<p><strong>Centralized CloudTrail Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account 111 (HQ)        → CloudTrail → 
+</span>Account 222 (Europe)     → CloudTrail → → All trails write to →
+Account 333 (US)         → CloudTrail → → Central S3 bucket in →
+Account 444 (Japan)      → CloudTrail → → Account 555 (Shared)
+Account 555 (Shared)     → CloudTrail →</code></pre></div>
+<p><strong>Configuration in Shared Services Account (555555555555):</strong></p>
+<p><strong>Step 10a — Create Central CloudTrail Bucket:</strong></p>
+<p>→ S3 → Create bucket: <code>shopnow-centralized-cloudtrail-logs</code></p>
+<p><strong>Bucket Policy for Cross-Account CloudTrail Writes:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Allow CloudTrail ACL Check</td><td>Allow</td><td><code>cloudtrail.amazonaws.com</code></td><td><code>s3:GetBucketAcl</code></td><td>Bucket ARN</td><td>None</td></tr><tr><td>Allow CloudTrail Write from All Accounts</td><td>Allow</td><td><code>cloudtrail.amazonaws.com</code></td><td><code>s3:PutObject</code></td><td><code>bucket-arn/AWSLogs/111111111111/*</code>, <code>bucket-arn/AWSLogs/222222222222/*</code>, <code>bucket-arn/AWSLogs/333333333333/*</code>, <code>bucket-arn/AWSLogs/444444444444/*</code>, <code>bucket-arn/AWSLogs/555555555555/*</code></td><td><code>s3:x-amz-acl = bucket-owner-full-control</code></td></tr></tbody></table>
+<p>→ Encrypt with a dedicated KMS key: <code>shopnow-cloudtrail-central-key</code> (Project 36 concepts)<br>
+→ KMS key policy must allow <code>cloudtrail.amazonaws.com</code> to use it</p>
+<p><strong>Step 10b — Configure CloudTrail in Each Account:</strong></p>
+<p>→ In each account → CloudTrail → Create trail or Edit existing</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trail name</td><td><code>shopnow-centralized-trail</code></td></tr><tr><td>S3 bucket</td><td><code>shopnow-centralized-cloudtrail-logs</code> (in Account 555)</td></tr><tr><td>S3 prefix</td><td>(auto-includes account ID in path)</td></tr><tr><td>Log file SSE-KMS encryption</td><td>✅ Enable with central KMS key</td></tr><tr><td>Management events</td><td>Read + Write</td></tr><tr><td>Data events — S3</td><td>All S3 buckets (Read + Write)</td></tr><tr><td>Insights</td><td>✅ Enable</td></tr></tbody></table>
+<p>→ Now ALL CloudTrail events from ALL accounts flow to ONE bucket<br>
+→ Security team can search across all accounts in one place<br>
+→ Athena can query this centralized log bucket (Project 18 concepts)</p>
+<p><strong>Step 10c — Athena Table for Cross-Account Audit:</strong></p>
+<p>→ In Shared Services account → Create Glue Catalog table pointing to the centralized CloudTrail bucket<br>
+→ Athena can now query:</p>
+<table><thead><tr><th>Query Purpose</th><th>Filter</th></tr></thead><tbody><tr><td>All cross-account AssumeRole events</td><td><code>eventName = 'AssumeRole'</code> AND <code>requestParameters</code> contains cross-account role ARN</td></tr><tr><td>All emergency access events</td><td><code>requestParameters.roleArn LIKE '%Emergency-Admin%'</code></td></tr><tr><td>All failed access attempts</td><td><code>errorCode = 'AccessDenied'</code></td></tr><tr><td>Actions by specific engineer</td><td><code>sourceIdentity = 'priya@shopnow.com'</code></td></tr><tr><td>All KMS key usage across accounts</td><td><code>eventSource = 'kms.amazonaws.com'</code></td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use tiered permission model — Monitor, DataRead, Deploy, Emergency — not one-size-fits-all<br>
+→ Always set maximum session duration on each role appropriate to its tier<br>
+→ Always enforce meaningful RoleSessionName via trust policy conditions<br>
+→ Always implement SourceIdentity for role chain traceability<br>
+→ Always use session policies to scope down permissions per task<br>
+→ Always require MFA for emergency/admin cross-account roles<br>
+→ Always store External IDs in Secrets Manager — not in wikis or code<br>
+→ Always set up EventBridge alerts for emergency role assumption<br>
+→ Always centralize CloudTrail logs in one account for unified audit<br>
+→ Always use separate AssumeRole calls instead of role chaining when possible<br>
+→ Always rotate External IDs annually with dual-ID transition window<br>
+→ Always document which roles exist in which accounts and their permission levels<br>
+→ Always use descriptive role names that indicate source account and permission tier</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never create a single "god role" with <code>*:*</code> permissions for all cross-account access<br>
+→ Never use the same External ID across all roles and all partner accounts<br>
+→ Never set maximum session duration to 12 hours for admin roles — keep it minimal<br>
+→ Never allow default SDK session names (<code>botocore-session-*</code>) — enforce naming conventions<br>
+→ Never skip MFA for emergency admin roles — this is the last line of defense<br>
+→ Never use role chaining when direct trust relationships can be established<br>
+→ Never forget that chained role sessions are HARD LIMITED to 1 hour<br>
+→ Never grant <code>iam:*</code> in cross-account roles — prevents privilege escalation<br>
+→ Never grant <code>sts:AssumeRole</code> on <code>*</code> in any account — always specify exact target role ARNs<br>
+→ Never allow cross-account roles to create other roles — prevents persistent backdoor creation<br>
+→ Never skip centralized CloudTrail — without it, cross-account activity is invisible<br>
+→ Never assume session policies EXPAND permissions — they can ONLY restrict<br>
+→ Never reuse session names across different engineers or pipelines — destroys accountability</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Approach</th><th>Why</th></tr></thead><tbody><tr><td>Monitoring across accounts</td><td>Tier 1 — ReadOnly role, 1-hour session</td><td>Minimum permissions for observability</td></tr><tr><td>Data lake access from subsidiary</td><td>Tier 2 — DataRead role with prefix restrictions</td><td>Same as Project 39 pattern</td></tr><tr><td>CI/CD deployment across accounts</td><td>Tier 3 — Deploy role, 4-hour session, session policy scoping</td><td>Sufficient duration, scoped per deployment</td></tr><tr><td>Production emergency</td><td>Tier 4 — Emergency Admin, 15-min session, MFA required</td><td>Maximum access, maximum audit, minimum duration</td></tr><tr><td>Accessing multiple accounts in one pipeline</td><td>Separate AssumeRole calls per account</td><td>Avoids chaining limitations, clear audit trail</td></tr><tr><td>Need to trace action through role chain</td><td>SourceIdentity parameter</td><td>Propagates through all hops</td></tr><tr><td>Limiting blast radius of leaked credentials</td><td>Session policy on each AssumeRole call</td><td>Narrows permissions to specific task</td></tr><tr><td>Scaling to 20+ accounts</td><td>Organizational conditions (Project 54 preview)</td><td>Avoids per-account trust policy management</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use cross-account role assumption for data transfer between accounts — use S3 replication (Project 30) or DMS (Project 58)<br>
+→ Do NOT use role chaining when direct trust is possible — chaining adds complexity and limits duration<br>
+→ Do NOT use emergency admin roles for routine operations — use appropriate tier<br>
+→ Do NOT use session policies as a replacement for proper role permission design — they are supplementary<br>
+→ Do NOT use cross-account roles for service-to-service communication that should use VPC Peering (Project 44) or Transit Gateway (Project 50)<br>
+→ Do NOT use individual cross-account roles when AWS Organizations SCPs (Project 54) can provide governance at scale</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — STS ASSUMEROLE COMPLETE EVALUATION FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Caller: SharedServices-CICDRole (Account 555)
+</span>Target: CrossAccount-Shared-Deploy (Account 111)
+        │
+        ▼
+STS receives AssumeRole request
+        │
+        ├── Validation 1: Request parameters
+        │     RoleArn format valid? ✅
+        │     RoleSessionName length 2-64, valid characters? ✅
+        │     DurationSeconds within 900-43200? ✅
+        │     ExternalId provided? ✅
+        │     SourceIdentity valid characters and length? ✅
+        │     Session Policy size within 2048 chars? ✅
+        │
+        ├── Validation 2: Caller permissions (Account 555)
+        │     IAM Policy on SharedServices-CICDRole:
+        │       sts:AssumeRole allowed on target role ARN? ✅
+        │     SCP on Account 555 (if in Organization):
+        │       sts:AssumeRole not denied? ✅
+        │     Permission boundary on SharedServices-CICDRole:
+        │       sts:AssumeRole not excluded? ✅
+        │
+        ├── Validation 3: Target trust policy (Account 111)
+        │     Trust policy on CrossAccount-Shared-Deploy:
+        │       Principal includes caller ARN? ✅
+        │       Condition sts:ExternalId matches? ✅
+        │       Condition sts:RoleSessionName matches pattern? ✅
+        │       Condition aws:MultiFactorAuthPresent (if required)? ✅ or N/A
+        │       Condition sts:SourceIdentity matches pattern? ✅ or N/A
+        │     SCP on Account 111 (if in Organization):
+        │       sts:AssumeRole not denied for this role? ✅
+        │
+        ├── Validation 4: Duration check
+        │     Requested duration ≤ Role's maximum session duration? ✅
+        │     If role chaining: duration ≤ 3600? ✅
+        │
+        └── ALL validations pass
+                │
+                ▼
+        STS generates temporary credentials:
+          AccessKeyId = ASIA... (temporary key prefix)
+          SecretAccessKey = (random)
+          SessionToken = (encodes role ARN, session name, expiration, policies)
+          Expiration = now + requested duration
+                │
+                ▼
+        CloudTrail logs in BOTH accounts:
+          Account 555: AssumeRole call (caller identity, target role, success)
+          Account 111: AssumeRole event (assumed role, session name, source identity)
+                │
+                ▼
+        Caller uses temporary credentials for subsequent API calls
+        Each API call checked against:
+          Role IAM Policy ∩ Session Policy ∩ Permission Boundary ∩ SCP</code></pre></div>
+<hr>
+<h3>MECHANIC 2 — TEMPORARY CREDENTIAL ANATOMY</h3>
+<p><strong>What the SessionToken contains (encoded, not human-readable):</strong></p>
+<table><thead><tr><th>Encoded Field</th><th>Purpose</th></tr></thead><tbody><tr><td>Role ARN</td><td>Which role was assumed</td></tr><tr><td>Session Name</td><td>Who assumed it</td></tr><tr><td>Source Identity</td><td>Original caller identity (if set)</td></tr><tr><td>Expiration Time</td><td>When credentials become invalid</td></tr><tr><td>Session Policy</td><td>Scoped-down permissions (if provided)</td></tr><tr><td>MFA Authentication Info</td><td>Whether MFA was used and when</td></tr><tr><td>External ID</td><td>What External ID was provided</td></tr></tbody></table>
+<p>→ The SessionToken is cryptographically signed by STS<br>
+→ Any tampering → signature verification fails → API call rejected<br>
+→ The token is opaque — services cannot read its contents directly<br>
+→ Only STS can verify and decode it</p>
+<p><strong>How AWS Services Validate Temporary Credentials:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>API Call arrives at S3 (or any AWS service)
+</span>        │
+        ▼
+Service extracts AccessKeyId + SessionToken from request
+        │
+        ▼
+Service calls STS internal validation:
+  1. Is the SessionToken signature valid? → Tamper check
+  2. Has the token expired? → Timestamp check
+  3. Has the source role been modified/deleted? → Real-time check
+  4. Is there an active SCP denial? → Organization check
+        │
+        ▼
+If all valid → extract the effective permissions from:
+  Role IAM Policy ∩ Session Policy ∩ Permission Boundary ∩ SCP
+        │
+        ▼
+Evaluate the specific API action against effective permissions</code></pre></div>
+<hr>
+<h3>MECHANIC 3 — ROLE CHAINING INTERNAL FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: SharedServices-CICDRole assumes CrossAccount-Shared-Deploy (in HQ)
+</span>        │
+        STS returns credentials with:
+          sourceIdentity: "cicd-pipeline-orders"
+          sessionName: "cicd-orders-build-4521"
+          expiration: 4 hours from now (role maximum)
+        │
+Step 2: Using HQ credentials, assume CrossAccount-HQ-To-Europe (in Europe)
+        │
+        STS evaluates:
+          Caller = assumed-role/CrossAccount-Shared-Deploy/cicd-orders-build-4521
+          Target trust policy must allow THIS assumed role ARN
+          sourceIdentity: "cicd-pipeline-orders" (PROPAGATED — cannot change)
+          
+        CRITICAL DIFFERENCE:
+          Maximum duration = 1 HOUR (hard limit for chained sessions)
+          Even if Europe's role maximum is 4 hours → capped at 1 hour
+          
+        STS returns NEW credentials with:
+          sourceIdentity: "cicd-pipeline-orders" (same — propagated)
+          sessionName: (new session name for this hop)
+          expiration: 1 hour from now (HARD LIMIT)</code></pre></div>
+<p><strong>Why 1-Hour Hard Limit for Chaining?</strong><br>
+→ AWS designed this to prevent indefinite credential extension<br>
+→ Without this limit → Chain A → B → C → D → E → each extending duration<br>
+→ Could create effectively permanent credentials through chaining<br>
+→ 1-hour limit forces re-authentication through the original identity periodically</p>
+<hr>
+<h3>MECHANIC 4 — EFFECTIVE PERMISSION CALCULATION</h3>
+<p>→ The most complex but most important mechanic to understand</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Effective Permissions = 
+</span>    INTERSECTION of:
+        ┌── Role IAM Policy (attached to the assumed role)
+        ├── Session Policy (passed during AssumeRole — if any)
+        ├── Permission Boundary (attached to the assumed role — if any)
+        └── SCP (from AWS Organizations — if member account)
+    
+    MINUS:
+        Any EXPLICIT DENY in any of the above</code></pre></div>
+<p><strong>Visual:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────┐
+</span>│         Role IAM Policy                    │
+│    ┌─────────────────────────────────┐    │
+│    │      Session Policy              │    │
+│    │   ┌─────────────────────────┐   │    │
+│    │   │   Permission Boundary    │   │    │
+│    │   │  ┌───────────────────┐  │   │    │
+│    │   │  │       SCP         │  │   │    │
+│    │   │  │  ┌─────────────┐  │  │   │    │
+│    │   │  │  │  EFFECTIVE   │  │  │   │    │
+│    │   │  │  │ PERMISSIONS  │  │  │   │    │
+│    │   │  │  └─────────────┘  │  │   │    │
+│    │   │  └───────────────────┘  │   │    │
+│    │   └─────────────────────────┘   │    │
+│    └─────────────────────────────────┘    │
+└───────────────────────────────────────────┘</code></pre></div>
+<p>→ The effective permissions are the INNERMOST overlap<br>
+→ Adding a session policy can ONLY make this smaller — never larger<br>
+→ This is why session policies are safe — they can ONLY restrict</p>
+<p><strong>Example:</strong></p>
+<table><thead><tr><th>Layer</th><th>s3:GetObject products/*</th><th>s3:GetObject orders/*</th><th>s3:PutObject</th><th>glue:*</th></tr></thead><tbody><tr><td>Role IAM Policy</td><td>✅ Allow</td><td>✅ Allow</td><td>✅ Allow</td><td>✅ Allow</td></tr><tr><td>Session Policy</td><td>✅ Allow</td><td>❌ Not mentioned</td><td>❌ Not mentioned</td><td>❌ Not mentioned</td></tr><tr><td>Permission Boundary</td><td>✅ Allow</td><td>✅ Allow</td><td>✅ Allow</td><td>✅ Allow</td></tr><tr><td>SCP</td><td>✅ Allow</td><td>✅ Allow</td><td>✅ Allow</td><td>✅ Allow</td></tr><tr><td><strong>Effective</strong></td><td>✅ <strong>Allowed</strong></td><td>❌ <strong>Denied</strong> (not in session policy)</td><td>❌ <strong>Denied</strong> (not in session policy)</td><td>❌ <strong>Denied</strong> (not in session policy)</td></tr></tbody></table>
+<p>→ Session policy only allowed <code>s3:GetObject products/*</code> → everything else is implicitly denied</p>
+<hr>
+<h3>MECHANIC 5 — CROSS-ACCOUNT CLOUDTRAIL EVENT STRUCTURE</h3>
+<p><strong>AssumeRole Event in Source Account (555555555555):</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td><code>eventName</code></td><td><code>AssumeRole</code></td></tr><tr><td><code>eventSource</code></td><td><code>sts.amazonaws.com</code></td></tr><tr><td><code>userIdentity.type</code></td><td><code>AssumedRole</code> (if called from another role) or <code>IAMUser</code></td></tr><tr><td><code>userIdentity.arn</code></td><td><code>arn:aws:iam::555555555555:role/SharedServices-CICDRole</code></td></tr><tr><td><code>requestParameters.roleArn</code></td><td><code>arn:aws:iam::111111111111:role/CrossAccount-Shared-Deploy</code></td></tr><tr><td><code>requestParameters.roleSessionName</code></td><td><code>cicd-orders-build-4521</code></td></tr><tr><td><code>requestParameters.externalId</code></td><td><code>shopnow-shared-deploy-2025</code></td></tr><tr><td><code>requestParameters.sourceIdentity</code></td><td><code>cicd-pipeline-orders</code></td></tr><tr><td><code>requestParameters.durationSeconds</code></td><td><code>3600</code></td></tr><tr><td><code>responseElements.credentials.accessKeyId</code></td><td><code>ASIA...</code> (temporary key ID)</td></tr><tr><td><code>responseElements.credentials.expiration</code></td><td><code>2025-01-15T03:00:00Z</code></td></tr><tr><td><code>responseElements.assumedRoleUser.arn</code></td><td><code>arn:aws:sts::111111111111:assumed-role/CrossAccount-Shared-Deploy/cicd-orders-build-4521</code></td></tr></tbody></table>
+<p><strong>Subsequent S3 Event in Destination Account (111111111111):</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td><code>eventName</code></td><td><code>GetObject</code></td></tr><tr><td><code>eventSource</code></td><td><code>s3.amazonaws.com</code></td></tr><tr><td><code>userIdentity.type</code></td><td><code>AssumedRole</code></td></tr><tr><td><code>userIdentity.arn</code></td><td><code>arn:aws:sts::111111111111:assumed-role/CrossAccount-Shared-Deploy/cicd-orders-build-4521</code></td></tr><tr><td><code>userIdentity.accountId</code></td><td><code>111111111111</code> (assumed role's account)</td></tr><tr><td><code>userIdentity.sessionContext.sessionIssuer.arn</code></td><td><code>arn:aws:iam::111111111111:role/CrossAccount-Shared-Deploy</code></td></tr><tr><td><code>sourceIdentity</code></td><td><code>cicd-pipeline-orders</code></td></tr></tbody></table>
+<p>→ <code>sourceIdentity</code> persists → traceable back to the original CI/CD pipeline<br>
+→ <code>RoleSessionName</code> identifies the specific build run</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Role chaining session capped at 1 hour</td><td>Long-running chained job fails after 1 hour</td><td>Hard limit on chained role sessions</td><td>Avoid chaining — use direct trust relationships</td></tr><tr><td>2</td><td>Session policy accidentally denies needed permissions</td><td>AssumeRole succeeds but API calls fail with Access Denied</td><td>Session policy missing required actions</td><td>Test session policy before deploying to CI/CD</td></tr><tr><td>3</td><td>MFA condition blocks service roles</td><td>Automated service cannot assume emergency role</td><td>Service roles cannot satisfy MFA conditions</td><td>MFA only on human-assumed roles — service roles use non-MFA tiers</td></tr><tr><td>4</td><td>External ID mismatch after rotation</td><td>AssumeRole fails with "non-valid ExternalId"</td><td>Trust policy updated but caller not yet updated</td><td>Use dual-ID window during rotation (Step 7)</td></tr><tr><td>5</td><td>Session name condition too restrictive</td><td>Legitimate callers rejected</td><td>Trust policy pattern doesn't match caller's session name format</td><td>Broaden StringLike pattern or update caller naming</td></tr><tr><td>6</td><td>SourceIdentity not set → chained role loses traceability</td><td>CloudTrail shows no source identity in chained sessions</td><td>SourceIdentity not passed in initial AssumeRole call</td><td>Always set SourceIdentity in the first hop</td></tr><tr><td>7</td><td>Maximum session duration set too low on role</td><td>CI/CD pipeline fails mid-deployment when credentials expire</td><td>Role maximum &lt; pipeline duration</td><td>Increase role maximum session duration OR implement credential refresh</td></tr><tr><td>8</td><td>Too many cross-account roles → management overhead</td><td>50+ roles across 10 accounts, inconsistent configurations</td><td>Per-pair role creation without standardization</td><td>Use naming conventions, Terraform/CloudFormation templates, or Organizations (Project 54)</td></tr><tr><td>9</td><td>Cross-account role has <code>iam:*</code> permission</td><td>Privilege escalation — assumed role creates new admin role in target account</td><td>Over-permissioned cross-account role</td><td>NEVER grant <code>iam:*</code>, <code>iam:CreateRole</code>, <code>iam:AttachRolePolicy</code> in cross-account roles</td></tr><tr><td>10</td><td>Deleted role referenced in trust policies</td><td>Trust policy references non-existent role ARN → future recreation could be exploited</td><td>Role deleted but trust policy not cleaned up</td><td>Audit trust policies when roles are deleted</td></tr><tr><td>11</td><td>Temporary credentials logged in CI/CD output</td><td>Credentials visible in build logs → potential theft</td><td>Application code prints credentials to stdout</td><td>Mask credentials in CI/CD pipeline, never print SessionToken</td></tr><tr><td>12</td><td>SCP in Organization blocks AssumeRole</td><td>Cross-account access stops working after Organization enrollment</td><td>SCP denies <code>sts:AssumeRole</code> to external accounts</td><td>Review SCPs when joining Organization (Project 54)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Account Count Scaling</strong></p>
+<ul>
+<li>2-5 accounts → Individual cross-account roles work fine (this project's approach)</li>
+<li>5-20 accounts → Use naming conventions + Infrastructure-as-Code templates</li>
+<li>20-50 accounts → Use AWS Organizations with organizational conditions</li>
+<li>50-100 accounts → Use AWS Organizations + SCPs + AWS SSO (IAM Identity Center)</li>
+<li>100+ accounts → Use AWS Control Tower + Account Factory + centralized governance</li>
+<li>Project 54 addresses the 20+ account scenario</li>
+</ul>
+<p>→ <strong>Role Count Scaling</strong></p>
+<ul>
+<li>IAM roles per account: Default 1,000 (soft limit — can increase to 5,000+)</li>
+<li>With 4 tiers × 10 source accounts = 40 cross-account roles per destination account</li>
+<li>Well within limits</li>
+<li>Use tags for role categorization and automated policy management</li>
+</ul>
+<p>→ <strong>STS API Scaling</strong></p>
+<ul>
+<li>AssumeRole: No published rate limit — designed for high-volume use</li>
+<li>STS endpoints are regional — use regional endpoints for lower latency</li>
+<li>Global endpoint (<code>sts.amazonaws.com</code>) works but routes to <code>us-east-1</code></li>
+<li>Regional endpoint (<code>sts.ap-south-1.amazonaws.com</code>) is faster for local callers</li>
+</ul>
+<p>→ <strong>Trust Policy Size Scaling</strong></p>
+<ul>
+<li>Maximum trust policy size: 2048 characters</li>
+<li>Each principal ARN adds ~70 characters</li>
+<li>Practical limit: ~20-25 specific role ARNs per trust policy</li>
+<li>If more → Use account-level trust (<code>root</code>) and control via IAM policies in source account</li>
+<li>Or use <code>aws:PrincipalOrgID</code> condition to trust entire Organization (Project 54)</li>
+</ul>
+<p>→ <strong>Credential Caching Scaling</strong></p>
+<ul>
+<li>AssumeRole returns credentials valid for the requested duration</li>
+<li>Cache credentials in memory — don't call AssumeRole for every API request</li>
+<li>Refresh credentials when ~80% of duration has elapsed</li>
+<li>AWS SDKs handle credential refresh automatically when configured with AssumeRole provider</li>
+</ul>
+<p>→ <strong>CloudTrail Centralization Scaling</strong></p>
+<ul>
+<li>Centralized bucket receives logs from all accounts</li>
+<li>At 50+ accounts → CloudTrail log volume becomes significant (TBs per month)</li>
+<li>Use S3 lifecycle policies (Project 12) to transition old logs to Glacier</li>
+<li>Use Athena with partitioned tables for efficient querying</li>
+<li>Consider CloudTrail Lake for managed query experience</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the complete role architecture:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>Where</th><th>Expected Result</th></tr></thead><tbody><tr><td>All tiered roles exist in each account</td><td>IAM → Roles → filter by "CrossAccount"</td><td>Roles matching naming convention</td></tr><tr><td>Trust policies reference correct source roles</td><td>Each role → Trust relationships tab</td><td>Correct principal ARNs with External ID</td></tr><tr><td>Permission policies match tier expectations</td><td>Each role → Permissions tab</td><td>Tier-appropriate permissions only</td></tr><tr><td>Maximum session duration set correctly</td><td>Each role → Summary → Maximum session duration</td><td>Matches tier specification</td></tr><tr><td>MFA condition on emergency roles</td><td>Emergency role → Trust relationships</td><td><code>aws:MultiFactorAuthPresent: true</code> condition</td></tr><tr><td>Session name condition enforced</td><td>Each role → Trust relationships</td><td><code>sts:RoleSessionName</code> condition present</td></tr><tr><td>External IDs stored securely</td><td>Secrets Manager in Shared Services</td><td>Secrets exist for each External ID</td></tr><tr><td>Centralized CloudTrail receiving from all accounts</td><td>Central bucket → verify log delivery</td><td><code>AWSLogs/</code> folders for all 5 account IDs</td></tr></tbody></table>
+<p>→ <strong>How to verify cross-account access is working:</strong></p>
+<table><thead><tr><th>Test</th><th>Steps</th><th>Expected Result</th></tr></thead><tbody><tr><td>Emergency role with MFA</td><td>From MFA-authenticated session → AssumeRole on Emergency role</td><td>Temporary credentials returned (15 min max)</td></tr><tr><td>Emergency role triggers alert</td><td>Assume emergency role → check EventBridge/SNS</td><td>Security team receives immediate alert</td></tr><tr><td>Session name enforcement</td><td>AssumeRole with <code>RoleSessionName = "random123"</code> (doesn't match pattern)</td><td>Access Denied by trust policy condition</td></tr><tr><td>Session name compliance</td><td>AssumeRole with <code>RoleSessionName = "engineer-priya-20250115"</code></td><td>Succeeds — matches <code>engineer-*</code> pattern</td></tr><tr><td>SourceIdentity propagation</td><td>Assume Role A with SourceIdentity → chain to Role B → check CloudTrail</td><td>SourceIdentity appears in both CloudTrail events</td></tr><tr><td>Credential expiration</td><td>Assume role with 15 min duration → wait 16 minutes → make API call</td><td>Access Denied — credentials expired</td></tr><tr><td>External ID enforcement</td><td>AssumeRole without External ID or with wrong value</td><td>Access Denied by trust policy condition</td></tr><tr><td>Role chaining duration cap</td><td>Assume Role A (4hr) → chain to Role B → request 4hr duration</td><td>Error — chained session capped at 1 hour</td></tr><tr><td>Centralized CloudTrail</td><td>Perform cross-account action → check central bucket in Shared Services</td><td>Event appears in <code>AWSLogs/{account-id}/</code> path</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing cross-account health:</strong></p>
+<table><thead><tr><th>Metric / Signal</th><th>Where</th><th>Alert Condition</th></tr></thead><tbody><tr><td>AssumeRole success rate</td><td>CloudTrail → filter <code>eventName = AssumeRole</code></td><td>Sudden drop in success rate</td></tr><tr><td>AssumeRole failure rate</td><td>CloudTrail → filter <code>eventName = AssumeRole</code>, <code>errorCode = AccessDenied</code></td><td>Any increase above baseline</td></tr><tr><td>Emergency role usage</td><td>EventBridge rule → CloudTrail pattern</td><td>ANY emergency assumption → immediate page</td></tr><tr><td>Session duration patterns</td><td>CloudTrail → analyze <code>requestParameters.durationSeconds</code></td><td>Sessions consistently hitting maximum → may need adjustment</td></tr><tr><td>Unique session names per day</td><td>CloudTrail analysis</td><td>Sudden spike → possible automated credential abuse</td></tr><tr><td>Cross-account API call volume</td><td>CloudTrail → group by assumed role ARN</td><td>Unusual volume → potential compromised credentials</td></tr><tr><td>Failed API calls after assumption</td><td>CloudTrail → filter by assumed role + <code>errorCode</code></td><td>Permissions mismatch → role policy needs review</td></tr><tr><td>SourceIdentity coverage</td><td>CloudTrail → check <code>sourceIdentity</code> field presence</td><td>Missing SourceIdentity → caller not setting it → fix caller</td></tr></tbody></table>
+<p>→ <strong>How to create a cross-account access dashboard:</strong></p>
+<table><thead><tr><th>Dashboard Widget</th><th>Data Source</th><th>Visualization</th></tr></thead><tbody><tr><td>Total AssumeRole calls per account per day</td><td>CloudTrail (Athena query on centralized bucket)</td><td>Stacked bar chart</td></tr><tr><td>Top 10 assumed roles by call volume</td><td>CloudTrail aggregation</td><td>Table</td></tr><tr><td>Failed AssumeRole attempts</td><td>CloudTrail filter <code>errorCode != null</code></td><td>Time series with alarm threshold</td></tr><tr><td>Emergency role usage timeline</td><td>CloudTrail filter on Emergency role ARNs</td><td>Event timeline</td></tr><tr><td>Average session duration by tier</td><td>CloudTrail analysis of <code>durationSeconds</code></td><td>Grouped bar chart</td></tr><tr><td>Cross-account data transfer volume</td><td>S3 request metrics + Cost Explorer</td><td>Line chart</td></tr><tr><td>Active sessions at any point</td><td>Derived from AssumeRole timestamp + duration</td><td>Real-time gauge</td></tr></tbody></table>
+<p>→ <strong>How to present multi-account architecture to auditor:</strong></p>
+<table><thead><tr><th>Auditor Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"How many accounts exist and what is each for?"</td><td>Show account topology table with purposes and owners</td></tr><tr><td>"Who can access which account?"</td><td>Show role matrix — tiered roles per account with source restrictions</td></tr><tr><td>"What permissions does each cross-account role have?"</td><td>Show IAM policies per tier — Monitor vs DataRead vs Deploy vs Emergency</td></tr><tr><td>"How are credentials managed?"</td><td>Show STS temporary credentials — auto-expire, no permanent keys</td></tr><tr><td>"Is there separation of duties?"</td><td>Show tier model — monitoring role cannot deploy, deploy role cannot admin</td></tr><tr><td>"How is emergency access controlled?"</td><td>Show MFA requirement, 15-minute sessions, EventBridge alerts, post-incident review</td></tr><tr><td>"Can you trace who did what across accounts?"</td><td>Show SourceIdentity propagation, session naming conventions, centralized CloudTrail</td></tr><tr><td>"What prevents privilege escalation?"</td><td>Show: No <code>iam:*</code> in cross-account roles, session policies, explicit deny guardrails</td></tr><tr><td>"What prevents the confused deputy problem?"</td><td>Show External IDs on every trust policy, stored in Secrets Manager</td></tr><tr><td>"Is there a centralized audit trail?"</td><td>Show centralized CloudTrail bucket with Athena query capability across all accounts</td></tr><tr><td>"Can access be revoked instantly?"</td><td>Demonstrate: Remove principal from trust policy → immediate denial across all sessions after expiration</td></tr><tr><td>"What about credential leaks?"</td><td>Show: Session policies minimize blast radius, short durations limit exposure window, CloudTrail detects anomalous usage</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Multi-account IAM role management requires a SYSTEMATIC approach — not ad-hoc role creation<br>
+→ The tiered permission model (Monitor → DataRead → Deploy → Emergency) provides defense-in-depth across account boundaries<br>
+→ STS AssumeRole is the FOUNDATION of all cross-account access — mastering it unlocks enterprise AWS architecture<br>
+→ Session duration should match the use case — 15 minutes for emergencies, 4 hours for deployments<br>
+→ Session policies provide per-task scoping — minimizing blast radius of credential exposure<br>
+→ RoleSessionName and SourceIdentity provide individual accountability — critical for compliance<br>
+→ External ID prevents confused deputy attacks — must be managed as sensitive configuration<br>
+→ MFA on emergency roles ensures only human operators with physical devices can access<br>
+→ Role chaining has a HARD 1-hour limit — prefer direct trust relationships over chaining<br>
+→ Centralized CloudTrail is NON-NEGOTIABLE for multi-account governance<br>
+→ Effective permissions are the INTERSECTION of Role Policy ∩ Session Policy ∩ Permission Boundary ∩ SCP<br>
+→ This project establishes the IDENTITY LAYER — how services and people prove who they are across account boundaries</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 2 introduced IAM fundamentals — users, groups, policies<br>
+→ Project 11 introduced IAM roles for EC2 — same role concept now extended cross-account<br>
+→ Project 36 introduced KMS key policies — cross-account roles must be added as key users<br>
+→ Project 37 introduced Secrets Manager — External IDs stored here securely<br>
+→ Project 38 introduced EventBridge — used for emergency access alerting<br>
+→ Project 39 established the BASIC cross-account pattern — this project systematizes and scales it</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 41 (next) will implement cross-account SNS → SQS notification — applying the trust model from this project to messaging services<br>
+→ Project 42 will implement cross-account Glue Catalog sharing via Lake Formation — using role assumption for catalog access<br>
+→ Project 44 will implement cross-account VPC Peering — network-level trust that complements the IAM-level trust established here<br>
+→ Project 50 will implement Transit Gateway — centralized network connectivity mirroring the centralized IAM architecture<br>
+→ Project 54 will introduce AWS Organizations + SCPs — replacing individual trust policies with ORGANIZATIONAL governance, solving the scaling problem when accounts exceed 20+<br>
+→ Project 60 will build the full Data Mesh — combining cross-account roles (this project), Lake Formation (Project 42), EventBridge (Project 38), and Organizations (Project 54) into a unified multi-account data platform</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The multi-account role architecture is in place<br>
+→ Five accounts can now securely access each other's resources with appropriate permission levels<br>
+→ But the operations team discovers a new requirement:</p>
+<blockquote>
+<p>"Our monitoring system in the Shared Services account needs to know when certain events happen in OTHER accounts.<br>
+For example:</p>
+<ul>
+<li>When HQ's Glue ETL job fails → Shared Services monitoring should know immediately</li>
+<li>When Europe uploads a new data file → Shared Services should trigger a centralized validation pipeline</li>
+<li>When US rotates a database credential → Shared Services should log it in the central audit system</li>
+</ul>
+<p>Currently, each account has its own EventBridge rules and SNS topics (from Project 38).<br>
+But the Shared Services account has NO visibility into events from other accounts.<br>
+We need events from HQ, Europe, US, and Japan to flow to our central Shared Services account for unified processing."</p>
+</blockquote>
+<p>→ The current setup has EventBridge rules within each account (Project 38)<br>
+→ But EventBridge events are ACCOUNT-SCOPED — they don't automatically cross account boundaries<br>
+→ SNS topics are also ACCOUNT-SCOPED — cross-account subscription requires specific policy configuration<br>
+→ SQS queues are ACCOUNT-SCOPED — cross-account message sending requires queue policy updates</p>
+<p>→ <strong>This is the exact problem Project 41 solves</strong><br>
+→ Project 41 introduces inter-account SNS → SQS notification patterns<br>
+→ It applies the trust model from THIS project (cross-account policies, principal authorization) to MESSAGING services<br>
+→ The SNS topic policy and SQS queue policy follow the same dual-authorization model as S3 bucket policy + IAM policy from Project 39<br>
+→ Additionally, it introduces <code>aws:PrincipalOrgID</code> condition — a preview of organizational governance (Project 54) that simplifies cross-account policy management when accounts are in the same AWS Organization</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 41: "The Central Account That Needed Alerts From All Accounts — Inter-Account SNS → SQS Notification"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-39.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 40/60</span></div><a class="nav-btn next" href="project-41.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

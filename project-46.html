@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 46: THE ETL THAT SHOULDN'T REPROCESS OLD DATA — Glue Job Bookmark &amp;  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 46: THE ETL THAT SHOULDN'T REPROCESS OLD DATA — Glue Job Bookmark &amp; Incremental ETL</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's data engineering team runs a daily Glue ETL job<br>
+→ The job extracts transaction records from MariaDB (from Project 9, 24) and writes Parquet files to S3 (from Project 1, 21)<br>
+→ The S3 data lake feeds Athena (from Project 18, 25) and Redshift Spectrum (from Project 28) for analytics</p>
+<p><strong>The Growth Problem:</strong></p>
+<table><thead><tr><th>Day</th><th>Total Records in MariaDB</th><th>New Records Since Yesterday</th><th>Glue Job Reads</th><th>Job Duration</th><th>Job Cost</th></tr></thead><tbody><tr><td>Day 1</td><td>10,000</td><td>10,000</td><td>10,000 (all)</td><td>2 minutes</td><td>$0.15</td></tr><tr><td>Day 30</td><td>300,000</td><td>10,000</td><td>300,000 (all)</td><td>45 minutes</td><td>$3.50</td></tr><tr><td>Day 90</td><td>900,000</td><td>10,000</td><td>900,000 (all)</td><td>2.5 hours</td><td>$12.00</td></tr><tr><td>Day 180</td><td>1,800,000</td><td>10,000</td><td>1,800,000 (all)</td><td>5 hours</td><td>$25.00</td></tr><tr><td>Day 365</td><td>3,650,000</td><td>10,000</td><td>3,650,000 (all)</td><td>10+ hours</td><td>$50.00+</td></tr></tbody></table>
+<p>→ Every single day — the Glue job re-reads EVERY record from Day 1<br>
+→ It processes 3.6 million records just to find 10,000 new ones<br>
+→ The output S3 folder has DUPLICATE data — the same records written every day<br>
+→ Athena queries return duplicate rows unless deduplication logic is added<br>
+→ Redshift Spectrum scans explode because of duplicated Parquet files</p>
+<p><strong>The Real Business Impact:</strong><br>
+→ Job that should cost $0.15/day now costs $50/day → $1,500/month → $18,000/year<br>
+→ Job that should take 2 minutes now takes 10 hours → misses the analytics SLA (reports needed by 8 AM)<br>
+→ Duplicate data in S3 causes incorrect aggregations in dashboards<br>
+→ The MariaDB is under heavy read pressure for 10 hours daily → slows down the production application</p>
+<p>→ The data engineer says: "I need Glue to remember where it left off and only process NEW data"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what "incremental ETL" means</p>
+<p><strong>Full Load (Current — Broken):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Every Run:
+</span>MariaDB [ALL 3.6M records] → Glue Job → S3 [Full dump every day]
+
+Day 1: Records 1-10,000 → S3/output/run1/
+Day 2: Records 1-20,000 → S3/output/run2/    ← Records 1-10,000 DUPLICATED
+Day 3: Records 1-30,000 → S3/output/run3/    ← Records 1-20,000 DUPLICATED</code></pre></div>
+<p><strong>Incremental Load (Target — Correct):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Every Run:
+</span>MariaDB [ONLY NEW records since last run] → Glue Job → S3 [Only new data appended]
+
+Day 1: Records 1-10,000 → S3/output/day1/
+Day 2: Records 10,001-20,000 → S3/output/day2/     ← Only NEW records
+Day 3: Records 20,001-30,000 → S3/output/day3/     ← Only NEW records</code></pre></div>
+<p>→ AWS Glue provides a built-in mechanism for this: <strong>Job Bookmarks</strong></p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand what Job Bookmarks are and how they track progress</li>
+<li>Step 2 — Understand the difference between S3 source bookmarks and JDBC source bookmarks</li>
+<li>Step 3 — Configure Job Bookmark on the Glue Job</li>
+<li>Step 4 — Understand bookmark keys and how Glue determines "new" data</li>
+<li>Step 5 — Configure JDBC bookmark keys for MariaDB</li>
+<li>Step 6 — Configure S3 bookmark behavior</li>
+<li>Step 7 — Handle bookmark pause, resume, and reset scenarios</li>
+<li>Step 8 — Handle schema evolution with bookmarks</li>
+<li>Step 9 — Monitor and troubleshoot bookmark behavior</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND WHAT JOB BOOKMARKS ARE</h3>
+<p>→ A Job Bookmark is a PERSISTENCE MECHANISM built into AWS Glue<br>
+→ It stores a "checkpoint" after each successful job run<br>
+→ On the next run — Glue reads the checkpoint and processes only data AFTER that point</p>
+<p><strong>Conceptual Model:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Run 1 (First Ever):
+</span>    → Bookmark: "No previous checkpoint"
+    → Glue reads ALL data from source
+    → Processes everything
+    → Bookmark saved: "Processed up to record X / file Y / timestamp Z"
+
+Run 2:
+    → Bookmark: "Last processed up to X"
+    → Glue reads ONLY data AFTER X
+    → Processes only new data
+    → Bookmark updated: "Processed up to record X+N"
+
+Run 3:
+    → Bookmark: "Last processed up to X+N"
+    → Glue reads ONLY data AFTER X+N
+    → And so on...</code></pre></div>
+<p>→ The bookmark is stored INTERNALLY by AWS Glue — you do NOT manage a file or database for this<br>
+→ It is tied to the specific Glue Job name + Job Run<br>
+→ It survives job restarts, account reboots, and console refreshes</p>
+<hr>
+<h3>STEP 2 — UNDERSTAND THE TWO SOURCE TYPES AND THEIR BOOKMARK BEHAVIOR</h3>
+<p><strong>Glue supports bookmarks for TWO types of sources — and they work COMPLETELY DIFFERENTLY:</strong></p>
+<hr>
+<h4>SOURCE TYPE A: S3 (File-Based Bookmark)</h4>
+<p><strong>How Glue determines "new" for S3:</strong><br>
+→ Glue tracks which FILES it has already processed<br>
+→ It uses a combination of:</p>
+<ul>
+<li>File path (S3 key)</li>
+<li>File modification timestamp</li>
+<li>File size</li>
+</ul>
+<p><strong>Behavior:</strong></p>
+<table><thead><tr><th>Scenario</th><th>What Glue Does</th></tr></thead><tbody><tr><td>New file added to S3 path since last run</td><td>✅ Processes the new file</td></tr><tr><td>Existing file modified (overwritten) since last run</td><td>✅ Processes the modified file</td></tr><tr><td>Existing file unchanged since last run</td><td>❌ Skips — already processed</td></tr><tr><td>File deleted since last run</td><td>❌ Ignores — bookmark doesn't handle deletes</td></tr></tbody></table>
+<p><strong>Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Run 1 (Day 1):
+</span>    S3 Input: transactions/file1.csv, transactions/file2.csv
+    Glue processes: file1.csv, file2.csv
+    Bookmark saved: {file1.csv: processed, file2.csv: processed}
+
+Run 2 (Day 2):
+    S3 Input: transactions/file1.csv, file2.csv, file3.csv (NEW)
+    Glue processes: file3.csv ONLY
+    Bookmark updated: {file1.csv, file2.csv, file3.csv: all processed}
+
+Run 3 (Day 3):
+    S3 Input: file1.csv (MODIFIED), file2.csv, file3.csv, file4.csv (NEW)
+    Glue processes: file1.csv (re-processes because modified) + file4.csv (new)
+    Bookmark updated accordingly</code></pre></div>
+<p>→ S3 bookmarks are FILE-LEVEL — not record-level<br>
+→ If a file has 1 million records and 1 record changes → the ENTIRE file is reprocessed<br>
+→ This is why partitioned file structures matter (from Project 25)</p>
+<hr>
+<h4>SOURCE TYPE B: JDBC (Database — MariaDB, PostgreSQL, MySQL, etc.)</h4>
+<p><strong>How Glue determines "new" for JDBC sources:</strong><br>
+→ Glue tracks using a BOOKMARK KEY — a column in the database table<br>
+→ The bookmark key must be a column that is:</p>
+<ul>
+<li>Monotonically increasing (always goes up, never goes down)</li>
+<li>Sequential or timestamp-based</li>
+<li>NOT updated on existing records (or updates would be missed)</li>
+</ul>
+<p><strong>Common Bookmark Key Choices:</strong></p>
+<table><thead><tr><th>Column Type</th><th>Example</th><th>Works as Bookmark Key?</th><th>Why</th></tr></thead><tbody><tr><td>Auto-increment primary key</td><td><code>transaction_id INT AUTO_INCREMENT</code></td><td>✅ Yes — always increases</td><td>New records always have higher IDs</td></tr><tr><td>Created timestamp</td><td><code>created_at TIMESTAMP DEFAULT NOW()</code></td><td>✅ Yes — always increases</td><td>New records have later timestamps</td></tr><tr><td>Updated timestamp</td><td><code>updated_at TIMESTAMP ON UPDATE NOW()</code></td><td>⚠️ Partially — catches updates but may reprocess</td><td>Updated records get new timestamps</td></tr><tr><td>Status column</td><td><code>status ENUM('new','processed')</code></td><td>❌ No — not monotonically increasing</td><td>Values go back and forth</td></tr><tr><td>Random UUID</td><td><code>id UUID</code></td><td>❌ No — not sequential</td><td>No ordering possible</td></tr><tr><td>Name or text column</td><td><code>customer_name VARCHAR</code></td><td>❌ No — not ordered</td><td>Alphabetical order is meaningless for "new"</td></tr></tbody></table>
+<p><strong>Behavior with JDBC Bookmark:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Table: transactions
+</span>Bookmark Key: transaction_id (AUTO_INCREMENT)
+
+Run 1 (Day 1):
+    SELECT * FROM transactions WHERE transaction_id &gt; 0
+    → Reads records 1 through 10,000
+    → Bookmark saved: {transaction_id: 10000}
+
+Run 2 (Day 2):
+    SELECT * FROM transactions WHERE transaction_id &gt; 10000
+    → Reads records 10,001 through 20,000 ONLY
+    → Bookmark updated: {transaction_id: 20000}
+
+Run 3 (Day 3):
+    SELECT * FROM transactions WHERE transaction_id &gt; 20000
+    → Reads records 20,001 through 30,000 ONLY
+    → Bookmark updated: {transaction_id: 30000}</code></pre></div>
+<p>→ Glue AUTOMATICALLY generates the WHERE clause based on the bookmark<br>
+→ You do NOT write the WHERE clause yourself — Glue injects it<br>
+→ The MariaDB only returns new records → less data transferred → less processing time</p>
+<hr>
+<h3>STEP 3 — CONFIGURE JOB BOOKMARK ON THE GLUE JOB</h3>
+<p>→ Navigate to AWS Glue Console → Jobs → Select the ETL job (from Project 21, 24)<br>
+→ Job details tab → Advanced properties section</p>
+<p><strong>Setting: Job bookmark</strong></p>
+<table><thead><tr><th>Option</th><th>Meaning</th><th>When to Use</th></tr></thead><tbody><tr><td>Enable</td><td>Glue tracks progress and processes only new data on each run</td><td>Default for all production incremental jobs</td></tr><tr><td>Disable</td><td>Glue processes ALL data every run (full load)</td><td>One-time migration, full reprocessing needed</td></tr><tr><td>Pause</td><td>Glue processes ALL data but does NOT update the bookmark</td><td>Testing — process everything without losing bookmark position</td></tr></tbody></table>
+<p>→ For PayScale → Set to <strong>Enable</strong></p>
+<p><strong>Where this setting lives:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Console → Jobs → [Job Name] → Job details
+</span>    → Advanced properties
+        → Job bookmark: Enable ✅</code></pre></div>
+<p>→ This single toggle transforms the job from full-load to incremental</p>
+<hr>
+<h3>STEP 4 — CONFIGURE JDBC BOOKMARK KEYS FOR MARIADB SOURCE</h3>
+<p>→ The Glue job reads from MariaDB using a JDBC connection (configured in Project 24)<br>
+→ The bookmark key must be specified in the job's DynamicFrame reader configuration</p>
+<p><strong>Configuration in Job Parameters:</strong></p>
+<p>→ Navigate to Glue Console → Jobs → [Job Name] → Job details → Job parameters</p>
+<p><strong>Understanding Bookmark Key Selection:</strong></p>
+<p><strong>PayScale's MariaDB <code>transactions</code> table:</strong></p>
+<table><thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Characteristics</th></tr></thead><tbody><tr><td>transaction_id</td><td>BIGINT AUTO_INCREMENT</td><td>NOT NULL</td><td>Primary key, monotonically increasing</td></tr><tr><td>customer_id</td><td>INT</td><td>NOT NULL</td><td>Foreign key — not sequential per transaction</td></tr><tr><td>amount</td><td>DECIMAL(10,2)</td><td>NOT NULL</td><td>Monetary value — not sequential</td></tr><tr><td>status</td><td>VARCHAR(20)</td><td>NOT NULL</td><td>'pending', 'completed', 'failed' — not ordered</td></tr><tr><td>created_at</td><td>TIMESTAMP</td><td>NOT NULL</td><td>DEFAULT CURRENT_TIMESTAMP — monotonically increasing</td></tr><tr><td>updated_at</td><td>TIMESTAMP</td><td>NULL</td><td>ON UPDATE CURRENT_TIMESTAMP — changes on updates</td></tr></tbody></table>
+<p><strong>Best Bookmark Key: <code>transaction_id</code></strong></p>
+<table><thead><tr><th>Criterion</th><th>transaction_id</th><th>created_at</th><th>updated_at</th></tr></thead><tbody><tr><td>Monotonically increasing?</td><td>✅ Yes (AUTO_INCREMENT)</td><td>✅ Yes (always later)</td><td>⚠️ Yes but changes on updates</td></tr><tr><td>Unique per record?</td><td>✅ Yes (primary key)</td><td>❌ No (same timestamp possible)</td><td>❌ No</td></tr><tr><td>Never updated on existing records?</td><td>✅ Yes (PK never changes)</td><td>✅ Yes (created once)</td><td>❌ No (changes on UPDATE)</td></tr><tr><td>Handles INSERT detection?</td><td>✅ Yes</td><td>✅ Yes</td><td>✅ Yes</td></tr><tr><td>Handles UPDATE detection?</td><td>❌ No (PK doesn't change on update)</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Data type sortable?</td><td>✅ Yes (integer comparison)</td><td>✅ Yes (timestamp comparison)</td><td>✅ Yes</td></tr></tbody></table>
+<p><strong>Decision Matrix:</strong></p>
+<table><thead><tr><th>Requirement</th><th>Best Bookmark Key</th></tr></thead><tbody><tr><td>Only need to detect NEW records (INSERTs)</td><td><code>transaction_id</code> (simplest, most reliable)</td></tr><tr><td>Need to detect NEW + UPDATED records</td><td><code>updated_at</code> (but will reprocess updated records)</td></tr><tr><td>Need to detect NEW + UPDATED + DELETED</td><td>Bookmark CANNOT handle this → use CDC (Project 58 — DMS)</td></tr></tbody></table>
+<p>→ PayScale's fraud scoring only needs NEW transactions → Use <code>transaction_id</code></p>
+<p><strong>Specifying the Bookmark Key:</strong></p>
+<p>→ In the Glue job script → The bookmark key is configured within the DynamicFrame creation context<br>
+→ Since we are configuration-focused (no code) → this is set through:</p>
+<p><strong>Job Parameters (Key-Value pairs in Job Details):</strong></p>
+<table><thead><tr><th>Key</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>--job-bookmark-option</code></td><td><code>job-bookmark-enable</code></td><td>Enables bookmark (same as UI toggle)</td></tr></tbody></table>
+<p>→ The bookmark key itself is specified in the TRANSFORMATION CONTEXT within the job script<br>
+→ For JDBC sources, Glue needs to know which column(s) to use for bookmarking</p>
+<p><strong>Bookmark Key Configuration for JDBC:</strong></p>
+<p>→ The <code>transformation_ctx</code> parameter in the DynamicFrame reader is what links a specific data read to a specific bookmark<br>
+→ Each <code>transformation_ctx</code> string must be UNIQUE within the job<br>
+→ Glue stores the bookmark AGAINST this context string</p>
+<p><strong>How Glue selects the bookmark key for JDBC automatically:</strong></p>
+<table><thead><tr><th>Condition</th><th>What Glue Uses as Bookmark Key</th></tr></thead><tbody><tr><td>Table has a primary key column</td><td>Uses the primary key automatically</td></tr><tr><td>Table has multiple primary key columns (composite key)</td><td>Uses all columns in the composite key</td></tr><tr><td>Table has no primary key</td><td>❌ Bookmark DOES NOT WORK — falls back to full load</td></tr><tr><td>You explicitly specify bookmark keys</td><td>Uses your specified columns (overrides auto-detection)</td></tr></tbody></table>
+<p>→ PayScale's <code>transactions</code> table has <code>transaction_id</code> as PRIMARY KEY<br>
+→ Glue will automatically use it as the bookmark key ✅<br>
+→ No additional configuration needed IF the primary key is the correct incremental column</p>
+<p><strong>What if the primary key is NOT suitable (e.g., UUID)?</strong><br>
+→ You must explicitly specify bookmark keys in the job script<br>
+→ The column must still be monotonically increasing<br>
+→ If no suitable column exists → bookmarks cannot help → consider adding a <code>created_at</code> timestamp column</p>
+<hr>
+<h3>STEP 5 — CONFIGURE S3 SOURCE BOOKMARK BEHAVIOR</h3>
+<p>→ PayScale also has a second Glue job that reads CSV files from an S3 landing zone<br>
+→ External partners drop daily CSV files into <code>s3://payscale-landing/transactions/</code></p>
+<p><strong>S3 Bookmark Configuration:</strong></p>
+<p>→ For S3 sources — bookmark tracking is AUTOMATIC when enabled<br>
+→ No bookmark key needed — Glue tracks by file path + modification timestamp</p>
+<p><strong>How it works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Path: s3://payscale-landing/transactions/
+</span>
+Run 1 (Day 1):
+    Files present: 2025-01-01.csv, 2025-01-02.csv
+    Glue processes: BOTH files
+    Bookmark: {2025-01-01.csv: timestamp_A, 2025-01-02.csv: timestamp_B}
+
+Run 2 (Day 2):
+    Files present: 2025-01-01.csv, 2025-01-02.csv, 2025-01-03.csv (NEW)
+    Glue checks bookmark:
+        → 2025-01-01.csv: same timestamp → SKIP
+        → 2025-01-02.csv: same timestamp → SKIP
+        → 2025-01-03.csv: NOT in bookmark → PROCESS ✅
+    Bookmark updated: {all three files tracked}</code></pre></div>
+<p><strong>Critical S3 Bookmark Behaviors:</strong></p>
+<table><thead><tr><th>Scenario</th><th>What Happens</th><th>Why</th></tr></thead><tbody><tr><td>New file added</td><td>✅ Processed</td><td>Not in bookmark</td></tr><tr><td>Existing file overwritten (new timestamp)</td><td>✅ Re-processed</td><td>Timestamp changed — Glue detects modification</td></tr><tr><td>Existing file content changed but timestamp same</td><td>❌ Skipped</td><td>Glue uses timestamp, not content hash</td></tr><tr><td>File deleted from S3</td><td>❌ No action</td><td>Bookmark doesn't track deletions</td></tr><tr><td>File renamed</td><td>✅ Processed as new file</td><td>New key = new file in S3 terms</td></tr></tbody></table>
+<p><strong>S3 File Ordering:</strong><br>
+→ Glue processes S3 files in LEXICOGRAPHIC ORDER of the S3 key<br>
+→ This means: <code>2025-01-02.csv</code> is processed BEFORE <code>2025-01-10.csv</code> (because "0" &lt; "1" character-wise)<br>
+→ But <code>2025-1-2.csv</code> would be processed AFTER <code>2025-1-10.csv</code> (because "2" &gt; "1")<br>
+→ Always use zero-padded dates: <code>2025-01-02</code> not <code>2025-1-2</code><br>
+→ File ordering affects bookmark checkpointing — if a job fails mid-way, it resumes from the last successfully processed file in order</p>
+<hr>
+<h3>STEP 6 — UNDERSTAND BOOKMARK STORAGE AND PERSISTENCE</h3>
+<p><strong>Where is the bookmark stored?</strong></p>
+<p>→ Glue stores bookmarks in an INTERNAL metadata store managed by AWS<br>
+→ You CANNOT directly read or edit the bookmark value<br>
+→ You can only:</p>
+<ul>
+<li>Reset the bookmark (start over)</li>
+<li>Pause the bookmark (process all but don't advance)</li>
+<li>Enable/disable the bookmark</li>
+</ul>
+<p><strong>Bookmark Lifecycle:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Job Created → Bookmark: Empty (no history)
+</span>    |
+    ↓
+Run 1 (Success) → Bookmark: Checkpoint A saved
+    |
+    ↓
+Run 2 (Success) → Bookmark: Checkpoint B saved (replaces A)
+    |
+    ↓
+Run 3 (FAILURE mid-way) → Bookmark: Checkpoint B remains (NOT updated)
+    |                        → Next run will re-process from B
+    ↓
+Run 4 (Success) → Bookmark: Checkpoint C saved
+    |
+    ↓
+Manual Reset → Bookmark: Cleared → Next run processes ALL data again</code></pre></div>
+<p><strong>Critical behavior on failure:</strong><br>
+→ If a job run FAILS → the bookmark is NOT updated<br>
+→ The next run re-processes the same data the failed run was working on<br>
+→ This is EXACTLY CORRECT behavior — prevents data loss<br>
+→ But it means: failed runs + successful retries may produce DUPLICATE output files in S3<br>
+→ Downstream consumers (Athena, Redshift) must handle or deduplicate</p>
+<hr>
+<h3>STEP 7 — BOOKMARK PAUSE, RESUME, AND RESET OPERATIONS</h3>
+<p><strong>Navigate to: Glue Console → Jobs → [Job Name] → Actions</strong></p>
+<hr>
+<p><strong>RESET BOOKMARK:</strong></p>
+<table><thead><tr><th>Setting</th><th>What It Does</th><th>When to Use</th></tr></thead><tbody><tr><td>Reset bookmark</td><td>Clears ALL bookmark history — next run processes everything from scratch</td><td>After schema changes, after data corrections, when you need a full reload</td></tr></tbody></table>
+<p>→ Navigate to Glue Console → Jobs → Select Job → Actions → Reset job bookmark<br>
+→ Confirm → Bookmark is cleared</p>
+<p><strong>Use Cases for Reset:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Action</th></tr></thead><tbody><tr><td>Source table schema changed (new columns added)</td><td>Reset → Full reprocessing with new schema</td></tr><tr><td>Historical data was corrected/backfilled</td><td>Reset → Reprocess everything to capture corrections</td></tr><tr><td>Output S3 path was accidentally deleted</td><td>Reset → Regenerate all output files</td></tr><tr><td>Bookmark got corrupted (rare)</td><td>Reset → Start fresh</td></tr><tr><td>Moving to a new S3 output path</td><td>Reset → Ensure all data lands in new location</td></tr></tbody></table>
+<hr>
+<p><strong>PAUSE BOOKMARK:</strong></p>
+<table><thead><tr><th>Setting</th><th>What It Does</th><th>When to Use</th></tr></thead><tbody><tr><td>Pause (set bookmark option to "pause")</td><td>Job processes ALL data but does NOT save a new bookmark checkpoint</td><td>Testing, validation, debugging</td></tr></tbody></table>
+<p><strong>Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Current bookmark: transaction_id = 50,000
+</span>
+Run with PAUSE:
+    → Reads ALL records from transaction_id &gt; 0 (ignores bookmark)
+    → Processes everything
+    → Bookmark STILL says: transaction_id = 50,000 (not updated)
+
+Next run with ENABLE:
+    → Reads records from transaction_id &gt; 50,000 (bookmark unchanged)
+    → Processes only new records since 50,000</code></pre></div>
+<p>→ Pause is useful when:</p>
+<ul>
+<li>You want to test a full reprocessing without losing your bookmark position</li>
+<li>You want to validate output quality on the full dataset</li>
+<li>You want to run a one-time report on all historical data</li>
+</ul>
+<hr>
+<h3>STEP 8 — HANDLE MULTIPLE SOURCES IN ONE JOB</h3>
+<p>→ PayScale's Glue job reads from TWO sources:</p>
+<ol>
+<li>MariaDB JDBC (transactions table)</li>
+<li>S3 CSV (partner transaction files)</li>
+</ol>
+<p>→ Each source has its OWN bookmark tracked INDEPENDENTLY</p>
+<p><strong>How this works:</strong></p>
+<p>→ Each DynamicFrame read operation has a <code>transformation_ctx</code> parameter<br>
+→ This is a STRING that uniquely identifies the read operation<br>
+→ Glue maintains a SEPARATE bookmark for each transformation_ctx</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Read Operation</th><th>transformation_ctx</th><th>Bookmark Tracks</th></tr></thead><tbody><tr><td>Read from MariaDB transactions table</td><td><code>"ctx_jdbc_transactions"</code></td><td>transaction_id checkpoint</td></tr><tr><td>Read from S3 partner files</td><td><code>"ctx_s3_partner_files"</code></td><td>File paths + timestamps</td></tr></tbody></table>
+<p>→ If you use the SAME transformation_ctx for two different reads → bookmarks COLLIDE → unpredictable behavior<br>
+→ Always use UNIQUE, DESCRIPTIVE context strings</p>
+<p><strong>What happens with multiple contexts on bookmark reset:</strong><br>
+→ Resetting the job bookmark clears ALL transformation contexts<br>
+→ You CANNOT reset just one context and keep the other<br>
+→ This is a limitation — if you need to reset only the JDBC source, you must reset both</p>
+<hr>
+<h3>STEP 9 — CONFIGURE OUTPUT TO AVOID DUPLICATES</h3>
+<p><strong>The Duplicate Problem:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Run 1: Processes records 1-10,000 → Writes: s3://output/part-00001.parquet
+</span>Run 2: Processes records 10,001-20,000 → Writes: s3://output/part-00001.parquet (DIFFERENT content)</code></pre></div>
+<p>→ Wait — if both runs write to the same path → Run 2 OVERWRITES Run 1's output<br>
+→ This means records 1-10,000 are LOST from S3</p>
+<p><strong>Solution: Partition Output by Run Date or Bookmark Range</strong></p>
+<p><strong>Approach 1 — Date-based partitioning (Recommended):</strong></p>
+<table><thead><tr><th>Run</th><th>Output Path</th><th>Content</th></tr></thead><tbody><tr><td>Run 1 (2025-01-01)</td><td><code>s3://output/date=2025-01-01/part-00001.parquet</code></td><td>Records 1-10,000</td></tr><tr><td>Run 2 (2025-01-02)</td><td><code>s3://output/date=2025-01-02/part-00001.parquet</code></td><td>Records 10,001-20,000</td></tr><tr><td>Run 3 (2025-01-03)</td><td><code>s3://output/date=2025-01-03/part-00001.parquet</code></td><td>Records 20,001-30,000</td></tr></tbody></table>
+<p>→ Each run writes to a UNIQUE partition → No overwrites → No duplicates<br>
+→ Athena (from Project 18, 25) can use partition projection on the <code>date</code> column for efficient querying</p>
+<p><strong>Approach 2 — Append mode with unique file names:</strong></p>
+<p>→ Glue generates unique file names (part-00001, part-00002, etc.) per run<br>
+→ If writing to the SAME path → files accumulate<br>
+→ But if a job FAILS and RETRIES → the retry writes duplicate files<br>
+→ Less clean than date-based partitioning</p>
+<p><strong>PayScale's Configuration:</strong></p>
+<p>→ Output S3 path includes a date partition derived from the job run timestamp<br>
+→ Glue Workflow (from Project 31) passes the run date as a job parameter</p>
+<table><thead><tr><th>Job Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>--run_date</code></td><td><code>2025-01-15</code> (passed by scheduler/workflow)</td><td>Used to construct output partition path</td></tr></tbody></table>
+<p>→ Output path: <code>s3://payscale-curated/fraud-transactions/date=2025-01-15/</code></p>
+<hr>
+<h3>STEP 10 — HANDLING SCHEMA EVOLUTION WITH BOOKMARKS</h3>
+<p><strong>Scenario: MariaDB table gets a new column</strong></p>
+<p>→ On Day 100, the development team adds a column <code>risk_score DECIMAL(5,2)</code> to the transactions table<br>
+→ The Glue job has been running for 100 days with bookmark enabled</p>
+<p><strong>What happens:</strong></p>
+<table><thead><tr><th>Run</th><th>Schema</th><th>Bookmark Behavior</th><th>Output</th></tr></thead><tbody><tr><td>Run 1-99</td><td>6 columns (no risk_score)</td><td>Normal incremental</td><td>Parquet with 6 columns</td></tr><tr><td>Run 100</td><td>7 columns (risk_score added)</td><td>Normal incremental — only reads new records</td><td>Parquet with 7 columns</td></tr></tbody></table>
+<p>→ Records before Day 100 have 6-column Parquet files<br>
+→ Records from Day 100 onward have 7-column Parquet files<br>
+→ Athena handles this gracefully — missing columns return NULL<br>
+→ Redshift Spectrum handles this too — schema-on-read</p>
+<p><strong>BUT — what if you need the new column for ALL historical records?</strong><br>
+→ Reset the bookmark → Full reprocessing → All Parquet files regenerated with 7 columns<br>
+→ Delete old output files first to avoid duplicates<br>
+→ This is the trade-off: bookmark reset = full cost but complete schema consistency</p>
+<p><strong>What about column REMOVAL or TYPE CHANGE?</strong></p>
+<table><thead><tr><th>Change</th><th>Bookmark Impact</th><th>Action Needed</th></tr></thead><tbody><tr><td>Column added</td><td>No bookmark impact — new records have new column</td><td>No action (or reset for historical consistency)</td></tr><tr><td>Column removed</td><td>Bookmark still works — new records just don't have the column</td><td>No action (or reset)</td></tr><tr><td>Column type changed (e.g., INT → BIGINT)</td><td>May cause DynamicFrame errors if types are incompatible</td><td>Reset bookmark + update job mapping</td></tr><tr><td>Column renamed</td><td>Glue treats it as a new column (old name missing, new name added)</td><td>Reset bookmark + update job mapping</td></tr><tr><td>Table renamed</td><td>Bookmark is tied to the old table name → new table = fresh start</td><td>Update job source configuration</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable Job Bookmarks for any recurring/scheduled Glue ETL job<br>
+→ Always verify the bookmark key column is monotonically increasing before relying on JDBC bookmarks<br>
+→ Always use PRIMARY KEY columns as bookmark keys when possible — Glue auto-detects them<br>
+→ Always use UNIQUE transformation_ctx strings for each DynamicFrame read operation<br>
+→ Always partition output by date/run to prevent overwrites and enable efficient querying<br>
+→ Always test with "Pause" mode first to verify behavior without advancing the bookmark<br>
+→ Always reset bookmark after schema changes that affect historical data<br>
+→ Always monitor bookmark behavior through CloudWatch metrics and job run details<br>
+→ Always handle the "failed run + retry = potential duplicates" scenario in downstream consumers<br>
+→ Always use zero-padded date formats in S3 keys for correct lexicographic ordering<br>
+→ Always document the bookmark key column for each Glue job — future engineers need to know what drives incrementality</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never assume bookmark works without a primary key on JDBC sources — it silently falls back to full load<br>
+→ Never use non-monotonic columns (status, name, UUID) as bookmark keys — produces incorrect incremental behavior<br>
+→ Never use the same transformation_ctx for different read operations — bookmark collision causes data loss or duplication<br>
+→ Never rely on bookmark for detecting DELETED records — bookmarks only track forward progress, not removals<br>
+→ Never rely on bookmark for detecting UPDATED records when using auto-increment PK — updates don't change the PK<br>
+→ Never reset bookmark without understanding the impact — full reprocessing may take hours and cost significantly more<br>
+→ Never forget that bookmark reset clears ALL transformation contexts — you cannot selectively reset one source<br>
+→ Never write incremental output to a non-partitioned path — overwrites or duplicates will occur<br>
+→ Never ignore failed job runs — the bookmark doesn't advance on failure, but partial output files may exist in S3<br>
+→ Never change the bookmark key column on an existing job without resetting — mismatched checkpoints cause skipped or duplicated data<br>
+→ Never assume S3 bookmark tracks content changes — it tracks file timestamp only</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE GLUE JOB BOOKMARKS</h2>
+<table><thead><tr><th>Scenario</th><th>Use Bookmarks?</th><th>Why</th></tr></thead><tbody><tr><td>Daily incremental load from MariaDB to S3</td><td>✅ Yes</td><td>Only process new records — saves cost and time</td></tr><tr><td>Hourly processing of new S3 files from a landing zone</td><td>✅ Yes</td><td>Only process newly arrived files</td></tr><tr><td>One-time full data migration</td><td>❌ No</td><td>No need for incrementality — disable bookmark</td></tr><tr><td>Detecting UPDATED records in source</td><td>⚠️ Partially</td><td>Only if bookmark key is updated_at timestamp — not with auto-increment PK</td></tr><tr><td>Detecting DELETED records in source</td><td>❌ No</td><td>Bookmarks cannot track deletions — use CDC (DMS, Project 58)</td></tr><tr><td>Source has no suitable monotonic column</td><td>❌ No</td><td>Bookmark will silently do full load every time</td></tr><tr><td>Job reads from multiple sources with different schemas</td><td>✅ Yes</td><td>Use separate transformation_ctx per source</td></tr><tr><td>Job writes to Redshift directly (not S3)</td><td>✅ Yes</td><td>Bookmark still tracks source reading — destination doesn't matter</td></tr><tr><td>Data needs exact deduplication guarantee</td><td>❌ Not sufficient</td><td>Bookmark prevents most duplicates but failed retries can cause some — add dedup logic</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE GLUE JOB BOOKMARKS</h2>
+<p>→ When you need Change Data Capture (INSERT + UPDATE + DELETE tracking) → Use DMS (Project 58)<br>
+→ When the source has no monotonically increasing column → Bookmark falls back to full load silently<br>
+→ When you need exactly-once processing guarantees → Bookmarks provide at-least-once (retries may duplicate)<br>
+→ When you need to reprocess specific date ranges selectively → Bookmarks are all-or-nothing (reset = full reprocess)<br>
+→ When source data is modified in place (same file overwritten with corrections) → Bookmark may miss changes if timestamp doesn't change<br>
+→ When the job is a one-time operation → Disable bookmark to avoid unnecessary overhead</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → BOOKMARK STATE MACHINE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌──────────────────────────────┐
+</span>                    │     GLUE BOOKMARK SERVICE     │
+                    │  (Internal AWS Managed Store) │
+                    └──────────┬───────────────────┘
+                               │
+                    Stores per Job:
+                    ├── Job Name
+                    ├── Run ID
+                    ├── Transformation Context → Checkpoint Data
+                    │       ctx_jdbc_transactions → {transaction_id: 50000}
+                    │       ctx_s3_partner_files → {file_list: [...], timestamps: [...]}
+                    └── State: ENABLED / DISABLED / PAUSED</code></pre></div>
+<p><strong>State Transitions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Job Run Starts
+</span>    |
+    ↓
+Is Bookmark Enabled?
+    |
+    ├── NO → Read ALL data from source → Write output → END (no bookmark saved)
+    |
+    ├── PAUSED → Read ALL data (ignore bookmark) → Write output → END (bookmark NOT updated)
+    |
+    └── YES → Read bookmark checkpoint
+                |
+                ↓
+            Has previous checkpoint?
+                |
+                ├── NO (first run) → Read ALL data → Save checkpoint → END
+                |
+                └── YES → Apply checkpoint as filter
+                            |
+                            ↓
+                        Source Type?
+                            |
+                            ├── JDBC → Generate WHERE clause: column &gt; checkpoint_value
+                            |          → Read filtered data → Process → Save new checkpoint
+                            |
+                            └── S3 → Compare file list/timestamps against checkpoint
+                                     → Read only new/modified files → Process → Save new checkpoint</code></pre></div>
+<hr>
+<h3>2 → JDBC BOOKMARK INTERNAL QUERY GENERATION</h3>
+<p><strong>What Glue actually does internally for MariaDB:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Bookmark State: {transaction_id: 50000}
+</span>Table: transactions
+Bookmark Key: transaction_id (auto-detected from PRIMARY KEY)
+
+Glue internally generates:
+    SELECT * FROM transactions 
+    WHERE transaction_id &gt; 50000 
+    ORDER BY transaction_id ASC
+
+→ This is pushed down to MariaDB as a SQL query
+→ MariaDB uses the PRIMARY KEY index to efficiently find records &gt; 50000
+→ Only matching records are transferred over JDBC
+→ Network transfer is minimal — only new data crosses the wire</code></pre></div>
+<p><strong>For composite primary keys:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Table: order_items
+</span>Primary Key: (order_id, item_id)
+
+Bookmark State: {order_id: 1000, item_id: 5}
+
+Glue internally generates:
+    SELECT * FROM order_items
+    WHERE (order_id &gt; 1000) 
+       OR (order_id = 1000 AND item_id &gt; 5)
+    ORDER BY order_id ASC, item_id ASC</code></pre></div>
+<p>→ Composite keys use lexicographic comparison<br>
+→ This ensures correct incremental behavior even with multi-column keys</p>
+<p><strong>For timestamp-based bookmark keys:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Bookmark Key: created_at (TIMESTAMP)
+</span>Bookmark State: {created_at: '2025-01-14 23:59:59'}
+
+Glue internally generates:
+    SELECT * FROM transactions
+    WHERE created_at &gt; '2025-01-14 23:59:59'
+    ORDER BY created_at ASC</code></pre></div>
+<p>→ WARNING: If multiple records have the EXACT same timestamp (same second)<br>
+→ Some may be in the previous batch, some in the next<br>
+→ Timestamp precision matters — DATETIME(6) with microseconds is safer than DATETIME</p>
+<hr>
+<h3>3 → S3 BOOKMARK INTERNAL FILE TRACKING</h3>
+<p><strong>What Glue stores for S3 bookmarks:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Bookmark State for S3 Source:
+</span>{
+    "path": "s3://payscale-landing/transactions/",
+    "files_processed": [
+        {"key": "2025-01-01.csv", "size": 1048576, "modificationTime": "2025-01-01T06:00:00Z"},
+        {"key": "2025-01-02.csv", "size": 2097152, "modificationTime": "2025-01-02T06:00:00Z"}
+    ]
+}</code></pre></div>
+<p><strong>On next run:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue lists all files in s3://payscale-landing/transactions/
+</span>    |
+    ↓
+For each file:
+    |
+    ├── File key exists in bookmark AND modificationTime matches → SKIP
+    |
+    ├── File key exists in bookmark BUT modificationTime differs → RE-PROCESS (file was modified)
+    |
+    └── File key NOT in bookmark → PROCESS (new file)</code></pre></div>
+<p><strong>S3 Listing Behavior:</strong><br>
+→ Glue performs a LIST operation on the S3 path<br>
+→ For paths with millions of files → listing itself can take minutes<br>
+→ This is why partitioned S3 paths (year/month/day) are important<br>
+→ If the Glue job reads from <code>s3://bucket/data/</code> with 10 million files → listing takes 10+ minutes before any processing starts<br>
+→ If partitioned as <code>s3://bucket/data/year=2025/month=01/day=15/</code> and the crawler/job targets a specific partition → listing is fast</p>
+<hr>
+<h3>4 → BOOKMARK AND JOB FAILURE INTERACTION</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Run N starts
+</span>    |
+    ↓
+Reads bookmark: checkpoint = 50000
+    |
+    ↓
+Reads records 50001-60000 from MariaDB
+    |
+    ↓
+Processes records... writing to S3...
+    |
+    ↓ (At record 55000 — JOB FAILS)
+    |
+    ↓
+Output in S3: Records 50001-55000 (PARTIAL — some files written)
+Bookmark: STILL at 50000 (NOT updated because job failed)
+    |
+    ↓
+Run N+1 starts (retry)
+    |
+    ↓
+Reads bookmark: checkpoint = 50000 (unchanged)
+    |
+    ↓
+Reads records 50001-60000 from MariaDB (SAME as failed run)
+    |
+    ↓
+Processes ALL records 50001-60000
+    |
+    ↓
+Output in S3: Records 50001-60000 (COMPLETE)
+BUT: Records 50001-55000 exist TWICE in S3 (from failed run + retry)
+Bookmark: Updated to 60000</code></pre></div>
+<p><strong>This is the AT-LEAST-ONCE delivery problem:</strong><br>
+→ Bookmarks guarantee NO data is MISSED<br>
+→ But they do NOT guarantee no DUPLICATES on failure/retry<br>
+→ The partial output from the failed run remains in S3</p>
+<p><strong>Mitigation Strategies:</strong></p>
+<table><thead><tr><th>Strategy</th><th>How</th><th>Complexity</th></tr></thead><tbody><tr><td>Partition by run date (from Step 9)</td><td>Failed run's output is in a different partition than retry</td><td>Low</td></tr><tr><td>Delete partial output before retry</td><td>Job starts by cleaning its output partition</td><td>Medium</td></tr><tr><td>Idempotent writes</td><td>Use Glue's overwrite mode per partition</td><td>Medium</td></tr><tr><td>Downstream deduplication</td><td>Athena/Redshift query with DISTINCT or ROW_NUMBER()</td><td>Low</td></tr></tbody></table>
+<hr>
+<h3>5 → BOOKMARK VERSUS GLUE CRAWLER INTERACTION</h3>
+<p>→ Glue Crawler (from Project 17) catalogs S3 data into the Glue Data Catalog<br>
+→ When bookmark-enabled Glue job writes NEW Parquet files to S3:</p>
+<ul>
+<li>The Crawler must run AFTER the ETL job to detect new partitions</li>
+<li>If Crawler runs before the ETL job completes → new data not yet cataloged</li>
+<li>Use Glue Workflow (from Project 31) to sequence: ETL Job → Crawler</li>
+</ul>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Workflow Sequence:
+</span>    Step 1: Glue ETL Job (bookmark-enabled) → Writes new Parquet files to S3
+    Step 2: Glue Crawler → Detects new files/partitions → Updates Glue Catalog
+    Step 3: Athena/Redshift Spectrum can now query the new data</code></pre></div>
+<p>→ Alternatively: Use <code>enableUpdateCatalog</code> and <code>partitionKeys</code> in the Glue job itself to update the catalog without a separate Crawler run</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>JDBC table has no primary key</td><td>Job processes ALL data every run despite bookmark enabled</td><td>Glue cannot determine bookmark key without PK</td><td>Add a primary key or explicitly specify bookmark keys</td></tr><tr><td>2</td><td>Bookmark key is UUID (not sequential)</td><td>Job processes ALL data or skips records randomly</td><td>UUID is not monotonically increasing</td><td>Use auto-increment INT or TIMESTAMP column</td></tr><tr><td>3</td><td>Same transformation_ctx for two reads</td><td>One source gets skipped or both get incorrect checkpoints</td><td>Bookmark collision — same context overwritten</td><td>Use unique context strings per read operation</td></tr><tr><td>4</td><td>Job fails but partial output remains in S3</td><td>Duplicate records after retry</td><td>Bookmark not updated on failure + partial files written</td><td>Clean output partition before retry OR deduplicate downstream</td></tr><tr><td>5</td><td>Reset bookmark accidentally</td><td>Next run reprocesses ALL historical data — takes hours, costs $$$</td><td>Bookmark cleared — no checkpoint</td><td>Be extremely careful with reset — confirm with team before executing</td></tr><tr><td>6</td><td>S3 files overwritten in-place (same timestamp)</td><td>Modified file not reprocessed</td><td>S3 bookmark uses timestamp — same timestamp = same file</td><td>Ensure file writes create new timestamps (or use new file names)</td></tr><tr><td>7</td><td>Output path not partitioned</td><td>Each run overwrites previous output OR creates massive duplicates</td><td>All runs write to same S3 prefix</td><td>Partition output by date/run_id</td></tr><tr><td>8</td><td>Bookmark key column has NULL values</td><td>Records with NULL bookmark key are skipped or cause errors</td><td>NULL cannot be compared with &gt; operator</td><td>Ensure bookmark key column is NOT NULL</td></tr><tr><td>9</td><td>Clock skew in timestamps</td><td>Records created during the bookmark checkpoint second may be missed or duplicated</td><td>Two records with same created_at — one processed, one not</td><td>Use high-precision timestamps (microseconds) or integer PKs</td></tr><tr><td>10</td><td>Schema change without bookmark reset</td><td>New columns appear as NULL in incremental output, old data has old schema</td><td>Bookmark only processes new records — old records retain old schema</td><td>Reset bookmark if schema consistency is needed for historical data</td></tr><tr><td>11</td><td>Multiple Glue jobs sharing same source</td><td>Each job has independent bookmarks — both process all new data</td><td>Bookmarks are per-job, not per-source</td><td>This is correct behavior — each job independently tracks its own progress</td></tr><tr><td>12</td><td>Bookmark works for weeks then suddenly does full load</td><td>Primary key column wrapped around (rare with BIGINT) or table was recreated</td><td>Bookmark key comparison fails with new key range</td><td>Investigate table changes — reset bookmark if table was recreated</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scalability</strong></p>
+<ul>
+<li>Without bookmarks: Cost and time scale with TOTAL data volume (linear growth forever)</li>
+<li>With bookmarks: Cost and time scale with INCREMENTAL data volume (constant per run if daily volume is constant)</li>
+</ul>
+<table><thead><tr><th>Metric</th><th>Without Bookmark (Day 365)</th><th>With Bookmark (Day 365)</th></tr></thead><tbody><tr><td>Records read from MariaDB</td><td>3,650,000</td><td>10,000</td></tr><tr><td>Data transferred over JDBC</td><td>~3.6 GB</td><td>~10 MB</td></tr><tr><td>Glue DPU-hours consumed</td><td>10+ hours</td><td>2 minutes</td></tr><tr><td>Daily cost</td><td>$50+</td><td>$0.15</td></tr><tr><td>Annual cost</td><td>$18,000+</td><td>$55</td></tr><tr><td>MariaDB read load</td><td>Heavy (10 hours of full scan)</td><td>Minimal (index scan on PK &gt; N)</td></tr></tbody></table>
+<p>→ <strong>S3 File Scalability</strong></p>
+<ul>
+<li>Bookmark tracks every processed file in its internal state</li>
+<li>With millions of files → bookmark state grows large → job startup time increases</li>
+<li>Mitigation: Use partitioned paths and target specific partitions instead of root paths</li>
+<li>Archive old partitions to reduce file listing overhead</li>
+</ul>
+<p>→ <strong>Concurrent Job Scalability</strong></p>
+<ul>
+<li>Each Glue job has its own independent bookmark</li>
+<li>10 jobs running concurrently → 10 independent bookmarks → no conflict</li>
+<li>However: 10 jobs reading from the same MariaDB → 10 concurrent JDBC connections</li>
+<li>Monitor MariaDB connection limits (from Project 45 — RDS connection considerations)</li>
+</ul>
+<p>→ <strong>Bookmark State Scalability</strong></p>
+<ul>
+<li>JDBC bookmarks: Tiny state (just one or two column values) → No scalability concern</li>
+<li>S3 bookmarks: State grows with number of files processed → Can become large over months</li>
+<li>Mitigation for S3: Periodically reset bookmark + archive old files to a different path</li>
+</ul>
+<p>→ <strong>Cross-Account Scalability</strong></p>
+<ul>
+<li>Bookmarks work identically for cross-account sources</li>
+<li>Glue job in Account B with JDBC connection to Account A's RDS (from Project 24, 44, 45)</li>
+<li>Bookmark tracks Account A's data independently — no cross-account bookmark interference</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify bookmark is working:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected Behavior</th></tr></thead><tbody><tr><td>Bookmark enabled</td><td>Glue Console → Job → Job details → Advanced properties</td><td>"Job bookmark: Enable"</td></tr><tr><td>Job processes fewer records each run</td><td>Job Run details → Metrics → "Data read"</td><td>Should be proportional to new data only, not total data</td></tr><tr><td>Output partitions grow incrementally</td><td>S3 Console → Output bucket → New partition per run</td><td>New date partition appears after each run</td></tr><tr><td>Job duration stays constant</td><td>Glue Console → Job Runs → Duration column</td><td>~2 minutes daily (not growing over time)</td></tr><tr><td>Bookmark checkpoint exists</td><td>Glue Console → Job → Job runs → Bookmark state (limited visibility)</td><td>Internal — inferred from behavior</td></tr></tbody></table>
+<p>→ <strong>How to verify bookmark is NOT working (silently doing full load):</strong></p>
+<table><thead><tr><th>Red Flag</th><th>What It Means</th></tr></thead><tbody><tr><td>Job duration increases linearly over days/weeks</td><td>Bookmark not filtering — reading all data every time</td></tr><tr><td>"Data read" metric grows even when source data growth is constant</td><td>Full load happening — bookmark key issue</td></tr><tr><td>Output S3 files contain duplicate records across runs</td><td>No partitioning + full load = overwrites or duplicates</td></tr><tr><td>MariaDB shows long-running queries during Glue job</td><td>Full table scan instead of indexed PK scan</td></tr></tbody></table>
+<p>→ <strong>How to debug bookmark issues:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Is bookmark enabled in Job settings?
+</span>    → No → Enable it
+    → Yes → Go to Step 2
+
+Step 2: Does the source table have a PRIMARY KEY?
+    → No → Add one OR explicitly specify bookmark keys
+    → Yes → Go to Step 3
+
+Step 3: Is the PRIMARY KEY monotonically increasing?
+    → No (UUID, random) → Change bookmark key to auto-increment or timestamp column
+    → Yes → Go to Step 4
+
+Step 4: Is transformation_ctx unique per read operation?
+    → No (same string for multiple reads) → Make them unique
+    → Yes → Go to Step 5
+
+Step 5: Was bookmark recently reset?
+    → Yes → First run after reset does full load — this is expected
+    → No → Go to Step 6
+
+Step 6: Check Glue job run logs in CloudWatch
+    → Look for bookmark-related log entries
+    → Check if WHERE clause is being applied to JDBC query
+    → Check if file filtering is happening for S3 source</code></pre></div>
+<p>→ <strong>Monitoring Dashboard (using CloudWatch from Project 8, 19):</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>Job Duration</td><td>Glue Job Metrics</td><td>Alert if duration &gt; 2x normal (indicates bookmark failure)</td></tr><tr><td>Data Read (bytes)</td><td>Glue Job Metrics</td><td>Alert if data read &gt; 2x normal</td></tr><tr><td>DPU Hours</td><td>Glue Job Metrics</td><td>Alert if DPU hours &gt; budget threshold</td></tr><tr><td>Database Connections</td><td>RDS CloudWatch Metrics</td><td>Alert if connections spike during Glue job window</td></tr><tr><td>S3 Objects Written</td><td>S3 Metrics</td><td>Alert if objects written per run &gt; expected (indicates duplicates)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Job Bookmarks transform Glue from a "brute force full load" tool into an efficient incremental ETL engine<br>
+→ JDBC bookmarks use a monotonically increasing column (usually PRIMARY KEY) to generate WHERE clause filters<br>
+→ S3 bookmarks track files by path + modification timestamp to skip already-processed files<br>
+→ Bookmarks are stored internally by AWS — you control them through enable/disable/pause/reset only<br>
+→ The transformation_ctx string is the critical link between a read operation and its bookmark — must be unique<br>
+→ Failed job runs do NOT advance the bookmark — this prevents data loss but can cause duplicates on retry<br>
+→ Output partitioning by date is ESSENTIAL to prevent overwrites and enable clean incremental consumption<br>
+→ Without bookmarks → cost scales with TOTAL data volume (grows forever)<br>
+→ With bookmarks → cost scales with INCREMENTAL data volume (stays constant if daily volume is constant)<br>
+→ Connection to previous projects:</p>
+<ul>
+<li>Glue ETL fundamentals (Project 21) — job creation, DynamicFrame, format conversion</li>
+<li>Glue JDBC connection to MariaDB (Project 24) — JDBC source configuration</li>
+<li>Glue Workflow orchestration (Project 31) — sequencing ETL job → Crawler</li>
+<li>S3 data organization (Project 1, 25) — partitioned output paths<br>
+→ Connection to next projects:</li>
+<li>Lake Formation (Project 47) governs WHO can access the incrementally loaded data</li>
+<li>Bookmarks handle INSERTs well but CANNOT handle DELETEs or complex UPDATEs → DMS CDC (Project 58) is the answer for full change tracking</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale's incremental ETL pipeline is now running efficiently<br>
+→ Data flows from MariaDB → Glue (with bookmarks) → S3 → Glue Catalog → Athena<br>
+→ But now the compliance team raises a concern:</p>
+<ul>
+<li>"The fraud analysts can see ALL customer transaction data — including customers outside their assigned region"</li>
+<li>"The junior analysts can see the <code>credit_card_number</code> column — they shouldn't"</li>
+<li>"The external auditor account needs access to aggregate tables but NOT raw transaction data"<br>
+→ The current setup has no FINE-GRAINED access control on the data lake<br>
+→ IAM policies (from Project 2) can control access to S3 buckets and Glue databases<br>
+→ But they CANNOT control access at the TABLE level or COLUMN level<br>
+→ You cannot write an IAM policy that says "allow access to columns A, B, C but deny column D"</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 47 solves</strong><br>
+→ Project 47 introduces AWS Lake Formation — the governance layer for data lakes<br>
+→ It provides TABLE-level, COLUMN-level, and even ROW-level access control<br>
+→ It integrates with Glue Catalog (from Project 17), Athena (from Project 18), and cross-account sharing (from Project 42)<br>
+→ Without Lake Formation → your data lake is either fully open or fully closed — no granularity</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 47: "The Organization That Needed Governed Data Access — Data Lake with Lake Formation Permissions"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-45.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 46/60</span></div><a class="nav-btn next" href="project-47.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

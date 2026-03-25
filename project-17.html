@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 17: THE DATA LAKE THAT NEEDED A CATALOG — Glue Crawler Cataloging S3 Dat — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 17: THE DATA LAKE THAT NEEDED A CATALOG — Glue Crawler Cataloging S3 Data</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-16) now has:</p>
+<ul>
+<li>S3 bucket with event-driven pipelines (Projects 1, 12, 15)</li>
+<li>RDS MariaDB for transactional operations (Projects 9, 14)</li>
+<li>Redshift for analytical queries (Project 16)</li>
+<li>Full VPC, messaging, monitoring infrastructure (Projects 3-8, 13)</li>
+</ul>
+<p>→ The data engineering team manages data from FIVE sources landing in S3:</p>
+<table><thead><tr><th>Data Source</th><th>S3 Location</th><th>Format</th><th>Files</th><th>Update Frequency</th></tr></thead><tbody><tr><td>Orders export</td><td><code>s3://shopnow-data-lake/raw/orders/</code></td><td>CSV</td><td>365 daily files</td><td>Daily</td></tr><tr><td>Product catalog</td><td><code>s3://shopnow-data-lake/raw/products/</code></td><td>JSON</td><td>12 monthly snapshots</td><td>Monthly</td></tr><tr><td>Clickstream</td><td><code>s3://shopnow-data-lake/raw/clickstream/</code></td><td>Parquet</td><td>8,760 hourly files</td><td>Hourly</td></tr><tr><td>Marketing campaigns</td><td><code>s3://shopnow-data-lake/raw/campaigns/</code></td><td>CSV</td><td>52 weekly files</td><td>Weekly</td></tr><tr><td>Customer demographics</td><td><code>s3://shopnow-data-lake/raw/customers/</code></td><td>CSV</td><td>4 quarterly files</td><td>Quarterly</td></tr></tbody></table>
+<p>→ Problem 1: Nobody knows the SCHEMA of each dataset<br>
+→ The orders CSV has 22 columns — but which columns? What data types?<br>
+→ The clickstream Parquet has nested structures — what's inside?<br>
+→ The product JSON has arrays and objects — how to query it?<br>
+→ Each time an analyst wants to query data → they download a sample → open in Excel → manually inspect columns<br>
+→ This takes 30-60 minutes per dataset → repeated by EVERY analyst</p>
+<p>→ Problem 2: To query S3 data → they must CREATE TABLE statements manually</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Example: To query orders CSV in Athena (future — Project 18):
+</span>  CREATE EXTERNAL TABLE orders (
+    order_id BIGINT,
+    customer_id BIGINT,
+    order_date STRING,
+    ... (22 columns — must type each one correctly)
+  )
+  ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+  STORED AS TEXTFILE
+  LOCATION 's3://shopnow-data-lake/raw/orders/'</code></pre></div>
+<p>→ Writing this for 5 datasets × 22+ columns each = tedious and error-prone<br>
+→ If the schema changes (new column added) → manual table definition is WRONG → queries fail<br>
+→ Nobody maintains these definitions → they become stale</p>
+<p>→ Problem 3: New data files arrive constantly<br>
+→ Clickstream: 24 new Parquet files per day<br>
+→ Orders: 1 new CSV per day<br>
+→ When a new file arrives with a NEW column → existing table definitions don't include it<br>
+→ Queries on the new column fail → analyst says "the data is broken"<br>
+→ Actually the TABLE DEFINITION is broken — the data is fine</p>
+<p>→ Problem 4: The team wants to use BOTH Athena (serverless SQL on S3) AND Redshift Spectrum (query S3 from Redshift)<br>
+→ Both services need a METADATA CATALOG that describes:</p>
+<ul>
+<li>Where the data is in S3 (location)</li>
+<li>What format it's in (CSV, Parquet, JSON)</li>
+<li>What columns exist (schema)</li>
+<li>What data types each column has</li>
+<li>How files are partitioned (by date, by region, etc.)<br>
+→ Without a shared catalog → each service needs separate table definitions → inconsistency</li>
+</ul>
+<p>→ Problem 5: Data is partitioned by date in S3:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/raw/orders/year=2024/month=01/day=15/orders-20240115.csv
+</span>s3://shopnow-data-lake/raw/orders/year=2024/month=01/day=16/orders-20240116.csv
+s3://shopnow-data-lake/raw/orders/year=2024/month=02/day=01/orders-20240201.csv</code></pre></div>
+<p>→ This Hive-style partitioning (<code>key=value/</code>) improves query performance<br>
+→ But someone must REGISTER each partition in the catalog<br>
+→ With 365 days × multiple years = thousands of partitions → manual registration is impossible</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>AUTOMATIC schema discovery — no manual column typing</li>
+<li>CENTRALIZED metadata catalog — one source of truth for all services</li>
+<li>AUTOMATIC partition registration — new partitions discovered without manual work</li>
+<li>Schema evolution handling — new columns detected automatically</li>
+<li>Shared catalog for Athena, Redshift Spectrum, Glue ETL, and future services</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a METADATA MANAGEMENT problem<br>
+→ AWS Glue provides TWO components that solve this:</p>
+<table><thead><tr><th>Component</th><th>What It Does</th><th>Analogy</th></tr></thead><tbody><tr><td>Glue Crawler</td><td>Automatically scans S3 data → discovers schemas → creates/updates table definitions</td><td>A librarian who reads every book and creates catalog cards</td></tr><tr><td>Glue Data Catalog</td><td>Centralized metadata store — databases, tables, columns, partitions, formats</td><td>The card catalog system in a library</td></tr></tbody></table>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────┐
+</span>│                        S3 DATA LAKE                              │
+│                                                                  │
+│  raw/orders/*.csv    raw/products/*.json    raw/clickstream/*.parquet │
+│       │                    │                       │             │
+└───────┼────────────────────┼───────────────────────┼─────────────┘
+        │                    │                       │
+        ▼                    ▼                       ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      GLUE CRAWLER                                │
+│                                                                  │
+│  Scans S3 locations → Reads file samples → Infers schemas        │
+│  Detects: format, columns, data types, partitions                │
+│  Creates/updates: Table definitions in Glue Data Catalog         │
+└──────────────────────────────────┬───────────────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    GLUE DATA CATALOG                              │
+│                                                                  │
+│  Database: shopnow_raw                                           │
+│    ├── Table: orders (22 columns, CSV, partitioned by date)      │
+│    ├── Table: products (15 columns, JSON)                        │
+│    ├── Table: clickstream (35 columns, Parquet, partitioned)     │
+│    ├── Table: campaigns (12 columns, CSV)                        │
+│    └── Table: customers (18 columns, CSV)                        │
+│                                                                  │
+│  CONSUMED BY:                                                    │
+│    → Athena (Project 18) — serverless SQL queries                │
+│    → Redshift Spectrum (Project 28) — query from Redshift        │
+│    → Glue ETL Jobs (Project 21) — data transformation           │
+│    → Lake Formation (Project 47) — governed access               │
+│    → EMR — Spark/Hive queries                                    │
+└──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Create the S3 data lake bucket with proper structure</li>
+<li>Step 2 — Understand the Glue Data Catalog hierarchy</li>
+<li>Step 3 — Create a Glue Database</li>
+<li>Step 4 — Create an IAM Role for Glue</li>
+<li>Step 5 — Create and configure Glue Crawlers</li>
+<li>Step 6 — Run crawlers and verify cataloged tables</li>
+<li>Step 7 — Understand schema evolution and partition management</li>
+<li>Step 8 — Schedule crawlers for automatic updates</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE THE S3 DATA LAKE BUCKET</h3>
+<p>→ S3 Console → "Create bucket" (Project 1 pattern)</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Bucket name</td><td><code>shopnow-data-lake</code></td></tr><tr><td>Region</td><td>ap-south-1</td></tr><tr><td>Versioning</td><td>Enable (Project 12)</td></tr><tr><td>Encryption</td><td>SSE-S3 (or SSE-KMS for compliance)</td></tr><tr><td>Block public access</td><td>All enabled</td></tr></tbody></table>
+<p><strong>Data Lake Folder Structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>shopnow-data-lake/
+</span>├── raw/                          ← Landing zone (original data as-is)
+│   ├── orders/
+│   │   ├── year=2024/
+│   │   │   ├── month=01/
+│   │   │   │   ├── day=15/
+│   │   │   │   │   └── orders-20240115.csv
+│   │   │   │   ├── day=16/
+│   │   │   │   │   └── orders-20240116.csv
+│   │   │   │   └── ...
+│   │   │   ├── month=02/
+│   │   │   └── ...
+│   │   └── year=2025/
+│   │       └── ...
+│   ├── products/
+│   │   └── products-snapshot-202501.json
+│   ├── clickstream/
+│   │   ├── year=2024/
+│   │   │   ├── month=01/
+│   │   │   │   ├── day=15/
+│   │   │   │   │   ├── hour=00/
+│   │   │   │   │   │   └── click-20240115-00.parquet
+│   │   │   │   │   ├── hour=01/
+│   │   │   │   │   └── ...
+│   │   │   │   └── ...
+│   │   │   └── ...
+│   │   └── ...
+│   ├── campaigns/
+│   │   └── campaign-week-2024-W03.csv
+│   └── customers/
+│       └── customers-Q4-2024.csv
+│
+├── curated/                      ← Cleaned and transformed data (Project 21)
+│   └── (populated by Glue ETL jobs)
+│
+└── refined/                      ← Business-ready aggregated data
+    └── (populated by Glue ETL jobs)</code></pre></div>
+<p><strong>Why This Structure:</strong></p>
+<table><thead><tr><th>Zone</th><th>Purpose</th><th>Data Quality</th><th>Who Writes</th><th>Who Reads</th></tr></thead><tbody><tr><td>raw/</td><td>Landing zone — original data as-is</td><td>Low (may have errors, duplicates)</td><td>Source systems, S3 events</td><td>Glue Crawlers, Glue ETL</td></tr><tr><td>curated/</td><td>Cleaned, deduplicated, standardized</td><td>Medium-High</td><td>Glue ETL jobs (Project 21)</td><td>Athena, Redshift Spectrum</td></tr><tr><td>refined/</td><td>Business-ready aggregations</td><td>High</td><td>Glue ETL jobs, Redshift</td><td>QuickSight, BI tools</td></tr></tbody></table>
+<p>→ This is the standard DATA LAKE ZONES pattern used in enterprise data lakes<br>
+→ Crawlers scan <code>raw/</code> → ETL transforms to <code>curated/</code> → further processing to <code>refined/</code><br>
+→ Full data lake architecture in Project 51</p>
+<p><strong>Hive-Style Partitioning:</strong></p>
+<p>→ <code>year=2024/month=01/day=15/</code> is called Hive-style partitioning<br>
+→ The folder names contain <code>key=value</code> format<br>
+→ Glue Crawler AUTOMATICALLY detects this pattern → creates partition columns<br>
+→ Athena/Spectrum can then filter by partition → reads ONLY relevant files</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Query: SELECT * FROM orders WHERE year = 2024 AND month = 1
+</span>
+WITHOUT partitioning: Scans ALL 365+ files across all dates → slow, expensive
+WITH partitioning: Scans ONLY files in year=2024/month=01/ → ~31 files → fast, cheap</code></pre></div>
+<p>→ Partitioning is the MOST important performance optimization for S3-based analytics<br>
+→ Always partition time-series data by date (year/month/day at minimum)</p>
+<hr>
+<h3>STEP 2 — UNDERSTAND THE GLUE DATA CATALOG HIERARCHY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>GLUE DATA CATALOG (Account-level, Regional)
+</span>│
+├── DATABASE: shopnow_raw
+│   │
+│   ├── TABLE: orders
+│   │   ├── Columns: order_id (bigint), customer_id (bigint), order_date (string), ...
+│   │   ├── Format: CSV (with comma delimiter)
+│   │   ├── Location: s3://shopnow-data-lake/raw/orders/
+│   │   ├── Partitions: year (string), month (string), day (string)
+│   │   └── SerDe: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+│   │
+│   ├── TABLE: products
+│   │   ├── Columns: product_id (bigint), name (string), category (string), ...
+│   │   ├── Format: JSON
+│   │   ├── Location: s3://shopnow-data-lake/raw/products/
+│   │   └── SerDe: org.openx.data.jsonserde.JsonSerDe
+│   │
+│   ├── TABLE: clickstream
+│   │   ├── Columns: session_id (string), user_id (bigint), page_url (string), ...
+│   │   ├── Format: Parquet
+│   │   ├── Location: s3://shopnow-data-lake/raw/clickstream/
+│   │   ├── Partitions: year, month, day, hour
+│   │   └── SerDe: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+│   │
+│   ├── TABLE: campaigns
+│   │   └── ...
+│   │
+│   └── TABLE: customers
+│       └── ...
+│
+├── DATABASE: shopnow_curated
+│   └── (Tables created by ETL jobs — Project 21)
+│
+└── DATABASE: shopnow_refined
+    └── (Tables created by ETL jobs — Project 21)</code></pre></div>
+<p><strong>Catalog Hierarchy:</strong></p>
+<table><thead><tr><th>Level</th><th>Analogy</th><th>Example</th></tr></thead><tbody><tr><td>Catalog</td><td>The entire library system</td><td>One per AWS account per region</td></tr><tr><td>Database</td><td>A section of the library (Fiction, Science, etc.)</td><td><code>shopnow_raw</code>, <code>shopnow_curated</code></td></tr><tr><td>Table</td><td>A specific book with its catalog card</td><td><code>orders</code>, <code>products</code>, <code>clickstream</code></td></tr><tr><td>Column</td><td>A chapter or field in the book</td><td><code>order_id</code>, <code>customer_id</code>, <code>amount</code></td></tr><tr><td>Partition</td><td>An edition or volume of the book</td><td><code>year=2024/month=01/day=15</code></td></tr></tbody></table>
+<p>→ The Glue Data Catalog is a HIVE-COMPATIBLE metastore<br>
+→ Any tool that supports Hive metastore can use the Glue Catalog<br>
+→ This includes: Athena, Redshift Spectrum, EMR (Spark/Hive), Glue ETL</p>
+<hr>
+<h3>STEP 3 — CREATE A GLUE DATABASE</h3>
+<p>→ Glue Console → "Databases" (left sidebar under Data Catalog) → "Add database"</p>
+<p><strong>Database 1: Raw Data</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Database name</td><td><code>shopnow_raw</code></td><td>Contains tables for raw/landing zone data</td></tr><tr><td>Location</td><td><code>s3://shopnow-data-lake/raw/</code></td><td>Default S3 location (optional but good practice)</td></tr><tr><td>Description</td><td>"Raw data from source systems — unprocessed"</td><td></td></tr></tbody></table>
+<p><strong>Database 2: Curated Data (for future — Project 21)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database name</td><td><code>shopnow_curated</code></td></tr><tr><td>Location</td><td><code>s3://shopnow-data-lake/curated/</code></td></tr><tr><td>Description</td><td>"Cleaned and transformed data — ready for analytics"</td></tr></tbody></table>
+<p><strong>Database 3: Refined Data (for future)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database name</td><td><code>shopnow_refined</code></td></tr><tr><td>Location</td><td><code>s3://shopnow-data-lake/refined/</code></td></tr><tr><td>Description</td><td>"Business-ready aggregated data — for dashboards and reports"</td></tr></tbody></table>
+<p>→ Click "Create database" for each</p>
+<p><strong>Database Naming Conventions:</strong></p>
+<table><thead><tr><th>Convention</th><th>Example</th><th>Use Case</th></tr></thead><tbody><tr><td>By data zone</td><td><code>shopnow_raw</code>, <code>shopnow_curated</code></td><td>Data lake zones (recommended)</td></tr><tr><td>By source system</td><td><code>shopnow_orders_db</code>, <code>shopnow_marketing_db</code></td><td>Source-oriented</td></tr><tr><td>By department</td><td><code>shopnow_finance</code>, <code>shopnow_analytics</code></td><td>Department-oriented</td></tr><tr><td>By environment</td><td><code>shopnow_raw_dev</code>, <code>shopnow_raw_prod</code></td><td>Environment separation</td></tr></tbody></table>
+<p>→ For ShopNow: Zone-based naming (<code>raw</code>, <code>curated</code>, <code>refined</code>) — aligns with data lake architecture</p>
+<hr>
+<h3>STEP 4 — CREATE AN IAM ROLE FOR GLUE</h3>
+<p>→ The Glue Crawler needs an IAM Role to:</p>
+<ul>
+<li>Read S3 data (scan files for schema inference)</li>
+<li>Write to the Glue Data Catalog (create/update tables)</li>
+<li>Write CloudWatch Logs (logging)</li>
+</ul>
+<p>→ IAM Console → "Roles" → "Create role"</p>
+<p><strong>Step 4a: Trust Policy</strong></p>
+<p>→ Trusted entity: AWS service → Glue</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Trust Policy:
+</span>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "glue.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}</code></pre></div>
+<p>→ This was previewed in Project 11 (Step 9) — <code>glue.amazonaws.com</code> service principal</p>
+<p><strong>Step 4b: Permission Policies</strong></p>
+<p><strong>Policy 1: S3 Access for Glue</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1: Read data lake bucket
+</span>  Sid: AllowGlueReadDataLake
+  Effect: Allow
+  Action:
+    - s3:GetObject
+    - s3:ListBucket
+    - s3:GetBucketLocation
+  Resource:
+    - arn:aws:s3:::shopnow-data-lake
+    - arn:aws:s3:::shopnow-data-lake/*</code></pre></div>
+<p>→ Crawler needs <code>s3:GetObject</code> to read sample data for schema inference<br>
+→ Crawler needs <code>s3:ListBucket</code> to enumerate files and discover partitions<br>
+→ <code>GetBucketLocation</code> is needed to determine the bucket's region</p>
+<p><strong>Policy 2: Glue Catalog Access</strong></p>
+<p>→ Attach AWS Managed Policy: <code>AWSGlueServiceRole</code><br>
+→ This provides:</p>
+<ul>
+<li><code>glue:*</code> on all Glue resources (catalog, databases, tables, crawlers, jobs)</li>
+<li><code>logs:CreateLogGroup</code>, <code>logs:CreateLogStream</code>, <code>logs:PutLogEvents</code> for CloudWatch Logs</li>
+<li>Basic S3 read permissions for Glue scripts</li>
+</ul>
+<p>→ ALTERNATIVELY for more restrictive access:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 2: Glue Catalog write access
+</span>  Sid: AllowGlueCatalogAccess
+  Effect: Allow
+  Action:
+    - glue:CreateTable
+    - glue:UpdateTable
+    - glue:DeleteTable
+    - glue:GetTable
+    - glue:GetTables
+    - glue:GetDatabase
+    - glue:GetDatabases
+    - glue:CreatePartition
+    - glue:BatchCreatePartition
+    - glue:UpdatePartition
+    - glue:GetPartition
+    - glue:GetPartitions
+    - glue:BatchGetPartition
+  Resource: "*"
+
+Statement 3: CloudWatch Logs
+  Sid: AllowCloudWatchLogs
+  Effect: Allow
+  Action:
+    - logs:CreateLogGroup
+    - logs:CreateLogStream
+    - logs:PutLogEvents
+  Resource: arn:aws:logs:*:*:/aws-glue/*</code></pre></div>
+<p><strong>Role Name and Tags:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>shopnow-glue-service-role</code></td></tr><tr><td>Description</td><td>"IAM role for Glue crawlers and ETL jobs — access to S3 data lake and Glue Catalog"</td></tr></tbody></table>
+<table><thead><tr><th>Tag Key</th><th>Tag Value</th></tr></thead><tbody><tr><td>Service</td><td>Glue</td></tr><tr><td>Environment</td><td>Production</td></tr><tr><td>Application</td><td>ShopNow-DataLake</td></tr></tbody></table>
+<p>→ Click "Create role"<br>
+→ This role is used by ALL Glue components: Crawlers, ETL Jobs, DevEndpoints</p>
+<hr>
+<h3>STEP 5 — CREATE AND CONFIGURE GLUE CRAWLERS</h3>
+<p>→ Glue Console → "Crawlers" (left sidebar) → "Create crawler"</p>
+<hr>
+<p><strong>CRAWLER 1: Orders Data</strong></p>
+<p><strong>Step 5a: Crawler Properties</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler name</td><td><code>shopnow-orders-crawler</code></td></tr><tr><td>Description</td><td>"Crawls raw orders CSV data — discovers schema and partitions"</td></tr></tbody></table>
+<p><strong>Step 5b: Data Sources</strong></p>
+<p>→ "Add a data source"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Data source</td><td>S3</td><td>Crawling S3 data</td></tr><tr><td>S3 path</td><td><code>s3://shopnow-data-lake/raw/orders/</code></td><td>Base path for orders data</td></tr><tr><td>Crawl all sub-folders</td><td>Yes</td><td>Discover partitions in sub-folders</td></tr><tr><td>Subsequent crawler runs</td><td>Crawl new sub-folders only</td><td>Don't re-crawl existing data — faster</td></tr></tbody></table>
+<p>→ "Crawl new sub-folders only" → On subsequent runs, only scan NEW partitions<br>
+→ This dramatically reduces crawl time for large datasets with many partitions</p>
+<p><strong>Step 5c: IAM Role</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>IAM role</td><td>shopnow-glue-service-role</td></tr></tbody></table>
+<p>→ The role created in Step 4 — has S3 read and Catalog write permissions</p>
+<p><strong>Step 5d: Output Configuration</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Target database</td><td>shopnow_raw</td><td>Where table definitions are created</td></tr><tr><td>Table name prefix</td><td>(empty)</td><td>No prefix — use discovered name</td></tr><tr><td>Crawler behavior when schema changes</td><td>Add new columns only</td><td>Don't delete existing columns if data changes</td></tr><tr><td>Crawler behavior for deleted objects</td><td>Mark table as deprecated</td><td>Don't delete table if data is removed</td></tr><tr><td>Table grouping behavior</td><td>Create a single table per S3 path</td><td>Each crawler source → one table</td></tr></tbody></table>
+<p><strong>Schema Change Handling Options:</strong></p>
+<table><thead><tr><th>Option</th><th>Behavior</th><th>Best For</th></tr></thead><tbody><tr><td>Add new columns only</td><td>Existing columns preserved, new columns added</td><td>Evolving schemas (most common)</td></tr><tr><td>Update all new and existing columns</td><td>Columns updated to match latest crawl</td><td>Schema corrections</td></tr><tr><td>Log changes but don't update</td><td>Schema changes logged, catalog unchanged</td><td>Strict schema governance</td></tr></tbody></table>
+<p>→ "Add new columns only" is the safest — prevents accidental column deletion<br>
+→ If a CSV gains a new column → crawler adds it to the table definition<br>
+→ If a CSV loses a column → crawler ignores (column stays in catalog with NULLs in new data)</p>
+<p><strong>Crawler Output Behavior Options:</strong></p>
+<table><thead><tr><th>Option</th><th>When Table Already Exists</th><th>Best For</th></tr></thead><tbody><tr><td>Update table definition</td><td>Merges discovered schema with existing</td><td>Evolving data</td></tr><tr><td>Create new table version</td><td>Creates a new version of the table</td><td>Audit trail of schema changes</td></tr><tr><td>Add new columns only</td><td>Only adds columns, never removes</td><td>Conservative approach</td></tr></tbody></table>
+<p><strong>Step 5e: Classifiers (Optional)</strong></p>
+<p>→ Classifiers tell the crawler HOW to interpret the data format<br>
+→ Built-in classifiers handle: CSV, JSON, Parquet, ORC, Avro, XML, GROK<br>
+→ For standard formats → no custom classifier needed<br>
+→ For custom formats (unusual delimiter, special date format) → create a custom classifier</p>
+<p><strong>Built-in CSV Classifier Behavior:</strong></p>
+<p>→ Glue automatically detects:</p>
+<ul>
+<li>Delimiter (comma, tab, pipe, etc.)</li>
+<li>Whether headers exist (first row)</li>
+<li>Column data types (string, bigint, double, etc.)</li>
+<li>Quote character</li>
+<li>Escape character</li>
+</ul>
+<p>→ For ShopNow's standard CSVs → built-in classifier works perfectly</p>
+<p><strong>Custom Classifier Example (If Needed):</strong></p>
+<p>→ Glue Console → "Classifiers" → "Add classifier"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Classifier name</td><td><code>shopnow-csv-pipe-delimited</code></td></tr><tr><td>Classifier type</td><td>CSV</td></tr><tr><td>Delimiter</td><td>`</td></tr><tr><td>Quote symbol</td><td><code>"</code></td></tr><tr><td>Contains header</td><td>Yes</td></tr></tbody></table>
+<p>→ Then attach this classifier to the crawler<br>
+→ For ShopNow → not needed (standard comma-delimited CSVs)</p>
+<p><strong>Step 5f: Schedule (Configure Later — Step 8)</strong></p>
+<p>→ For now → set to "On demand" (run manually)<br>
+→ We'll add scheduling in Step 8</p>
+<p>→ Click "Create crawler"</p>
+<hr>
+<p><strong>CRAWLER 2: Clickstream Data (Parquet)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler name</td><td><code>shopnow-clickstream-crawler</code></td></tr><tr><td>S3 path</td><td><code>s3://shopnow-data-lake/raw/clickstream/</code></td></tr><tr><td>IAM role</td><td>shopnow-glue-service-role</td></tr><tr><td>Target database</td><td>shopnow_raw</td></tr><tr><td>Schema changes</td><td>Add new columns only</td></tr><tr><td>Subsequent runs</td><td>Crawl new sub-folders only</td></tr></tbody></table>
+<p>→ Parquet files are SELF-DESCRIBING — they contain their own schema<br>
+→ The crawler reads the Parquet metadata → extracts column names and types → no inference needed<br>
+→ Parquet schema discovery is FASTER and MORE ACCURATE than CSV (no guessing data types)</p>
+<hr>
+<p><strong>CRAWLER 3: Product Catalog (JSON)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler name</td><td><code>shopnow-products-crawler</code></td></tr><tr><td>S3 path</td><td><code>s3://shopnow-data-lake/raw/products/</code></td></tr><tr><td>IAM role</td><td>shopnow-glue-service-role</td></tr><tr><td>Target database</td><td>shopnow_raw</td></tr><tr><td>Schema changes</td><td>Add new columns only</td></tr></tbody></table>
+<p>→ JSON files → crawler infers schema from JSON structure<br>
+→ Nested objects become <code>struct</code> types in the catalog<br>
+→ Arrays become <code>array</code> types<br>
+→ The crawler samples a portion of the data to infer the complete schema</p>
+<hr>
+<p><strong>CRAWLER 4: All Remaining Sources (Single Crawler, Multiple Targets)</strong></p>
+<p>→ A single crawler can crawl MULTIPLE S3 paths</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler name</td><td><code>shopnow-misc-data-crawler</code></td></tr><tr><td>Data sources</td><td>s3://shopnow-data-lake/raw/campaigns/ AND s3://shopnow-data-lake/raw/customers/</td></tr><tr><td>IAM role</td><td>shopnow-glue-service-role</td></tr><tr><td>Target database</td><td>shopnow_raw</td></tr></tbody></table>
+<p>→ This creates TWO tables: <code>campaigns</code> and <code>customers</code><br>
+→ One crawler → multiple sources → multiple tables<br>
+→ Reduces the number of crawlers to manage</p>
+<hr>
+<h3>STEP 6 — RUN CRAWLERS AND VERIFY CATALOGED TABLES</h3>
+<p><strong>Running a Crawler:</strong></p>
+<p>→ Glue Console → "Crawlers" → Select <code>shopnow-orders-crawler</code> → "Run"<br>
+→ Status changes: Ready → Running → Stopping → Ready<br>
+→ Duration: 30 seconds to several minutes (depends on data volume and partition count)</p>
+<p><strong>Crawler Execution Details:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Crawler: shopnow-orders-crawler
+</span>Status: Completed
+Duration: 47 seconds
+Tables created: 1
+Tables updated: 0
+Partitions created: 380
+Partitions updated: 0
+
+What happened:
+1. Crawler listed all objects under s3://shopnow-data-lake/raw/orders/
+2. Discovered Hive-style partition structure: year=XXXX/month=XX/day=XX/
+3. Read sample CSV file → inferred 22 columns with data types
+4. Created table "orders" in database "shopnow_raw"
+5. Registered 380 partitions (365 days of 2024 + 15 days of 2025)</code></pre></div>
+<p><strong>Verify the Created Table:</strong></p>
+<p>→ Glue Console → "Tables" (left sidebar under Data Catalog) → Select <code>orders</code></p>
+<p><strong>Table Properties:</strong></p>
+<table><thead><tr><th>Property</th><th>Value</th></tr></thead><tbody><tr><td>Table name</td><td>orders</td></tr><tr><td>Database</td><td>shopnow_raw</td></tr><tr><td>Location</td><td>s3://shopnow-data-lake/raw/orders/</td></tr><tr><td>Classification</td><td>csv</td></tr><tr><td>Input format</td><td>org.apache.hadoop.mapred.TextInputFormat</td></tr><tr><td>Output format</td><td>org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat</td></tr><tr><td>Serialization library</td><td>org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe</td></tr><tr><td>Delimiter</td><td>,</td></tr><tr><td>Has header</td><td>true</td></tr></tbody></table>
+<p><strong>Discovered Schema (Columns):</strong></p>
+<table><thead><tr><th>Column Name</th><th>Data Type</th><th>Comment</th></tr></thead><tbody><tr><td>order_id</td><td>bigint</td><td>Inferred from numeric values</td></tr><tr><td>customer_id</td><td>bigint</td><td>Inferred from numeric values</td></tr><tr><td>order_date</td><td>string</td><td>Inferred as string (dates often inferred as strings)</td></tr><tr><td>product_id</td><td>bigint</td><td></td></tr><tr><td>quantity</td><td>int</td><td></td></tr><tr><td>unit_price</td><td>double</td><td>Inferred from decimal values</td></tr><tr><td>total_amount</td><td>double</td><td></td></tr><tr><td>discount_percent</td><td>double</td><td></td></tr><tr><td>payment_method</td><td>string</td><td></td></tr><tr><td>shipping_address</td><td>string</td><td></td></tr><tr><td>city</td><td>string</td><td></td></tr><tr><td>state</td><td>string</td><td></td></tr><tr><td>pincode</td><td>string</td><td>Inferred as string (leading zeros)</td></tr><tr><td>order_status</td><td>string</td><td></td></tr><tr><td>...</td><td>...</td><td>(22 columns total)</td></tr></tbody></table>
+<p><strong>Partition Keys (Automatically Detected):</strong></p>
+<table><thead><tr><th>Partition Key</th><th>Data Type</th></tr></thead><tbody><tr><td>year</td><td>string</td></tr><tr><td>month</td><td>string</td></tr><tr><td>day</td><td>string</td></tr></tbody></table>
+<p>→ The crawler detected the <code>year=XXXX/month=XX/day=XX/</code> pattern automatically<br>
+→ These become PARTITION COLUMNS that can be used in WHERE clauses for performance</p>
+<p><strong>Verify Partitions:</strong></p>
+<p>→ Glue Console → Select table <code>orders</code> → "Partitions" tab<br>
+→ Shows all 380 partitions with their S3 locations</p>
+<table><thead><tr><th>Partition Values</th><th>Location</th></tr></thead><tbody><tr><td>year=2024, month=01, day=15</td><td>s3://shopnow-data-lake/raw/orders/year=2024/month=01/day=15/</td></tr><tr><td>year=2024, month=01, day=16</td><td>s3://shopnow-data-lake/raw/orders/year=2024/month=01/day=16/</td></tr><tr><td>...</td><td>...</td></tr><tr><td>year=2025, month=01, day=15</td><td>s3://shopnow-data-lake/raw/orders/year=2025/month=01/day=15/</td></tr></tbody></table>
+<p>→ Each partition maps to a specific S3 "folder"<br>
+→ When Athena queries <code>WHERE year='2024' AND month='01'</code> → only scans ~31 partitions → FAST</p>
+<hr>
+<p><strong>Run ALL Crawlers and Verify:</strong></p>
+<table><thead><tr><th>Crawler</th><th>Tables Created</th><th>Partitions</th><th>Duration</th></tr></thead><tbody><tr><td>shopnow-orders-crawler</td><td>1 (orders)</td><td>380</td><td>47 seconds</td></tr><tr><td>shopnow-clickstream-crawler</td><td>1 (clickstream)</td><td>8,760</td><td>3 minutes</td></tr><tr><td>shopnow-products-crawler</td><td>1 (products)</td><td>0 (not partitioned)</td><td>15 seconds</td></tr><tr><td>shopnow-misc-data-crawler</td><td>2 (campaigns, customers)</td><td>52 + 4</td><td>22 seconds</td></tr></tbody></table>
+<p><strong>Verify All Tables in Catalog:</strong></p>
+<p>→ Glue Console → "Tables" → Filter by database: <code>shopnow_raw</code></p>
+<table><thead><tr><th>Table</th><th>Format</th><th>Columns</th><th>Partitions</th><th>Location</th></tr></thead><tbody><tr><td>orders</td><td>CSV</td><td>22</td><td>380</td><td>s3://shopnow-data-lake/raw/orders/</td></tr><tr><td>clickstream</td><td>Parquet</td><td>35</td><td>8,760</td><td>s3://shopnow-data-lake/raw/clickstream/</td></tr><tr><td>products</td><td>JSON</td><td>15</td><td>0</td><td>s3://shopnow-data-lake/raw/products/</td></tr><tr><td>campaigns</td><td>CSV</td><td>12</td><td>52</td><td>s3://shopnow-data-lake/raw/campaigns/</td></tr><tr><td>customers</td><td>CSV</td><td>18</td><td>4</td><td>s3://shopnow-data-lake/raw/customers/</td></tr></tbody></table>
+<p>→ 5 tables cataloged → ready for Athena (Project 18) and Redshift Spectrum (Project 28)</p>
+<hr>
+<h3>STEP 7 — UNDERSTAND SCHEMA EVOLUTION AND PARTITION MANAGEMENT</h3>
+<hr>
+<p><strong>Schema Evolution: New Column Added</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE: orders CSV has 22 columns
+</span>  order_id, customer_id, order_date, ..., order_status
+
+AFTER: Source system adds a new column "loyalty_points"
+  order_id, customer_id, order_date, ..., order_status, loyalty_points
+
+What happens on next crawler run:
+  1. Crawler reads new CSV file → discovers 23 columns (was 22)
+  2. New column "loyalty_points" detected (type: int)
+  3. Crawler behavior: "Add new columns only"
+  4. Table updated: loyalty_points (int) added to schema
+  5. Old files: loyalty_points = NULL (column didn't exist)
+  6. New files: loyalty_points = actual value</code></pre></div>
+<p>→ Schema evolution is handled GRACEFULLY<br>
+→ Old data → NULL for new columns → no errors<br>
+→ New data → full values → no schema mismatch</p>
+<hr>
+<p><strong>Schema Evolution: Column Type Change</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE: pincode column is "string" (correct — pincodes have leading zeros)
+</span>AFTER: New data file has pincode as numeric (lost leading zeros)
+
+Crawler behavior:
+  "Add new columns only" → Does NOT change existing column type
+  pincode stays as "string" → new numeric values are read as strings → works
+
+  "Update all new and existing columns" → Would change to "bigint"
+  → Old string values with leading zeros would fail to parse → DANGEROUS</code></pre></div>
+<p>→ "Add new columns only" protects against type changes → safest option<br>
+→ If you NEED to change a type → manually update the table definition in the Catalog</p>
+<hr>
+<p><strong>Partition Management: New Partitions</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE: Crawler ran on Jan 15, 2025 — registered partitions up to 2025/01/15
+</span>AFTER: New data arrives for Jan 16, 17, 18
+
+What happens on next crawler run:
+  Subsequent runs setting: "Crawl new sub-folders only"
+  1. Crawler checks for new sub-folders since last run
+  2. Discovers: year=2025/month=01/day=16/, day=17/, day=18/
+  3. Creates 3 new partitions in the catalog
+  4. Does NOT re-crawl existing partitions → fast</code></pre></div>
+<p>→ With "Crawl new sub-folders only" → each subsequent run is FAST<br>
+→ Only new data is discovered → minutes instead of hours for large datasets</p>
+<p><strong>Alternative: MSCK REPAIR TABLE (Athena)</strong></p>
+<p>→ Instead of running a crawler → you can register new partitions directly in Athena:</p>
+<code>SQL (Athena): MSCK REPAIR TABLE shopnow_raw.orders</code>
+<p>→ This scans S3 for new Hive-style partitions → adds them to the catalog<br>
+→ Faster than running a full crawler for partition-only updates<br>
+→ But doesn't detect schema changes — only new partitions</p>
+<p><strong>Alternative: ALTER TABLE ADD PARTITION (Manual)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SQL (Athena):
+</span>  ALTER TABLE shopnow_raw.orders ADD
+    PARTITION (year='2025', month='01', day='16')
+    LOCATION 's3://shopnow-data-lake/raw/orders/year=2025/month=01/day=16/'</code></pre></div>
+<p>→ Manually register a specific partition → fastest method<br>
+→ Useful in ETL pipelines that know exactly which partitions were created<br>
+→ Glue ETL jobs (Project 21) often use this approach after writing data</p>
+<hr>
+<h3>STEP 8 — SCHEDULE CRAWLERS FOR AUTOMATIC UPDATES</h3>
+<p>→ Glue Console → "Crawlers" → Select crawler → "Edit" → "Schedule"</p>
+<p><strong>Scheduling Options:</strong></p>
+<table><thead><tr><th>Option</th><th>Setting</th><th>Use Case</th></tr></thead><tbody><tr><td>On demand</td><td>No schedule — run manually</td><td>Testing, one-time crawls</td></tr><tr><td>Hourly</td><td><code>cron(0 * * * ? *)</code></td><td>Frequently updated data (clickstream)</td></tr><tr><td>Daily</td><td><code>cron(0 6 * * ? *)</code></td><td>Daily data feeds (orders)</td></tr><tr><td>Weekly</td><td><code>cron(0 6 ? * MON *)</code></td><td>Weekly data (campaigns)</td></tr><tr><td>Monthly</td><td><code>cron(0 6 1 * ? *)</code></td><td>Monthly data (products)</td></tr><tr><td>Custom</td><td>Any cron expression</td><td>Custom schedules</td></tr></tbody></table>
+<p><strong>ShopNow Crawler Schedules:</strong></p>
+<table><thead><tr><th>Crawler</th><th>Schedule</th><th>Cron Expression</th><th>Rationale</th></tr></thead><tbody><tr><td>shopnow-orders-crawler</td><td>Daily at 6 AM UTC</td><td><code>cron(0 6 * * ? *)</code></td><td>Orders arrive daily overnight</td></tr><tr><td>shopnow-clickstream-crawler</td><td>Every 6 hours</td><td><code>cron(0 0/6 * * ? *)</code></td><td>Clickstream arrives hourly, crawl periodically</td></tr><tr><td>shopnow-products-crawler</td><td>Weekly Monday 6 AM</td><td><code>cron(0 6 ? * MON *)</code></td><td>Products update infrequently</td></tr><tr><td>shopnow-misc-data-crawler</td><td>Weekly Monday 7 AM</td><td><code>cron(0 7 ? * MON *)</code></td><td>Campaigns and customers update weekly/quarterly</td></tr></tbody></table>
+<p>→ Crawlers run automatically on schedule → discover new data → update catalog<br>
+→ Analysts always see up-to-date table definitions → no manual work</p>
+<p><strong>Crawler Run Cost:</strong></p>
+<p>→ Crawlers are billed in DPU-hours (Data Processing Units)<br>
+→ 1 DPU = 4 vCPU + 16 GB memory<br>
+→ Minimum: 2 DPUs per crawler run<br>
+→ Cost: $0.44 per DPU-hour<br>
+→ Typical crawler run: 2 DPUs × 1-5 minutes = $0.015-$0.075 per run<br>
+→ Daily crawler: ~$0.04/day = ~$1.20/month → very cheap</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create separate Glue databases for each data zone (raw, curated, refined)<br>
+→ Always use Hive-style partitioning (<code>key=value/</code>) for time-series data in S3<br>
+→ Always set crawler schema change behavior to "Add new columns only" — safest option<br>
+→ Always set subsequent crawl behavior to "Crawl new sub-folders only" — faster incremental crawls<br>
+→ Always create a dedicated IAM Role for Glue with least-privilege S3 and Catalog permissions<br>
+→ Always schedule crawlers to run after data is expected to arrive — not during data loading<br>
+→ Always verify crawled table schemas against expected schemas — crawlers can misinterpret types<br>
+→ Always use meaningful database and table names — they appear in Athena and Spectrum<br>
+→ Always use Parquet format where possible — self-describing, compressed, columnar → best performance<br>
+→ Always partition data by the most commonly filtered dimension (usually date)<br>
+→ Always check crawler logs in CloudWatch for errors — silent failures are common<br>
+→ Always tag crawlers and databases for cost tracking and organizational management</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never let crawlers create tables in the default database — use purpose-specific databases<br>
+→ Never use "Update all new and existing columns" for production — can change column types unexpectedly<br>
+→ Never crawl the entire bucket with one crawler — separate crawlers per data source for isolation<br>
+→ Never schedule crawlers during data loading — may read partial/incomplete files<br>
+→ Never assume crawler-inferred data types are always correct — dates are often inferred as strings<br>
+→ Never use non-Hive-style partition folders expecting automatic partition detection — crawler won't recognize them<br>
+→ Never forget to grant the Glue role access to KMS if S3 data is KMS-encrypted<br>
+→ Never skip Glue Database creation — tables without databases are hard to organize<br>
+→ Never run crawlers more frequently than data arrives — wastes DPU costs<br>
+→ Never ignore crawler errors — a failed crawler means stale catalog → wrong query results<br>
+→ Never create hundreds of individual crawlers when a few multi-source crawlers suffice<br>
+→ Never forget that Glue Catalog is REGIONAL — tables in ap-south-1 are not visible in us-east-1</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>Discover schema of unknown S3 data</td><td>Glue Crawler (this project)</td></tr><tr><td>Create table definitions for known schemas</td><td>Manual <code>CREATE TABLE</code> in Athena or Glue API</td></tr><tr><td>Register new partitions only (schema unchanged)</td><td><code>MSCK REPAIR TABLE</code> in Athena or <code>ALTER TABLE ADD PARTITION</code></td></tr><tr><td>Catalog data in RDS/Redshift</td><td>Glue JDBC Crawler (connects to databases — Project 24 preview)</td></tr><tr><td>Catalog streaming data</td><td>Glue Schema Registry (for Kafka/Kinesis schemas)</td></tr><tr><td>Centralized metadata for data lake</td><td>Glue Data Catalog (this project)</td></tr><tr><td>Governed access to catalog tables</td><td>Lake Formation (Project 47)</td></tr><tr><td>Query cataloged S3 data</td><td>Athena (Project 18) or Redshift Spectrum (Project 28)</td></tr><tr><td>Transform cataloged data</td><td>Glue ETL Jobs (Project 21)</td></tr></tbody></table>
+<p><strong>Crawler vs Manual Table Definition:</strong></p>
+<table><thead><tr><th>Approach</th><th>Pros</th><th>Cons</th><th>Best For</th></tr></thead><tbody><tr><td>Glue Crawler</td><td>Automatic discovery, handles schema evolution, finds partitions</td><td>May misinterpret types, DPU cost, slight delay</td><td>Unknown/evolving schemas</td></tr><tr><td>Manual CREATE TABLE</td><td>Precise control over types, instant, free</td><td>Must maintain manually, no auto-partition discovery</td><td>Well-known, stable schemas</td></tr><tr><td>Glue API (programmatic)</td><td>Automated, precise, can be part of ETL pipeline</td><td>Requires code</td><td>ETL pipelines that create their own tables</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Glue Crawlers for real-time schema detection → Crawlers run in batches, not real-time<br>
+→ Do NOT use Glue Crawlers when you already know the exact schema → Manual definition is faster and more precise<br>
+→ Do NOT use Glue Data Catalog when you need a full data governance platform → Use Lake Formation (Project 47) ON TOP of Glue Catalog<br>
+→ Do NOT use Glue Crawlers for non-S3 data unless specifically needed → JDBC crawlers have connection overhead<br>
+→ Do NOT use Glue Crawlers as the only schema documentation → Maintain data dictionaries separately</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → HOW A CRAWLER DISCOVERS SCHEMAS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Crawler: shopnow-orders-crawler starts
+</span>        │
+        ▼
+Step 1: ENUMERATE — List all objects in the S3 path
+        s3:ListBucket on s3://shopnow-data-lake/raw/orders/
+        Discovers: 380 sub-folders (year=.../month=.../day=.../), 380 CSV files
+        │
+        ▼
+Step 2: CLASSIFY — Determine file format
+        Reads first few KB of a sample file
+        Built-in classifiers try to match:
+          - CSV classifier: Tries comma, tab, pipe delimiters → comma works ✓
+          - JSON classifier: Not valid JSON → skip
+          - Parquet classifier: Not Parquet magic bytes → skip
+        Classification result: CSV (comma-delimited, with header row)
+        │
+        ▼
+Step 3: SAMPLE — Read sample data for schema inference
+        Reads first N rows (configurable, default varies by format)
+        For CSV: Reads header row → column names
+        For each column → analyzes values to infer data type:
+          "12345" → all rows are numeric → bigint
+          "999.99" → decimal values → double
+          "2024-01-15" → looks like date but stored as string → string
+          "Shoes" → text → string
+          "" (empty) → could be any type → string (safest)
+        │
+        ▼
+Step 4: DETECT PARTITIONS — Identify Hive-style partitions
+        Folder structure: year=2024/month=01/day=15/
+        Pattern detected: key=value/ → Hive-style partitions
+        Partition keys: year (string), month (string), day (string)
+        Enumerates all unique partition value combinations → 380 partitions
+        │
+        ▼
+Step 5: GROUP — Determine table grouping
+        All files in raw/orders/ have the same schema → single table "orders"
+        If files had DIFFERENT schemas → would create separate tables
+        │
+        ▼
+Step 6: CATALOG — Write to Glue Data Catalog
+        │
+        ├── Table already exists?
+        │   ├── NO → CREATE new table with discovered schema
+        │   └── YES → UPDATE based on schema change behavior
+        │       ├── "Add new columns only" → Merge new columns, keep existing
+        │       ├── "Update all" → Replace schema with new discovery
+        │       └── "Log only" → Record changes, don't modify
+        │
+        ├── Register partitions
+        │   For each partition: {year=2024, month=01, day=15} → s3://path/
+        │   Batch create partitions in the catalog
+        │
+        └── Write crawler metrics
+            Tables created/updated, partitions created, duration, DPU-hours
+        │
+        ▼
+Step 7: LOG — Write results to CloudWatch Logs
+        Log group: /aws-glue/crawlers
+        Contains: Discovery details, errors, warnings, statistics</code></pre></div>
+<hr>
+<h3>2 → HOW THE GLUE DATA CATALOG STORES METADATA</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>GLUE DATA CATALOG (Internal Structure):
+</span>
+┌─────────────────────────────────────────────────────────────┐
+│ CATALOG (Account: 123456789012, Region: ap-south-1)         │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ DATABASE: shopnow_raw                                   │ │
+│ │                                                         │ │
+│ │ ┌─────────────────────────────────────────────────────┐ │ │
+│ │ │ TABLE: orders                                       │ │ │
+│ │ │                                                     │ │ │
+│ │ │ Storage Descriptor:                                 │ │ │
+│ │ │   Location: s3://shopnow-data-lake/raw/orders/      │ │ │
+│ │ │   InputFormat: TextInputFormat                      │ │ │
+│ │ │   OutputFormat: HiveIgnoreKeyTextOutputFormat        │ │ │
+│ │ │   SerDe: LazySimpleSerDe                            │ │ │
+│ │ │   SerDe Parameters: {delimiter: ",", header: true}  │ │ │
+│ │ │                                                     │ │ │
+│ │ │ Columns:                                            │ │ │
+│ │ │   [0] order_id: bigint                              │ │ │
+│ │ │   [1] customer_id: bigint                           │ │ │
+│ │ │   [2] order_date: string                            │ │ │
+│ │ │   ... (22 columns)                                  │ │ │
+│ │ │                                                     │ │ │
+│ │ │ Partition Keys:                                     │ │ │
+│ │ │   [0] year: string                                  │ │ │
+│ │ │   [1] month: string                                 │ │ │
+│ │ │   [2] day: string                                   │ │ │
+│ │ │                                                     │ │ │
+│ │ │ Partitions:                                         │ │ │
+│ │ │   {year=2024, month=01, day=15}                     │ │ │
+│ │ │     → s3://shopnow-data-lake/raw/orders/year=2024/  │ │ │
+│ │ │       month=01/day=15/                              │ │ │
+│ │ │   {year=2024, month=01, day=16}                     │ │ │
+│ │ │     → s3://...                                      │ │ │
+│ │ │   ... (380 partitions)                              │ │ │
+│ │ │                                                     │ │ │
+│ │ │ Table Parameters:                                   │ │ │
+│ │ │   classification: csv                               │ │ │
+│ │ │   compressionType: none                             │ │ │
+│ │ │   typeOfData: file                                  │ │ │
+│ │ │   CrawlerSchemaDeserializerVersion: 1.0             │ │ │
+│ │ │   CrawlerSchemaSerializerVersion: 1.0               │ │ │
+│ │ │   UPDATED_BY_CRAWLER: shopnow-orders-crawler        │ │ │
+│ │ │   averageRecordSize: 450                            │ │ │
+│ │ │   objectCount: 380                                  │ │ │
+│ │ │   recordCount: 50000000                             │ │ │
+│ │ │   sizeKey: 15728640000                              │ │ │
+│ │ └─────────────────────────────────────────────────────┘ │ │
+│ │                                                         │ │
+│ │ (More tables: clickstream, products, campaigns, etc.)   │ │
+│ └─────────────────────────────────────────────────────────┘ │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ The catalog is a MANAGED service — AWS handles storage and availability<br>
+→ Catalog is accessible via Glue API, Athena, Redshift Spectrum, EMR<br>
+→ Catalog is the SINGLE SOURCE OF TRUTH for table metadata in the data lake</p>
+<hr>
+<h3>3 → HOW SERVICES USE THE GLUE CATALOG</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ATHENA (Project 18):
+</span>  User runs: SELECT * FROM shopnow_raw.orders WHERE year='2024' AND month='01'
+  Athena → Glue Catalog: GetTable("shopnow_raw", "orders")
+  Catalog returns: Schema, format, SerDe, partition keys
+  Athena → Glue Catalog: GetPartitions(year='2024', month='01')
+  Catalog returns: 31 partition locations (one per day in January)
+  Athena → S3: Read only 31 CSV files (not all 380)
+  Athena → Process → Return results
+
+REDSHIFT SPECTRUM (Project 28):
+  User runs: SELECT category, SUM(amount) FROM spectrum.orders WHERE year='2024'
+  Redshift → Glue Catalog: GetTable, GetPartitions
+  Same flow as Athena but executed by Redshift Spectrum layer
+
+GLUE ETL JOB (Project 21):
+  Job reads: DynamicFrame.from_catalog(database="shopnow_raw", table_name="orders")
+  Glue → Catalog: GetTable → returns schema + location
+  Glue → S3: Read data using cataloged schema
+  Glue → Transform → Write to curated/</code></pre></div>
+<hr>
+<h3>4 → GLUE CATALOG PRICING</h3>
+<table><thead><tr><th>Component</th><th>Cost</th></tr></thead><tbody><tr><td>First 1 million objects stored (tables, partitions, etc.)</td><td>Free</td></tr><tr><td>Additional objects</td><td>$1.00 per 100,000 objects per month</td></tr><tr><td>First 1 million requests (GetTable, GetPartitions, etc.)</td><td>Free</td></tr><tr><td>Additional requests</td><td>$1.00 per million requests</td></tr><tr><td>Crawler DPU-hours</td><td>$0.44 per DPU-hour</td></tr></tbody></table>
+<p><strong>ShopNow Cost Estimate:</strong></p>
+<table><thead><tr><th>Component</th><th>Calculation</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Catalog objects (5 tables + ~9,200 partitions)</td><td>&lt; 1 million → Free</td><td>$0</td></tr><tr><td>Catalog requests (queries + crawler runs)</td><td>&lt; 1 million → Free</td><td>$0</td></tr><tr><td>Crawler runs (4 crawlers, various schedules)</td><td>~60 runs × 2 DPU × 0.02 hours × $0.44</td><td>~$1.06</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~$1.06/month</strong></td></tr></tbody></table>
+<p>→ Glue Catalog and Crawlers are extremely cheap<br>
+→ The real cost is in ETL jobs (Project 21) and query execution (Athena/Redshift)</p>
+<hr>
+<h3>5 → GLUE CATALOG LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>Databases per catalog</td><td>10,000</td></tr><tr><td>Tables per database</td><td>1,000,000</td></tr><tr><td>Partitions per table</td><td>10,000,000</td></tr><tr><td>Columns per table</td><td>400 (Glue) — but Athena supports up to 100</td></tr><tr><td>Versions per table</td><td>100,000</td></tr><tr><td>Crawlers per account</td><td>1,000</td></tr><tr><td>Concurrent crawler runs</td><td>100</td></tr><tr><td>DPUs per crawler</td><td>2 minimum</td></tr><tr><td>Partition values per GetPartitions call</td><td>1,000,000</td></tr></tbody></table>
+<p>→ 10 million partitions per table is generous → supports years of hourly partitioned data<br>
+→ If approaching limits → consolidate partitions (daily instead of hourly)</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Crawler infers date columns as strings</td><td>Queries can't use date functions on string columns</td><td>Manually update column type in catalog or use CAST in queries</td></tr><tr><td>2</td><td>Crawler misinterprets numeric strings (pincode) as bigint</td><td>Leading zeros lost → "110001" becomes 110001</td><td>Use custom classifier or manually fix type to string</td></tr><tr><td>3</td><td>Crawler runs during data upload</td><td>Reads partial/incomplete file → wrong schema or corrupt data</td><td>Schedule crawler AFTER data loading completes</td></tr><tr><td>4</td><td>Non-Hive-style partitions (date=20240115 instead of year=2024/month=01/day=15)</td><td>Crawler doesn't detect partitions → single table with all data → slow queries</td><td>Use Hive-style key=value/ partition naming</td></tr><tr><td>5</td><td>Missing IAM permissions on S3</td><td>Crawler fails with "Access Denied" → no tables created</td><td>Verify role has s3:GetObject and s3:ListBucket on the data path</td></tr><tr><td>6</td><td>KMS-encrypted S3 without KMS permissions on Glue role</td><td>Crawler can't read encrypted data → fails silently</td><td>Add kms:Decrypt to Glue role for the S3 encryption key</td></tr><tr><td>7</td><td>Mixed file formats in same S3 path</td><td>Crawler creates multiple tables or picks wrong format</td><td>Keep one format per S3 path</td></tr><tr><td>8</td><td>Schema change breaks existing queries</td><td>New column added but old Athena views reference fixed columns</td><td>Use "Add new columns only" + test queries after crawl</td></tr><tr><td>9</td><td>Too many small partitions</td><td>Catalog API becomes slow, query planning overhead increases</td><td>Use appropriate partition granularity (daily, not per-minute)</td></tr><tr><td>10</td><td>Crawler creates tables with auto-generated names</td><td>Table names like "raw_orders" or "orders_csv" — confusing</td><td>Use table name prefix setting or rename after creation</td></tr><tr><td>11</td><td>Empty S3 path → crawler creates no table</td><td>No table in catalog → queries fail → confusion</td><td>Ensure at least one data file exists before first crawl</td></tr><tr><td>12</td><td>Forgot to run crawler after new data → stale catalog</td><td>Analysts query old data → wrong business decisions</td><td>Schedule crawlers on appropriate frequency</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Data Volume Scalability</strong></p>
+<ul>
+<li>Crawlers can scan PBs of data in S3</li>
+<li>"Crawl new sub-folders only" keeps incremental crawls fast</li>
+<li>Partition count: Up to 10 million per table → supports years of granular data</li>
+<li>Catalog storage: Up to 1 million tables per database</li>
+</ul>
+<p>→ <strong>Crawler Scalability</strong></p>
+<ul>
+<li>Up to 1,000 crawlers per account</li>
+<li>Up to 100 concurrent crawler runs</li>
+<li>Each crawler uses minimum 2 DPUs → auto-scales based on data volume</li>
+<li>Multi-source crawlers reduce crawler count → one crawler, many tables</li>
+</ul>
+<p>→ <strong>Catalog Query Scalability</strong></p>
+<ul>
+<li>Catalog API handles millions of requests per month</li>
+<li>First million requests free → ample for most organizations</li>
+<li>Athena and Spectrum batch partition requests efficiently</li>
+<li>Partition indexing (available for very large partition counts) improves GetPartitions performance</li>
+</ul>
+<p>→ <strong>Multi-Account Scalability</strong></p>
+<ul>
+<li>Each account has its own catalog</li>
+<li>Cross-account catalog sharing via Lake Formation (Project 42)</li>
+<li>Resource links enable consumer accounts to reference producer account tables</li>
+<li>AWS RAM (Resource Access Manager) for organizational sharing</li>
+</ul>
+<p>→ <strong>Schema Evolution Scalability</strong></p>
+<ul>
+<li>Crawlers handle column additions gracefully</li>
+<li>Table versioning tracks schema changes over time</li>
+<li>Consumers (Athena, Spectrum) handle NULL values for missing columns automatically</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify crawlers are working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Crawler exists</td><td>Glue Console → Crawlers → Verify listed</td></tr><tr><td>Crawler last run status</td><td>Crawlers → Status column: "Ready" (succeeded) or "Failed"</td></tr><tr><td>Crawler run history</td><td>Select crawler → "Crawler runs" tab → Duration, tables, partitions</td></tr><tr><td>Tables created</td><td>Glue Console → Tables → Filter by database → Count matches expected</td></tr><tr><td>Schema correct</td><td>Select table → Schema tab → Verify column names and types</td></tr><tr><td>Partitions registered</td><td>Select table → Partitions tab → Verify partition values and locations</td></tr><tr><td>CloudWatch Logs</td><td>CloudWatch → Log groups → /aws-glue/crawlers → Search for errors</td></tr></tbody></table>
+<p>→ <strong>How to debug "crawler failed":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Check crawler run status
+</span>        Glue Console → Crawlers → Select crawler → "Crawler runs"
+        Status: "Failed" → Click to see error details
+
+STEP 2: Check CloudWatch Logs
+        CloudWatch → Log groups → /aws-glue/crawlers
+        Filter by crawler name → look for ERROR messages
+        Common errors:
+          - "Access Denied" → IAM role missing S3 permissions
+          - "KMS Exception" → Role missing KMS decrypt permissions
+          - "Internal Service Error" → Transient AWS issue → retry
+
+STEP 3: Verify IAM Role
+        IAM Console → Roles → shopnow-glue-service-role
+        → Permissions → Does it have s3:GetObject on the S3 path?
+        → Trust → Does it trust glue.amazonaws.com?
+
+STEP 4: Verify S3 Path
+        S3 Console → Navigate to the crawler's S3 path
+        → Do files actually exist there?
+        → Are files in the expected format?
+
+STEP 5: Verify Network (for JDBC crawlers)
+        If crawling RDS/Redshift → VPC, subnet, SG must allow connectivity
+        (Not applicable for S3 crawlers — S3 is accessed via API)
+
+STEP 6: Test with a simpler path
+        Create a test path with 1 file → run crawler → does it work?
+        If yes → original path may have format issues</code></pre></div>
+<p>→ <strong>Monitoring Crawler Health:</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alert On</th></tr></thead><tbody><tr><td>Crawler run status</td><td>Glue Console / EventBridge</td><td>Any "Failed" status</td></tr><tr><td>Crawler duration</td><td>CloudWatch (Glue metrics)</td><td>Duration &gt; 2× normal</td></tr><tr><td>Tables created/updated</td><td>Crawler run details</td><td>Unexpected 0 tables (no data found)</td></tr><tr><td>Partitions created</td><td>Crawler run details</td><td>Unexpected 0 partitions (data not partitioned as expected)</td></tr></tbody></table>
+<p>→ EventBridge (Project 38) can capture Glue Crawler state changes:</p>
+<ul>
+<li>Rule: When crawler state = "Failed" → SNS notification</li>
+<li>This enables automatic alerting for crawler failures</li>
+</ul>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ The Glue Data Catalog is the CENTRAL METADATA STORE for the entire data lake<br>
+→ Glue Crawlers AUTOMATICALLY discover schemas, data types, and partitions in S3<br>
+→ Once cataloged → data is queryable by Athena, Redshift Spectrum, Glue ETL, and EMR<br>
+→ Hive-style partitioning (<code>key=value/</code>) enables automatic partition discovery and query optimization<br>
+→ "Add new columns only" schema change behavior is the safest for evolving data<br>
+→ "Crawl new sub-folders only" keeps incremental crawls fast and cheap<br>
+→ Crawlers are CHEAP (~$1/month) → the value they provide in automation is enormous<br>
+→ The catalog is Hive-compatible → any tool that supports Hive metastore can use it<br>
+→ Separate databases for each data zone (raw, curated, refined) keeps the catalog organized</p>
+<p>→ Connection to Project 1: S3 is the storage layer — Glue Catalog is the metadata layer</p>
+<ul>
+<li>S3 stores the actual data files</li>
+<li>Catalog stores: where the data is, what format, what columns, what partitions</li>
+<li>Together they form the data lake foundation</li>
+</ul>
+<p>→ Connection to Project 11: IAM Role for Glue (<code>glue.amazonaws.com</code> trust) provides access</p>
+<ul>
+<li>Role needs S3 read + Catalog write + CloudWatch Logs write permissions</li>
+</ul>
+<p>→ Connection to Project 16: Redshift will use the Glue Catalog via Spectrum</p>
+<ul>
+<li>External schema in Redshift → references Glue Catalog database</li>
+<li>Tables cataloged here are immediately available in Redshift Spectrum</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 18: Athena queries S3 data USING the Glue Catalog (next project)</li>
+<li>Project 21: Glue ETL jobs read FROM and write TO cataloged tables</li>
+<li>Project 25: End-to-end pipeline: S3 → Crawler → Catalog → Athena</li>
+<li>Project 28: Redshift Spectrum uses Glue Catalog as external metastore</li>
+<li>Project 42: Cross-account Glue Catalog sharing via Lake Formation</li>
+<li>Project 47: Lake Formation governs access TO Glue Catalog tables</li>
+<li>Project 51: Enterprise Data Lake with full catalog governance</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has a Glue Data Catalog with 5 tables describing their S3 data<br>
+→ The BI analysts say: "Great — we have a catalog. But HOW do we actually QUERY this data?"<br>
+→ They don't want to:</p>
+<ul>
+<li>Load data into Redshift (takes time, costs money for storage)</li>
+<li>Load data into MariaDB (can't handle the volume)</li>
+<li>Download and open in Excel (impossible for 50 million rows)<br>
+→ They want to write SQL → query S3 data DIRECTLY → get results → pay only for data scanned</li>
+</ul>
+<p>→ <strong>This is exactly what Project 18 solves</strong><br>
+→ Project 18 introduces Amazon Athena — serverless SQL queries on S3<br>
+→ Athena reads table definitions from the Glue Data Catalog (this project)<br>
+→ Athena scans S3 data directly — no loading, no servers, no infrastructure<br>
+→ Pay only per query: $5 per TB of data scanned<br>
+→ Partitioning (this project) and columnar format (Parquet) dramatically reduce scan costs</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 18: "The Analyst Who Didn't Want to Spin Up a Server — Athena Querying S3 via Glue Catalog"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-16.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 17/60</span></div><a class="nav-btn next" href="project-18.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

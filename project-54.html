@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 54: THE 50-ACCOUNT ORGANIZATION THAT NEEDED GUARDRAILS — AWS Organizatio — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 54: THE 50-ACCOUNT ORGANIZATION THAT NEEDED GUARDRAILS — AWS Organizations, SCPs &amp; Centralized Governance</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale has grown from 3 AWS accounts (18 months ago) to 11 accounts today<br>
+→ 3 more business units are onboarding next quarter — each needs 2 accounts (prod + dev) = 6 new accounts<br>
+→ By year-end — PayScale will have 17+ accounts<br>
+→ Strategic plan: 30-50 accounts within 2 years (microservices, regional expansion, acquisitions)</p>
+<p><strong>Current Account Inventory:</strong></p>
+<table><thead><tr><th>Account</th><th>Account ID</th><th>Purpose</th><th>Who Manages</th><th>Created By</th></tr></thead><tbody><tr><td>Account A — Platform</td><td>111111111111</td><td>Core Payment Processing</td><td>Platform Team</td><td>Manual — 2 years ago</td></tr><tr><td>Account B — Risk</td><td>222222222222</td><td>Fraud Detection + Data Lake</td><td>Risk Team</td><td>Manual — 18 months ago</td></tr><tr><td>Account C — Analytics</td><td>333333333333</td><td>Reporting + Dashboards</td><td>Analytics Team</td><td>Manual — 15 months ago</td></tr><tr><td>Account D — Audit</td><td>444444444444</td><td>External Auditor Access</td><td>Security Team</td><td>Manual — 12 months ago</td></tr><tr><td>Account E — Compliance</td><td>555555555555</td><td>Regulatory Systems</td><td>Compliance Team</td><td>Manual — 10 months ago</td></tr><tr><td>Account F — Dev</td><td>666666666666</td><td>Development Environment</td><td>Platform Team</td><td>Manual — 8 months ago</td></tr><tr><td>Account G — Staging</td><td>777777777777</td><td>Staging Environment</td><td>Platform Team</td><td>Manual — 8 months ago</td></tr><tr><td>Account H — Shared Services</td><td>888888888888</td><td>DNS, Logging, NAT, TGW</td><td>Platform Team</td><td>Manual — 6 months ago</td></tr><tr><td>Account J — Data Lake</td><td>999999999999</td><td>S3 + Glue + Lake Formation</td><td>Data Platform Team</td><td>Manual — 3 months ago</td></tr><tr><td>Account K — Security</td><td>101010101010</td><td>GuardDuty, Security Hub</td><td>Security Team</td><td>Manual — 2 months ago</td></tr><tr><td>Account L — Billing</td><td>121212121212</td><td>Cost management, budgets</td><td>Finance Team</td><td>Manual — 1 month ago</td></tr></tbody></table>
+<p><strong>The Governance Chaos:</strong></p>
+<table><thead><tr><th>Problem</th><th>Current State</th><th>Impact</th></tr></thead><tbody><tr><td>No organization-wide policies</td><td>Each account has independently configured IAM</td><td>A developer in Account F created an IAM user with <code>AdministratorAccess</code> — full root-level power</td></tr><tr><td>No service restrictions</td><td>Any account can launch any service</td><td>Account G (staging) launched a p4d.24xlarge GPU instance ($32.77/hour) for "testing" — $786/day bill discovered a week later</td></tr><tr><td>No encryption enforcement</td><td>Some accounts encrypt, some don't</td><td>Compliance audit found 4 unencrypted S3 buckets and 2 unencrypted RDS instances</td></tr><tr><td>CloudTrail disabled in 3 accounts</td><td>No audit trail</td><td>Security incident in Account F — no logs to investigate</td></tr><tr><td>No region restrictions</td><td>Accounts launch resources in any region</td><td>Account C launched resources in us-west-2 — data residency violation (India-only requirement)</td></tr><tr><td>11 separate AWS invoices</td><td>CFO reconciles manually</td><td>3 hours per month of manual billing reconciliation</td></tr><tr><td>New account setup takes 2 weeks</td><td>Manual: Create account → Configure IAM → Set up VPC → Enable CloudTrail → Configure security → ...</td><td>New business unit waited 3 weeks to start development</td></tr><tr><td>No standardized tagging</td><td>Some accounts tag, some don't</td><td>Cost allocation impossible — cannot attribute costs to business units</td></tr><tr><td>Root account credentials scattered</td><td>Some root accounts use personal email addresses</td><td>If employee leaves — root access is compromised</td></tr><tr><td>No central security baseline</td><td>Each account has different security posture</td><td>Security team must audit 11 accounts individually — takes 2 weeks per audit cycle</td></tr></tbody></table>
+<p><strong>The CISO's Mandate:</strong></p>
+<p>→ "I need ORGANIZATION-WIDE guardrails that NO individual account can override"<br>
+→ "CloudTrail must be enabled in EVERY account — nobody should be able to disable it"<br>
+→ "All data must be encrypted at rest — in EVERY account, EVERY service"<br>
+→ "No account should launch resources outside ap-south-1 and us-east-1"<br>
+→ "No account should be able to create IAM users with console access — use SSO only"<br>
+→ "New account creation must be automated with baseline security — not 2 weeks of manual work"</p>
+<p><strong>The CFO's Mandate:</strong></p>
+<p>→ "One invoice — not 11"<br>
+→ "Cost allocation by business unit, environment, and project"<br>
+→ "Spending limits per account — no more surprise $786/day GPU bills"<br>
+→ "Volume discounts should apply across ALL accounts — not per-account pricing"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what AWS Organizations provides</p>
+<table><thead><tr><th>Capability</th><th>What It Does</th><th>Without Organizations</th></tr></thead><tbody><tr><td>Multi-account management</td><td>Group accounts into a hierarchy</td><td>Each account is independent — no central view</td></tr><tr><td>Service Control Policies (SCPs)</td><td>Organization-wide permission guardrails</td><td>Each account sets its own IAM policies — no enforcement</td></tr><tr><td>Consolidated billing</td><td>Single invoice for all accounts</td><td>Separate invoice per account</td></tr><tr><td>Volume discounts</td><td>Aggregate usage across accounts for pricing tiers</td><td>Each account starts from zero usage tier</td></tr><tr><td>Organizational Units (OUs)</td><td>Group accounts by function (prod, dev, security)</td><td>No grouping — flat list of accounts</td></tr><tr><td>Account vending</td><td>Programmatic account creation with baseline config</td><td>Manual account creation + manual setup</td></tr><tr><td>Tag policies</td><td>Enforce tagging standards across accounts</td><td>No enforcement — voluntary tagging</td></tr><tr><td>Service integrations</td><td>CloudTrail, Config, GuardDuty, Security Hub work org-wide</td><td>Each service configured per-account</td></tr></tbody></table>
+<p><strong>Organizations Hierarchy Design:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Root (Management Account — Account L: Billing)
+</span>    |
+    ├── OU: Security
+    │   ├── Account K — Security Tools (GuardDuty, Security Hub)
+    │   └── Account D — Audit
+    |
+    ├── OU: Infrastructure
+    │   ├── Account H — Shared Services (DNS, NAT, TGW)
+    │   └── Account J — Data Lake
+    |
+    ├── OU: Production
+    │   ├── Account A — Platform (Production)
+    │   ├── Account B — Risk/Fraud (Production)
+    │   ├── Account C — Analytics (Production)
+    │   └── Account E — Compliance
+    |
+    ├── OU: Non-Production
+    │   ├── Account F — Dev
+    │   └── Account G — Staging
+    |
+    └── OU: Sandbox
+        └── (Future experimental accounts)</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Create AWS Organization with management account</li>
+<li>Step 2 — Design and create Organizational Units (OUs)</li>
+<li>Step 3 — Invite existing accounts into the Organization</li>
+<li>Step 4 — Design and attach Service Control Policies (SCPs)</li>
+<li>Step 5 — Configure consolidated billing and cost allocation</li>
+<li>Step 6 — Configure tag policies for standardized tagging</li>
+<li>Step 7 — Configure centralized CloudTrail</li>
+<li>Step 8 — Design account vending for automated new account creation</li>
+<li>Step 9 — Configure delegated administration for security services</li>
+<li>Step 10 — Monitor and audit organizational compliance</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE AWS ORGANIZATION</h3>
+<p><strong>Which Account Should Be the Management Account?</strong></p>
+<table><thead><tr><th>Option</th><th>Account</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Account A (Platform)</td><td>Application account</td><td>Already exists</td><td>Mixes application and management — dangerous</td></tr><tr><td>Account H (Shared Services)</td><td>Infrastructure account</td><td>Central role already</td><td>Mixes infrastructure and governance</td></tr><tr><td>Account L (Billing)</td><td>Dedicated billing account</td><td>Clean separation, billing-focused</td><td>Already exists for this purpose ✅</td></tr><tr><td>NEW Account (Management)</td><td>Brand new</td><td>Cleanest isolation</td><td>Another account to create</td></tr></tbody></table>
+<p>→ PayScale uses <strong>Account L (Billing — 121212121212)</strong> as the Management Account<br>
+→ The Management Account should have MINIMAL workloads — only organization management<br>
+→ It becomes the billing payer for ALL member accounts<br>
+→ No application resources should run in the Management Account</p>
+<p><strong>Create Organization:</strong></p>
+<p>→ Log into Account L (121212121212) as root or administrator<br>
+→ Navigate to AWS Organizations Console → Create an organization</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Feature set</td><td>All features</td><td>Enables SCPs, tag policies, and all governance capabilities</td></tr></tbody></table>
+<p><strong>Feature Set Options:</strong></p>
+<table><thead><tr><th>Feature Set</th><th>Capabilities</th><th>When to Use</th></tr></thead><tbody><tr><td>All features</td><td>SCPs + Tag Policies + AI Opt-Out + Backup Policies + Consolidated Billing</td><td>Always — no reason to choose less</td></tr><tr><td>Consolidated billing only</td><td>Only billing consolidation — no governance policies</td><td>Never recommended — you lose all governance capabilities</td></tr></tbody></table>
+<p>→ Click "Create organization"<br>
+→ Account L is now the Management Account<br>
+→ Organization ID: <code>o-payscale123</code></p>
+<p><strong>Management Account Best Practices:</strong></p>
+<table><thead><tr><th>Practice</th><th>Why</th></tr></thead><tbody><tr><td>No application workloads</td><td>Blast radius — compromise of management account = compromise of entire organization</td></tr><tr><td>Minimal IAM users</td><td>Only organization administrators should have access</td></tr><tr><td>Strong MFA on root</td><td>Root of management account can override SCPs — MUST be protected</td></tr><tr><td>No SCPs applied to management account</td><td>SCPs don't affect the management account — by design</td></tr><tr><td>Dedicated email for root</td><td>Use a distribution list (<a href="mailto:aws-org-root@payscale.com">aws-org-root@payscale.com</a>), not personal email</td></tr><tr><td>CloudTrail always enabled</td><td>Audit all organization management actions</td></tr></tbody></table>
+<hr>
+<h3>STEP 2 — DESIGN AND CREATE ORGANIZATIONAL UNITS</h3>
+<p><strong>OU Design Principles:</strong></p>
+<table><thead><tr><th>Principle</th><th>Implementation</th></tr></thead><tbody><tr><td>Group by function and security posture</td><td>Production accounts have different SCPs than dev accounts</td></tr><tr><td>Separate workloads from infrastructure</td><td>Infrastructure OU (shared services, data lake) separate from application OUs</td></tr><tr><td>Separate security from everything</td><td>Security OU has most restrictive access</td></tr><tr><td>Plan for growth</td><td>Create OUs for future use (Sandbox) even if empty now</td></tr><tr><td>Maximum 5 levels of nesting</td><td>AWS supports 5 OU levels — keep it shallow (2-3 levels recommended)</td></tr></tbody></table>
+<p><strong>Create OUs:</strong></p>
+<p>→ Navigate to AWS Organizations Console → Organize accounts → Root<br>
+→ Actions → Create organizational unit</p>
+<table><thead><tr><th>OU Name</th><th>Parent</th><th>Purpose</th><th>SCP Policy</th></tr></thead><tbody><tr><td>Security</td><td>Root</td><td>Security and audit accounts</td><td>Most restrictive — no modifications allowed</td></tr><tr><td>Infrastructure</td><td>Root</td><td>Shared services and data platform</td><td>Moderate — controlled service access</td></tr><tr><td>Production</td><td>Root</td><td>Production business applications</td><td>Strict — approved services only</td></tr><tr><td>Non-Production</td><td>Root</td><td>Development and staging</td><td>Moderate — more services allowed, budget limits</td></tr><tr><td>Sandbox</td><td>Root</td><td>Experimental and learning</td><td>Most permissive but cost-limited</td></tr></tbody></table>
+<p><strong>After OU Creation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Root (o-payscale123)
+</span>    ├── OU: Security (ou-xxxx-security)
+    ├── OU: Infrastructure (ou-xxxx-infra)
+    ├── OU: Production (ou-xxxx-prod)
+    ├── OU: Non-Production (ou-xxxx-nonprod)
+    └── OU: Sandbox (ou-xxxx-sandbox)</code></pre></div>
+<hr>
+<h3>STEP 3 — INVITE EXISTING ACCOUNTS INTO THE ORGANIZATION</h3>
+<p><strong>Two Methods to Add Accounts:</strong></p>
+<table><thead><tr><th>Method</th><th>How</th><th>When to Use</th></tr></thead><tbody><tr><td>Invite existing account</td><td>Management account sends invitation → Member account accepts</td><td>For accounts that already exist (PayScale's situation)</td></tr><tr><td>Create new account</td><td>Management account creates account directly within the organization</td><td>For new accounts (future account vending)</td></tr></tbody></table>
+<p><strong>Invite Process:</strong></p>
+<p>→ Navigate to AWS Organizations Console → Accounts → Add an AWS account → Invite</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Email or Account ID</td><td>111111111111 (Account A)</td></tr><tr><td>Message</td><td>"PayScale AWS Organization invitation — please accept"</td></tr></tbody></table>
+<p>→ Account A receives invitation email<br>
+→ Account A administrator logs in → AWS Organizations Console → Invitations → Accept</p>
+<p><strong>Repeat for All Existing Accounts:</strong></p>
+<table><thead><tr><th>Account</th><th>Invitation Status</th><th>Target OU</th></tr></thead><tbody><tr><td>Account A — Platform</td><td>Accepted ✅</td><td>Production</td></tr><tr><td>Account B — Risk</td><td>Accepted ✅</td><td>Production</td></tr><tr><td>Account C — Analytics</td><td>Accepted ✅</td><td>Production</td></tr><tr><td>Account D — Audit</td><td>Accepted ✅</td><td>Security</td></tr><tr><td>Account E — Compliance</td><td>Accepted ✅</td><td>Production</td></tr><tr><td>Account F — Dev</td><td>Accepted ✅</td><td>Non-Production</td></tr><tr><td>Account G — Staging</td><td>Accepted ✅</td><td>Non-Production</td></tr><tr><td>Account H — Shared Services</td><td>Accepted ✅</td><td>Infrastructure</td></tr><tr><td>Account J — Data Lake</td><td>Accepted ✅</td><td>Infrastructure</td></tr><tr><td>Account K — Security</td><td>Accepted ✅</td><td>Security</td></tr></tbody></table>
+<p><strong>Move Accounts to OUs:</strong></p>
+<p>→ Navigate to AWS Organizations Console → Accounts → Select account → Actions → Move</p>
+<table><thead><tr><th>Account</th><th>From</th><th>To</th></tr></thead><tbody><tr><td>Account A</td><td>Root</td><td>OU: Production</td></tr><tr><td>Account B</td><td>Root</td><td>OU: Production</td></tr><tr><td>Account C</td><td>Root</td><td>OU: Production</td></tr><tr><td>Account D</td><td>Root</td><td>OU: Security</td></tr><tr><td>Account E</td><td>Root</td><td>OU: Production</td></tr><tr><td>Account F</td><td>Root</td><td>OU: Non-Production</td></tr><tr><td>Account G</td><td>Root</td><td>OU: Non-Production</td></tr><tr><td>Account H</td><td>Root</td><td>OU: Infrastructure</td></tr><tr><td>Account J</td><td>Root</td><td>OU: Infrastructure</td></tr><tr><td>Account K</td><td>Root</td><td>OU: Security</td></tr></tbody></table>
+<p><strong>Result:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Root (Account L — Management/Billing)
+</span>    |
+    ├── OU: Security
+    │   ├── Account K — Security Tools
+    │   └── Account D — Audit
+    |
+    ├── OU: Infrastructure
+    │   ├── Account H — Shared Services
+    │   └── Account J — Data Lake
+    |
+    ├── OU: Production
+    │   ├── Account A — Platform
+    │   ├── Account B — Risk/Fraud
+    │   ├── Account C — Analytics
+    │   └── Account E — Compliance
+    |
+    ├── OU: Non-Production
+    │   ├── Account F — Dev
+    │   └── Account G — Staging
+    |
+    └── OU: Sandbox
+        └── (empty — ready for future)</code></pre></div>
+<p><strong>What Changes When an Account Joins the Organization:</strong></p>
+<table><thead><tr><th>Change</th><th>Impact</th></tr></thead><tbody><tr><td>Billing moves to management account</td><td>Account L pays for all member accounts</td></tr><tr><td>SCPs become applicable</td><td>Any SCP attached to the OU or root affects the account</td></tr><tr><td>Organization-wide services can be enabled</td><td>CloudTrail, Config, GuardDuty can be managed centrally</td></tr><tr><td>Account can be moved between OUs</td><td>OU-specific SCPs change when account moves</td></tr><tr><td>Account cannot leave without management account approval</td><td>Prevents unauthorized departures</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — DESIGN AND ATTACH SERVICE CONTROL POLICIES (SCPs)</h3>
+<p><strong>Understanding SCPs — The Most Powerful Governance Tool:</strong></p>
+<table><thead><tr><th>Aspect</th><th>IAM Policy</th><th>Service Control Policy (SCP)</th></tr></thead><tbody><tr><td>Scope</td><td>Single account, single principal</td><td>Organization-wide or OU-wide</td></tr><tr><td>Override</td><td>Can be overridden by another IAM policy</td><td>CANNOT be overridden by ANY IAM policy</td></tr><tr><td>Effect</td><td>Grants permissions</td><td>Sets MAXIMUM ALLOWED permissions (guardrails)</td></tr><tr><td>Who it affects</td><td>Specific users/roles</td><td>ALL principals in the account (including root)</td></tr><tr><td>Exception</td><td>—</td><td>Management account is NEVER affected by SCPs</td></tr></tbody></table>
+<p><strong>How SCPs Work (Critical Understanding):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCP says: "DENY ec2:RunInstances in us-west-2"
+</span>IAM Policy says: "ALLOW ec2:RunInstances in us-west-2"
+
+Result: DENIED ❌
+
+→ SCP is a CEILING — it defines the MAXIMUM permissions
+→ IAM policy is the ACTUAL permission within that ceiling
+→ Even if IAM says ALLOW — SCP DENY wins
+→ Even the ACCOUNT ROOT USER is bound by SCPs
+→ ONLY the MANAGEMENT ACCOUNT root is exempt from SCPs</code></pre></div>
+<p><strong>SCP Strategy: Deny-List vs Allow-List:</strong></p>
+<table><thead><tr><th>Strategy</th><th>How It Works</th><th>When to Use</th></tr></thead><tbody><tr><td>Deny-list (Recommended)</td><td>Start with full access → Deny specific dangerous actions</td><td>Most organizations — easier to manage</td></tr><tr><td>Allow-list</td><td>Start with no access → Allow only specific services</td><td>Maximum security — but complex to maintain</td></tr></tbody></table>
+<p>→ PayScale uses <strong>Deny-list</strong> strategy — block dangerous actions, allow everything else</p>
+<hr>
+<p><strong>SCP 1: Deny Region Restriction (ALL OUs except Sandbox)</strong></p>
+<p><strong>Purpose:</strong> Prevent resource creation outside approved regions</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-unapproved-regions</code></td></tr><tr><td>Attached to</td><td>Root (affects all OUs)</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY all actions on all services
+</span>WHERE condition: aws:RequestedRegion NOT IN [ap-south-1, us-east-1]
+EXCEPT for: Global services (IAM, Organizations, CloudFront, Route 53, STS, Support)</code></pre></div>
+<p><strong>Why us-east-1 is Included:</strong><br>
+→ Some global services (S3 bucket creation for CloudFront, ACM certificates for CloudFront) require us-east-1<br>
+→ CloudWatch Events for global services route through us-east-1<br>
+→ Billing and Cost Explorer are in us-east-1<br>
+→ Without us-east-1 → Some legitimate operations fail</p>
+<p><strong>Excluded Services (Must NOT be region-restricted):</strong></p>
+<table><thead><tr><th>Service</th><th>Why Excluded</th></tr></thead><tbody><tr><td>IAM</td><td>Global service — no region concept</td></tr><tr><td>STS</td><td>Global service — federation and role assumption</td></tr><tr><td>Organizations</td><td>Global service — org management</td></tr><tr><td>CloudFront</td><td>Global service — edge distribution</td></tr><tr><td>Route 53</td><td>Global service — DNS</td></tr><tr><td>WAF (Global)</td><td>Global WAF policies</td></tr><tr><td>Support</td><td>AWS Support is global</td></tr><tr><td>Budgets</td><td>Global service</td></tr><tr><td>Cost Explorer</td><td>Global service</td></tr><tr><td>Health</td><td>AWS Health events are global</td></tr></tbody></table>
+<hr>
+<p><strong>SCP 2: Deny CloudTrail Modification (ALL OUs)</strong></p>
+<p><strong>Purpose:</strong> Prevent anyone from disabling, deleting, or modifying CloudTrail</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-cloudtrail-modification</code></td></tr><tr><td>Attached to</td><td>Root (affects all OUs)</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY the following actions:
+</span>    cloudtrail:DeleteTrail
+    cloudtrail:StopLogging
+    cloudtrail:UpdateTrail
+    cloudtrail:PutEventSelectors (removing event selectors)
+    
+ON ALL resources
+FOR ALL principals (including root of member accounts)</code></pre></div>
+<p>→ Even the root user of Account A CANNOT disable CloudTrail<br>
+→ Only the Management Account (Account L) root can modify the organizational trail<br>
+→ This ensures audit trail integrity across the entire organization</p>
+<hr>
+<p><strong>SCP 3: Deny Unencrypted Resources (Production + Infrastructure OUs)</strong></p>
+<p><strong>Purpose:</strong> Enforce encryption at rest for all data services</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-unencrypted-resources</code></td></tr><tr><td>Attached to</td><td>OU: Production, OU: Infrastructure</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY s3:CreateBucket
+</span>WHERE condition: s3:x-amz-server-side-encryption is NOT present
+
+DENY rds:CreateDBInstance
+WHERE condition: rds:StorageEncrypted = false
+
+DENY redshift:CreateCluster
+WHERE condition: redshift:Encrypted = false
+
+DENY ec2:CreateVolume
+WHERE condition: ec2:Encrypted = false
+
+DENY ec2:RunInstances
+WHERE condition: ec2:Encrypted = false (for EBS volumes)</code></pre></div>
+<p>→ Any attempt to create unencrypted S3 bucket, RDS instance, Redshift cluster, or EBS volume → DENIED<br>
+→ This is a PREVENTIVE control — stops the problem BEFORE it happens<br>
+→ Compared to AWS Config rules (DETECTIVE control) — Config detects AFTER creation</p>
+<hr>
+<p><strong>SCP 4: Deny IAM User Creation with Console Access (ALL OUs)</strong></p>
+<p><strong>Purpose:</strong> Force SSO usage — no long-lived IAM credentials</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-iam-console-users</code></td></tr><tr><td>Attached to</td><td>Root (affects all OUs)</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY iam:CreateLoginProfile (creates console password for IAM user)
+</span>DENY iam:CreateAccessKey (creates long-lived access keys)
+
+EXCEPT when performed by:
+    arn:aws:iam::*:role/OrganizationAccountAccessRole (bootstrap role)
+    arn:aws:iam::*:role/CICDPipelineRole (automated deployments)</code></pre></div>
+<p>→ No human can create IAM users with passwords or access keys<br>
+→ Exception for automated roles that need service account access keys<br>
+→ All human access must go through AWS IAM Identity Center (SSO)</p>
+<hr>
+<p><strong>SCP 5: Deny Expensive Instance Types (Non-Production + Sandbox OUs)</strong></p>
+<p><strong>Purpose:</strong> Prevent accidental launch of expensive resources in dev/staging</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-expensive-instances</code></td></tr><tr><td>Attached to</td><td>OU: Non-Production, OU: Sandbox</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY ec2:RunInstances
+</span>WHERE condition: ec2:InstanceType IN [
+    p4d.24xlarge, p3.16xlarge, p3.8xlarge,     -- GPU instances ($10-32/hour)
+    x2idn.*, x2iedn.*, x1e.*,                  -- Memory-optimized ($13-26/hour)
+    inf1.24xlarge, inf2.*,                      -- Inference ($4-12/hour)
+    dl1.24xlarge,                               -- Deep Learning ($13/hour)
+    *.metal                                      -- Bare metal instances
+]
+
+DENY redshift:CreateCluster
+WHERE condition: redshift:NodeType IN [
+    ra3.16xlarge, dc2.8xlarge                   -- Large Redshift nodes
+]
+
+DENY rds:CreateDBInstance
+WHERE condition: rds:DBInstanceClass IN [
+    db.r6g.16xlarge, db.r5.24xlarge,           -- Large RDS instances
+    db.x2g.*                                    -- Memory-optimized RDS
+]</code></pre></div>
+<p>→ Developers cannot launch $32/hour GPU instances in dev accounts<br>
+→ The $786/day surprise bill from Account G → PREVENTED<br>
+→ If they genuinely need expensive instances → Request exception through the Platform Team</p>
+<hr>
+<p><strong>SCP 6: Deny Leaving the Organization (ALL OUs)</strong></p>
+<p><strong>Purpose:</strong> Prevent member accounts from leaving the organization</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-leave-organization</code></td></tr><tr><td>Attached to</td><td>Root</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY organizations:LeaveOrganization
+</span>FOR ALL principals</code></pre></div>
+<p>→ No account can unilaterally leave the organization<br>
+→ Only the Management Account can remove a member account<br>
+→ Prevents rogue administrators from escaping governance</p>
+<hr>
+<p><strong>SCP 7: Deny Public S3 Buckets (ALL OUs)</strong></p>
+<p><strong>Purpose:</strong> Prevent creation of publicly accessible S3 buckets</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SCP Name</td><td><code>scp-deny-public-s3</code></td></tr><tr><td>Attached to</td><td>Root</td></tr></tbody></table>
+<p><strong>Policy Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DENY s3:PutBucketPublicAccessBlock
+</span>WHERE condition: s3:PublicAccessBlockConfiguration.BlockPublicAcls = false
+    OR s3:PublicAccessBlockConfiguration.BlockPublicPolicy = false
+    OR s3:PublicAccessBlockConfiguration.IgnorePublicAcls = false
+    OR s3:PublicAccessBlockConfiguration.RestrictPublicBuckets = false
+
+DENY s3:PutBucketPolicy
+WHERE condition: Policy contains Principal = "*" (public access)</code></pre></div>
+<p>→ Nobody in any account can make an S3 bucket public<br>
+→ The Customer Success team's public bucket (from the problem statement) → PREVENTED<br>
+→ If a team genuinely needs a public bucket (static website) → Request exception from Security OU</p>
+<hr>
+<p><strong>SCP Attachment Summary:</strong></p>
+<table><thead><tr><th>SCP</th><th>Root</th><th>Security OU</th><th>Infrastructure OU</th><th>Production OU</th><th>Non-Production OU</th><th>Sandbox OU</th></tr></thead><tbody><tr><td>scp-deny-unapproved-regions</td><td>✅</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td></tr><tr><td>scp-deny-cloudtrail-modification</td><td>✅</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td></tr><tr><td>scp-deny-leave-organization</td><td>✅</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td></tr><tr><td>scp-deny-public-s3</td><td>✅</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td></tr><tr><td>scp-deny-iam-console-users</td><td>✅</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td><td>Inherited</td></tr><tr><td>scp-deny-unencrypted-resources</td><td>—</td><td>—</td><td>✅</td><td>✅</td><td>—</td><td>—</td></tr><tr><td>scp-deny-expensive-instances</td><td>—</td><td>—</td><td>—</td><td>—</td><td>✅</td><td>✅</td></tr></tbody></table>
+<p><strong>SCP Inheritance:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Root SCP applies to ALL OUs and ALL accounts (except Management Account)
+</span>    |
+    ├── Security OU: Root SCPs + Security-specific SCPs
+    │   └── Account K: Inherits all SCPs from Root + Security OU
+    |
+    ├── Production OU: Root SCPs + Production-specific SCPs
+    │   └── Account A: Inherits all SCPs from Root + Production OU
+    |
+    └── Non-Production OU: Root SCPs + Non-Prod-specific SCPs
+        └── Account F: Inherits all SCPs from Root + Non-Prod OU</code></pre></div>
+<p>→ SCPs are CUMULATIVE — a principal must be allowed by ALL SCPs in the path from Root to the account<br>
+→ If Root SCP denies an action → OU-level SCP cannot override it<br>
+→ SCPs only RESTRICT — they never GRANT permissions</p>
+<hr>
+<h3>STEP 5 — CONFIGURE CONSOLIDATED BILLING AND COST ALLOCATION</h3>
+<p><strong>Consolidated Billing (Automatic with Organizations):</strong></p>
+<p>→ Once accounts join the organization → All billing consolidates under the Management Account (Account L)<br>
+→ One invoice, one payment method, one AWS support plan</p>
+<table><thead><tr><th>Before Organizations</th><th>After Organizations</th></tr></thead><tbody><tr><td>11 separate invoices</td><td>1 consolidated invoice</td></tr><tr><td>11 payment methods</td><td>1 payment method</td></tr><tr><td>No volume discounts across accounts</td><td>Aggregate usage for volume pricing</td></tr><tr><td>Cannot compare costs across accounts</td><td>Cost Explorer shows all accounts</td></tr></tbody></table>
+<p><strong>Cost Allocation Tags:</strong></p>
+<p>→ Navigate to Billing Console (Account L) → Cost Allocation Tags → Activate</p>
+<table><thead><tr><th>Tag Key</th><th>Type</th><th>Purpose</th><th>Enforced By</th></tr></thead><tbody><tr><td><code>Environment</code></td><td>User-defined</td><td>prod, staging, dev, sandbox</td><td>Tag Policy</td></tr><tr><td><code>BusinessUnit</code></td><td>User-defined</td><td>fraud, platform, analytics, compliance</td><td>Tag Policy</td></tr><tr><td><code>Project</code></td><td>User-defined</td><td>Project name</td><td>Tag Policy</td></tr><tr><td><code>CostCenter</code></td><td>User-defined</td><td>Finance cost center code</td><td>Tag Policy</td></tr><tr><td><code>Owner</code></td><td>User-defined</td><td>Team email</td><td>Tag Policy</td></tr><tr><td><code>DataClassification</code></td><td>User-defined</td><td>public, internal, confidential, restricted</td><td>Tag Policy</td></tr></tbody></table>
+<p>→ After activation → Cost Explorer can group costs by these tags<br>
+→ Example: "Show me all costs for BusinessUnit=fraud across all accounts"</p>
+<p><strong>AWS Budgets (from Billing Console):</strong></p>
+<table><thead><tr><th>Budget</th><th>Scope</th><th>Amount</th><th>Alert</th></tr></thead><tbody><tr><td>Organization total</td><td>All accounts</td><td>$15,000/month</td><td>80% and 100% alert to CFO</td></tr><tr><td>Production OU</td><td>Accounts A, B, C, E</td><td>$10,000/month</td><td>80% alert to Platform Team</td></tr><tr><td>Non-Production OU</td><td>Accounts F, G</td><td>$2,000/month</td><td>80% alert to Dev Team Lead</td></tr><tr><td>Per-account (Account B)</td><td>Account B only</td><td>$3,000/month</td><td>80% alert to Risk Team Lead</td></tr><tr><td>Sandbox OU</td><td>Sandbox accounts</td><td>$500/month</td><td>50% and 100% alert</td></tr></tbody></table>
+<p>→ Budgets can trigger SNS notifications (from Project 6) or even Lambda actions<br>
+→ Example: Budget at 100% → Lambda function stops non-essential EC2 instances in Sandbox</p>
+<hr>
+<h3>STEP 6 — CONFIGURE TAG POLICIES</h3>
+<p><strong>Purpose:</strong> Enforce consistent tagging across all accounts</p>
+<p>→ Navigate to AWS Organizations Console → Policies → Tag policies → Enable</p>
+<p><strong>Tag Policy:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Policy name</td><td><code>tag-policy-mandatory-tags</code></td><td>Descriptive</td></tr><tr><td>Attached to</td><td>Root</td><td>Applies to all accounts</td></tr></tbody></table>
+<p><strong>Policy Definition:</strong></p>
+<table><thead><tr><th>Tag Key</th><th>Required</th><th>Allowed Values</th><th>Enforced On</th></tr></thead><tbody><tr><td><code>Environment</code></td><td>✅ Yes</td><td><code>production</code>, <code>staging</code>, <code>development</code>, <code>sandbox</code></td><td>EC2, RDS, S3, Redshift, Lambda, Glue</td></tr><tr><td><code>BusinessUnit</code></td><td>✅ Yes</td><td><code>fraud</code>, <code>platform</code>, <code>analytics</code>, <code>compliance</code>, <code>infrastructure</code>, <code>security</code></td><td>All taggable resources</td></tr><tr><td><code>CostCenter</code></td><td>✅ Yes</td><td>Pattern: <code>CC-[0-9]{4}</code> (e.g., CC-1234)</td><td>All taggable resources</td></tr><tr><td><code>Owner</code></td><td>✅ Yes</td><td>Pattern: <code>*@payscale.com</code></td><td>All taggable resources</td></tr></tbody></table>
+<p><strong>Tag Policy Enforcement Levels:</strong></p>
+<table><thead><tr><th>Level</th><th>Behavior</th><th>PayScale Choice</th></tr></thead><tbody><tr><td>Report only</td><td>Non-compliant tags are flagged but not blocked</td><td>✅ Start here (first 3 months)</td></tr><tr><td>Prevent non-compliant</td><td>Resources without required tags cannot be created</td><td>Move to this after 3 months</td></tr></tbody></table>
+<p>→ Start with "report only" to identify existing non-compliance<br>
+→ After cleanup → Switch to "prevent" to enforce going forward<br>
+→ AWS Config rules (from Project 57) complement tag policies by detecting existing untagged resources</p>
+<hr>
+<h3>STEP 7 — CONFIGURE CENTRALIZED CLOUDTRAIL</h3>
+<p><strong>Organization Trail:</strong></p>
+<p>→ Navigate to CloudTrail Console (Account L — Management Account)<br>
+→ Create trail</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Trail name</td><td><code>payscale-org-trail</code></td><td>Organization-wide trail</td></tr><tr><td>Apply to organization</td><td>✅ Yes</td><td>Logs ALL accounts in the organization</td></tr><tr><td>Storage location</td><td><code>s3://payscale-org-cloudtrail-logs</code> (Account K — Security)</td><td>Centralized log storage in security account</td></tr><tr><td>Log file SSE-KMS encryption</td><td>✅ Enabled</td><td>Encrypt logs with KMS (from Project 36)</td></tr><tr><td>KMS key</td><td>Customer managed key in Account K</td><td>Security team controls the key</td></tr><tr><td>Log file validation</td><td>✅ Enabled</td><td>Detect tampering with log files</td></tr><tr><td>Management events</td><td>✅ Read + Write</td><td>Log all API calls</td></tr><tr><td>Data events — S3</td><td>✅ All S3 buckets</td><td>Log all S3 object-level operations</td></tr><tr><td>Data events — Lambda</td><td>✅ All Lambda functions</td><td>Log all Lambda invocations</td></tr><tr><td>Insights events</td><td>✅ Enabled</td><td>Detect unusual API activity</td></tr></tbody></table>
+<p><strong>What Organization Trail Provides:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Any API call in ANY account:
+</span>    Account A: ec2:RunInstances → Logged ✅
+    Account F: iam:CreateUser → Logged ✅
+    Account B: s3:PutObject → Logged ✅
+    Account G: redshift:DeleteCluster → Logged ✅
+    
+ALL logs → s3://payscale-org-cloudtrail-logs (Account K)
+    → Encrypted with KMS
+    → Log file validation enabled (tamper detection)
+    → Retained indefinitely (lifecycle policy for cost management)</code></pre></div>
+<p>→ Even if SCP prevents CloudTrail modification in member accounts → The organizational trail runs independently<br>
+→ Member accounts CANNOT see or modify the organizational trail<br>
+→ Only the Management Account can manage it<br>
+→ Security team (Account K) can query logs via Athena (from Project 18)</p>
+<p><strong>S3 Bucket Policy for CloudTrail Logs (Account K):</strong></p>
+<table><thead><tr><th>Principal</th><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>cloudtrail.amazonaws.com</code></td><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-org-cloudtrail-logs/*</code></td><td>CloudTrail writes logs</td></tr><tr><td><code>cloudtrail.amazonaws.com</code></td><td><code>s3:GetBucketAcl</code></td><td><code>arn:aws:s3:::payscale-org-cloudtrail-logs</code></td><td>CloudTrail verifies bucket permissions</td></tr><tr><td>Account K Security Roles</td><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::payscale-org-cloudtrail-logs/*</code></td><td>Security team reads logs</td></tr><tr><td>ALL other accounts</td><td>DENY all</td><td>—</td><td>No member account can read or delete logs</td></tr></tbody></table>
+<hr>
+<h3>STEP 8 — DESIGN ACCOUNT VENDING FOR AUTOMATED NEW ACCOUNT CREATION</h3>
+<p><strong>The Problem Account Vending Solves:</strong></p>
+<table><thead><tr><th>Manual Process</th><th>Automated Account Vending</th></tr></thead><tbody><tr><td>Create AWS account manually</td><td>API call creates account</td></tr><tr><td>Configure IAM policies (2 hours)</td><td>Pre-configured IAM roles deployed automatically</td></tr><tr><td>Create VPC with subnets (1 hour)</td><td>Standard VPC template deployed automatically</td></tr><tr><td>Enable CloudTrail (30 min)</td><td>Organizational trail covers it automatically</td></tr><tr><td>Configure Security Hub (30 min)</td><td>Delegated admin auto-enrolls new accounts</td></tr><tr><td>Set up TGW attachment (1 hour)</td><td>Automated TGW attachment via template</td></tr><tr><td>Configure budget alerts (30 min)</td><td>Budget template deployed automatically</td></tr><tr><td>Enable encryption defaults (30 min)</td><td>SCPs enforce encryption from moment one</td></tr><tr><td>Apply tags (30 min)</td><td>Tag policies enforce tagging from moment one</td></tr><tr><td><strong>Total: 2 weeks</strong></td><td><strong>Total: 30 minutes</strong></td></tr></tbody></table>
+<p><strong>Account Vending Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Platform Team requests new account
+</span>    |
+    ↓
+Service Catalog / Control Tower provisions:
+    |
+    ├── Step 1: Create account via Organizations API
+    │   → organizations:CreateAccount
+    │   → Account created within the Organization
+    │   → Automatically placed in specified OU
+    |
+    ├── Step 2: Apply baseline CloudFormation StackSet
+    │   → VPC with standard CIDR (from IP allocation plan)
+    │   → Subnets (public, private, TGW)
+    │   → NAT Gateway or TGW attachment
+    │   → Security Groups (standard baseline)
+    │   → IAM roles (OrganizationAccountAccessRole, admin, read-only)
+    │   → S3 bucket for account-specific logs
+    │   → Default EBS encryption enabled
+    │   → Default S3 Block Public Access enabled
+    |
+    ├── Step 3: SCP inheritance from OU
+    │   → Account automatically inherits OU SCPs
+    │   → No manual SCP attachment needed
+    |
+    ├── Step 4: Enroll in centralized services
+    │   → GuardDuty member enrollment (via delegated admin in Account K)
+    │   → Security Hub member enrollment
+    │   → AWS Config recording enabled
+    |
+    ├── Step 5: TGW attachment
+    │   → VPC attachment to shared Transit Gateway (from Project 50)
+    │   → Route propagation based on OU (production or non-production route table)
+    |
+    └── Step 6: Notification
+        → SNS: "New account provisioned: AccountName, AccountID, OU"
+        → Team receives credentials via SSO</code></pre></div>
+<p><strong>AWS Control Tower (Recommended for Account Vending):</strong></p>
+<p>→ AWS Control Tower automates much of this process<br>
+→ It provides a "landing zone" with pre-configured governance<br>
+→ Includes: Account Factory, Guardrails (SCPs), Centralized Logging, SSO</p>
+<table><thead><tr><th>Control Tower Component</th><th>What It Does</th><th>Equivalent Manual Step</th></tr></thead><tbody><tr><td>Account Factory</td><td>Creates accounts with baseline config</td><td>Steps 1-2 above</td></tr><tr><td>Mandatory Guardrails</td><td>Preventive SCPs (like our SCPs)</td><td>Step 3</td></tr><tr><td>Detective Guardrails</td><td>AWS Config rules for compliance checking</td><td>Step 4</td></tr><tr><td>Log Archive Account</td><td>Centralized CloudTrail + Config logs</td><td>Step 7 (our Account K)</td></tr><tr><td>Audit Account</td><td>Cross-account read-only access for auditing</td><td>Account D</td></tr></tbody></table>
+<p>→ Control Tower is the RECOMMENDED approach for organizations with 10+ accounts<br>
+→ It implements best practices automatically — less manual configuration</p>
+<hr>
+<h3>STEP 9 — CONFIGURE DELEGATED ADMINISTRATION</h3>
+<p><strong>Problem:</strong> Security services (GuardDuty, Security Hub, Config) need organization-wide visibility<br>
+→ But running them from the Management Account is a bad practice (minimal workloads in management account)<br>
+→ Solution: Delegate administration to Account K (Security Account)</p>
+<p><strong>Delegated Admin for GuardDuty:</strong></p>
+<p>→ Navigate to Organizations Console (Account L) → Services → GuardDuty → Delegated administrator</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Delegated administrator account</td><td>Account K (101010101010)</td><td>Security team manages GuardDuty</td></tr><tr><td>Auto-enable for new accounts</td><td>✅ Yes</td><td>New accounts automatically enrolled</td></tr></tbody></table>
+<p><strong>What Delegated Admin Can Do:</strong></p>
+<table><thead><tr><th>Capability</th><th>Management Account</th><th>Delegated Admin (Account K)</th></tr></thead><tbody><tr><td>Enable GuardDuty for member accounts</td><td>✅</td><td>✅</td></tr><tr><td>View findings across all accounts</td><td>✅</td><td>✅</td></tr><tr><td>Configure detectors</td><td>✅</td><td>✅</td></tr><tr><td>Manage member accounts</td><td>✅</td><td>✅</td></tr><tr><td>Remove delegated admin</td><td>✅</td><td>❌</td></tr></tbody></table>
+<p><strong>Delegated Admin for Security Hub:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Delegated administrator</td><td>Account K (101010101010)</td></tr><tr><td>Auto-enable for new accounts</td><td>✅ Yes</td></tr><tr><td>Standards</td><td>CIS AWS Foundations, AWS Foundational Security Best Practices</td></tr></tbody></table>
+<p><strong>Delegated Admin for AWS Config:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Delegated administrator</td><td>Account K (101010101010)</td></tr><tr><td>Aggregator</td><td>Organization-wide Config aggregator in Account K</td></tr></tbody></table>
+<p>→ Account K now has a SINGLE PANE OF GLASS for security across ALL accounts<br>
+→ GuardDuty findings, Security Hub scores, Config compliance — all visible from Account K<br>
+→ Security team doesn't need to log into each account individually</p>
+<hr>
+<h3>STEP 10 — MONITOR AND AUDIT ORGANIZATIONAL COMPLIANCE</h3>
+<p><strong>Compliance Dashboard (Account K — Security):</strong></p>
+<table><thead><tr><th>Check</th><th>Source</th><th>Frequency</th><th>Alert</th></tr></thead><tbody><tr><td>SCP compliance</td><td>Organizations API</td><td>Real-time</td><td>Any SCP detachment → Immediate alert</td></tr><tr><td>CloudTrail enabled in all accounts</td><td>Org Trail status</td><td>Daily</td><td>Any account missing trail → Alert</td></tr><tr><td>Encryption compliance</td><td>AWS Config rules</td><td>Hourly</td><td>Unencrypted resource detected → Alert</td></tr><tr><td>Tag compliance</td><td>Tag policy report</td><td>Daily</td><td>Non-compliant tags → Weekly report</td></tr><tr><td>GuardDuty findings</td><td>GuardDuty (Account K)</td><td>Real-time</td><td>High severity → Immediate alert</td></tr><tr><td>Security Hub score</td><td>Security Hub (Account K)</td><td>Daily</td><td>Score &lt; 80% → Alert to account owner</td></tr><tr><td>Budget compliance</td><td>AWS Budgets</td><td>Daily</td><td>Any budget &gt; 80% → Alert</td></tr><tr><td>Region compliance</td><td>AWS Config rule</td><td>Hourly</td><td>Resource in unapproved region → Alert</td></tr><tr><td>Public S3 detection</td><td>AWS Config rule</td><td>Hourly</td><td>Public bucket detected → Immediate alert</td></tr><tr><td>Root user activity</td><td>CloudTrail + EventBridge</td><td>Real-time</td><td>Any root user login → Immediate alert</td></tr></tbody></table>
+<p><strong>CloudTrail Log Analysis (via Athena from Project 18):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>-- Find all root user logins across the organization
+</span>SELECT 
+    useridentity.accountid,
+    useridentity.type,
+    eventname,
+    sourceipaddress,
+    eventtime
+FROM org_cloudtrail_logs
+WHERE useridentity.type = 'Root'
+    AND eventname = 'ConsoleLogin'
+ORDER BY eventtime DESC;
+
+-- Find all unencrypted resource creations
+SELECT
+    useridentity.accountid,
+    useridentity.arn,
+    eventname,
+    requestparameters,
+    eventtime
+FROM org_cloudtrail_logs
+WHERE eventname IN ('CreateBucket', 'CreateDBInstance', 'RunInstances')
+    AND responseelements LIKE '%"encrypted":false%'
+ORDER BY eventtime DESC;</code></pre></div>
+<p>→ Athena queries CloudTrail logs stored in S3 (Account K)<br>
+→ Provides forensic capability across the entire organization<br>
+→ Lake Formation governance (from Project 47) controls who can query these logs</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use a DEDICATED management account with no application workloads<br>
+→ Always enable "All features" when creating the organization — never just consolidated billing<br>
+→ Always design OU structure BEFORE inviting accounts — moving accounts between OUs changes their SCPs<br>
+→ Always use Deny-list SCP strategy — start permissive, add specific denials<br>
+→ Always protect CloudTrail with SCPs — audit trail integrity is non-negotiable<br>
+→ Always enforce encryption at rest via SCPs in production and infrastructure OUs<br>
+→ Always restrict regions via SCPs — prevent data residency violations<br>
+→ Always configure consolidated billing with cost allocation tags from day one<br>
+→ Always delegate security service administration to a dedicated security account<br>
+→ Always implement account vending for automated new account provisioning<br>
+→ Always start tag policies in "report only" mode — switch to enforcement after cleanup<br>
+→ Always protect the management account root with hardware MFA<br>
+→ Always use AWS Control Tower for organizations with 10+ accounts<br>
+→ Always set budget alerts at organization, OU, and account levels<br>
+→ Always keep the management account minimal — no applications, no data, no experiments</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use an application account as the management account — compromise risk is too high<br>
+→ Never choose "consolidated billing only" feature set — you lose all governance capabilities<br>
+→ Never apply SCPs to the management account — they have no effect (by design) — protect it with IAM instead<br>
+→ Never create Allow-list SCPs without thorough testing — you WILL break legitimate operations<br>
+→ Never forget that SCPs affect the ACCOUNT ROOT USER — test carefully before deploying<br>
+→ Never deploy SCPs to production without testing in Sandbox/Non-Prod first<br>
+→ Never allow member accounts to leave the organization without approval<br>
+→ Never skip the region restriction SCP — one resource in the wrong region = compliance violation<br>
+→ Never let individual accounts manage their own CloudTrail — use organizational trail<br>
+→ Never grant AdministratorAccess in member accounts without SCP guardrails — SCPs are the safety net<br>
+→ Never ignore tag policy compliance — untagged resources are unattributable costs<br>
+→ Never use personal email addresses for account root users — use distribution lists<br>
+→ Never create new accounts manually when account vending is available — inconsistent baseline<br>
+→ Never assume SCPs are retroactive — they prevent NEW actions but don't fix EXISTING resources</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE AWS ORGANIZATIONS</h2>
+<table><thead><tr><th>Scenario</th><th>Use Organizations?</th><th>Why</th></tr></thead><tbody><tr><td>3+ AWS accounts</td><td>✅ Yes</td><td>Centralized management, consolidated billing</td></tr><tr><td>Need organization-wide security policies</td><td>✅ Yes</td><td>SCPs enforce guardrails</td></tr><tr><td>Need to restrict services or regions</td><td>✅ Yes</td><td>SCPs are the only way to restrict account root</td></tr><tr><td>Multiple teams with different permissions</td><td>✅ Yes</td><td>OUs + SCPs provide differentiated governance</td></tr><tr><td>Compliance requires audit trail across accounts</td><td>✅ Yes</td><td>Organizational CloudTrail</td></tr><tr><td>Need consolidated billing</td><td>✅ Yes</td><td>Single invoice, volume discounts</td></tr><tr><td>Single AWS account</td><td>❌ No</td><td>No multi-account management needed</td></tr><tr><td>Accounts owned by different legal entities</td><td>⚠️ Careful</td><td>Billing consolidation has tax implications</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE SPECIFIC FEATURES</h2>
+<p>→ Do not use Allow-list SCPs when you have &gt; 20 AWS services in use — maintenance burden is extreme<br>
+→ Do not enforce tag policies immediately on existing accounts — start with report-only mode<br>
+→ Do not delegate admin for ALL services to one account — spread delegation based on function<br>
+→ Do not use the management account for anything except organization management<br>
+→ Do not create more than 3 levels of OU nesting — complexity increases exponentially</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → SCP EVALUATION CHAIN</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User in Account A (Production OU) calls: ec2:RunInstances in us-west-2
+</span>
+Evaluation Order:
+    |
+    ↓
+Step 1: Root-level SCPs
+    scp-deny-unapproved-regions: us-west-2 NOT IN [ap-south-1, us-east-1]
+    → DENY ❌ → STOP — Action is DENIED
+    
+    (Even if Account A's IAM policy says ALLOW ec2:RunInstances in us-west-2)
+    (Even if Account A's root user attempts it)
+    (The action is BLOCKED at the organization level)</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User in Account A calls: ec2:RunInstances (m5.xlarge) in ap-south-1
+</span>
+Evaluation Order:
+    |
+    ↓
+Step 1: Root-level SCPs
+    scp-deny-unapproved-regions: ap-south-1 IS IN [ap-south-1, us-east-1] → PASS ✅
+    scp-deny-cloudtrail-modification: Not relevant → PASS ✅
+    scp-deny-leave-organization: Not relevant → PASS ✅
+    scp-deny-public-s3: Not relevant → PASS ✅
+    scp-deny-iam-console-users: Not relevant → PASS ✅
+    |
+    ↓
+Step 2: OU-level SCPs (Production OU)
+    scp-deny-unencrypted-resources: ec2:Encrypted condition → 
+        Is EBS encryption enabled? 
+        → YES → PASS ✅
+        → NO → DENY ❌
+    |
+    ↓
+Step 3: IAM Policy evaluation (within Account A)
+    Does the user's IAM policy allow ec2:RunInstances?
+    → YES → ALLOW ✅
+    → NO → DENY ❌
+    |
+    ↓
+Step 4: Resource-based policy evaluation (if applicable)
+    |
+    ↓
+FINAL RESULT: ALLOW ✅ (all layers passed)</code></pre></div>
+<p><strong>The Complete Permission Decision Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Request arrives
+</span>    |
+    ↓
+SCP Check (Organization level):
+    ALL SCPs from Root to OU to Account must ALLOW (or not DENY)
+    Any DENY in any SCP → Request DENIED → STOP
+    |
+    ↓
+IAM Check (Account level):
+    IAM policy must ALLOW the action
+    No ALLOW → Request DENIED → STOP
+    |
+    ↓
+Resource Policy Check (if applicable):
+    Resource policy (S3 bucket policy, KMS key policy) evaluated
+    |
+    ↓
+Permission Boundary Check (if applicable):
+    Permission boundary on IAM entity evaluated
+    |
+    ↓
+Session Policy Check (if applicable):
+    Session policy on assumed role evaluated
+    |
+    ↓
+FINAL: ALLOW only if ALL checks pass</code></pre></div>
+<p>→ SCP is the FIRST check — it acts as a pre-filter before IAM evaluation<br>
+→ This is why SCPs are so powerful — they cannot be bypassed by any IAM configuration</p>
+<hr>
+<h3>2 → ORGANIZATIONAL UNIT HIERARCHY AND INHERITANCE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Root
+</span>├── SCP: scp-deny-unapproved-regions
+├── SCP: scp-deny-cloudtrail-modification
+├── SCP: scp-deny-leave-organization
+├── SCP: scp-deny-public-s3
+├── SCP: scp-deny-iam-console-users
+│
+├── OU: Production
+│   ├── SCP: scp-deny-unencrypted-resources (OU-specific)
+│   │
+│   ├── Account A → Inherits: ALL Root SCPs + Production OU SCPs
+│   ├── Account B → Inherits: ALL Root SCPs + Production OU SCPs
+│   └── Account E → Inherits: ALL Root SCPs + Production OU SCPs
+│
+└── OU: Non-Production
+    ├── SCP: scp-deny-expensive-instances (OU-specific)
+    │
+    ├── Account F → Inherits: ALL Root SCPs + Non-Prod OU SCPs
+    └── Account G → Inherits: ALL Root SCPs + Non-Prod OU SCPs</code></pre></div>
+<p><strong>Effective SCPs per Account:</strong></p>
+<table><thead><tr><th>Account</th><th>Effective SCPs</th></tr></thead><tbody><tr><td>Account A (Production)</td><td>Regions + CloudTrail + Leave + Public S3 + IAM Users + Encryption</td></tr><tr><td>Account F (Non-Production)</td><td>Regions + CloudTrail + Leave + Public S3 + IAM Users + Expensive Instances</td></tr><tr><td>Account L (Management)</td><td>NONE — Management account is exempt from ALL SCPs</td></tr></tbody></table>
+<p>→ Moving Account F from Non-Production to Production:</p>
+<ul>
+<li>LOSES: scp-deny-expensive-instances</li>
+<li>GAINS: scp-deny-unencrypted-resources</li>
+<li>KEEPS: All Root-level SCPs (unchanged)</li>
+<li>Effect is IMMEDIATE — no delay</li>
+</ul>
+<hr>
+<h3>3 → CONSOLIDATED BILLING MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Month-End Billing Calculation:
+</span>
+Account A: $2,500 (EC2 + RDS + S3)
+Account B: $3,000 (EC2 + RDS + S3 + Glue + Athena)
+Account C: $1,500 (Athena + QuickSight)
+Account F: $800 (EC2 + S3)
+Account H: $1,200 (NAT Gateway + TGW + Route 53)
+Account J: $500 (S3 + Glue)
+... (other accounts)
+
+Total Organization Usage: $12,000
+
+Volume Discount Calculation:
+    S3 storage across all accounts: 5 TB
+    → Without consolidation: Each account in first pricing tier ($0.023/GB)
+    → With consolidation: Organization total in second pricing tier ($0.022/GB)
+    → Savings: $0.001/GB × 5 TB = $5/month (small but scales)
+    
+    EC2 usage across all accounts: 50,000 hours
+    → Without consolidation: Each account below Savings Plans threshold
+    → With consolidation: Organization total qualifies for better pricing
+    
+Consolidated Invoice: $12,000 (single invoice to Account L)
+Per-Account Breakdown: Available in Cost Explorer
+Per-Tag Breakdown: Available via Cost Allocation Tags</code></pre></div>
+<p>→ The Management Account receives ONE invoice<br>
+→ Cost Explorer shows breakdown by account, OU, service, tag<br>
+→ Volume discounts apply to AGGREGATE usage across all accounts</p>
+<hr>
+<h3>4 → ACCOUNT CREATION MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Management Account calls: organizations:CreateAccount
+</span>    |
+    ↓
+AWS Creates New Account:
+    ├── New AWS Account ID generated (e.g., 131313131313)
+    ├── Root user email set (from API parameter)
+    ├── Account automatically joins the organization
+    ├── Account placed in specified OU (or Root if not specified)
+    ├── OrganizationAccountAccessRole created automatically
+    │   → Trust: Management Account can assume this role
+    │   → Permissions: AdministratorAccess in new account
+    │   → Purpose: Management Account can configure the new account
+    |
+    ↓
+SCPs Take Effect Immediately:
+    → OU SCPs apply from the moment the account is created
+    → No window of non-compliance
+    |
+    ↓
+Organization Trail Covers New Account:
+    → CloudTrail organizational trail automatically includes new account
+    → No manual CloudTrail setup needed
+    |
+    ↓
+Delegated Admin Services Enroll New Account:
+    → GuardDuty auto-enables (if configured)
+    → Security Hub auto-enables (if configured)
+    → AWS Config auto-enables (if configured)</code></pre></div>
+<p>→ New account is GOVERNED from second one — no compliance gap<br>
+→ OrganizationAccountAccessRole allows the Management Account to perform initial setup<br>
+→ Account vending scripts use this role to deploy baseline infrastructure</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>SCP blocks legitimate operation</td><td>"Access Denied" for an action that IAM allows</td><td>SCP is too restrictive — blocks a needed service</td><td>Test SCPs in Sandbox OU first → Add exceptions for legitimate use cases</td></tr><tr><td>2</td><td>Forgot to exclude global services from region SCP</td><td>IAM, CloudFront, Route 53 operations fail</td><td>Region restriction SCP blocks global services</td><td>Add condition exceptions for global services</td></tr><tr><td>3</td><td>Applied SCP to management account</td><td>No effect — management account is exempt</td><td>Misunderstanding of SCP scope</td><td>Protect management account with IAM policies instead</td></tr><tr><td>4</td><td>Deployed allow-list SCP without all needed services</td><td>Multiple services break across all accounts</td><td>Allow-list missed services that teams use</td><td>Use deny-list strategy OR thoroughly inventory all services before allow-list</td></tr><tr><td>5</td><td>Moved account to wrong OU</td><td>Account gains/loses SCPs unexpectedly</td><td>Accidental OU move</td><td>Restrict organizations:MoveAccount to senior admins only</td></tr><tr><td>6</td><td>Account root email is personal address</td><td>Employee leaves — root access lost</td><td>Used personal email during account creation</td><td>Use distribution list emails for all account roots</td></tr><tr><td>7</td><td>No SCP testing in Sandbox first</td><td>SCP breaks production workloads</td><td>Deployed directly to Production OU</td><td>Always test in Sandbox → Non-Prod → Production (staged rollout)</td></tr><tr><td>8</td><td>Tag policy enforcement breaks deployments</td><td>CloudFormation stacks fail because resources lack required tags</td><td>Enforcement enabled before all templates updated</td><td>Start with report-only → Update templates → Enable enforcement</td></tr><tr><td>9</td><td>Budget alerts not configured</td><td>$15,000 bill discovered at month-end</td><td>No proactive monitoring</td><td>Configure budgets at org, OU, and account levels</td></tr><tr><td>10</td><td>Delegated admin not configured</td><td>Security team must log into each account individually</td><td>Centralized security services not delegated</td><td>Delegate GuardDuty, Security Hub, Config to security account</td></tr><tr><td>11</td><td>Organizational CloudTrail bucket policy wrong</td><td>Logs not being written — compliance gap</td><td>S3 bucket doesn't allow CloudTrail service principal</td><td>Verify bucket policy allows cloudtrail.amazonaws.com</td></tr><tr><td>12</td><td>SCP prevents Terraform/CloudFormation operations</td><td>Infrastructure as Code deployments fail</td><td>SCP blocks actions that IaC needs (e.g., iam:CreateRole)</td><td>Add exceptions for deployment roles in SCPs</td></tr><tr><td>13</td><td>New account not enrolled in security services</td><td>GuardDuty/Security Hub gap for new account</td><td>Auto-enrollment not configured</td><td>Enable auto-enrollment in delegated admin settings</td></tr><tr><td>14</td><td>SCPs not retroactive</td><td>Existing unencrypted resources remain after encryption SCP</td><td>SCPs prevent new actions but don't fix existing resources</td><td>Use AWS Config rules to detect + remediate existing non-compliance</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Account Scalability</strong></p>
+<table><thead><tr><th>Metric</th><th>Limit</th><th>Extendable?</th></tr></thead><tbody><tr><td>Accounts per organization</td><td>10 (default) → request increase</td><td>Yes — routinely increased to 100+</td></tr><tr><td>OUs per organization</td><td>Unlimited (within 5 nesting levels)</td><td>N/A</td></tr><tr><td>SCPs per organization</td><td>1,000</td><td>Yes</td></tr><tr><td>SCPs per OU/account</td><td>5 attached at each level</td><td>Yes</td></tr><tr><td>SCP size</td><td>5,120 characters per SCP</td><td>No — must split into multiple SCPs</td></tr><tr><td>Tag policies per organization</td><td>1,000</td><td>Yes</td></tr></tbody></table>
+<p>→ <strong>SCP Scalability</strong></p>
+<ul>
+<li>5 SCPs per OU means: Complex policies must be split into multiple SCPs</li>
+<li>5,120 character limit means: Very detailed allow-lists may exceed limit</li>
+<li>Solution: Use deny-list strategy (shorter policies) + split into multiple SCPs</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<table><thead><tr><th>Accounts</th><th>Manual Management Cost</th><th>Automated Management Cost</th></tr></thead><tbody><tr><td>5</td><td>1 engineer part-time</td><td>Account vending + SCPs (near-zero marginal cost)</td></tr><tr><td>20</td><td>2 engineers full-time</td><td>Account vending + SCPs (near-zero marginal cost)</td></tr><tr><td>50</td><td>5 engineers full-time</td><td>Account vending + SCPs + 1 engineer maintaining automation</td></tr><tr><td>100+</td><td>Unsustainable without automation</td><td>Account vending + SCPs + 2 engineers</td></tr></tbody></table>
+<p>→ Organizations + SCPs + Account Vending scale LINEARLY — manual management scales EXPONENTIALLY</p>
+<p>→ <strong>Governance Scalability</strong></p>
+<ul>
+<li>SCPs apply to ALL accounts in an OU automatically — no per-account configuration</li>
+<li>New account inherits ALL OU SCPs from moment of creation — zero governance gap</li>
+<li>Delegated admin services auto-enroll new accounts — zero security gap</li>
+<li>Tag policies apply organization-wide — no per-account tag enforcement</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify organizational governance is working:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th></tr></thead><tbody><tr><td>Organization exists</td><td>Organizations Console</td><td>Organization ID visible, all features enabled</td></tr><tr><td>All accounts in correct OUs</td><td>Organizations Console → Accounts</td><td>Each account in its designated OU</td></tr><tr><td>SCPs attached correctly</td><td>Organizations Console → Policies → SCPs</td><td>Each SCP attached to correct OU</td></tr><tr><td>SCP enforcement working</td><td>Test: Try blocked action in member account</td><td>"Access Denied" error</td></tr><tr><td>Consolidated billing active</td><td>Billing Console (Management Account)</td><td>Single invoice, all accounts listed</td></tr><tr><td>CloudTrail organizational trail</td><td>CloudTrail Console (Management Account)</td><td>Trail status: Logging, applies to organization</td></tr><tr><td>Delegated admin configured</td><td>Organizations Console → Services</td><td>GuardDuty, Security Hub delegated to Account K</td></tr><tr><td>Tag policy active</td><td>Organizations Console → Policies → Tag policies</td><td>Policy enabled, attached to Root</td></tr><tr><td>Budget alerts configured</td><td>Budgets Console (Management Account)</td><td>Budgets at org, OU, and account levels</td></tr></tbody></table>
+<p>→ <strong>How to audit SCP effectiveness:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Test 1: Region restriction
+</span>    → Log into Account A → Try to launch EC2 in us-west-2
+    → Expected: "Access Denied" (SCP blocks unapproved region)
+
+Test 2: CloudTrail protection
+    → Log into Account B → Try to stop CloudTrail logging
+    → Expected: "Access Denied" (SCP blocks CloudTrail modification)
+
+Test 3: Encryption enforcement
+    → Log into Account A → Try to create unencrypted S3 bucket
+    → Expected: "Access Denied" (SCP requires encryption)
+
+Test 4: Expensive instance restriction
+    → Log into Account F → Try to launch p4d.24xlarge
+    → Expected: "Access Denied" (SCP blocks expensive instances in Non-Prod)
+
+Test 5: Public S3 restriction
+    → Log into Account B → Try to make bucket public
+    → Expected: "Access Denied" (SCP blocks public S3)
+
+Test 6: Organization leave restriction
+    → Log into Account A → Try to leave organization
+    → Expected: "Access Denied" (SCP blocks leaving)</code></pre></div>
+<p>→ <strong>Compliance Reporting:</strong></p>
+<table><thead><tr><th>Report</th><th>Source</th><th>Frequency</th><th>Audience</th></tr></thead><tbody><tr><td>SCP compliance</td><td>Organizations API</td><td>Weekly</td><td>CISO</td></tr><tr><td>Tag compliance</td><td>Tag policy compliance report</td><td>Weekly</td><td>Finance + Platform Team</td></tr><tr><td>Security posture</td><td>Security Hub score per account</td><td>Daily</td><td>Security Team</td></tr><tr><td>Cost compliance</td><td>AWS Budgets</td><td>Daily</td><td>CFO + Account Owners</td></tr><tr><td>Encryption compliance</td><td>AWS Config rules</td><td>Daily</td><td>Security Team</td></tr><tr><td>Region compliance</td><td>AWS Config rules</td><td>Daily</td><td>Compliance Team</td></tr><tr><td>Root user activity</td><td>CloudTrail + EventBridge</td><td>Real-time</td><td>Security Team (immediate alert)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ AWS Organizations transforms a collection of independent accounts into a GOVERNED, MANAGED hierarchy<br>
+→ Service Control Policies (SCPs) are the MOST POWERFUL governance tool — they override ALL IAM policies including account root<br>
+→ SCPs are GUARDRAILS (ceiling) not GRANTS (floor) — they limit maximum permissions, they don't give permissions<br>
+→ The Management Account is EXEMPT from SCPs — protect it with IAM and extreme access restriction<br>
+→ Organizational Units (OUs) enable differentiated governance — production gets encryption enforcement, dev gets cost limits<br>
+→ Consolidated billing provides single invoice + volume discounts + cost allocation via tags<br>
+→ Tag policies enforce consistent tagging — the foundation for cost attribution and resource management<br>
+→ Organizational CloudTrail provides tamper-proof audit trail across ALL accounts<br>
+→ Delegated administration allows security team to manage GuardDuty/Security Hub/Config organization-wide<br>
+→ Account vending automates new account creation from 2 weeks to 30 minutes with baseline security<br>
+→ SCPs are NOT retroactive — they prevent NEW non-compliant actions but don't fix EXISTING resources → Use AWS Config for detection + remediation<br>
+→ Always test SCPs in Sandbox → Non-Prod → Production (staged rollout)</p>
+<p>→ <strong>Connection to previous projects:</strong></p>
+<ul>
+<li>Cross-account IAM (Project 40) — Organizations provides the trust framework for cross-account role assumption</li>
+<li>Cross-account networking (Project 44, 50) — OUs inform TGW route table segmentation (production vs non-production)</li>
+<li>Lake Formation cross-account (Project 42, 47) — Organization-wide data governance aligns with OU structure</li>
+<li>Enterprise data lake (Project 51) — Centralized data lake account fits into Infrastructure OU</li>
+<li>KMS encryption (Project 36) — SCPs enforce encryption organization-wide</li>
+<li>CloudTrail (Project 57) — Organizational trail provides organization-wide audit</li>
+<li>SNS notifications (Project 6) — Budget alerts use SNS</li>
+<li>All previous cross-account patterns — Organizations simplifies RAM sharing (auto-accept within organization)</li>
+</ul>
+<p>→ <strong>Connection to next projects:</strong></p>
+<ul>
+<li>Cross-Region DR (Project 55) — Organizations ensures DR accounts have same governance</li>
+<li>Cost optimization (Project 56) — Consolidated billing enables organization-wide cost analysis</li>
+<li>Zero-trust security (Project 57) — SCPs + CloudTrail + Config + GuardDuty form the security foundation</li>
+<li>Data Mesh (Project 60) — Organizations + OUs map to data mesh domain ownership</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale's organization is now governed with SCPs, consolidated billing, and centralized security<br>
+→ But the disaster recovery team raises a critical concern:</p>
+<p>→ "What happens if ap-south-1 (Mumbai) goes down completely?"<br>
+→ "Our entire data platform — MariaDB, S3 data lake, Redshift, streaming pipeline — is in ONE region"<br>
+→ "A regional outage means:"</p>
+<ul>
+<li>Payment processing stops → Revenue loss: $500,000/hour</li>
+<li>Fraud detection stops → Fraud losses: $50,000/hour</li>
+<li>Data lake inaccessible → All analytics blocked</li>
+<li>No recovery plan exists → Recovery time: UNKNOWN</li>
+</ul>
+<p>→ The Board mandates:</p>
+<ul>
+<li>RTO (Recovery Time Objective): &lt; 4 hours</li>
+<li>RPO (Recovery Point Objective): &lt; 1 hour</li>
+<li>Cross-region disaster recovery for all critical systems</li>
+<li>Regular DR testing (at least quarterly)</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 55 solves</strong><br>
+→ Project 55: "The Platform That Couldn't Afford Regional Failure — Cross-Region DR for MariaDB + S3 + Redshift"<br>
+→ It designs a DR strategy using:</p>
+<ul>
+<li>Cross-Region RDS Read Replica promotion (from Project 29)</li>
+<li>S3 Cross-Region Replication (from Project 30)</li>
+<li>Redshift Cross-Region Snapshots</li>
+<li>Route 53 DNS failover<br>
+→ The Organizations governance (this project) ensures DR accounts have the same SCPs and security baseline</li>
+</ul>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 55: "The Platform That Couldn't Afford Regional Failure — Cross-Region DR for MariaDB + S3 + Redshift"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-53.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 54/60</span></div><a class="nav-btn next" href="project-55.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

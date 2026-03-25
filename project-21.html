@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 21: THE CSV FILES THAT SLOWED EVERYTHING DOWN — Glue ETL Job for S3 CSV  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 21: THE CSV FILES THAT SLOWED EVERYTHING DOWN — Glue ETL Job for S3 CSV to Parquet Transformation</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's data team has been using the pipeline built in Projects 17 and 18<br>
+→ Glue Crawler catalogs raw CSV files in S3 → Athena queries the catalog<br>
+→ The data landscape today:</p>
+<table><thead><tr><th>Dataset</th><th>Format</th><th>Size</th><th>Location</th><th>Query Frequency</th></tr></thead><tbody><tr><td>Order transactions</td><td>CSV</td><td>8 GB (growing 500 MB/day)</td><td><code>s3://shopnow-data-lake/raw/orders/</code></td><td>40 queries/day</td></tr><tr><td>Product catalog</td><td>CSV</td><td>2 GB</td><td><code>s3://shopnow-data-lake/raw/products/</code></td><td>20 queries/day</td></tr><tr><td>Customer profiles</td><td>JSON</td><td>3 GB</td><td><code>s3://shopnow-data-lake/raw/customers/</code></td><td>15 queries/day</td></tr><tr><td>Clickstream events</td><td>CSV</td><td>25 GB (growing 2 GB/day)</td><td><code>s3://shopnow-data-lake/raw/clickstream/</code></td><td>10 queries/day</td></tr></tbody></table>
+<p>→ Problem 1: COST EXPLOSION</p>
+<ul>
+<li>Athena charges $5 per TB scanned (Project 18)</li>
+<li>Every query on the 8 GB orders CSV scans the ENTIRE 8 GB — even if the query only needs 2 columns</li>
+<li>40 queries/day × 8 GB × $5/TB = $1.60/day just for orders</li>
+<li>Clickstream: 10 queries × 25 GB × $5/TB = $1.25/day</li>
+<li>Total across all datasets: ~$120/month and growing rapidly</li>
+</ul>
+<p>→ Problem 2: QUERY SPEED</p>
+<ul>
+<li>A simple aggregation on orders takes 45 seconds scanning 8 GB of CSV</li>
+<li>The CEO's dashboard times out because underlying queries are too slow</li>
+<li>CSV is ROW-based — Athena must read every row even when only 3 of 25 columns are needed</li>
+</ul>
+<p>→ Problem 3: DATA QUALITY</p>
+<ul>
+<li>Raw CSV files have inconsistent date formats (some <code>MM/DD/YYYY</code>, some <code>YYYY-MM-DD</code>)</li>
+<li>Some numeric columns contain text values ("N/A", "null", empty strings)</li>
+<li>Duplicate records exist across files uploaded on different days</li>
+<li>Column names have spaces and special characters (<code>Order ID</code>, <code>Ship-Date</code>, <code>Customer Name</code>)</li>
+</ul>
+<p>→ Problem 4: NO PARTITIONING</p>
+<ul>
+<li>All order files sit in one flat prefix: <code>raw/orders/</code></li>
+<li>A query for "January 2025 orders" still scans ALL months of data</li>
+<li>No way to skip irrelevant data</li>
+</ul>
+<p>→ The data engineering lead says: "We need an ETL process that cleans, transforms, and converts our raw data into an optimized format — and we need it automated"</p>
+<p>→ The target state:</p>
+<table><thead><tr><th>Aspect</th><th>Current (Raw)</th><th>Target (Transformed)</th></tr></thead><tbody><tr><td>Format</td><td>CSV / JSON</td><td>Parquet</td></tr><tr><td>Compression</td><td>None</td><td>Snappy</td></tr><tr><td>Schema</td><td>Inconsistent</td><td>Clean, typed, standardized</td></tr><tr><td>Partitioning</td><td>None</td><td>By year/month/day</td></tr><tr><td>Column names</td><td>Spaces, special chars</td><td>snake_case</td></tr><tr><td>Data quality</td><td>Duplicates, nulls, mixed formats</td><td>Deduplicated, null-handled, consistent</td></tr><tr><td>Storage size</td><td>38 GB</td><td>~8 GB (Parquet + Snappy compression)</td></tr><tr><td>Athena scan cost</td><td>~$120/month</td><td>~$15/month</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is an ETL (Extract-Transform-Load) problem<br>
+→ Extract: Read raw CSV/JSON from S3<br>
+→ Transform: Clean, convert types, standardize columns, deduplicate, partition<br>
+→ Load: Write optimized Parquet files back to S3 in a structured layout</p>
+<p>→ AWS Glue ETL Job is the service purpose-built for this</p>
+<p>→ Understanding what Glue ETL is (vs what we already know):</p>
+<ul>
+<li>Project 17: Glue CRAWLER — discovers schema, creates catalog tables (reads metadata)</li>
+<li>This project: Glue ETL JOB — reads data, transforms it, writes it back (processes actual data)</li>
+<li>The Crawler is about CATALOGING → The Job is about TRANSFORMING</li>
+<li>They are complementary — often used together in a pipeline</li>
+</ul>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand Glue Job types and when to use which</li>
+<li>Step 2 — Understand the Glue execution environment (what runs under the hood)</li>
+<li>Step 3 — Create IAM Role for the Glue Job</li>
+<li>Step 4 — Create the Glue Job with source/target configuration</li>
+<li>Step 5 — Configure job parameters (DPUs, timeout, retries)</li>
+<li>Step 6 — Configure transformations via Glue Studio Visual Editor</li>
+<li>Step 7 — Configure output format (Parquet + Snappy + Partitioning)</li>
+<li>Step 8 — Run the job and verify output</li>
+<li>Step 9 — Re-crawl the output to update the Glue Catalog</li>
+<li>Step 10 — Query optimized data via Athena and compare costs</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND GLUE JOB TYPES</h3>
+<p>→ AWS Glue offers multiple job types — choosing the wrong one wastes money and time</p>
+<table><thead><tr><th>Job Type</th><th>Engine</th><th>Best For</th><th>Min Resources</th><th>Cost Model</th></tr></thead><tbody><tr><td>Spark (ETL)</td><td>Apache Spark (distributed)</td><td>Large datasets (GBs to TBs), complex transformations</td><td>2 DPUs</td><td>Per DPU-hour</td></tr><tr><td>Spark (Streaming)</td><td>Spark Structured Streaming</td><td>Continuous/micro-batch streaming ETL</td><td>2 DPUs</td><td>Per DPU-hour (runs continuously)</td></tr><tr><td>Python Shell</td><td>Python runtime (single node)</td><td>Small datasets (MBs), simple scripts, API calls</td><td>1/16 DPU or 1 DPU</td><td>Per DPU-hour</td></tr><tr><td>Ray</td><td>Ray distributed framework</td><td>ML workloads, distributed Python</td><td>2 DPUs</td><td>Per DPU-hour</td></tr></tbody></table>
+<p>→ For ShopNow's 38 GB dataset with transformations → <strong>Spark (ETL)</strong> is the correct choice<br>
+→ Python Shell would be too slow and run out of memory<br>
+→ Streaming is for continuous data — we have batch files<br>
+→ Ray is for ML workloads — we're doing ETL</p>
+<p><strong>What is a DPU (Data Processing Unit)?</strong></p>
+<table><thead><tr><th>Component</th><th>Specification</th></tr></thead><tbody><tr><td>1 DPU</td><td>4 vCPUs + 16 GB RAM</td></tr><tr><td>Minimum for Spark job</td><td>2 DPUs (1 driver + 1 worker)</td></tr><tr><td>Maximum for Spark job</td><td>100 DPUs (default limit)</td></tr><tr><td>Billing granularity</td><td>Per second, minimum 1 minute</td></tr></tbody></table>
+<p>→ 2 DPUs = 8 vCPUs + 32 GB RAM → sufficient for small-medium datasets<br>
+→ 10 DPUs = 40 vCPUs + 160 GB RAM → large datasets with complex joins<br>
+→ More DPUs = faster execution but higher cost</p>
+<p><strong>Glue Job Versions (Worker Types):</strong></p>
+<table><thead><tr><th>Worker Type</th><th>Resources per Worker</th><th>Use Case</th></tr></thead><tbody><tr><td>Standard</td><td>4 vCPU, 16 GB RAM, 50 GB disk</td><td>General ETL</td></tr><tr><td>G.1X</td><td>4 vCPU, 16 GB RAM, 64 GB disk</td><td>Memory-intensive transforms</td></tr><tr><td>G.2X</td><td>8 vCPU, 32 GB RAM, 128 GB disk</td><td>ML transforms, large shuffles</td></tr><tr><td>G.4X</td><td>16 vCPU, 64 GB RAM, 256 GB disk</td><td>Very large datasets, complex joins</td></tr><tr><td>G.8X</td><td>32 vCPU, 128 GB RAM, 512 GB disk</td><td>Extreme workloads</td></tr><tr><td>G.025X</td><td>2 vCPU, 4 GB RAM, 64 GB disk</td><td>Small jobs, cost optimization</td></tr><tr><td>Z.2X</td><td>8 vCPU, 64 GB RAM, 128 GB disk</td><td>Jobs needing high memory-to-CPU ratio</td></tr></tbody></table>
+<p>→ For ShopNow's 38 GB → <strong>G.1X with 10 workers</strong> is appropriate<br>
+→ Total resources: 40 vCPU, 160 GB RAM<br>
+→ Cost: 10 workers × G.1X pricing × job duration</p>
+<hr>
+<h3>STEP 2 — UNDERSTAND THE GLUE EXECUTION ENVIRONMENT</h3>
+<p>→ When you "run" a Glue Job, here's what happens behind the scenes:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>You click "Run Job"
+</span>       ↓
+Glue provisions a Spark cluster in AWS-managed infrastructure
+       ↓
+Cluster has: 1 Driver node + N Worker nodes (you configure N)
+       ↓
+Driver node reads your job configuration / script
+       ↓
+Driver creates a Spark execution plan
+       ↓
+Workers read data from S3 in PARALLEL (each worker reads a portion)
+       ↓
+Workers apply transformations in parallel
+       ↓
+Workers write output to S3 in PARALLEL
+       ↓
+Job completes → Cluster is TERMINATED → You stop paying</code></pre></div>
+<p>→ Key insight: You do NOT manage servers, clusters, or Spark installations<br>
+→ Glue provisions everything → runs your job → tears it down<br>
+→ This is "serverless Spark"</p>
+<p>→ Cold start time: 30 seconds to 2 minutes (cluster provisioning)<br>
+→ For frequently-run jobs — Glue offers "Flex" execution (uses spare capacity, cheaper, longer cold start)</p>
+<p><strong>Glue Execution Classes:</strong></p>
+<table><thead><tr><th>Class</th><th>Cold Start</th><th>Cost</th><th>Best For</th></tr></thead><tbody><tr><td>Standard</td><td>~1 minute</td><td>Full price</td><td>Time-sensitive jobs, SLA-bound</td></tr><tr><td>Flex</td><td>2-5 minutes</td><td>~35% cheaper</td><td>Non-urgent batch jobs, overnight processing</td></tr></tbody></table>
+<p>→ ShopNow's daily ETL runs overnight → <strong>Flex</strong> is ideal (save 35%)</p>
+<hr>
+<h3>STEP 3 — CREATE IAM ROLE FOR GLUE JOB</h3>
+<p>→ The Glue Job needs an IAM Role (just like EC2 needed one in Project 11)<br>
+→ This role is ASSUMED by the Glue service when executing the job</p>
+<p>→ Navigate to IAM → Roles → Create Role</p>
+<p><strong>Trusted Entity:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity type</td><td>AWS Service</td></tr><tr><td>Service</td><td>Glue</td></tr></tbody></table>
+<p>→ This creates a trust policy: <code>"Service": "glue.amazonaws.com"</code> can AssumeRole</p>
+<p><strong>Permissions Required:</strong></p>
+<table><thead><tr><th>Permission</th><th>Purpose</th><th>Policy</th></tr></thead><tbody><tr><td>S3 Read on source bucket</td><td>Read raw CSV/JSON files</td><td>Custom policy</td></tr><tr><td>S3 Write on target bucket</td><td>Write Parquet files</td><td>Custom policy</td></tr><tr><td>Glue Catalog access</td><td>Read/write catalog tables</td><td><code>AWSGlueServiceRole</code> (managed)</td></tr><tr><td>CloudWatch Logs</td><td>Write job execution logs</td><td>Included in <code>AWSGlueServiceRole</code></td></tr></tbody></table>
+<p><strong>Option A: AWS Managed Policy</strong><br>
+→ Attach <code>AWSGlueServiceRole</code><br>
+→ This grants Glue Catalog access + CloudWatch Logs<br>
+→ Does NOT include S3 access (you must add this)</p>
+<p><strong>Option B: Custom S3 Policy (Must Add)</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>s3:GetObject</code>, <code>s3:ListBucket</code></td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake/raw/*</code> and <code>arn:aws:s3:::shopnow-data-lake</code></td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>s3:PutObject</code>, <code>s3:DeleteObject</code>, <code>s3:GetObject</code>, <code>s3:ListBucket</code></td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake/transformed/*</code> and <code>arn:aws:s3:::shopnow-data-lake</code></td></tr></tbody></table>
+<p>→ Why <code>DeleteObject</code> on target? Glue may need to overwrite existing files when re-running the job</p>
+<p><strong>Role Name:</strong> <code>GlueETL-ShopNow-DataLake-Role</code></p>
+<p>→ This role follows the same pattern as Project 17 (Crawler role) but with WRITE access to the target location</p>
+<hr>
+<h3>STEP 4 — CREATE THE GLUE JOB</h3>
+<p>→ Navigate to AWS Glue Console → ETL Jobs → Create Job</p>
+<p><strong>Two Creation Methods:</strong></p>
+<table><thead><tr><th>Method</th><th>Description</th><th>Best For</th></tr></thead><tbody><tr><td>Visual with a source and target</td><td>Drag-and-drop visual editor</td><td>Standard ETL patterns, less experienced users</td></tr><tr><td>Script editor</td><td>Write Spark/PySpark script directly</td><td>Complex logic, experienced engineers</td></tr><tr><td>Notebook</td><td>Interactive Jupyter-style development</td><td>Exploration, development, debugging</td></tr></tbody></table>
+<p>→ For ShopNow → Start with <strong>Visual Editor</strong> (Glue Studio)<br>
+→ Visual Editor generates the underlying script automatically<br>
+→ You can switch to script mode later for customization</p>
+<hr>
+<h3>STEP 5 — CONFIGURE SOURCE NODE (Extract)</h3>
+<p>→ In the Visual Editor → Add a Source node</p>
+<p><strong>Source Configuration for Orders:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Source type</td><td>S3</td><td>Reading from S3 bucket</td></tr><tr><td>S3 source type</td><td>Data Catalog table</td><td>Use the table already crawled in Project 17</td></tr><tr><td>Database</td><td><code>shopnow_raw_db</code></td><td>Glue Catalog database from Project 17</td></tr><tr><td>Table</td><td><code>orders</code></td><td>Table created by Crawler</td></tr></tbody></table>
+<p>→ Alternative: Instead of Data Catalog, you can point directly to S3 path</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>When to Use</th></tr></thead><tbody><tr><td>S3 source type</td><td>S3 location</td><td>When no Crawler/Catalog exists yet</td></tr><tr><td>S3 URL</td><td><code>s3://shopnow-data-lake/raw/orders/</code></td><td>Direct path</td></tr><tr><td>Data format</td><td>CSV</td><td>Must specify format manually</td></tr><tr><td>Delimiter</td><td><code>,</code></td><td>CSV delimiter</td></tr><tr><td>Has header</td><td>Yes</td><td>First row is column names</td></tr></tbody></table>
+<p>→ Using Data Catalog is preferred because:</p>
+<ul>
+<li>Schema is already inferred by the Crawler</li>
+<li>Data types are pre-determined</li>
+<li>Partition information is available</li>
+<li>Glue Job Bookmarks work better with Catalog tables (Project 46)</li>
+</ul>
+<p><strong>What happens internally when Source reads:</strong><br>
+→ Glue creates a DynamicFrame (Glue's enhanced version of Spark DataFrame)<br>
+→ DynamicFrame reads all files matching the table's S3 location<br>
+→ Each worker reads a PORTION of the files in parallel<br>
+→ CSV parsing happens on the workers (header detection, delimiter splitting)</p>
+<hr>
+<h3>STEP 6 — CONFIGURE TRANSFORM NODES (Transform)</h3>
+<p>→ This is where the data quality issues get fixed<br>
+→ In the Visual Editor → Add Transform nodes between Source and Target</p>
+<hr>
+<p><strong>Transform 1: Change Schema (Rename &amp; Retype Columns)</strong></p>
+<p>→ Add node: "Change Schema" (also called "ApplyMapping")</p>
+<table><thead><tr><th>Original Column</th><th>New Column Name</th><th>Original Type</th><th>New Type</th><th>Action</th></tr></thead><tbody><tr><td><code>Order ID</code></td><td><code>order_id</code></td><td>string</td><td>string</td><td>Rename (remove space)</td></tr><tr><td><code>Customer Name</code></td><td><code>customer_name</code></td><td>string</td><td>string</td><td>Rename</td></tr><tr><td><code>Ship-Date</code></td><td><code>ship_date</code></td><td>string</td><td>string</td><td>Rename (remove hyphen)</td></tr><tr><td><code>Order Date</code></td><td><code>order_date</code></td><td>string</td><td>date</td><td>Rename + Retype</td></tr><tr><td><code>Total Amount</code></td><td><code>total_amount</code></td><td>string</td><td>double</td><td>Rename + Retype</td></tr><tr><td><code>Quantity</code></td><td><code>quantity</code></td><td>string</td><td>int</td><td>Retype</td></tr><tr><td><code>Discount%</code></td><td><code>discount_pct</code></td><td>string</td><td>double</td><td>Rename (remove special char)</td></tr><tr><td><code>Internal Notes</code></td><td>(drop)</td><td>string</td><td>—</td><td>Remove column entirely</td></tr></tbody></table>
+<p>→ Why rename?</p>
+<ul>
+<li>Athena and Redshift don't handle spaces/special characters in column names well</li>
+<li>snake_case is the industry standard for data lake columns</li>
+<li>Consistent naming prevents query errors downstream</li>
+</ul>
+<p>→ Why retype?</p>
+<ul>
+<li>CSV stores everything as strings — Crawler may have inferred some correctly, others not</li>
+<li>Explicit type casting ensures: <code>total_amount</code> is numeric (can be summed, averaged)</li>
+<li>Date types enable date functions in Athena (YEAR, MONTH, date arithmetic)</li>
+</ul>
+<p>→ Why drop columns?</p>
+<ul>
+<li><code>Internal Notes</code> is not needed for analytics</li>
+<li>Removing it reduces file size and improves query performance</li>
+<li>Parquet is columnar — fewer columns = less data per query</li>
+</ul>
+<hr>
+<p><strong>Transform 2: Filter (Remove Invalid Records)</strong></p>
+<p>→ Add node: "Filter"</p>
+<table><thead><tr><th>Filter Condition</th><th>Purpose</th></tr></thead><tbody><tr><td><code>total_amount</code> is not null</td><td>Remove records with missing amounts</td></tr><tr><td><code>total_amount</code> &gt; 0</td><td>Remove zero/negative amounts (likely errors)</td></tr><tr><td><code>order_date</code> is not null</td><td>Remove records without dates</td></tr><tr><td><code>order_id</code> is not null</td><td>Remove records without order IDs</td></tr></tbody></table>
+<p>→ Filter evaluates conditions and DROPS rows that don't match<br>
+→ This is data quality enforcement at the ETL layer</p>
+<hr>
+<p><strong>Transform 3: Drop Duplicates</strong></p>
+<p>→ Add node: "Drop Duplicates"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Columns to match</td><td><code>order_id</code></td></tr></tbody></table>
+<p>→ If two records have the same <code>order_id</code> → keep only the first one<br>
+→ This handles the duplicate records problem from overlapping file uploads</p>
+<p>→ For more complex deduplication (keep latest based on timestamp):</p>
+<ul>
+<li>Switch to Script mode</li>
+<li>Use window functions to rank records by <code>updated_at</code> within each <code>order_id</code></li>
+<li>Keep only rank = 1</li>
+</ul>
+<hr>
+<p><strong>Transform 4: Derived Column (Add Partition Columns)</strong></p>
+<p>→ Add node: "Derived Column" (or "Custom Transform")</p>
+<table><thead><tr><th>New Column</th><th>Derived From</th><th>Purpose</th></tr></thead><tbody><tr><td><code>year</code></td><td>Extract year from <code>order_date</code></td><td>Partition key</td></tr><tr><td><code>month</code></td><td>Extract month from <code>order_date</code></td><td>Partition key</td></tr><tr><td><code>day</code></td><td>Extract day from <code>order_date</code></td><td>Partition key</td></tr></tbody></table>
+<p>→ These columns will be used to PARTITION the output in S3<br>
+→ Partitioning is the #1 cost optimization for Athena (explained in Step 7)</p>
+<hr>
+<p><strong>Transform 5: Resolve Choice (Handle Ambiguous Types)</strong></p>
+<p>→ Glue's DynamicFrame has a unique feature: "ChoiceType"<br>
+→ When a column has mixed types (some rows are int, some are string), Glue creates a ChoiceType<br>
+→ Example: <code>quantity</code> column has values <code>5</code>, <code>10</code>, <code>N/A</code>, <code>null</code></p>
+<p>→ Add node: "Resolve Choice"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Behavior</th></tr></thead><tbody><tr><td>Choice resolution</td><td><code>cast:int</code></td><td>Force all values to int — non-castable become null</td></tr><tr><td>Alternative</td><td><code>make_struct</code></td><td>Keep both types as a struct (rarely useful)</td></tr><tr><td>Alternative</td><td><code>project:string</code></td><td>Force everything to string (safe but less useful)</td></tr></tbody></table>
+<p>→ <code>cast:int</code> is usually the right choice for numeric columns<br>
+→ "N/A" values become null → handled by the Filter transform above or by downstream logic</p>
+<hr>
+<p><strong>Visual Editor Pipeline View:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────┐    ┌──────────────┐    ┌────────┐    ┌───────────────┐    ┌────────────────┐    ┌────────────────┐    ┌──────────┐
+</span>│  Source   │───▶│ Resolve      │───▶│ Change │───▶│ Filter        │───▶│ Drop           │───▶│ Derived        │───▶│  Target  │
+│  (S3/    │    │ Choice       │    │ Schema │    │ (Remove       │    │ Duplicates     │    │ Column         │    │  (S3/    │
+│  Catalog) │    │ (Fix types)  │    │ (Rename│    │  invalid)     │    │ (Dedup by      │    │ (year/month/   │    │  Parquet)│
+│           │    │              │    │  retype│    │               │    │  order_id)     │    │  day from date)│    │          │
+│           │    │              │    │  drop) │    │               │    │                │    │                │    │          │
+└──────────┘    └──────────────┘    └────────┘    └───────────────┘    └────────────────┘    └────────────────┘    └──────────┘</code></pre></div>
+<hr>
+<h3>STEP 7 — CONFIGURE TARGET NODE (Load)</h3>
+<p>→ Add a Target node at the end of the transformation chain</p>
+<p><strong>Target Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Target type</td><td>S3</td><td>Writing back to S3</td></tr><tr><td>Format</td><td>Parquet</td><td>Columnar format — the entire point of this project</td></tr><tr><td>Compression</td><td>Snappy</td><td>Fast compression with good ratio</td></tr><tr><td>S3 Target Location</td><td><code>s3://shopnow-data-lake/transformed/orders/</code></td><td>Separate from raw — never overwrite source</td></tr><tr><td>Data Catalog update</td><td>Create a table in the Data Catalog</td><td>Auto-registers the output for Athena</td></tr><tr><td>Database</td><td><code>shopnow_transformed_db</code></td><td>New database for transformed data</td></tr><tr><td>Table name</td><td><code>orders</code></td><td>Table name in transformed database</td></tr><tr><td>Partition keys</td><td><code>year</code>, <code>month</code>, <code>day</code></td><td>Columns to partition by</td></tr></tbody></table>
+<hr>
+<p><strong>Understanding Parquet — Why It Changes Everything:</strong></p>
+<table><thead><tr><th>Aspect</th><th>CSV</th><th>Parquet</th></tr></thead><tbody><tr><td>Storage model</td><td>Row-based (entire row stored together)</td><td>Column-based (each column stored separately)</td></tr><tr><td>Reading 3 of 25 columns</td><td>Must read ALL 25 columns for every row</td><td>Reads ONLY the 3 needed columns</td></tr><tr><td>Compression</td><td>Poor (text data, redundant headers)</td><td>Excellent (similar values grouped, dictionary encoding)</td></tr><tr><td>Schema</td><td>External (no type info in file)</td><td>Embedded (types stored in file footer)</td></tr><tr><td>Splittable</td><td>Yes (line-by-line)</td><td>Yes (row groups)</td></tr><tr><td>File size (typical)</td><td>1x (baseline)</td><td>0.2x – 0.3x (70-80% smaller)</td></tr><tr><td>Athena scan</td><td>Full file size</td><td>Only relevant columns + row groups</td></tr></tbody></table>
+<p>→ Concrete example for ShopNow orders:</p>
+<ul>
+<li>25 columns in the orders table</li>
+<li>Typical Athena query uses 3 columns: <code>order_date</code>, <code>total_amount</code>, <code>customer_id</code></li>
+<li>CSV: Scan 8 GB (all columns, all rows)</li>
+<li>Parquet: Scan ~0.6 GB (3/25 columns × compression × row group pruning)</li>
+<li>Cost reduction: 8 GB × $5/TB = $0.04/query → 0.6 GB × $5/TB = $0.003/query → <strong>13x cheaper</strong></li>
+</ul>
+<hr>
+<p><strong>Understanding Snappy Compression:</strong></p>
+<table><thead><tr><th>Compression</th><th>Speed</th><th>Ratio</th><th>Splittable</th><th>Use Case</th></tr></thead><tbody><tr><td>Snappy</td><td>Very fast</td><td>Moderate (~2-4x)</td><td>Yes (with Parquet)</td><td>Default for analytics (Athena, Spark, Redshift Spectrum)</td></tr><tr><td>GZIP</td><td>Slow</td><td>High (~5-8x)</td><td>No (standalone), Yes (with Parquet)</td><td>Maximum compression, cold storage</td></tr><tr><td>LZO</td><td>Fast</td><td>Low (~2x)</td><td>Yes</td><td>Legacy Hadoop workloads</td></tr><tr><td>ZSTD</td><td>Fast</td><td>High (~4-7x)</td><td>Yes (with Parquet)</td><td>Modern alternative to GZIP, better speed</td></tr><tr><td>None</td><td>N/A</td><td>1x</td><td>Yes</td><td>When speed matters more than size</td></tr></tbody></table>
+<p>→ Snappy is the recommended default for Parquet in AWS analytics<br>
+→ Athena, Redshift Spectrum, and EMR all natively support Snappy-compressed Parquet<br>
+→ GZIP gives better compression but slower read/write — use for archival<br>
+→ ZSTD is emerging as a strong alternative — supported in newer Glue versions</p>
+<hr>
+<p><strong>Understanding Partitioning — The Other Half of Cost Optimization:</strong></p>
+<p>→ Partitioning means physically organizing files in S3 by partition key values</p>
+<p><strong>Without partitioning:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/transformed/orders/
+</span>  ├── part-00000.parquet    (contains all dates mixed together)
+  ├── part-00001.parquet
+  ├── part-00002.parquet
+  └── ... (100 files, ~2 GB total)</code></pre></div>
+<p>→ Query: "Show me January 2025 orders"<br>
+→ Athena scans ALL 2 GB — cannot skip any files</p>
+<p><strong>With partitioning by year/month/day:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/transformed/orders/
+</span>  ├── year=2024/
+  │     ├── month=01/
+  │     │     ├── day=01/
+  │     │     │     ├── part-00000.parquet
+  │     │     │     └── part-00001.parquet
+  │     │     ├── day=02/
+  │     │     │     └── part-00000.parquet
+  │     │     └── ...
+  │     ├── month=02/
+  │     └── ...
+  ├── year=2025/
+  │     ├── month=01/
+  │     │     ├── day=01/
+  │     │     │     └── part-00000.parquet
+  │     │     └── ...
+  │     └── ...
+  └── ...</code></pre></div>
+<p>→ Query: "Show me January 2025 orders"<br>
+→ Athena reads ONLY files under <code>year=2025/month=01/</code> → skips all other months/years<br>
+→ Instead of scanning 2 GB → scans ~60 MB (one month out of ~36 months of data)<br>
+→ Cost: 2 GB × $5/TB = $0.01 → 60 MB × $5/TB = $0.0003 → <strong>33x cheaper</strong></p>
+<p><strong>Partition key format in S3:</strong><br>
+→ Hive-style partitioning: <code>key=value/</code> in the path<br>
+→ Athena and Glue Catalog recognize this format natively<br>
+→ When you specify <code>year</code>, <code>month</code>, <code>day</code> as partition keys in the Glue Job target:</p>
+<ul>
+<li>Glue automatically creates the <code>year=XXXX/month=XX/day=XX/</code> folder structure</li>
+<li>Glue writes each record's Parquet file into the matching partition folder</li>
+<li>The partition columns are NOT stored inside the Parquet files (they're in the path)</li>
+</ul>
+<p><strong>Choosing partition keys:</strong></p>
+<table><thead><tr><th>Consideration</th><th>Guidance</th></tr></thead><tbody><tr><td>Most common filter in queries</td><td>Partition by that column (e.g., date for time-series)</td></tr><tr><td>Cardinality too high</td><td>Don't partition by <code>order_id</code> (millions of unique values = millions of folders)</td></tr><tr><td>Cardinality too low</td><td>Don't partition by <code>country</code> if 95% of data is one country</td></tr><tr><td>Sweet spot</td><td>100-10,000 partitions total</td></tr><tr><td>Common pattern</td><td><code>year/month</code> or <code>year/month/day</code> for time-series data</td></tr></tbody></table>
+<p>→ For ShopNow orders: <code>year/month/day</code> → ~365 partitions per year → good cardinality</p>
+<hr>
+<h3>STEP 8 — CONFIGURE JOB PROPERTIES</h3>
+<p>→ In the Job Details tab (or "Job details" in Visual Editor):</p>
+<p><strong>Basic Properties:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-orders-csv-to-parquet</code></td><td>Descriptive, follows naming convention</td></tr><tr><td>IAM Role</td><td><code>GlueETL-ShopNow-DataLake-Role</code></td><td>Role created in Step 3</td></tr><tr><td>Glue version</td><td>Glue 4.0</td><td>Latest version — uses Spark 3.3.0</td></tr><tr><td>Language</td><td>Python 3</td><td>PySpark — default for Glue</td></tr><tr><td>Worker type</td><td>G.1X</td><td>4 vCPU, 16 GB RAM per worker</td></tr><tr><td>Number of workers</td><td>10</td><td>Total: 40 vCPU, 160 GB RAM</td></tr><tr><td>Job timeout (minutes)</td><td>60</td><td>Kill job if it runs longer than 1 hour</td></tr><tr><td>Max retries</td><td>1</td><td>Retry once on failure</td></tr><tr><td>Max concurrent runs</td><td>1</td><td>Prevent duplicate runs</td></tr></tbody></table>
+<p><strong>Advanced Properties:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Execution class</td><td>Flex</td><td>35% cheaper — acceptable for nightly batch</td></tr><tr><td>Script path</td><td><code>s3://shopnow-glue-scripts/orders-csv-to-parquet.py</code></td><td>Where Glue stores the generated script</td></tr><tr><td>Temporary directory</td><td><code>s3://shopnow-glue-temp/orders/</code></td><td>Scratch space for Spark shuffle data</td></tr><tr><td>Spark UI logs</td><td><code>s3://shopnow-glue-spark-logs/orders/</code></td><td>For debugging Spark execution plans</td></tr><tr><td>Job bookmark</td><td>Enable</td><td>Track processed data — critical for incremental ETL (Project 46)</td></tr><tr><td>Number of retries</td><td>1</td><td>Auto-retry on transient failures</td></tr><tr><td>Job metrics</td><td>Enable</td><td>Push Spark metrics to CloudWatch</td></tr><tr><td>Continuous logging</td><td>Enable</td><td>Stream logs to CloudWatch in real-time (not just after completion)</td></tr></tbody></table>
+<hr>
+<p><strong>Understanding Job Bookmarks (Preview — Deep Dive in Project 46):</strong></p>
+<p>→ Without bookmarks: Every job run processes ALL data from the beginning<br>
+→ With bookmarks: Glue tracks which data was already processed → only processes NEW data<br>
+→ For S3 sources: Bookmark tracks which files have been processed (by file path + timestamp)<br>
+→ For JDBC sources: Bookmark tracks the last processed value of a key column<br>
+→ Enable now → understand deeply in Project 46</p>
+<hr>
+<p><strong>Understanding Job Timeout:</strong></p>
+<table><thead><tr><th>Dataset Size</th><th>Worker Count</th><th>Typical Duration</th><th>Recommended Timeout</th></tr></thead><tbody><tr><td>&lt; 1 GB</td><td>2-5 workers</td><td>2-5 minutes</td><td>30 minutes</td></tr><tr><td>1-10 GB</td><td>5-10 workers</td><td>5-15 minutes</td><td>60 minutes</td></tr><tr><td>10-100 GB</td><td>10-20 workers</td><td>15-45 minutes</td><td>120 minutes</td></tr><tr><td>100 GB - 1 TB</td><td>20-50 workers</td><td>30-90 minutes</td><td>180 minutes</td></tr><tr><td>&gt; 1 TB</td><td>50-100 workers</td><td>60-180 minutes</td><td>360 minutes</td></tr></tbody></table>
+<p>→ Timeout prevents runaway jobs from consuming resources indefinitely<br>
+→ Set timeout to 2-3x expected duration — accounts for data volume growth</p>
+<hr>
+<h3>STEP 9 — RUN THE JOB AND MONITOR</h3>
+<p>→ Click "Save" → Click "Run"</p>
+<p><strong>Monitoring the Job Run:</strong></p>
+<p>→ Navigate to Glue Console → ETL Jobs → Select job → Runs tab</p>
+<p><strong>Job Run States:</strong></p>
+<table><thead><tr><th>State</th><th>Meaning</th></tr></thead><tbody><tr><td>STARTING</td><td>Provisioning Spark cluster (cold start)</td></tr><tr><td>RUNNING</td><td>Job is executing — processing data</td></tr><tr><td>SUCCEEDED</td><td>Job completed successfully</td></tr><tr><td>FAILED</td><td>Job crashed — check error logs</td></tr><tr><td>TIMEOUT</td><td>Job exceeded the configured timeout</td></tr><tr><td>STOPPED</td><td>Job was manually stopped by user</td></tr><tr><td>ERROR</td><td>Infrastructure error — not your code's fault</td></tr></tbody></table>
+<p><strong>Monitoring Metrics (CloudWatch):</strong></p>
+<p>→ Navigate to CloudWatch → Metrics → Glue</p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th><th>Healthy Range</th></tr></thead><tbody><tr><td><code>glue.driver.aggregate.bytesRead</code></td><td>Total data read from source</td><td>Should match expected input size</td></tr><tr><td><code>glue.driver.aggregate.bytesWritten</code></td><td>Total data written to target</td><td>Should be 20-30% of input (Parquet compression)</td></tr><tr><td><code>glue.driver.aggregate.recordsRead</code></td><td>Number of input records</td><td>Should match expected record count</td></tr><tr><td><code>glue.driver.aggregate.recordsWritten</code></td><td>Number of output records</td><td>Less than input if filtering/deduplication applied</td></tr><tr><td><code>glue.driver.aggregate.elapsedTime</code></td><td>Total job execution time</td><td>Monitor for degradation over time</td></tr><tr><td><code>glue.ALL.jvm.heap.usage</code></td><td>Memory utilization</td><td>Should stay below 80% — above = need larger workers</td></tr><tr><td><code>glue.ALL.system.cpuSystemLoad</code></td><td>CPU utilization</td><td>Low = over-provisioned, consider fewer workers</td></tr></tbody></table>
+<p><strong>Spark UI (Advanced Debugging):</strong></p>
+<p>→ Glue generates Spark UI logs in the configured S3 path<br>
+→ Navigate to Glue Console → Job run → View Spark UI<br>
+→ Shows:</p>
+<ul>
+<li>Execution stages (how Spark broke down the work)</li>
+<li>Task distribution across workers</li>
+<li>Shuffle data (data movement between workers)</li>
+<li>Skew detection (one worker doing much more than others)</li>
+</ul>
+<hr>
+<h3>STEP 10 — VERIFY OUTPUT IN S3</h3>
+<p>→ Navigate to S3 Console → <code>shopnow-data-lake/transformed/orders/</code></p>
+<p><strong>Expected S3 structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>transformed/orders/
+</span>  ├── year=2024/
+  │     ├── month=01/
+  │     │     ├── day=01/
+  │     │     │     ├── part-00000-xxxxx.snappy.parquet
+  │     │     │     └── part-00001-xxxxx.snappy.parquet
+  │     │     ├── day=02/
+  │     │     └── ...
+  │     └── ...
+  ├── year=2025/
+  │     └── ...
+  └── _metadata/    (Glue catalog metadata — can ignore)</code></pre></div>
+<p><strong>Verification Checks:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Files are Parquet?</td><td>File extension is <code>.parquet</code></td><td>✅</td></tr><tr><td>Compression is Snappy?</td><td>File name contains <code>.snappy.</code></td><td>✅</td></tr><tr><td>Partitions exist?</td><td>S3 path has <code>year=XXXX/month=XX/day=XX/</code></td><td>✅</td></tr><tr><td>File sizes reasonable?</td><td>Each file is 64-256 MB (optimal for Athena)</td><td>✅</td></tr><tr><td>Total size reduced?</td><td>8 GB CSV → ~2 GB Parquet</td><td>✅ (75% reduction)</td></tr><tr><td>No empty partitions?</td><td>Each day folder has at least one file</td><td>✅</td></tr></tbody></table>
+<p><strong>File Size Optimization:</strong></p>
+<table><thead><tr><th>File Size</th><th>Impact on Athena</th><th>Guidance</th></tr></thead><tbody><tr><td>&lt; 10 MB</td><td>Too many small files → excessive S3 LIST calls → slow</td><td>Bad</td></tr><tr><td>10-64 MB</td><td>Acceptable but not optimal</td><td>OK</td></tr><tr><td>64-256 MB</td><td>Optimal — balances parallelism and overhead</td><td>Best</td></tr><tr><td>256 MB - 1 GB</td><td>Acceptable — fewer files, less parallelism</td><td>OK</td></tr><tr><td>&gt; 1 GB</td><td>Too large — limits parallelism, slow individual file reads</td><td>Bad</td></tr></tbody></table>
+<p>→ Glue's default output creates files based on Spark partitioning<br>
+→ To control output file size → configure <code>groupFiles</code> and <code>groupSize</code> in the job<br>
+→ Or use Spark's <code>coalesce()</code> / <code>repartition()</code> in script mode</p>
+<hr>
+<h3>STEP 11 — RE-CRAWL OUTPUT TO UPDATE CATALOG</h3>
+<p>→ The Glue Job wrote Parquet files to <code>transformed/orders/</code><br>
+→ If the Job was configured with "Create a table in the Data Catalog" (Step 7), the catalog is already updated<br>
+→ If NOT — run a Crawler (Project 17 pattern) on the output path</p>
+<p><strong>Option A: Job already updated catalog (preferred)</strong><br>
+→ Navigate to Glue → Data Catalog → Databases → <code>shopnow_transformed_db</code> → Tables<br>
+→ Verify table <code>orders</code> exists with:</p>
+<ul>
+<li>Column types matching our schema changes</li>
+<li>Partition keys: <code>year</code>, <code>month</code>, <code>day</code></li>
+<li>SerDe: Parquet</li>
+<li>Location: <code>s3://shopnow-data-lake/transformed/orders/</code></li>
+</ul>
+<p><strong>Option B: Create a Crawler for transformed data</strong><br>
+→ Navigate to Glue → Crawlers → Create Crawler (same process as Project 17)</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler name</td><td><code>shopnow-transformed-orders-crawler</code></td></tr><tr><td>Data source</td><td><code>s3://shopnow-data-lake/transformed/orders/</code></td></tr><tr><td>IAM Role</td><td>Same role as Project 17</td></tr><tr><td>Target database</td><td><code>shopnow_transformed_db</code></td></tr><tr><td>Table prefix</td><td>(none)</td></tr><tr><td>Schedule</td><td>Run after ETL job completes (or on-demand)</td></tr></tbody></table>
+<p>→ Run the Crawler → It discovers:</p>
+<ul>
+<li>Parquet format (auto-detected from file content)</li>
+<li>Column names and types from Parquet schema</li>
+<li>Partitions from the <code>year=X/month=X/day=X</code> path structure</li>
+</ul>
+<hr>
+<h3>STEP 12 — QUERY OPTIMIZED DATA IN ATHENA</h3>
+<p>→ Navigate to Athena Console (Project 18)<br>
+→ Select database: <code>shopnow_transformed_db</code><br>
+→ Table <code>orders</code> is available</p>
+<p><strong>Cost Comparison:</strong></p>
+<table><thead><tr><th>Query</th><th>CSV (raw) Data Scanned</th><th>Parquet (transformed) Data Scanned</th><th>Cost Reduction</th></tr></thead><tbody><tr><td>All columns, all records</td><td>8 GB</td><td>2 GB</td><td>75%</td></tr><tr><td>3 columns, all records</td><td>8 GB</td><td>0.6 GB</td><td>92%</td></tr><tr><td>3 columns, January 2025 only</td><td>8 GB</td><td>18 MB</td><td>99.8%</td></tr><tr><td>Count by month, 1 column</td><td>8 GB</td><td>80 MB</td><td>99%</td></tr></tbody></table>
+<p>→ The combination of Parquet (columnar) + Snappy (compression) + Partitioning (pruning) delivers massive cost and performance improvements</p>
+<p><strong>Speed Comparison:</strong></p>
+<table><thead><tr><th>Query</th><th>CSV Time</th><th>Parquet Time</th></tr></thead><tbody><tr><td>Full table scan</td><td>45 seconds</td><td>8 seconds</td></tr><tr><td>Single month aggregation</td><td>42 seconds</td><td>2 seconds</td></tr><tr><td>Specific day lookup</td><td>40 seconds</td><td>0.5 seconds</td></tr></tbody></table>
+<hr>
+<h3>STEP 13 — SCHEDULE THE JOB (Automation)</h3>
+<p>→ This ETL should run daily to process new raw data</p>
+<p><strong>Option A: Glue Schedule (Built-in)</strong><br>
+→ Navigate to Glue → Job → Schedules → Add Schedule</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Frequency</td><td>Daily</td></tr><tr><td>Start time</td><td>02:00 UTC</td></tr><tr><td>Description</td><td>Daily CSV to Parquet transformation</td></tr></tbody></table>
+<p>→ Uses cron expression internally: <code>cron(0 2 * * ? *)</code></p>
+<p><strong>Option B: EventBridge Schedule (More flexible — Project 38)</strong><br>
+→ Create EventBridge rule targeting the Glue Job<br>
+→ Allows conditional logic, chaining with other services</p>
+<p><strong>Option C: Glue Workflow (Orchestration — Project 31)</strong><br>
+→ Chain: Crawler → ETL Job → Crawler → in a single workflow<br>
+→ This is the production-grade approach — explored in Project 31</p>
+<hr>
+<h3>STEP 14 — CREATE JOBS FOR OTHER DATASETS</h3>
+<p>→ Repeat the process for each dataset:</p>
+<p><strong>Job 2: Products CSV to Parquet</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-products-csv-to-parquet</code></td></tr><tr><td>Source</td><td><code>shopnow_raw_db.products</code></td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/products/</code></td></tr><tr><td>Format</td><td>Parquet + Snappy</td></tr><tr><td>Partitions</td><td><code>category</code> (product category)</td></tr><tr><td>Workers</td><td>5 (smaller dataset)</td></tr><tr><td>Schedule</td><td>Daily at 02:30 UTC</td></tr></tbody></table>
+<p><strong>Job 3: Customers JSON to Parquet</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-customers-json-to-parquet</code></td></tr><tr><td>Source</td><td><code>shopnow_raw_db.customers</code></td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/customers/</code></td></tr><tr><td>Format</td><td>Parquet + Snappy</td></tr><tr><td>Partitions</td><td><code>registration_year</code></td></tr><tr><td>Workers</td><td>5</td></tr><tr><td>Schedule</td><td>Daily at 03:00 UTC</td></tr><tr><td>Special handling</td><td>JSON source — Glue handles JSON natively, same Visual Editor</td></tr></tbody></table>
+<p><strong>Job 4: Clickstream CSV to Parquet</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-clickstream-csv-to-parquet</code></td></tr><tr><td>Source</td><td><code>shopnow_raw_db.clickstream</code></td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/clickstream/</code></td></tr><tr><td>Format</td><td>Parquet + Snappy</td></tr><tr><td>Partitions</td><td><code>year</code>, <code>month</code>, <code>day</code></td></tr><tr><td>Workers</td><td>15 (largest dataset — 25 GB)</td></tr><tr><td>Worker type</td><td>G.2X (more memory for large shuffles)</td></tr><tr><td>Schedule</td><td>Daily at 03:30 UTC</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always convert CSV/JSON to Parquet for analytical workloads — the cost savings alone justify the ETL<br>
+→ Always partition by the most commonly filtered column (usually date)<br>
+→ Always use Snappy compression with Parquet — it's the standard for AWS analytics<br>
+→ Always separate raw and transformed data in different S3 prefixes — never overwrite source</p>
+<table><thead><tr><th>Zone</th><th>Path</th><th>Purpose</th></tr></thead><tbody><tr><td>Raw</td><td><code>s3://bucket/raw/</code></td><td>Immutable landing zone — source of truth</td></tr><tr><td>Transformed</td><td><code>s3://bucket/transformed/</code></td><td>Cleaned, optimized, partitioned</td></tr><tr><td>Curated</td><td><code>s3://bucket/curated/</code></td><td>Business-ready, aggregated (future projects)</td></tr></tbody></table>
+<p>→ Always enable Job Bookmarks for incremental processing<br>
+→ Always set job timeout to prevent runaway costs<br>
+→ Always enable CloudWatch metrics and continuous logging for observability<br>
+→ Always right-size workers — start small, monitor metrics, scale up if needed<br>
+→ Always verify output file sizes — target 64-256 MB per file for Athena<br>
+→ Always use Flex execution class for non-time-sensitive batch jobs (35% savings)<br>
+→ Always use a separate Glue Catalog database for transformed data — don't mix with raw catalog<br>
+→ Always test with a small subset first — run job on 1 day's data before processing entire history</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never query raw CSV directly in Athena for production workloads — it's slow and expensive<br>
+→ Never write transformed output to the SAME S3 path as raw input — you lose the ability to reprocess<br>
+→ Never skip partitioning — unpartitioned Parquet is better than CSV but still wastes scan costs<br>
+→ Never over-partition — partitioning by <code>order_id</code> creates millions of tiny files (worse performance)<br>
+→ Never under-provision workers for large datasets — job runs for hours, costs more in DPU-hours than adding workers<br>
+→ Never over-provision workers for small datasets — 50 workers for 1 GB of data wastes cold start time and money<br>
+→ Never ignore the Spark UI when jobs are slow — it reveals data skew, shuffle bottlenecks, and serialization issues<br>
+→ Never leave job timeout as default (2880 minutes = 48 hours) — a stuck job runs for 2 days before failing<br>
+→ Never use Standard execution class for nightly batch jobs — Flex is 35% cheaper with acceptable cold start<br>
+→ Never create a Parquet file per input record — use coalesce/repartition to control output file count<br>
+→ Never forget to update the Glue Catalog after the job — Athena can't query data it doesn't know about<br>
+→ Never use G.4X or G.8X workers unless you've proven smaller workers are insufficient — they're 4-8x more expensive</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE GLUE ETL JOBS</h2>
+<table><thead><tr><th>Scenario</th><th>Use Glue ETL?</th><th>Why</th></tr></thead><tbody><tr><td>Convert CSV/JSON to Parquet in S3</td><td>✅ Yes</td><td>Primary use case — this project</td></tr><tr><td>Clean and standardize data in S3</td><td>✅ Yes</td><td>Schema transformation, type casting, filtering</td></tr><tr><td>Extract from JDBC databases to S3</td><td>✅ Yes</td><td>Project 24 — MariaDB to S3</td></tr><tr><td>Large-scale data transformation (GBs-TBs)</td><td>✅ Yes</td><td>Distributed Spark handles large data</td></tr><tr><td>Scheduled batch ETL</td><td>✅ Yes</td><td>Built-in scheduling or EventBridge</td></tr><tr><td>One-time data migration</td><td>✅ Yes</td><td>Run once, verify, done</td></tr><tr><td>Simple file copy between S3 locations</td><td>❌ No</td><td>Use S3 batch operations or AWS CLI — Glue is overkill</td></tr><tr><td>Real-time transformation (&lt; 1 second latency)</td><td>❌ No</td><td>Use Lambda (Project 26) or Kinesis (Project 52)</td></tr><tr><td>Sub-second transformations on small data (&lt; 100 MB)</td><td>❌ No</td><td>Use Lambda — Glue has 30+ second cold start</td></tr><tr><td>SQL-only transformations</td><td>❌ Consider</td><td>Athena CTAS can do simple transformations without Glue (Project 25)</td></tr><tr><td>Complex ML feature engineering</td><td>❌ Consider</td><td>EMR or SageMaker may be more appropriate</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE GLUE ETL JOBS</h2>
+<p>→ When data is tiny (&lt; 100 MB) → Lambda or Athena CTAS is simpler and cheaper<br>
+→ When transformation is just a SQL query → Athena CTAS (CREATE TABLE AS SELECT) can convert to Parquet directly<br>
+→ When you need sub-second response → Glue has cold start overhead (30 sec - 5 min)<br>
+→ When you need custom libraries not available in Glue's Spark environment → Use EMR (full Spark control)<br>
+→ When processing is purely real-time event-by-event → Use Lambda or Kinesis<br>
+→ When budget is extremely tight and data is small → Use EC2 with a Python script (no per-DPU-hour charge)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → GLUE JOB EXECUTION LIFECYCLE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User triggers job (console / API / schedule / workflow)
+</span>       ↓
+Glue Job Orchestrator receives request
+       ↓
+Orchestrator checks: concurrent run limit, job bookmark state
+       ↓
+Orchestrator provisions Spark cluster:
+  ├── 1 Driver node (coordinates work)
+  └── N Worker nodes (execute tasks)
+       ↓
+Driver reads job script from S3
+       ↓
+Driver creates Spark execution plan (DAG — Directed Acyclic Graph)
+       ↓
+DAG is divided into Stages → Stages into Tasks
+       ↓
+Tasks are distributed to Workers
+       ↓
+Workers execute tasks in parallel:
+  ├── Read data from S3 (InputFormat → DynamicFrame)
+  ├── Apply transformations (map, filter, join, aggregate)
+  └── Write results to S3 (OutputFormat → Parquet files)
+       ↓
+Driver collects task results and status
+       ↓
+If all tasks succeed → Job status = SUCCEEDED
+If any task fails after retries → Job status = FAILED
+       ↓
+Spark cluster is TERMINATED
+       ↓
+Job bookmark is updated (if enabled) — records what was processed
+       ↓
+CloudWatch metrics and logs are finalized</code></pre></div>
+<hr>
+<h3>2 → DYNAMICFRAME vs SPARK DATAFRAME</h3>
+<p>→ Glue introduces DynamicFrame — an enhanced version of Spark's DataFrame</p>
+<table><thead><tr><th>Feature</th><th>Spark DataFrame</th><th>Glue DynamicFrame</th></tr></thead><tbody><tr><td>Schema enforcement</td><td>Strict — fails on schema mismatch</td><td>Flexible — handles mixed types via ChoiceType</td></tr><tr><td>Null handling</td><td>Standard Spark nulls</td><td>Enhanced — tracks null reasons</td></tr><tr><td>Schema evolution</td><td>Manual handling</td><td>Built-in with ResolveChoice</td></tr><tr><td>Integration with Glue Catalog</td><td>Manual</td><td>Native</td></tr><tr><td>Conversion</td><td>N/A</td><td>Can convert to/from DataFrame anytime</td></tr></tbody></table>
+<p>→ You can convert between them freely:</p>
+<ul>
+<li>DynamicFrame → DataFrame: When you need Spark SQL features (window functions, complex aggregations)</li>
+<li>DataFrame → DynamicFrame: When you need Glue features (write to Catalog, Job Bookmarks)</li>
+</ul>
+<p>→ Visual Editor uses DynamicFrame by default<br>
+→ Script mode can use either</p>
+<hr>
+<h3>3 → HOW PARQUET WRITES HAPPEN INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Worker has transformed records in memory
+</span>       ↓
+Records are organized into Row Groups (default ~128 MB each)
+       ↓
+Within each Row Group, data is organized by COLUMN:
+  ├── Column 1 (order_id): all values for this row group
+  ├── Column 2 (customer_name): all values for this row group
+  ├── Column 3 (total_amount): all values for this row group
+  └── ... (25 columns)
+       ↓
+Each column chunk is compressed with Snappy
+       ↓
+Column statistics are computed:
+  ├── Min value, Max value
+  ├── Null count
+  └── Distinct count (approximate)
+       ↓
+File footer is written:
+  ├── Schema (column names, types)
+  ├── Row group metadata
+  ├── Column chunk offsets
+  └── Column statistics
+       ↓
+File is written to S3 as: part-XXXXX-YYYYY.snappy.parquet</code></pre></div>
+<p><strong>Why column statistics matter:</strong><br>
+→ When Athena reads Parquet:</p>
+<ul>
+<li>It reads the file footer FIRST (tiny — a few KB)</li>
+<li>It checks column statistics: "Does this row group contain any order_date in January 2025?"</li>
+<li>If min/max of order_date in a row group is [2024-06-01, 2024-06-30] → SKIP entire row group</li>
+<li>This is called "predicate pushdown" or "row group pruning"</li>
+<li>Works IN ADDITION to partition pruning → double optimization</li>
+</ul>
+<hr>
+<h3>4 → HOW PARTITIONED WRITES HAPPEN</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Worker has record: {order_id: "ORD-5678", order_date: "2025-01-15", ...}
+</span>       ↓
+Worker extracts partition values:
+  year = 2025, month = 01, day = 15
+       ↓
+Worker determines target S3 path:
+  s3://shopnow-data-lake/transformed/orders/year=2025/month=01/day=15/
+       ↓
+Worker writes the record to a Parquet file in that path
+  NOTE: partition columns (year, month, day) are NOT in the Parquet file
+        They exist only in the S3 path — Athena reconstructs them from the path
+       ↓
+Each unique partition value combination gets its own S3 "directory"
+       ↓
+After all records are written:
+  Glue updates the Catalog with partition metadata
+  Each partition is registered: {year=2025, month=01, day=15} → S3 location</code></pre></div>
+<p><strong>Partition registration in Catalog:</strong><br>
+→ The Glue Catalog stores a mapping:</p>
+<table><thead><tr><th>Partition Values</th><th>S3 Location</th></tr></thead><tbody><tr><td>year=2024, month=01, day=01</td><td>s3://…/orders/year=2024/month=01/day=01/</td></tr><tr><td>year=2024, month=01, day=02</td><td>s3://…/orders/year=2024/month=01/day=02/</td></tr><tr><td>year=2025, month=01, day=15</td><td>s3://…/orders/year=2025/month=01/day=15/</td></tr></tbody></table>
+<p>→ When Athena queries with <code>WHERE year = 2025 AND month = 1</code>:</p>
+<ul>
+<li>Athena checks the Catalog for matching partitions</li>
+<li>Only partitions matching the filter are returned</li>
+<li>Athena reads files ONLY from those S3 paths</li>
+<li>All other partitions are completely skipped</li>
+</ul>
+<hr>
+<h3>5 → HOW GLUE READS CSV INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Worker receives task: "Read files from s3://shopnow-data-lake/raw/orders/"
+</span>       ↓
+Worker lists all files in the S3 prefix
+       ↓
+Files are distributed across workers (each worker gets a subset)
+       ↓
+Each worker reads its assigned files:
+  ├── Downloads file content from S3
+  ├── Splits by newline (row delimiter)
+  ├── Splits each line by comma (column delimiter)
+  ├── Applies header row (first line) as column names
+  ├── Infers types OR uses Catalog schema
+  └── Creates DynamicFrame rows
+       ↓
+All workers have their portions of data in memory
+  → Ready for transformations</code></pre></div>
+<p><strong>CSV-specific challenges Glue handles:</strong><br>
+→ Quoted fields (commas inside quotes): Handled by CSV parser<br>
+→ Multi-line values (newlines inside quotes): Handled with <code>multiline</code> option<br>
+→ Different encodings (UTF-8, Latin-1): Configurable via job parameters<br>
+→ Files with different schemas (extra columns, missing columns): DynamicFrame handles gracefully</p>
+<hr>
+<h3>6 → COST CALCULATION DEEP DIVE</h3>
+<p><strong>Glue ETL Pricing:</strong></p>
+<table><thead><tr><th>Component</th><th>Price (us-east-1)</th></tr></thead><tbody><tr><td>Standard execution</td><td>$0.44 per DPU-hour</td></tr><tr><td>Flex execution</td><td>$0.29 per DPU-hour</td></tr><tr><td>Billing granularity</td><td>Per second, 1-minute minimum</td></tr></tbody></table>
+<p><strong>ShopNow Orders Job Cost Estimate:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td>Worker type</td><td>G.1X (1 DPU per worker)</td></tr><tr><td>Number of workers</td><td>10</td></tr><tr><td>Execution class</td><td>Flex</td></tr><tr><td>Estimated run time</td><td>12 minutes (0.2 hours)</td></tr><tr><td>Cost</td><td>10 DPUs × 0.2 hours × $0.29 = <strong>$0.58 per run</strong></td></tr><tr><td>Daily schedule</td><td>$0.58/day × 30 = <strong>$17.40/month</strong></td></tr></tbody></table>
+<p><strong>Cost vs Savings:</strong></p>
+<table><thead><tr><th>Item</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Glue ETL job (all 4 datasets)</td><td>~$50</td></tr><tr><td>Athena savings (from Parquet + partitioning)</td><td>~$105 saved ($120 → $15)</td></tr><tr><td><strong>Net savings</strong></td><td><strong>~$55/month</strong> (and growing as data grows)</td></tr></tbody></table>
+<p>→ The ETL job PAYS FOR ITSELF in Athena cost savings alone<br>
+→ Plus: faster queries, better data quality, cleaner schema</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>Job fails with "Access Denied"</td><td>FAILED status, S3 permission error in logs</td><td>IAM Role missing S3 read/write permissions</td><td>Add S3 permissions to Glue role (Step 3)</td></tr><tr><td>2</td><td>Job succeeds but output is empty</td><td>0 files in target S3 path</td><td>Source path wrong, or all records filtered out, or source files are empty</td><td>Verify source path and check filter conditions</td></tr><tr><td>3</td><td>Thousands of tiny files in output</td><td>Each partition has 50+ files under 1 MB</td><td>Spark creates one output file per task — too many tasks for small data</td><td>Use coalesce or groupFiles to reduce output file count</td></tr><tr><td>4</td><td>One giant file per partition</td><td>Each partition has one 2 GB file</td><td>Too few Spark partitions — data not parallelized enough</td><td>Use repartition to increase output file count</td></tr><tr><td>5</td><td>Job runs for 3 hours on 5 GB data</td><td>Extremely slow execution</td><td>Data skew — one partition has 90% of the data</td><td>Check Spark UI for skew → repartition data before writing</td></tr><tr><td>6</td><td>OutOfMemoryError on workers</td><td>Job fails with OOM in logs</td><td>Worker type too small for data size</td><td>Upgrade to G.2X or G.4X workers</td></tr><tr><td>7</td><td>Schema mismatch between runs</td><td>New columns in source not in target</td><td>Source CSV got new columns — Glue used old Catalog schema</td><td>Re-run Crawler on source → update job mapping</td></tr><tr><td>8</td><td>Duplicate data in output</td><td>Same records appear multiple times</td><td>Job ran twice without bookmarks → processed same data twice</td><td>Enable Job Bookmarks (Step 8)</td></tr><tr><td>9</td><td>Partition columns have null values</td><td><code>year=__HIVE_DEFAULT_PARTITION__/</code> in S3</td><td>Some records have null dates → partition key is null</td><td>Filter out null dates BEFORE partitioned write</td></tr><tr><td>10</td><td>Job costs $50 for a small transformation</td><td>Bill higher than expected</td><td>Over-provisioned workers (50 workers for 1 GB data) OR Standard execution class</td><td>Right-size workers, use Flex execution</td></tr><tr><td>11</td><td>Athena can't see new partitions</td><td>Query returns no results for new dates</td><td>Catalog not updated with new partition metadata</td><td>Run MSCK REPAIR TABLE in Athena OR re-crawl OR enable automatic partition detection</td></tr><tr><td>12</td><td>Parquet files not compressed</td><td>Files are larger than expected</td><td>Compression not configured in target</td><td>Explicitly set compression to Snappy in target configuration</td></tr><tr><td>13</td><td>Type casting fails silently</td><td><code>total_amount</code> column has all nulls</td><td>CSV values like "$1,234.56" can't be cast to double (dollar sign, comma)</td><td>Clean string values before type casting (remove $, commas)</td></tr><tr><td>14</td><td>Job bookmark not advancing</td><td>Job reprocesses all data every run</td><td>Bookmark misconfigured or source data modified in-place</td><td>Ensure source files are append-only — don't modify existing files</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scaling</strong></p>
+<table><thead><tr><th>Data Size</th><th>Worker Type</th><th>Workers</th><th>Estimated Duration</th><th>Cost per Run</th></tr></thead><tbody><tr><td>&lt; 1 GB</td><td>G.025X</td><td>2</td><td>2-3 min</td><td>$0.02</td></tr><tr><td>1-10 GB</td><td>G.1X</td><td>5-10</td><td>5-15 min</td><td>$0.25-$0.75</td></tr><tr><td>10-100 GB</td><td>G.1X</td><td>10-20</td><td>15-45 min</td><td>$0.75-$4.50</td></tr><tr><td>100 GB - 1 TB</td><td>G.2X</td><td>20-50</td><td>30-90 min</td><td>$5-$30</td></tr><tr><td>1-10 TB</td><td>G.2X / G.4X</td><td>50-100</td><td>1-4 hours</td><td>$30-$200</td></tr><tr><td>&gt; 10 TB</td><td>G.4X / G.8X</td><td>100+</td><td>4+ hours</td><td>$200+ (consider EMR)</td></tr></tbody></table>
+<p>→ <strong>Auto Scaling (Glue 3.0+)</strong></p>
+<ul>
+<li>Glue can auto-scale workers based on workload</li>
+<li>Configure: "Maximum number of workers" instead of fixed number</li>
+<li>Glue starts with fewer workers → scales up if data is large → scales down when stages complete</li>
+<li>Saves money on variable-size workloads</li>
+</ul>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Behavior</th></tr></thead><tbody><tr><td>Number of workers</td><td>10 (fixed)</td><td>Always uses 10 workers</td></tr><tr><td>Max workers (auto-scaling)</td><td>20</td><td>Starts small, scales up to 20 as needed</td></tr></tbody></table>
+<p>→ <strong>Multi-Job Scaling</strong></p>
+<table><thead><tr><th>Approach</th><th>When</th></tr></thead><tbody><tr><td>One job per dataset</td><td>Simple, independent scheduling, isolated failures</td></tr><tr><td>One job processing multiple datasets</td><td>Fewer jobs to manage, but one failure blocks all</td></tr><tr><td>Parameterized job with different inputs</td><td>DRY principle — one job script, multiple configurations</td></tr></tbody></table>
+<p>→ ShopNow approach: One job per dataset (4 jobs) — isolates failures<br>
+→ At scale (50+ datasets): Parameterized jobs with config-driven execution</p>
+<p>→ <strong>Concurrent Execution Limits</strong></p>
+<table><thead><tr><th>Limit</th><th>Default</th><th>Requestable</th></tr></thead><tbody><tr><td>Max concurrent job runs per account</td><td>200</td><td>Yes — up to 1000+</td></tr><tr><td>Max concurrent DPUs per account</td><td>600</td><td>Yes</td></tr><tr><td>Max DPUs per job</td><td>100</td><td>Yes</td></tr></tbody></table>
+<p>→ <strong>Cost Optimization at Scale</strong></p>
+<table><thead><tr><th>Strategy</th><th>Savings</th></tr></thead><tbody><tr><td>Flex execution class</td><td>35%</td></tr><tr><td>Auto-scaling workers</td><td>20-40% (avoids over-provisioning)</td></tr><tr><td>Job bookmarks (incremental)</td><td>80%+ (process only new data, not full history)</td></tr><tr><td>Right-sized workers</td><td>30-50% (don't use G.4X when G.1X suffices)</td></tr><tr><td>Optimize output file size</td><td>Reduces Athena costs downstream</td></tr><tr><td>Partition wisely</td><td>Reduces Athena scan costs by 90%+</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify job correctness:</strong></p>
+<table><thead><tr><th>Verification</th><th>How to Check</th><th>Expected</th></tr></thead><tbody><tr><td>Job succeeded?</td><td>Glue Console → Job Runs → Status</td><td>SUCCEEDED</td></tr><tr><td>Correct record count?</td><td>CloudWatch metric <code>recordsRead</code> vs <code>recordsWritten</code></td><td>Written ≤ Read (filtering/dedup reduces count)</td></tr><tr><td>Correct file format?</td><td>S3 → Check file extension</td><td><code>.snappy.parquet</code></td></tr><tr><td>Correct partitioning?</td><td>S3 → Check folder structure</td><td><code>year=XXXX/month=XX/day=XX/</code></td></tr><tr><td>Correct file size?</td><td>S3 → Check individual file sizes</td><td>64-256 MB each</td></tr><tr><td>Correct total size?</td><td>S3 → Bucket metrics</td><td>~20-30% of raw CSV size</td></tr><tr><td>Correct schema?</td><td>Glue Catalog → Table → Schema</td><td>snake_case names, correct types</td></tr><tr><td>Data quality?</td><td>Query in Athena → check for nulls, duplicates</td><td>No unexpected nulls, no duplicates</td></tr><tr><td>Cost reasonable?</td><td>CloudWatch → Glue metrics → DPU-hours</td><td>Within expected range</td></tr><tr><td>Bookmark working?</td><td>Run job again → check if it processes only NEW data</td><td>Second run processes 0 records (if no new data)</td></tr></tbody></table>
+<p>→ <strong>Operational Monitoring Pattern:</strong></p>
+<table><thead><tr><th>Alert</th><th>Metric</th><th>Threshold</th><th>Action</th></tr></thead><tbody><tr><td>Job failed</td><td>Job run status</td><td>FAILED</td><td>SNS notification (Project 6)</td></tr><tr><td>Job running too long</td><td><code>elapsedTime</code></td><td>&gt; 2x normal duration</td><td>Investigate — data growth? skew?</td></tr><tr><td>Job output too small</td><td><code>recordsWritten</code></td><td>&lt; 50% of expected</td><td>Data quality issue — check source</td></tr><tr><td>Job cost spike</td><td>DPU-hours</td><td>&gt; 2x normal</td><td>Check worker count, data volume</td></tr><tr><td>Memory pressure</td><td><code>jvm.heap.usage</code></td><td>&gt; 90%</td><td>Upgrade worker type</td></tr></tbody></table>
+<p>→ Connect these alerts to SNS (Project 6) via CloudWatch Alarms (Project 8)</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Glue ETL Jobs are the TRANSFORMATION engine of the AWS data lake<br>
+→ The pattern Raw CSV → Glue ETL → Parquet is the single most impactful optimization for Athena cost and performance<br>
+→ The three pillars of optimization: <strong>Columnar format (Parquet)</strong> + <strong>Compression (Snappy)</strong> + <strong>Partitioning (year/month/day)</strong><br>
+→ Together, these three can reduce Athena scan costs by 95%+ and query time by 90%+</p>
+<p>→ The data lake now has a proper structure:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Data Lake
+</span>  ├── raw/          ← Landing zone (CSV, JSON — untouched)
+  │     ├── orders/
+  │     ├── products/
+  │     ├── customers/
+  │     └── clickstream/
+  │
+  ├── transformed/  ← Clean zone (Parquet, partitioned — this project)
+  │     ├── orders/year=.../month=.../day=.../
+  │     ├── products/category=.../
+  │     ├── customers/registration_year=.../
+  │     └── clickstream/year=.../month=.../day=.../
+  │
+  └── curated/      ← Business zone (aggregated, joined — future projects)</code></pre></div>
+<p>→ This project connects to everything that follows:</p>
+<table><thead><tr><th>Future Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 22 (Redshift COPY from S3)</td><td>Parquet files from this project are what Redshift loads</td></tr><tr><td>Project 24 (MariaDB to S3 via Glue)</td><td>Same Glue Job pattern but with JDBC source instead of S3</td></tr><tr><td>Project 25 (End-to-End Pipeline)</td><td>Glue ETL is the middle step: Crawler → <strong>ETL Job</strong> → Crawler → Athena</td></tr><tr><td>Project 28 (Redshift Spectrum)</td><td>Spectrum queries the Parquet files created by this job</td></tr><tr><td>Project 31 (Glue Workflow)</td><td>Multiple ETL jobs orchestrated in a workflow</td></tr><tr><td>Project 46 (Job Bookmarks)</td><td>Deep dive into incremental processing introduced here</td></tr><tr><td>Project 49 (Complex Pipeline)</td><td>ETL Job becomes one step in a multi-service orchestration</td></tr></tbody></table></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-20.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 21/60</span></div><a class="nav-btn next" href="project-22.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 15: THE DATA TEAM THAT WANTED REAL-TIME UPLOAD ALERTS — S3 Event Notific — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 15: THE DATA TEAM THAT WANTED REAL-TIME UPLOAD ALERTS — S3 Event Notifications to SNS</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-14) now has:</p>
+<ul>
+<li>S3 bucket with versioning, lifecycle, and bucket policies (Projects 1, 10, 12)</li>
+<li>SNS → SQS fan-out for order processing (Project 13)</li>
+<li>EC2 to RDS connectivity with pooling and SSL (Project 14)</li>
+<li>IAM Roles for all services (Project 11)</li>
+</ul>
+<p>→ The marketing team uploads 50-200 new product images to S3 daily<br>
+→ The catalog team must:</p>
+<ol>
+<li>Resize images to standard dimensions (800×800 for web, 200×200 for thumbnail)</li>
+<li>Update the product catalog database with image URLs</li>
+<li>Notify the quality assurance team to review new images</li>
+<li>Update the CDN cache with new image paths</li>
+</ol>
+<p>→ Problem 1: The catalog team manually checks S3 every few hours<br>
+→ They open the S3 Console → browse to <code>products/images/</code> → look for new files<br>
+→ Sometimes they miss uploads for 2-3 days → new products show "No Image Available" on the website<br>
+→ Customers see products without images → conversion rate drops 15%</p>
+<p>→ Problem 2: The data engineering team uploads daily CSV data feeds to <code>data/raw/</code> in S3<br>
+→ These CSVs need to be processed by a Glue ETL job (future — Project 21)<br>
+→ Currently — the ETL job runs on a fixed schedule (every 6 hours)<br>
+→ If data arrives at 9:01 AM → next processing at 12:00 PM → 3 hours of stale data<br>
+→ The business team says: "We need data processed WITHIN MINUTES of upload — not hours"</p>
+<p>→ Problem 3: The compliance team needs to know IMMEDIATELY when files are deleted from the <code>invoices/</code> prefix<br>
+→ Accidental invoice deletion is a regulatory violation<br>
+→ Currently — nobody knows when files are deleted until the monthly audit<br>
+→ By then → it's too late to investigate → compliance penalty</p>
+<p>→ Problem 4: The security team wants to be alerted when ANY file is uploaded to the <code>restricted/</code> prefix<br>
+→ This prefix should only receive files from the batch reporting system<br>
+→ Unauthorized uploads could indicate a security breach<br>
+→ Currently → no real-time detection of unauthorized uploads</p>
+<p>→ Problem 5: <code>priya-dev</code> tried to configure S3 Event Notifications<br>
+→ She set up the notification → but S3 returned "Unable to validate the following destination configurations"<br>
+→ She didn't understand that S3 needs PERMISSION to publish to SNS/SQS<br>
+→ The topic/queue access policies were missing the S3 service principal</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>When images are uploaded → AUTOMATICALLY trigger processing pipeline</li>
+<li>When data files arrive → IMMEDIATELY start ETL processing</li>
+<li>When invoices are deleted → INSTANTLY alert compliance team</li>
+<li>When restricted files appear → IMMEDIATELY alert security team</li>
+<li>ALL of this must work WITHOUT polling, WITHOUT cron jobs, WITHOUT manual checks</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is an EVENT-DRIVEN ARCHITECTURE problem<br>
+→ S3 can AUTOMATICALLY generate events when objects are created, deleted, or modified<br>
+→ These events can be sent to: SNS topics, SQS queues, Lambda functions, or EventBridge</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 BUCKET
+</span>    │
+    │ Object created/deleted/restored
+    │
+    ▼
+S3 EVENT NOTIFICATION ENGINE
+    │
+    │ Matches event against configured rules
+    │ (prefix filter + suffix filter + event type)
+    │
+    ├──► SNS Topic → Fan-out to multiple subscribers (Project 13 pattern)
+    │
+    ├──► SQS Queue → Direct to a single consumer
+    │
+    ├──► Lambda Function → Serverless processing (Project 26)
+    │
+    └──► EventBridge → Complex event routing (Project 38)</code></pre></div>
+<p>→ S3 events are the TRIGGER that starts automated workflows<br>
+→ Combined with SNS fan-out (Project 13) → one upload can trigger MULTIPLE independent actions<br>
+→ This eliminates polling, cron jobs, and manual checking</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand S3 event types</li>
+<li>Step 2 — Configure destination permissions (SNS topic policy, SQS queue policy)</li>
+<li>Step 3 — Create event notification configurations with prefix/suffix filters</li>
+<li>Step 4 — Configure multiple notification rules for different prefixes</li>
+<li>Step 5 — Understand the event message format</li>
+<li>Step 6 — Build the complete event-driven pipeline</li>
+<li>Step 7 — Test and verify end-to-end event flow</li>
+<li>Step 8 — Handle edge cases and failure scenarios</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND S3 EVENT TYPES</h3>
+<p>→ S3 generates events for specific object lifecycle actions<br>
+→ You choose WHICH event types trigger notifications</p>
+<p><strong>Event Type Categories:</strong></p>
+<hr>
+<p><strong>Object Created Events:</strong></p>
+<table><thead><tr><th>Event Type</th><th>Triggered When</th></tr></thead><tbody><tr><td><code>s3:ObjectCreated:*</code></td><td>ANY creation method (wildcard — covers all below)</td></tr><tr><td><code>s3:ObjectCreated:Put</code></td><td>Object uploaded via PUT API (single upload)</td></tr><tr><td><code>s3:ObjectCreated:Post</code></td><td>Object uploaded via POST API (form-based upload)</td></tr><tr><td><code>s3:ObjectCreated:Copy</code></td><td>Object created via COPY API (copying from another object)</td></tr><tr><td><code>s3:ObjectCreated:CompleteMultipartUpload</code></td><td>Multipart upload completed</td></tr></tbody></table>
+<p>→ For most use cases → use <code>s3:ObjectCreated:*</code> to catch ALL creation methods<br>
+→ Specific types are useful when you need to distinguish HOW the object was created</p>
+<hr>
+<p><strong>Object Removed Events:</strong></p>
+<table><thead><tr><th>Event Type</th><th>Triggered When</th></tr></thead><tbody><tr><td><code>s3:ObjectRemoved:*</code></td><td>ANY deletion method (wildcard)</td></tr><tr><td><code>s3:ObjectRemoved:Delete</code></td><td>Object permanently deleted (version-specific delete)</td></tr><tr><td><code>s3:ObjectRemoved:DeleteMarkerCreated</code></td><td>Delete marker created (versioned bucket — simple delete)</td></tr></tbody></table>
+<p>→ With versioning (Project 12):</p>
+<ul>
+<li>Simple DELETE → creates delete marker → triggers <code>DeleteMarkerCreated</code></li>
+<li>Version-specific DELETE → permanently removes version → triggers <code>Delete</code><br>
+→ Without versioning:</li>
+<li>DELETE → permanently removes object → triggers <code>Delete</code></li>
+</ul>
+<hr>
+<p><strong>Object Restore Events (Glacier):</strong></p>
+<table><thead><tr><th>Event Type</th><th>Triggered When</th></tr></thead><tbody><tr><td><code>s3:ObjectRestore:Post</code></td><td>Restore request initiated for a Glacier object</td></tr><tr><td><code>s3:ObjectRestore:Completed</code></td><td>Restore completed — object is now accessible</td></tr><tr><td><code>s3:ObjectRestore:Delete</code></td><td>Temporary restored copy expired and was deleted</td></tr></tbody></table>
+<p>→ Useful for workflows that need to process data after it's restored from Glacier (Project 12)</p>
+<hr>
+<p><strong>Replication Events (Project 30):</strong></p>
+<table><thead><tr><th>Event Type</th><th>Triggered When</th></tr></thead><tbody><tr><td><code>s3:Replication:OperationFailedReplication</code></td><td>Cross-region replication failed</td></tr><tr><td><code>s3:Replication:OperationMissedThreshold</code></td><td>Replication exceeded SLA threshold</td></tr><tr><td><code>s3:Replication:OperationReplicatedAfterThreshold</code></td><td>Replication completed but was late</td></tr><tr><td><code>s3:Replication:OperationNotTracked</code></td><td>Object not tracked for replication metrics</td></tr></tbody></table>
+<hr>
+<p><strong>Other Events:</strong></p>
+<table><thead><tr><th>Event Type</th><th>Triggered When</th></tr></thead><tbody><tr><td><code>s3:LifecycleTransition</code></td><td>Lifecycle rule transitioned object to different storage class (Project 12)</td></tr><tr><td><code>s3:LifecycleExpiration:*</code></td><td>Lifecycle rule expired/deleted an object</td></tr><tr><td><code>s3:LifecycleExpiration:Delete</code></td><td>Current version expired</td></tr><tr><td><code>s3:LifecycleExpiration:DeleteMarkerCreated</code></td><td>Delete marker created by lifecycle</td></tr><tr><td><code>s3:IntelligentTiering</code></td><td>Intelligent-Tiering moved object between tiers</td></tr><tr><td><code>s3:ObjectTagging:*</code></td><td>Tags added or deleted from an object</td></tr><tr><td><code>s3:ObjectAcl:Put</code></td><td>ACL modified on an object</td></tr></tbody></table>
+<p><strong>ShopNow Event Mapping:</strong></p>
+<table><thead><tr><th>Use Case</th><th>Event Type</th><th>Prefix/Suffix Filter</th></tr></thead><tbody><tr><td>New product image uploaded</td><td><code>s3:ObjectCreated:*</code></td><td>Prefix: <code>products/images/</code>, Suffix: <code>.jpg</code></td></tr><tr><td>New data file for ETL</td><td><code>s3:ObjectCreated:*</code></td><td>Prefix: <code>data/raw/</code>, Suffix: <code>.csv</code></td></tr><tr><td>Invoice deleted</td><td><code>s3:ObjectRemoved:*</code></td><td>Prefix: <code>invoices/</code></td></tr><tr><td>Unauthorized upload to restricted</td><td><code>s3:ObjectCreated:*</code></td><td>Prefix: <code>restricted/</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 2 — CONFIGURE DESTINATION PERMISSIONS</h3>
+<p>→ This is the step that MOST people miss → causes "Unable to validate destination" error<br>
+→ S3 needs EXPLICIT permission to publish to SNS topics and SQS queues<br>
+→ The permission is granted via the DESTINATION's resource policy (not IAM — not S3's policy)</p>
+<hr>
+<p><strong>DESTINATION 1: SNS Topic for Image Processing</strong></p>
+<p>→ Create a NEW SNS topic specifically for S3 image events</p>
+<p>→ SNS Console → "Create topic"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td></tr><tr><td>Name</td><td><code>shopnow-s3-image-events</code></td></tr><tr><td>Encryption</td><td>Enable (aws/sns)</td></tr></tbody></table>
+<p>→ Now configure the TOPIC ACCESS POLICY to allow S3 to publish:</p>
+<p>→ SNS Console → Select <code>shopnow-s3-image-events</code> → "Edit" → Access policy</p>
+<p><strong>Topic Policy Statement:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowS3ToPublishImageEvents
+  Effect: Allow
+  Principal:
+    Service: s3.amazonaws.com
+  Action: sns:Publish
+  Resource: arn:aws:sns:ap-south-1:123456789012:shopnow-s3-image-events
+  Condition:
+    ArnLike:
+      aws:SourceArn: arn:aws:s3:::shopnow-productimages-prod-aps1
+    StringEquals:
+      aws:SourceAccount: "123456789012"</code></pre></div>
+<p><strong>Why Each Condition Matters:</strong></p>
+<table><thead><tr><th>Condition</th><th>Purpose</th><th>Without It</th></tr></thead><tbody><tr><td><code>ArnLike: aws:SourceArn</code></td><td>Only THIS specific bucket can publish</td><td>ANY bucket could publish to your topic</td></tr><tr><td><code>StringEquals: aws:SourceAccount</code></td><td>Only YOUR account's S3 can publish</td><td>Another account's S3 bucket with the same name could publish (confused deputy)</td></tr></tbody></table>
+<p>→ Both conditions together = defense in depth<br>
+→ This was introduced in Project 6 (Step 6) — same pattern, now applied for S3 specifically</p>
+<hr>
+<p><strong>DESTINATION 2: SNS Topic for Data ETL Events</strong></p>
+<p>→ SNS Console → Create topic: <code>shopnow-s3-data-events</code><br>
+→ Same access policy pattern — change only the topic ARN in the Resource field</p>
+<hr>
+<p><strong>DESTINATION 3: SNS Topic for Compliance Alerts (Invoice Deletions)</strong></p>
+<p>→ SNS Console → Create topic: <code>shopnow-s3-compliance-alerts</code><br>
+→ Same access policy pattern</p>
+<hr>
+<p><strong>DESTINATION 4: SQS Queue for Security Alerts (Direct — No SNS)</strong></p>
+<p>→ For the restricted prefix → send directly to SQS (no fan-out needed — single consumer)</p>
+<p>→ SQS Console → Create queue: <code>shopnow-s3-security-alerts</code> (Standard)</p>
+<p><strong>Queue Access Policy:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowS3ToSendSecurityAlerts
+  Effect: Allow
+  Principal:
+    Service: s3.amazonaws.com
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-s3-security-alerts
+  Condition:
+    ArnLike:
+      aws:SourceArn: arn:aws:s3:::shopnow-productimages-prod-aps1
+    StringEquals:
+      aws:SourceAccount: "123456789012"</code></pre></div>
+<p>→ Same pattern as SNS — S3 service principal + SourceArn + SourceAccount conditions<br>
+→ This was previewed in Project 7 (Step 8) — now applied for S3 specifically</p>
+<hr>
+<p><strong>CRITICAL: Configure Permissions BEFORE Creating Event Notifications</strong></p>
+<p>→ When you create an S3 event notification → S3 VALIDATES the destination<br>
+→ S3 sends a test message to the destination → if it fails → notification creation is REJECTED<br>
+→ Error: "Unable to validate the following destination configurations"<br>
+→ This means: The topic/queue policy doesn't allow S3 to publish<br>
+→ ALWAYS set up destination permissions FIRST → then create event notifications</p>
+<hr>
+<h3>STEP 3 — CREATE EVENT NOTIFICATION CONFIGURATIONS</h3>
+<p>→ S3 Console → Select bucket <code>shopnow-productimages-prod-aps1</code> → "Properties" tab<br>
+→ Scroll to "Event notifications" → "Create event notification"</p>
+<hr>
+<p><strong>NOTIFICATION 1: New Product Images → SNS Topic</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Event name</td><td><code>new-product-image-notification</code></td><td>Descriptive name</td></tr><tr><td>Prefix</td><td><code>products/images/</code></td><td>Only trigger for objects in this "folder"</td></tr><tr><td>Suffix</td><td><code>.jpg</code></td><td>Only trigger for JPEG files</td></tr><tr><td>Event types</td><td><code>s3:ObjectCreated:*</code></td><td>All creation methods (PUT, POST, COPY, multipart)</td></tr><tr><td>Destination</td><td>SNS topic</td><td>Fan-out to multiple consumers</td></tr><tr><td>SNS topic</td><td><code>arn:aws:sns:ap-south-1:123456789012:shopnow-s3-image-events</code></td><td>The topic we created with proper access policy</td></tr></tbody></table>
+<p>→ Click "Save changes"<br>
+→ S3 validates: Can it publish to this SNS topic? → YES (access policy allows) → Notification created ✓</p>
+<p><strong>What This Triggers:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Marketing uploads: products/images/new-shoe-001.jpg
+</span>    │
+    ▼
+S3 matches: Prefix "products/images/" ✓, Suffix ".jpg" ✓, Event "ObjectCreated" ✓
+    │
+    ▼
+S3 publishes event to SNS topic: shopnow-s3-image-events
+    │
+    ▼
+SNS fans out to subscribers:
+  → SQS: image-resize-queue → Image Resizing Service
+  → SQS: catalog-update-queue → Catalog Database Update Service
+  → SQS: qa-review-queue → QA Team Notification
+  → Email: catalog-team@shopnow.com → Human notification</code></pre></div>
+<p><strong>What Does NOT Trigger:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Upload: products/videos/demo.mp4 → Suffix ".mp4" ≠ ".jpg" → NO event
+</span>Upload: marketing/banner.jpg → Prefix "marketing/" ≠ "products/images/" → NO event
+Upload: products/images/spec-sheet.pdf → Suffix ".pdf" ≠ ".jpg" → NO event
+Delete: products/images/old-shoe.jpg → Event "ObjectRemoved" ≠ "ObjectCreated" → NO event</code></pre></div>
+<hr>
+<p><strong>NOTIFICATION 2: New Data Files → SNS Topic</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event name</td><td><code>new-data-file-notification</code></td></tr><tr><td>Prefix</td><td><code>data/raw/</code></td></tr><tr><td>Suffix</td><td><code>.csv</code></td></tr><tr><td>Event types</td><td><code>s3:ObjectCreated:*</code></td></tr><tr><td>Destination</td><td>SNS topic</td></tr><tr><td>SNS topic</td><td><code>arn:aws:sns:ap-south-1:123456789012:shopnow-s3-data-events</code></td></tr></tbody></table>
+<p>→ When CSV files land in <code>data/raw/</code> → SNS topic receives event → triggers ETL pipeline</p>
+<hr>
+<p><strong>NOTIFICATION 3: Invoice Deletions → SNS Topic</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event name</td><td><code>invoice-deletion-alert</code></td></tr><tr><td>Prefix</td><td><code>invoices/</code></td></tr><tr><td>Suffix</td><td>(empty — match all file types)</td></tr><tr><td>Event types</td><td><code>s3:ObjectRemoved:*</code> (both Delete and DeleteMarkerCreated)</td></tr><tr><td>Destination</td><td>SNS topic</td></tr><tr><td>SNS topic</td><td><code>arn:aws:sns:ap-south-1:123456789012:shopnow-s3-compliance-alerts</code></td></tr></tbody></table>
+<p>→ ANY deletion in <code>invoices/</code> → compliance team alerted immediately<br>
+→ No suffix filter → catches all file types (PDF, CSV, etc.)<br>
+→ Both deletion types captured → permanent deletes AND delete markers (versioned bucket — Project 12)</p>
+<hr>
+<p><strong>NOTIFICATION 4: Restricted Prefix Uploads → SQS Queue</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event name</td><td><code>restricted-upload-security-alert</code></td></tr><tr><td>Prefix</td><td><code>restricted/</code></td></tr><tr><td>Suffix</td><td>(empty)</td></tr><tr><td>Event types</td><td><code>s3:ObjectCreated:*</code></td></tr><tr><td>Destination</td><td>SQS queue</td></tr><tr><td>SQS queue</td><td><code>arn:aws:sqs:ap-south-1:123456789012:shopnow-s3-security-alerts</code></td></tr></tbody></table>
+<p>→ ANY upload to <code>restricted/</code> → directly to SQS → security team consumer processes<br>
+→ Direct SQS (no SNS) because only one consumer needs this event<br>
+→ If multiple consumers needed it → use SNS → SQS fan-out (Project 13)</p>
+<hr>
+<p><strong>Filter Rules and Limitations:</strong></p>
+<table><thead><tr><th>Rule</th><th>Detail</th></tr></thead><tbody><tr><td>Prefix filter</td><td>Matches the beginning of the object key</td></tr><tr><td>Suffix filter</td><td>Matches the end of the object key</td></tr><tr><td>Combined</td><td>Prefix AND suffix must both match (AND logic)</td></tr><tr><td>Case sensitivity</td><td>Prefix and suffix are CASE-SENSITIVE</td></tr><tr><td>Maximum notifications per bucket</td><td>No hard limit on number of notification configs</td></tr><tr><td>Overlap restriction</td><td>Cannot have overlapping prefix+suffix+event type combinations for the SAME destination type</td></tr></tbody></table>
+<p><strong>Overlap Rule — CRITICAL:</strong></p>
+<p>→ S3 does NOT allow two notification configs with the same prefix+suffix+event type if they go to the SAME destination type (both to SNS, or both to SQS)<br>
+→ BUT: You CAN have the same prefix+suffix+event type going to DIFFERENT destination types (one to SNS AND one to SQS)</p>
+<table><thead><tr><th>Config A</th><th>Config B</th><th>Allowed?</th></tr></thead><tbody><tr><td>Prefix: <code>data/</code>, Event: Created, Dest: SNS-A</td><td>Prefix: <code>data/</code>, Event: Created, Dest: SNS-B</td><td>❌ NO (same prefix+event, both SNS)</td></tr><tr><td>Prefix: <code>data/</code>, Event: Created, Dest: SNS-A</td><td>Prefix: <code>data/</code>, Event: Created, Dest: SQS-A</td><td>✅ YES (different destination types)</td></tr><tr><td>Prefix: <code>data/</code>, Event: Created, Dest: SNS-A</td><td>Prefix: <code>data/raw/</code>, Event: Created, Dest: SNS-B</td><td>✅ YES (different prefixes — <code>data/</code> vs <code>data/raw/</code>)</td></tr><tr><td>Prefix: <code>data/</code>, Event: Created, Dest: SNS-A</td><td>Prefix: <code>data/</code>, Event: Removed, Dest: SNS-B</td><td>✅ YES (different event types)</td></tr></tbody></table>
+<p>→ To send the SAME event to MULTIPLE SNS topics → use ONE SNS topic → fan out to multiple SQS queues (Project 13)<br>
+→ Or use EventBridge (Project 38) which doesn't have this limitation</p>
+<hr>
+<h3>STEP 4 — SET UP SNS FAN-OUT FOR IMAGE PROCESSING</h3>
+<p>→ Now connect the SNS topic to multiple SQS queues (applying Project 13 pattern)</p>
+<p><strong>Create SQS Queues for Image Processing Pipeline:</strong></p>
+<table><thead><tr><th>Queue Name</th><th>Type</th><th>Purpose</th><th>Consumer</th></tr></thead><tbody><tr><td><code>shopnow-image-resize</code></td><td>Standard</td><td>Resize images to standard dimensions</td><td>Image Processing Service</td></tr><tr><td><code>shopnow-catalog-update</code></td><td>Standard</td><td>Update product catalog DB with new image URLs</td><td>Catalog Service</td></tr><tr><td><code>shopnow-image-qa-review</code></td><td>Standard</td><td>QA team reviews new images</td><td>QA Dashboard</td></tr></tbody></table>
+<p><strong>For Each Queue — Add SQS Access Policy (Project 13 Step 3):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowImageEventsSNSToSend
+  Effect: Allow
+  Principal:
+    Service: sns.amazonaws.com
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:{queue-name}
+  Condition:
+    ArnEquals:
+      aws:SourceArn: arn:aws:sns:ap-south-1:123456789012:shopnow-s3-image-events</code></pre></div>
+<p><strong>Subscribe Queues to SNS Topic:</strong></p>
+<p>→ SNS Console → Select <code>shopnow-s3-image-events</code> → Create subscriptions:</p>
+<table><thead><tr><th>Protocol</th><th>Endpoint</th><th>Raw Delivery</th></tr></thead><tbody><tr><td>SQS</td><td>shopnow-image-resize</td><td>Enable</td></tr><tr><td>SQS</td><td>shopnow-catalog-update</td><td>Enable</td></tr><tr><td>SQS</td><td>shopnow-image-qa-review</td><td>Enable</td></tr><tr><td>Email</td><td><a href="mailto:catalog-team@shopnow.com">catalog-team@shopnow.com</a></td><td>N/A (email always wrapped)</td></tr></tbody></table>
+<p><strong>Complete Pipeline Visualization:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Marketing uploads: products/images/new-shoe-001.jpg
+</span>    │
+    ▼
+S3 Event Notification Engine
+    │ Prefix: products/images/ ✓
+    │ Suffix: .jpg ✓
+    │ Event: ObjectCreated ✓
+    │
+    ▼
+SNS Topic: shopnow-s3-image-events
+    │
+    ├──► SQS: shopnow-image-resize
+    │    → Image Processing Service resizes to 800×800 and 200×200
+    │    → Stores resized images back in S3: products/images/resized/
+    │
+    ├──► SQS: shopnow-catalog-update
+    │    → Catalog Service reads event → extracts S3 key
+    │    → Updates RDS MariaDB (Project 14): product_images table
+    │
+    ├──► SQS: shopnow-image-qa-review
+    │    → QA Dashboard shows new images for human review
+    │
+    └──► Email: catalog-team@shopnow.com
+         → "New product image uploaded: products/images/new-shoe-001.jpg"
+
+ENTIRE FLOW: Upload → Notification → Processing = SECONDS (not days)</code></pre></div>
+<hr>
+<h3>STEP 5 — UNDERSTAND THE EVENT MESSAGE FORMAT</h3>
+<p>→ When S3 publishes an event → the message contains detailed information about the object and event</p>
+<p><strong>S3 Event Message Structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Records": [
+    {
+      "eventVersion": "2.1",
+      "eventSource": "aws:s3",
+      "awsRegion": "ap-south-1",
+      "eventTime": "2025-01-15T14:30:00.000Z",
+      "eventName": "ObjectCreated:Put",
+      "userIdentity": {
+        "principalId": "AROAQWERTYUIOP:i-0abc123def456"
+      },
+      "requestParameters": {
+        "sourceIPAddress": "10.0.1.50"
+      },
+      "responseElements": {
+        "x-amz-request-id": "C3D13FE58DE4C810",
+        "x-amz-id-2": "FMyUVURIY8/IgAtTv8xRjskZQpcIZ9KG4V5Wp6S7S/JRWeUWerMUE5JgHvANOjpD"
+      },
+      "s3": {
+        "s3SchemaVersion": "1.0",
+        "configurationId": "new-product-image-notification",
+        "bucket": {
+          "name": "shopnow-productimages-prod-aps1",
+          "ownerIdentity": {
+            "principalId": "A3NL1KOZZKExample"
+          },
+          "arn": "arn:aws:s3:::shopnow-productimages-prod-aps1"
+        },
+        "object": {
+          "key": "products/images/new-shoe-001.jpg",
+          "size": 2048576,
+          "eTag": "d41d8cd98f00b204e9800998ecf8427e",
+          "versionId": "096fKKXTRTtl3on89fVO.nfljtsv6qko",
+          "sequencer": "0055AED6DCD90281E5"
+        }
+      }
+    }
+  ]
+}</code></pre></div>
+<p><strong>Key Fields for Consumers:</strong></p>
+<table><thead><tr><th>Field</th><th>Path</th><th>Use</th></tr></thead><tbody><tr><td>Event type</td><td><code>Records[0].eventName</code></td><td>Determine what happened (Created, Removed)</td></tr><tr><td>Bucket name</td><td><code>Records[0].s3.bucket.name</code></td><td>Which bucket the event is from</td></tr><tr><td>Object key</td><td><code>Records[0].s3.object.key</code></td><td>Which file (URL-encoded)</td></tr><tr><td>Object size</td><td><code>Records[0].s3.object.size</code></td><td>File size in bytes</td></tr><tr><td>Object version</td><td><code>Records[0].s3.object.versionId</code></td><td>Which version (versioned bucket)</td></tr><tr><td>Event time</td><td><code>Records[0].eventTime</code></td><td>When the event occurred</td></tr><tr><td>Who uploaded</td><td><code>Records[0].userIdentity.principalId</code></td><td>IAM principal that performed the action</td></tr><tr><td>Source IP</td><td><code>Records[0].requestParameters.sourceIPAddress</code></td><td>IP address of the uploader</td></tr><tr><td>ETag</td><td><code>Records[0].s3.object.eTag</code></td><td>MD5 hash of the object content</td></tr><tr><td>Sequencer</td><td><code>Records[0].s3.object.sequencer</code></td><td>Ordering key for events on the same object</td></tr><tr><td>Config ID</td><td><code>Records[0].s3.configurationId</code></td><td>Which notification config triggered this</td></tr></tbody></table>
+<p><strong>URL Encoding in Object Key:</strong></p>
+<p>→ CRITICAL: The object key is URL-ENCODED in the event message<br>
+→ Spaces become <code>+</code>, special characters become <code>%XX</code><br>
+→ Example: <code>products/images/shoe 001.jpg</code> → <code>products/images/shoe+001.jpg</code><br>
+→ Consumers MUST URL-DECODE the key before using it to access S3<br>
+→ Forgetting this → <code>GetObject</code> call fails with "NoSuchKey" → confusing bug</p>
+<p><strong>Sequencer Field:</strong></p>
+<p>→ The sequencer is a hexadecimal value that increases with each event for the same object key<br>
+→ Use it to determine EVENT ORDER for the same object<br>
+→ If you receive two events for the same key → compare sequencers → higher = later<br>
+→ This is important when: Upload v1 → Upload v2 → events arrive out of order<br>
+→ Sequencer comparison ensures you process the LATEST version</p>
+<hr>
+<h3>STEP 6 — CONFIGURE ADDITIONAL EVENT DESTINATIONS</h3>
+<p><strong>Data ETL Pipeline — SNS Fan-Out:</strong></p>
+<p>→ The <code>shopnow-s3-data-events</code> topic needs subscribers for the ETL pipeline</p>
+<table><thead><tr><th>Queue Name</th><th>Purpose</th></tr></thead><tbody><tr><td><code>shopnow-data-etl-trigger</code></td><td>Triggers Glue ETL job (Project 21, 25)</td></tr><tr><td><code>shopnow-data-validation</code></td><td>Validates CSV format before ETL</td></tr></tbody></table>
+<p>→ Subscribe both to <code>shopnow-s3-data-events</code> (same Project 13 pattern)<br>
+→ When CSV lands in <code>data/raw/</code> → both validation and ETL trigger simultaneously</p>
+<p><strong>Compliance Alert Pipeline:</strong></p>
+<p>→ The <code>shopnow-s3-compliance-alerts</code> topic needs subscribers</p>
+<table><thead><tr><th>Subscriber</th><th>Protocol</th><th>Purpose</th></tr></thead><tbody><tr><td><a href="mailto:compliance-team@shopnow.com">compliance-team@shopnow.com</a></td><td>Email</td><td>Human notification</td></tr><tr><td>+919876543210 (Compliance Officer)</td><td>SMS</td><td>Immediate phone alert</td></tr><tr><td><code>shopnow-compliance-audit-queue</code></td><td>SQS</td><td>Automated audit log entry</td></tr></tbody></table>
+<p>→ Invoice deletion → email + SMS + audit queue → comprehensive compliance response</p>
+<p><strong>Security Alert Pipeline:</strong></p>
+<p>→ The <code>shopnow-s3-security-alerts</code> SQS queue has a single consumer<br>
+→ The security service reads the queue → checks if the upload was authorized<br>
+→ If unauthorized → triggers incident response (SNS alert to security team)</p>
+<hr>
+<h3>STEP 7 — TEST AND VERIFY END-TO-END EVENT FLOW</h3>
+<p><strong>Test 1: Image Upload Event</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ACTION: Upload a test image
+</span>  S3 Console → shopnow-productimages-prod-aps1
+  → Navigate to products/images/
+  → Upload test-shoe-001.jpg
+
+VERIFY:
+  Step 1: SNS Topic received event?
+    CloudWatch → SNS metrics → NumberOfMessagesPublished for shopnow-s3-image-events
+    Should increment by 1 ✓
+
+  Step 2: SQS Queues received messages?
+    SQS Console → shopnow-image-resize → Messages available = 1 ✓
+    SQS Console → shopnow-catalog-update → Messages available = 1 ✓
+    SQS Console → shopnow-image-qa-review → Messages available = 1 ✓
+
+  Step 3: Email received?
+    Check catalog-team@shopnow.com inbox → S3 event email ✓
+
+  Step 4: Message content correct?
+    SQS Console → shopnow-image-resize → Poll for messages
+    → Message body contains: bucket name, object key, event type ✓
+    → Object key: "products/images/test-shoe-001.jpg" ✓</code></pre></div>
+<p><strong>Test 2: Non-Matching Upload (Should NOT Trigger)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ACTION: Upload a PNG file (suffix doesn't match .jpg filter)
+</span>  Upload test-banner.png to products/images/
+
+VERIFY:
+  SQS Console → All image queues → Messages available = 0 ✓
+  (No event generated — suffix .png doesn't match .jpg filter)</code></pre></div>
+<p><strong>Test 3: Invoice Deletion Event</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ACTION: Delete a test invoice
+</span>  S3 Console → invoices/ → Delete test-invoice.pdf
+
+VERIFY:
+  SNS: shopnow-s3-compliance-alerts → NumberOfMessagesPublished incremented ✓
+  Email: compliance-team@shopnow.com received alert ✓
+  SMS: Compliance officer received text message ✓
+  SQS: shopnow-compliance-audit-queue → Messages available = 1 ✓
+  
+  Message content → eventName: "ObjectRemoved:DeleteMarkerCreated" ✓
+  (Versioned bucket — delete creates marker, not permanent deletion — Project 12)</code></pre></div>
+<p><strong>Test 4: Restricted Prefix Upload</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ACTION: Upload a test file to restricted/
+</span>  Upload test-file.txt to restricted/
+
+VERIFY:
+  SQS: shopnow-s3-security-alerts → Messages available = 1 ✓
+  Message contains: userIdentity showing WHO uploaded ✓
+  Message contains: sourceIPAddress showing WHERE from ✓
+  Security consumer can investigate the unauthorized upload ✓</code></pre></div>
+<hr>
+<h3>STEP 8 — HANDLE EDGE CASES AND FAILURE SCENARIOS</h3>
+<hr>
+<p><strong>Edge Case 1: High-Volume Uploads (Burst Scenario)</strong></p>
+<p>→ Marketing team bulk-uploads 500 images at once (drag-and-drop)<br>
+→ 500 S3 events generated in rapid succession<br>
+→ All 500 published to SNS topic → all 500 delivered to each SQS queue</p>
+<p>→ This is FINE because:</p>
+<ul>
+<li>SNS Standard topics handle millions of messages per second</li>
+<li>SQS Standard queues handle unlimited messages per second</li>
+<li>Consumers process at their own pace → queues buffer the burst</li>
+<li>This is exactly the pattern designed in Project 13</li>
+</ul>
+<p>→ POTENTIAL ISSUE: If using FIFO queues → 300 msg/sec limit per message group<br>
+→ Solution: Use Standard queues for image processing (duplicates are harmless — resize same image twice = same result)</p>
+<hr>
+<p><strong>Edge Case 2: Event Delivery Guarantee</strong></p>
+<p>→ S3 event notifications provide AT-LEAST-ONCE delivery<br>
+→ Rare possibility: Same event delivered TWICE to the destination<br>
+→ This can happen during: S3 internal retries, network issues</p>
+<p>→ Impact on consumers:</p>
+<ul>
+<li>Image resize: Idempotent — resizing same image twice produces same result ✓</li>
+<li>Catalog update: Must be idempotent — INSERT should use <code>INSERT IGNORE</code> or <code>UPSERT</code> ✓</li>
+<li>Compliance alert: Duplicate alert is acceptable (better safe than sorry) ✓</li>
+<li>Security alert: Duplicate alert is acceptable ✓</li>
+</ul>
+<p>→ DESIGN PRINCIPLE: All consumers of S3 events must be IDEMPOTENT<br>
+→ Processing the same event twice should produce the same result as processing it once</p>
+<hr>
+<p><strong>Edge Case 3: Event Ordering</strong></p>
+<p>→ S3 does NOT guarantee event ordering across different objects<br>
+→ Upload A.jpg then B.jpg → B.jpg event might arrive before A.jpg event<br>
+→ For SAME object: Upload v1 then v2 → v2 event might arrive before v1 event<br>
+→ Use the <code>sequencer</code> field to determine the correct order for the same object key</p>
+<p>→ For ShopNow: Event ordering doesn't matter for image processing<br>
+→ Each image is processed independently → order is irrelevant</p>
+<hr>
+<p><strong>Edge Case 4: Event Delivery Timing</strong></p>
+<p>→ S3 events are typically delivered within SECONDS of the object action<br>
+→ AWS documentation states: "Typically delivered in seconds, but can occasionally take a minute or longer"<br>
+→ This is NOT real-time streaming → it's near-real-time event notification<br>
+→ For time-critical applications → account for possible delays</p>
+<p>→ For ShopNow: Seconds-to-minutes delay is acceptable<br>
+→ "Within minutes of upload" requirement is met ✓</p>
+<hr>
+<p><strong>Edge Case 5: Large Objects and Multipart Uploads</strong></p>
+<p>→ A 5 GB video uploaded via multipart upload<br>
+→ S3 generates the event ONLY when <code>CompleteMultipartUpload</code> is called<br>
+→ No event during individual part uploads<br>
+→ The event fires AFTER the complete object is available</p>
+<p>→ This means: When the consumer receives the event → the object is fully uploaded and readable<br>
+→ No risk of reading a partially uploaded object</p>
+<hr>
+<p><strong>Edge Case 6: Versioning + Events</strong></p>
+<p>→ With versioning enabled (Project 12):</p>
+<ul>
+<li>Upload v1 → event with versionId of v1</li>
+<li>Upload v2 (overwrite) → NEW event with versionId of v2</li>
+<li>Delete (simple) → event with eventName <code>ObjectRemoved:DeleteMarkerCreated</code></li>
+<li>Delete (version-specific) → event with eventName <code>ObjectRemoved:Delete</code></li>
+</ul>
+<p>→ Each version action generates its OWN event<br>
+→ Consumers receive the versionId in the event → can process the specific version</p>
+<hr>
+<p><strong>Edge Case 7: SNS Topic or SQS Queue Unavailable</strong></p>
+<p>→ If the destination is temporarily unavailable when S3 tries to publish:<br>
+→ S3 retries the event delivery<br>
+→ Retry behavior: Multiple retries over a period of time (not precisely documented)<br>
+→ If ALL retries fail → the event is LOST</p>
+<p>→ Mitigation:</p>
+<ul>
+<li>SNS and SQS are highly available (99.9%+) → delivery failures are extremely rare</li>
+<li>For critical events → also enable S3 → EventBridge (Project 38) as a backup destination</li>
+<li>EventBridge has its own retry and DLQ mechanisms</li>
+<li>CloudTrail logs ALL S3 API calls → even if events are lost, the audit trail exists</li>
+</ul>
+<hr>
+<p><strong>Edge Case 8: Destination Validation Failure</strong></p>
+<p>→ If you modify the SNS topic policy AFTER creating the notification → remove S3 permission<br>
+→ S3 continues to TRY publishing events → events fail silently<br>
+→ No error appears in S3 Console → events are just lost<br>
+→ S3 only validates permissions at CONFIGURATION TIME, not at runtime</p>
+<p>→ Mitigation:</p>
+<ul>
+<li>Never modify destination policies after creating notifications</li>
+<li>If you must modify → test by uploading a file and verifying event delivery</li>
+<li>Monitor SNS <code>NumberOfNotificationsFailed</code> metric</li>
+</ul>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always configure destination permissions (topic/queue policy) BEFORE creating event notifications<br>
+→ Always include BOTH <code>aws:SourceArn</code> AND <code>aws:SourceAccount</code> conditions in destination policies<br>
+→ Always use specific prefix and suffix filters to reduce noise → avoid triggering on irrelevant objects<br>
+→ Always design consumers to be IDEMPOTENT → S3 events are at-least-once delivery<br>
+→ Always URL-decode the object key from event messages before using it<br>
+→ Always use the <code>sequencer</code> field when processing multiple events for the same object key<br>
+→ Always test with actual uploads after configuration → don't assume it works<br>
+→ Always monitor SNS/SQS metrics to verify events are flowing<br>
+→ Always use SNS fan-out when multiple consumers need the same event → don't create duplicate S3 notifications<br>
+→ Always enable Raw Message Delivery on SQS subscriptions (Project 13)<br>
+→ Always create DLQs for consumer queues → handle processing failures gracefully<br>
+→ Always document which prefixes trigger which pipelines → event routing becomes complex</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never create event notifications without configuring destination permissions first → "Unable to validate" error<br>
+→ Never forget to include SourceAccount condition → prevents confused deputy attacks<br>
+→ Never assume events arrive instantly → allow for seconds-to-minutes delay<br>
+→ Never assume events arrive exactly once → design idempotent consumers<br>
+→ Never assume events arrive in order → use sequencer for same-key ordering<br>
+→ Never create overlapping prefix+suffix+event configs for the same destination type → S3 rejects it<br>
+→ Never use overly broad filters (no prefix, no suffix) → triggers on every object → overwhelming volume<br>
+→ Never hardcode bucket names in consumer code → read from the event message instead<br>
+→ Never modify destination policies after creating notifications without testing → events may silently fail<br>
+→ Never rely solely on S3 events for audit → use CloudTrail as the authoritative audit log<br>
+→ Never use S3 event notifications for complex event routing → use EventBridge (Project 38) instead<br>
+→ Never forget that the object key is URL-encoded → common source of "NoSuchKey" bugs</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Destination</th><th>Why</th></tr></thead><tbody><tr><td>One upload → multiple independent processors</td><td>S3 → SNS → multiple SQS queues</td><td>Fan-out pattern (Project 13)</td></tr><tr><td>One upload → one processor</td><td>S3 → SQS directly</td><td>No fan-out needed</td></tr><tr><td>One upload → immediate serverless processing</td><td>S3 → Lambda</td><td>No queue management needed (Project 26)</td></tr><tr><td>Complex event routing based on content</td><td>S3 → EventBridge</td><td>Rich pattern matching (Project 38)</td></tr><tr><td>Human notification of uploads</td><td>S3 → SNS → Email/SMS</td><td>SNS handles human protocols</td></tr><tr><td>Upload triggers multi-step workflow</td><td>S3 → EventBridge → Step Functions</td><td>Orchestration (Project 32)</td></tr></tbody></table>
+<p><strong>S3 Event Notifications vs EventBridge:</strong></p>
+<table><thead><tr><th>Feature</th><th>S3 Event Notifications</th><th>S3 → EventBridge</th></tr></thead><tbody><tr><td>Filtering</td><td>Prefix + Suffix only</td><td>Full JSON event pattern matching</td></tr><tr><td>Destinations</td><td>SNS, SQS, Lambda</td><td>20+ AWS services directly</td></tr><tr><td>Multiple rules per prefix</td><td>Limited (overlap restrictions)</td><td>Unlimited rules</td></tr><tr><td>Archive and replay</td><td>No</td><td>Yes</td></tr><tr><td>Cross-account delivery</td><td>Complex</td><td>Built-in</td></tr><tr><td>Cost</td><td>Free (no charge for S3 notifications)</td><td>$1.00 per million events</td></tr><tr><td>Setup complexity</td><td>Simple</td><td>More complex</td></tr><tr><td>Best for</td><td>Simple event routing</td><td>Complex event-driven architectures</td></tr></tbody></table>
+<p>→ For ShopNow's current needs → S3 Event Notifications are sufficient and FREE<br>
+→ For complex future requirements → EventBridge (Project 38) provides more power</p>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use S3 events for real-time streaming → Use Kinesis (Project 52)<br>
+→ Do NOT use S3 events for complex content-based routing → Use EventBridge (Project 38)<br>
+→ Do NOT use S3 events when you need guaranteed exactly-once processing → Events are at-least-once<br>
+→ Do NOT use S3 events for monitoring ALL S3 API calls → Use CloudTrail data events (Project 57)<br>
+→ Do NOT use S3 events for cross-region notification → Events are generated in the bucket's region only<br>
+→ Do NOT use S3 events as a replacement for S3 inventory → Use S3 Inventory for bulk analysis</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → HOW S3 EVENT GENERATION WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User uploads: products/images/new-shoe-001.jpg
+</span>        │
+        ▼
+Step 1: S3 receives PutObject API call
+        Stores the object across multiple AZs (Project 1 — 11 9s durability)
+        Returns HTTP 200 to the uploader
+        │
+        ▼
+Step 2: S3 Event Notification Engine activates
+        (AFTER the object is successfully stored — not before)
+        │
+        ▼
+Step 3: Engine evaluates ALL notification configurations on this bucket
+        │
+        ├── Config 1: Prefix "products/images/", Suffix ".jpg", Event "ObjectCreated:*"
+        │   Key "products/images/new-shoe-001.jpg":
+        │   Prefix match: "products/images/" ✓
+        │   Suffix match: ".jpg" ✓
+        │   Event match: "ObjectCreated:Put" matches "ObjectCreated:*" ✓
+        │   → GENERATE EVENT for this config
+        │
+        ├── Config 2: Prefix "data/raw/", Suffix ".csv", Event "ObjectCreated:*"
+        │   Prefix match: "data/raw/" vs "products/images/" ✗
+        │   → NO EVENT
+        │
+        ├── Config 3: Prefix "invoices/", Event "ObjectRemoved:*"
+        │   Event match: "ObjectCreated" ≠ "ObjectRemoved" ✗
+        │   → NO EVENT
+        │
+        └── Config 4: Prefix "restricted/", Event "ObjectCreated:*"
+            Prefix match: "restricted/" vs "products/images/" ✗
+            → NO EVENT
+        │
+        ▼
+Step 4: For each matching config → construct event message
+        (JSON with Records array — as shown in Step 5)
+        │
+        ▼
+Step 5: Deliver event to configured destination
+        │
+        ├── Config 1 destination: SNS topic shopnow-s3-image-events
+        │   S3 calls sns:Publish
+        │   SNS receives → fans out to subscribers
+        │
+        └── Delivery complete</code></pre></div>
+<hr>
+<h3>2 → HOW PREFIX AND SUFFIX MATCHING WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Notification Config:
+</span>  Prefix: "products/images/"
+  Suffix: ".jpg"
+
+Object Key: "products/images/category/shoes/new-shoe-001.jpg"
+
+Prefix Match:
+  Key starts with "products/images/"? 
+  "products/images/category/shoes/new-shoe-001.jpg"
+   ^^^^^^^^^^^^^^^^
+  YES ✓ (prefix matches the beginning)
+
+Suffix Match:
+  Key ends with ".jpg"?
+  "products/images/category/shoes/new-shoe-001.jpg"
+                                              ^^^^
+  YES ✓ (suffix matches the end)
+
+RESULT: MATCH → Generate event</code></pre></div>
+<p><strong>Important: Prefix matches ANY depth:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Prefix: "products/"
+</span>
+These ALL match:
+  products/shoe.jpg ✓
+  products/images/shoe.jpg ✓
+  products/images/category/shoes/shoe.jpg ✓
+  products/a ✓
+
+These do NOT match:
+  marketing/shoe.jpg ✗ (different prefix)
+  Products/shoe.jpg ✗ (case-sensitive: "P" ≠ "p")</code></pre></div>
+<p>→ Prefix matching is a SIMPLE string comparison on the beginning of the key<br>
+→ It does NOT understand "folder" hierarchy → <code>products/</code> matches anything starting with <code>products/</code><br>
+→ Case-sensitive → <code>Products/</code> ≠ <code>products/</code></p>
+<hr>
+<h3>3 → HOW EVENT DELIVERY TO SNS WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Event Engine has event to deliver to SNS topic
+</span>        │
+        ▼
+Step 1: S3 constructs the event JSON message
+        │
+        ▼
+Step 2: S3 calls sns:Publish API
+        TopicArn: arn:aws:sns:ap-south-1:123456789012:shopnow-s3-image-events
+        Message: (event JSON)
+        MessageAttributes:
+          - eventSource: "aws:s3"
+          - eventName: "ObjectCreated:Put"
+        │
+        ▼
+Step 3: SNS receives the Publish call
+        │
+        ├── Authenticates: Is the caller S3? (service principal)
+        ├── Authorizes: Does the topic policy allow s3.amazonaws.com to publish?
+        │   Condition: SourceArn matches bucket ARN?
+        │   Condition: SourceAccount matches account ID?
+        │   All conditions met → ALLOWED
+        │
+        └── SNS stores message → fans out to subscribers (Project 6 mechanics)
+        │
+        ▼
+Step 4: SNS delivers to each subscriber (Project 13 mechanics)
+        Each SQS queue receives the event message
+        Each email subscriber receives notification</code></pre></div>
+<hr>
+<h3>4 → HOW S3 → EVENTBRIDGE DIFFERS</h3>
+<p>→ Starting 2021, S3 can send ALL events to EventBridge (not just configured events)<br>
+→ Must be explicitly enabled: S3 Console → Properties → Amazon EventBridge → "On"</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Event (with EventBridge enabled):
+</span>
+Step 1: Object action occurs
+Step 2: S3 Event Notification Engine (prefix/suffix matching — as before)
+        → Delivers to configured SNS/SQS/Lambda destinations
+Step 3: ADDITIONALLY: S3 sends event to EventBridge event bus
+        → ALL events, ALL prefixes, ALL suffixes
+        → EventBridge rules handle filtering
+
+EventBridge advantages:
+  → Filter on ANY field in the event JSON (not just prefix/suffix)
+  → Route to 20+ AWS service targets
+  → Archive events for replay
+  → No overlap restrictions
+  → Cross-account delivery built-in</code></pre></div>
+<p>→ S3 Event Notifications and EventBridge can work SIMULTANEOUSLY<br>
+→ Events go to BOTH destinations<br>
+→ Use S3 notifications for simple routing, EventBridge for complex routing</p>
+<p>→ EventBridge deep dive in Project 38</p>
+<hr>
+<h3>5 → PRICING</h3>
+<table><thead><tr><th>Component</th><th>Cost</th></tr></thead><tbody><tr><td>S3 Event Notification generation</td><td>FREE — no charge for generating events</td></tr><tr><td>S3 → SNS delivery</td><td>FREE — no charge for S3 publishing to SNS</td></tr><tr><td>S3 → SQS delivery</td><td>FREE — no charge for S3 sending to SQS</td></tr><tr><td>S3 → Lambda invocation</td><td>Lambda pricing applies (per invocation + duration)</td></tr><tr><td>S3 → EventBridge</td><td>$1.00 per million events delivered to EventBridge</td></tr><tr><td>SNS → SQS delivery</td><td>Standard SNS/SQS pricing (negligible — Project 13)</td></tr></tbody></table>
+<p>→ S3 Event Notifications to SNS/SQS are completely FREE<br>
+→ Only the downstream processing (consumer compute) costs money<br>
+→ EventBridge adds $1/million events — still very cheap</p>
+<hr>
+<h3>6 → LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Limit</th></tr></thead><tbody><tr><td>Event notification configurations per bucket</td><td>No documented hard limit</td></tr><tr><td>SNS topic destinations per notification</td><td>1 per config (use fan-out for multiple)</td></tr><tr><td>SQS queue destinations per notification</td><td>1 per config</td></tr><tr><td>Lambda function destinations per notification</td><td>1 per config</td></tr><tr><td>Prefix + suffix filter combinations</td><td>Must not overlap for same destination type</td></tr><tr><td>Event delivery latency</td><td>Typically seconds, occasionally minutes</td></tr><tr><td>Event message size</td><td>~2-4 KB per event (varies)</td></tr><tr><td>Records per event message</td><td>Usually 1 (can be batched in rare cases)</td></tr><tr><td>Maximum event destinations per bucket</td><td>SNS + SQS + Lambda + EventBridge (all can coexist)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Missing destination access policy</td><td>"Unable to validate destination" error on creation</td><td>Configure topic/queue policy BEFORE creating notification</td></tr><tr><td>2</td><td>URL-encoded object key not decoded</td><td>Consumer tries to GetObject with encoded key → "NoSuchKey"</td><td>Always URL-decode the key from event message</td></tr><tr><td>3</td><td>Overlapping prefix+suffix+event for same destination type</td><td>S3 rejects the notification configuration</td><td>Use single SNS topic → fan-out to multiple queues</td></tr><tr><td>4</td><td>Processing non-idempotently</td><td>Duplicate event → duplicate processing → data corruption</td><td>Design all consumers to be idempotent</td></tr><tr><td>5</td><td>Case-sensitive prefix mismatch</td><td>Prefix "Products/" doesn't match key "products/image.jpg"</td><td>Verify exact case of prefix matches actual S3 key structure</td></tr><tr><td>6</td><td>Event fires for lifecycle transitions</td><td>Lifecycle moves object to Glacier → triggers ObjectCreated event → consumer confused</td><td>Filter by specific event types, not just ObjectCreated:*</td></tr><tr><td>7</td><td>Circular event loop</td><td>S3 event → Lambda → writes back to same bucket → triggers another event → infinite loop</td><td>Use different prefixes for input and output, or different buckets</td></tr><tr><td>8</td><td>Consumer assumes immediate availability</td><td>Event received but object not yet accessible (extremely rare)</td><td>Add brief retry with backoff if GetObject returns 404</td></tr><tr><td>9</td><td>Destination policy removed after configuration</td><td>Events silently fail — no error in S3 Console</td><td>Monitor SNS/SQS delivery metrics continuously</td></tr><tr><td>10</td><td>Batch upload generates thousands of events</td><td>Consumer overwhelmed → queue backs up → processing delayed</td><td>Use SQS buffering (Project 7) + auto-scale consumers (Project 33)</td></tr><tr><td>11</td><td>Not monitoring event flow</td><td>Events stop flowing due to policy change → nobody notices</td><td>CloudWatch alarm on SNS NumberOfMessagesPublished = 0</td></tr><tr><td>12</td><td>Using event notifications for audit</td><td>Events are at-least-once and may be lost → incomplete audit</td><td>Use CloudTrail for authoritative audit logging (Project 57)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Event Generation Scalability</strong></p>
+<ul>
+<li>S3 can generate millions of events per second</li>
+<li>No limit on event generation rate</li>
+<li>Each object action generates exactly one event per matching configuration</li>
+<li>Bulk uploads → bulk events → SNS/SQS handle the throughput</li>
+</ul>
+<p>→ <strong>Destination Scalability</strong></p>
+<ul>
+<li>SNS Standard topics: Virtually unlimited throughput → handles any burst</li>
+<li>SQS Standard queues: Virtually unlimited throughput → buffers any burst</li>
+<li>Lambda: Concurrent execution limits apply → may need to increase limits</li>
+<li>EventBridge: 400 events/second per account per region (soft limit)</li>
+</ul>
+<p>→ <strong>Consumer Scalability</strong></p>
+<ul>
+<li>Each SQS queue independently buffers events</li>
+<li>Multiple consumers per queue → horizontal scaling</li>
+<li>Auto Scaling based on queue depth (Project 33) → automatic scale-out during bursts</li>
+<li>Different consumers process at different rates → no bottleneck</li>
+</ul>
+<p>→ <strong>Multi-Pipeline Scalability</strong></p>
+<ul>
+<li>One bucket can have dozens of notification configurations</li>
+<li>Each configuration routes to a different pipeline</li>
+<li>Adding new pipelines requires: new notification config + new destination → zero change to existing pipelines</li>
+<li>This is the same additive extensibility as SNS fan-out (Project 13)</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Event generation and delivery are FREE for SNS/SQS</li>
+<li>Cost is entirely in consumer compute</li>
+<li>At 1 million events/day → consumer cost depends on processing complexity, not event volume</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify event notifications are configured correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Notifications exist</td><td>S3 Console → Bucket → Properties → Event notifications listed</td></tr><tr><td>Prefix/suffix correct</td><td>Each notification → verify prefix and suffix values</td></tr><tr><td>Event types correct</td><td>Each notification → verify selected event types</td></tr><tr><td>Destination correct</td><td>Each notification → verify SNS/SQS/Lambda ARN</td></tr><tr><td>Destination policy allows S3</td><td>SNS/SQS Console → Access policy → s3.amazonaws.com with conditions</td></tr><tr><td>Events flowing</td><td>Upload test file → check destination for new messages</td></tr></tbody></table>
+<p>→ <strong>How to debug "events not arriving":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Does the upload match the notification filter?
+</span>        Check prefix (case-sensitive) and suffix against the actual object key
+        Upload to exact matching prefix → does event arrive?
+
+STEP 2: Is the notification configuration still present?
+        S3 Console → Properties → Event notifications
+        Sometimes configurations are accidentally deleted
+
+STEP 3: Is the destination accessible?
+        Check SNS topic policy / SQS queue policy
+        Does it still allow s3.amazonaws.com?
+        Was the policy accidentally modified?
+
+STEP 4: Is the destination receiving but not visible?
+        For SNS → check CloudWatch: NumberOfMessagesPublished
+        For SQS → check: ApproximateNumberOfMessagesVisible
+        Messages might be delivered but consumed immediately
+
+STEP 5: Is EventBridge intercepting?
+        If EventBridge is enabled → events go there too
+        EventBridge rules might be consuming events
+
+STEP 6: Check CloudTrail for the S3 API call
+        CloudTrail → Event history → Filter: PutObject
+        Confirms the upload actually happened
+
+STEP 7: Try a different file
+        Upload a completely new file (not overwrite)
+        Some edge cases with versioning may behave differently</code></pre></div>
+<p>→ <strong>Monitoring Dashboard Additions:</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>S3 Image Events Published</td><td>SNS NumberOfMessagesPublished for shopnow-s3-image-events</td><td>Verify image events flowing</td></tr><tr><td>S3 Data Events Published</td><td>SNS NumberOfMessagesPublished for shopnow-s3-data-events</td><td>Verify data events flowing</td></tr><tr><td>Image Resize Queue Depth</td><td>SQS ApproximateNumberOfMessagesVisible for shopnow-image-resize</td><td>Monitor image processing backlog</td></tr><tr><td>Compliance Alert Queue</td><td>SQS ApproximateNumberOfMessagesVisible for shopnow-compliance-audit-queue</td><td>Monitor compliance events</td></tr><tr><td>Security Alert Queue</td><td>SQS ApproximateNumberOfMessagesVisible for shopnow-s3-security-alerts</td><td>Monitor security events</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ S3 Event Notifications transform S3 from PASSIVE storage into an ACTIVE event source<br>
+→ Objects being created, deleted, or modified automatically trigger downstream processing<br>
+→ This eliminates polling, cron jobs, and manual monitoring — pure event-driven architecture<br>
+→ Destination permissions (topic/queue policies) must be configured BEFORE creating notifications<br>
+→ S3 events are AT-LEAST-ONCE → all consumers must be IDEMPOTENT<br>
+→ Prefix and suffix filters enable targeted event routing → different prefixes trigger different pipelines<br>
+→ Object keys in events are URL-ENCODED → consumers must decode before use<br>
+→ S3 → SNS → SQS fan-out creates the most flexible event processing architecture<br>
+→ Event generation and delivery to SNS/SQS are FREE → only consumer compute costs money</p>
+<p>→ Connection to Project 1: Events are generated by the S3 bucket created in Project 1</p>
+<ul>
+<li>Versioning (Project 12) affects event types (DeleteMarkerCreated vs Delete)</li>
+</ul>
+<p>→ Connection to Project 6: SNS topics receive S3 events</p>
+<ul>
+<li>Topic access policies must allow s3.amazonaws.com (configured in Project 6 pattern)</li>
+<li>Filter policies on subscriptions can further route events (Project 6)</li>
+</ul>
+<p>→ Connection to Project 7: SQS queues buffer S3 events for consumers</p>
+<ul>
+<li>Queue access policies must allow s3.amazonaws.com</li>
+<li>Visibility timeout, DLQ, long polling all apply (Project 7)</li>
+</ul>
+<p>→ Connection to Project 10: Bucket policies don't affect event notification delivery</p>
+<ul>
+<li>Event notifications are a separate configuration from bucket policies</li>
+<li>BUT: Consumers need S3 access (IAM Role — Project 11) to read the objects referenced in events</li>
+</ul>
+<p>→ Connection to Project 13: SNS → SQS fan-out is the pattern used for multi-consumer event processing</p>
+<ul>
+<li>One S3 event → one SNS topic → multiple SQS queues → multiple independent consumers</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 25: S3 → Glue Crawler → Glue Catalog → Athena (data lake pipeline triggered by uploads)</li>
+<li>Project 26: SNS → SQS → Lambda (serverless event processing)</li>
+<li>Project 34: S3 → Lambda → Redshift (automated data warehouse loading)</li>
+<li>Project 38: S3 → EventBridge (advanced event routing)</li>
+<li>Project 49: Complex multi-service pipeline starting from S3 upload events</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has automated event-driven pipelines triggered by S3 uploads<br>
+→ The data engineering team says: "We have CSV data files arriving in S3 every day"<br>
+→ The business intelligence team wants to run analytical queries on this data<br>
+→ But they need a DATA WAREHOUSE — not a transactional database like MariaDB (Project 9)</p>
+<p>→ MariaDB is designed for: INSERT, UPDATE, DELETE on individual rows (OLTP — Online Transaction Processing)<br>
+→ They need a system designed for: SELECT with aggregations on millions of rows (OLAP — Online Analytical Processing)<br>
+→ Example queries:</p>
+<ul>
+<li>"What were total sales by category for the last 6 months?"</li>
+<li>"Which products had the highest return rate by region?"</li>
+<li>"What is the average order value trend week-over-week?"<br>
+→ These queries scan MILLIONS of rows → MariaDB takes 45 minutes → Redshift takes 5 seconds</li>
+</ul>
+<p>→ <strong>This is exactly what Project 16 solves</strong><br>
+→ Project 16 introduces Amazon Redshift — the columnar data warehouse<br>
+→ It explains how columnar storage differs from row-based storage (MariaDB)<br>
+→ It sets up a Redshift cluster in the VPC (Project 5) with proper Security Groups (Project 4)<br>
+→ It prepares for: COPY from S3 (Project 22), UNLOAD to S3 (Project 23), Spectrum (Project 28)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 16: "The Analyst Who Needed a Data Warehouse — Redshift Single-Node Cluster Setup"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-14.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 15/60</span></div><a class="nav-btn next" href="project-16.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

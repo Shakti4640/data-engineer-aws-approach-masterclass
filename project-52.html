@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 52: THE REAL-TIME DASHBOARD — Kinesis Data Streams → Firehose → S3 → Glu — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 52: THE REAL-TIME DASHBOARD — Kinesis Data Streams → Firehose → S3 → Glue → Athena</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's enterprise data lake (Project 51) is operational and serving batch analytics<br>
+→ The fraud detection team has been catching fraud patterns — but ALWAYS 24 hours late</p>
+<p><strong>The Timeline of a Fraud Event Today (Batch Architecture):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TIME 0:        Customer makes payment → Transaction written to MariaDB
+</span>TIME +0s:      MariaDB stores record → Production app continues
+TIME +24h:     Nightly Glue ETL extracts from MariaDB → Writes to S3 Raw Zone
+TIME +24h 30m: Glue ETL transforms Raw → Curated
+TIME +24h 45m: Analyst runs Athena query → Discovers suspicious pattern
+TIME +25h:     Fraud team investigates → Confirms fraud
+TIME +25h 30m: Account frozen → But customer already lost $50,000
+
+TOTAL DETECTION TIME: 25+ HOURS</code></pre></div>
+<p><strong>The Real-World Impact:</strong></p>
+<table><thead><tr><th>Metric</th><th>Current (Batch)</th><th>Required (Real-Time)</th></tr></thead><tbody><tr><td>Data freshness</td><td>24 hours</td><td>&lt; 60 seconds</td></tr><tr><td>Fraud detection time</td><td>25+ hours</td><td>&lt; 5 minutes</td></tr><tr><td>Customer money at risk</td><td>Full transaction amount</td><td>Minimal (caught before completion)</td></tr><tr><td>Fraudulent transactions per day</td><td>15-20 (discovered next day)</td><td>2-3 (caught in real-time)</td></tr><tr><td>Monthly fraud losses</td><td>$750,000</td><td>Target: $75,000 (90% reduction)</td></tr></tbody></table>
+<p><strong>The Requirements:</strong></p>
+<p>→ Every transaction event must arrive in the data lake within 60 seconds<br>
+→ Athena must be able to query the latest data immediately<br>
+→ The streaming data must follow the SAME zone architecture (from Project 51)<br>
+→ The SAME governance (Lake Formation from Project 47) must apply<br>
+→ Batch AND streaming data must coexist in the same tables<br>
+→ The fraud team needs a near-real-time dashboard that auto-refreshes every minute<br>
+→ Historical batch data (3 years) + real-time streaming data must be queryable together</p>
+<p><strong>The Architecture Gap:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT (Batch Only):
+</span>    MariaDB → Glue ETL (nightly) → S3 → Athena
+    Latency: 24 hours
+
+NEEDED (Batch + Streaming):
+    MariaDB → Glue ETL (nightly) → S3 → Athena          ← Historical (unchanged)
+    Application → Kinesis → Firehose → S3 → Athena       ← Real-time (NEW)
+    
+    Both land in the SAME data lake zones
+    Both queryable through the SAME Athena tables</code></pre></div>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the streaming landscape on AWS</p>
+<table><thead><tr><th>Service</th><th>Purpose</th><th>Latency</th><th>Use Case</th></tr></thead><tbody><tr><td>Kinesis Data Streams</td><td>Ingest and buffer real-time events</td><td>Milliseconds</td><td>Real-time event capture</td></tr><tr><td>Kinesis Data Firehose</td><td>Deliver streaming data to destinations (S3, Redshift, etc.)</td><td>60-900 seconds (buffered)</td><td>Near-real-time delivery to storage</td></tr><tr><td>Kinesis Data Analytics</td><td>Process streaming data with SQL/Flink</td><td>Milliseconds</td><td>Real-time aggregation, alerting</td></tr><tr><td>Amazon MSK (Kafka)</td><td>Managed Apache Kafka</td><td>Milliseconds</td><td>When teams already use Kafka</td></tr></tbody></table>
+<p><strong>Why Kinesis Data Streams + Firehose for PayScale?</strong></p>
+<table><thead><tr><th>Decision Factor</th><th>Choice</th><th>Why</th></tr></thead><tbody><tr><td>Event ingestion</td><td>Kinesis Data Streams</td><td>Managed, serverless scaling, millisecond latency</td></tr><tr><td>Delivery to S3</td><td>Kinesis Data Firehose</td><td>Native S3 delivery, automatic batching, format conversion</td></tr><tr><td>Why not direct to S3?</td><td>Firehose handles batching</td><td>Writing one S3 object per event = millions of tiny files = terrible for Athena</td></tr><tr><td>Why not just Firehose without Streams?</td><td>Streams enables multiple consumers</td><td>Firehose delivers to S3, but Streams also feeds Lambda for real-time alerting</td></tr><tr><td>Why not MSK (Kafka)?</td><td>Overkill</td><td>PayScale doesn't use Kafka — Kinesis is simpler, fully managed</td></tr></tbody></table>
+<p><strong>The Complete Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Transaction Application
+</span>    |
+    ↓ Produces event
+    |
+Kinesis Data Stream ("fraud-transactions-stream")
+    |
+    ├──→ Consumer 1: Kinesis Firehose → S3 (data lake — near-real-time analytics)
+    |
+    ├──→ Consumer 2: Lambda (real-time fraud scoring — immediate alert)
+    |
+    └──→ Consumer 3: Kinesis Data Analytics (real-time aggregation — optional)</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Create Kinesis Data Stream</li>
+<li>Step 2 — Configure application to produce events to the stream</li>
+<li>Step 3 — Create Kinesis Data Firehose delivery stream</li>
+<li>Step 4 — Configure Firehose to deliver to S3 in Parquet format with partitioning</li>
+<li>Step 5 — Configure Glue Catalog table for streaming data</li>
+<li>Step 6 — Configure Athena to query streaming + batch data together</li>
+<li>Step 7 — Configure Lambda consumer for real-time fraud alerting</li>
+<li>Step 8 — Monitor and tune the streaming pipeline</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE KINESIS DATA STREAM</h3>
+<p>→ Navigate to Kinesis Console → Data Streams → Create data stream</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Data stream name</td><td><code>fraud-transactions-stream</code></td><td>Descriptive, matches domain</td></tr><tr><td>Capacity mode</td><td>On-demand</td><td>Auto-scales based on traffic — no shard management</td></tr></tbody></table>
+<p><strong>Capacity Mode Decision:</strong></p>
+<table><thead><tr><th>Mode</th><th>How It Works</th><th>When to Use</th><th>Pricing</th></tr></thead><tbody><tr><td>On-demand</td><td>AWS auto-scales shards based on traffic</td><td>Unpredictable or variable traffic patterns</td><td>Per GB ingested + per GB retrieved</td></tr><tr><td>Provisioned</td><td>You manually specify number of shards</td><td>Predictable, steady traffic</td><td>Per shard-hour</td></tr></tbody></table>
+<p><strong>Provisioned Mode Details (if chosen instead):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Number of shards</td><td>2 (start small)</td><td>Each shard: 1 MB/s write, 2 MB/s read</td></tr><tr><td>Data retention period</td><td>24 hours (default)</td><td>How long data stays in stream for consumers</td></tr></tbody></table>
+<p><strong>PayScale's Traffic Estimate:</strong></p>
+<table><thead><tr><th>Metric</th><th>Value</th><th>Shard Calculation</th></tr></thead><tbody><tr><td>Peak transactions per second</td><td>500</td><td>500 × 1 KB avg = 500 KB/s</td></tr><tr><td>Average transactions per second</td><td>100</td><td>100 × 1 KB avg = 100 KB/s</td></tr><tr><td>Required write capacity</td><td>500 KB/s peak</td><td>1 shard handles 1 MB/s → 1 shard sufficient</td></tr><tr><td>Safety margin (2x)</td><td>1 MB/s</td><td>1 shard + buffer → 2 shards recommended</td></tr></tbody></table>
+<p>→ PayScale chooses <strong>On-demand</strong> — traffic varies significantly between business hours and nights<br>
+→ On-demand automatically scales from 0 to hundreds of shards<br>
+→ No capacity planning needed — AWS handles everything</p>
+<p><strong>Data Retention Period:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Retention period</td><td>24 hours (default)</td><td>Sufficient for Firehose to read and deliver to S3</td></tr></tbody></table>
+<p>→ Can extend to 7 days (standard) or 365 days (extended) if consumers need to replay older data<br>
+→ Extended retention costs more — only enable if replay capability is required<br>
+→ For PayScale → 24 hours is sufficient — once data reaches S3, it's permanently stored</p>
+<p><strong>Encryption:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Server-side encryption</td><td>✅ Enable</td><td>Encrypt data at rest in the stream</td></tr><tr><td>Encryption type</td><td>AWS managed key (aws/kinesis) OR Customer managed key (from Project 36)</td><td>KMS encryption</td></tr></tbody></table>
+<p>→ For compliance with PCI-DSS → Use customer managed KMS key<br>
+→ Same key policy concepts from Project 36 apply</p>
+<p><strong>After Creation:</strong><br>
+→ Stream ARN: <code>arn:aws:kinesis:ap-south-1:222222222222:stream/fraud-transactions-stream</code><br>
+→ Status: <code>ACTIVE</code></p>
+<hr>
+<h3>STEP 2 — UNDERSTAND EVENT PRODUCTION TO THE STREAM</h3>
+<p><strong>What the Application Sends:</strong></p>
+<p>→ The payment processing application (Account A) produces an event for every transaction</p>
+<p><strong>Event Structure (JSON):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "transaction_id": "txn-2025-01-15-00042851",
+    "customer_id": "cust-88421",
+    "amount": 1250.00,
+    "currency": "INR",
+    "merchant_id": "merch-5521",
+    "merchant_name": "Electronics Hub",
+    "merchant_category": "electronics",
+    "city": "Mumbai",
+    "country": "IN",
+    "status": "pending",
+    "payment_method": "credit_card",
+    "card_last4"[REDACTED:CREDIT_DEBIT_NUMBER]532",
+    "risk_indicators": {
+        "is_international": false,
+        "is_high_amount": true,
+        "device_fingerprint": "fp-abc123",
+        "ip_country": "IN"
+    },
+    "event_timestamp": "2025-01-15T14:32:15.123Z"
+}</code></pre></div>
+<p><strong>Event Size:</strong> ~500 bytes to 1 KB per event<br>
+<strong>Event Volume:</strong> 100-500 events per second (varies by time of day)</p>
+<p><strong>Partition Key Strategy:</strong></p>
+<p>→ When producing to Kinesis → Each event needs a PARTITION KEY<br>
+→ The partition key determines WHICH SHARD receives the event<br>
+→ Events with the same partition key go to the same shard (ordered within shard)</p>
+<table><thead><tr><th>Partition Key Choice</th><th>Distribution</th><th>Ordering</th><th>Best For</th></tr></thead><tbody><tr><td><code>transaction_id</code></td><td>Excellent (unique per event)</td><td>No ordering guarantee</td><td>Maximum throughput distribution</td></tr><tr><td><code>customer_id</code></td><td>Good (many customers)</td><td>All events for same customer → same shard → ordered</td><td>Customer-level ordering needed</td></tr><tr><td><code>merchant_id</code></td><td>Moderate (fewer merchants than customers)</td><td>All events for same merchant → same shard</td><td>Merchant-level analysis</td></tr><tr><td>Constant value (e.g., "all")</td><td>❌ Terrible — all events to one shard</td><td>Perfect ordering</td><td>Never — creates hot shard</td></tr></tbody></table>
+<p>→ PayScale uses <code>customer_id</code> as partition key<br>
+→ Reason: Fraud detection needs to see a customer's events in order (rapid successive transactions = suspicious)<br>
+→ This means all events for customer "cust-88421" go to the same shard and are ordered by arrival time</p>
+<p><strong>IAM Permissions for Producer Application:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>kinesis:PutRecord</code></td><td><code>arn:aws:kinesis:ap-south-1:222222222222:stream/fraud-transactions-stream</code></td><td>Send single event</td></tr><tr><td><code>kinesis:PutRecords</code></td><td>Same</td><td>Send batch of events (more efficient)</td></tr></tbody></table>
+<p>→ PutRecords (batch) is preferred over PutRecord (single) — reduces API calls and cost<br>
+→ Batch up to 500 records or 5 MB per PutRecords call</p>
+<p><strong>Cross-Account Production (Account A → Account B's Stream):</strong></p>
+<p>→ If the stream is in Account B but the producer application is in Account A:<br>
+→ Option 1: Cross-account IAM role assumption (from Project 40) — Producer assumes Account B role<br>
+→ Option 2: Kinesis resource policy — Account B's stream policy allows Account A to PutRecords<br>
+→ PayScale creates the stream in Account B (Risk team owns fraud detection)<br>
+→ Account A's application assumes a cross-account role to produce events</p>
+<hr>
+<h3>STEP 3 — CREATE KINESIS DATA FIREHOSE DELIVERY STREAM</h3>
+<p><strong>Purpose:</strong> Read from Kinesis Data Stream → Buffer → Convert format → Deliver to S3</p>
+<p>→ Navigate to Kinesis Console → Delivery streams → Create delivery stream</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Source</td><td>Amazon Kinesis Data Streams</td><td>Reading from the stream created in Step 1</td></tr><tr><td>Kinesis data stream</td><td><code>fraud-transactions-stream</code></td><td>The specific stream</td></tr><tr><td>Delivery stream name</td><td><code>fraud-transactions-firehose-to-s3</code></td><td>Descriptive</td></tr><tr><td>Destination</td><td>Amazon S3</td><td>Landing in the data lake</td></tr></tbody></table>
+<hr>
+<p><strong>S3 Destination Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>S3 bucket</td><td><code>payscale-datalake-landing</code> (Account J — from Project 51)</td><td>Landing zone of the enterprise data lake</td></tr><tr><td>S3 prefix</td><td><code>domain=fraud/entity=transactions_streaming/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/</code></td><td>Dynamic partitioning by timestamp</td></tr><tr><td>S3 error prefix</td><td><code>domain=fraud/entity=transactions_streaming_errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/</code></td><td>Failed records go here</td></tr></tbody></table>
+<p><strong>Dynamic Partitioning — The Critical Feature:</strong></p>
+<p>→ Without dynamic partitioning → Firehose writes ALL events to ONE S3 prefix<br>
+→ Result: One giant file per buffer interval → No partition pruning in Athena</p>
+<p>→ With dynamic partitioning → Firehose routes events to S3 prefixes based on event content or timestamp<br>
+→ Result: Hive-style partitioned output → Athena partition pruning works perfectly</p>
+<p><strong>Dynamic Partitioning Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Dynamic partitioning</td><td>✅ Enabled</td><td>Route events to different S3 prefixes</td></tr><tr><td>Multi record deaggregation</td><td>✅ Enabled (JSON type)</td><td>Split aggregated records into individual events</td></tr><tr><td>New line delimiter</td><td>✅ Enabled</td><td>Add newline between JSON records (required for Athena JSON SerDe)</td></tr><tr><td>Inline parsing for JSON</td><td>✅ Enabled</td><td>Extract partition keys from JSON event body</td></tr></tbody></table>
+<p><strong>Partition Keys (extracted from JSON):</strong></p>
+<table><thead><tr><th>Key Name</th><th>JQ Expression</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>year</td><td><code>.event_timestamp[:4]</code></td><td>Event JSON</td><td>Year partition</td></tr><tr><td>month</td><td><code>.event_timestamp[5:7]</code></td><td>Event JSON</td><td>Month partition</td></tr><tr><td>day</td><td><code>.event_timestamp[8:10]</code></td><td>Event JSON</td><td>Day partition</td></tr><tr><td>hour</td><td><code>.event_timestamp[11:13]</code></td><td>Event JSON</td><td>Hour partition (finer granularity for streaming)</td></tr><tr><td>country</td><td><code>.country</code></td><td>Event JSON</td><td>Country partition (for row-level filtering alignment)</td></tr></tbody></table>
+<p>→ Alternatively → Use Firehose timestamp expressions (<code>!{timestamp:yyyy}</code>) which use the Firehose processing time<br>
+→ For PayScale → Use event_timestamp from the JSON body (more accurate — represents when the transaction happened, not when Firehose processed it)</p>
+<hr>
+<p><strong>Buffer Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Buffer size</td><td>64 MB</td><td>Firehose buffers up to 64 MB before writing to S3</td></tr><tr><td>Buffer interval</td><td>60 seconds</td><td>Firehose writes to S3 at LEAST every 60 seconds</td></tr></tbody></table>
+<p><strong>How Buffering Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Events arrive continuously from Kinesis Data Stream
+</span>    |
+    ↓
+Firehose buffers events in memory:
+    |
+    ├── Buffer reaches 64 MB? → Flush to S3 immediately
+    |
+    └── 60 seconds elapsed? → Flush to S3 regardless of buffer size
+    
+    Whichever condition is met FIRST triggers the flush</code></pre></div>
+<p><strong>Buffer Trade-offs:</strong></p>
+<table><thead><tr><th>Buffer Size</th><th>Buffer Interval</th><th>Result</th><th>Use Case</th></tr></thead><tbody><tr><td>1 MB</td><td>60 seconds</td><td>Frequent small files (many S3 objects)</td><td>Lowest latency</td></tr><tr><td>64 MB</td><td>60 seconds</td><td>Moderate files every minute</td><td>Balance of latency and file size</td></tr><tr><td>128 MB</td><td>300 seconds</td><td>Fewer large files every 5 minutes</td><td>Cost optimization (fewer S3 PUTs)</td></tr><tr><td>128 MB</td><td>900 seconds</td><td>Fewest files every 15 minutes</td><td>Maximum cost optimization</td></tr></tbody></table>
+<p>→ PayScale chooses 64 MB / 60 seconds<br>
+→ Data arrives in S3 within 60 seconds of the event → Meets the &lt; 60 second requirement<br>
+→ File sizes are reasonable for Athena (not too many tiny files)</p>
+<hr>
+<p><strong>Format Conversion Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Record format conversion</td><td>✅ Enabled</td><td>Convert JSON → Parquet before writing to S3</td></tr><tr><td>Output format</td><td>Apache Parquet</td><td>Columnar format — optimal for Athena queries (from Project 21)</td></tr><tr><td>Compression</td><td>Snappy</td><td>Fast compression/decompression — standard for Parquet</td></tr><tr><td>Schema source</td><td>AWS Glue Data Catalog</td><td>Firehose uses Glue table schema for Parquet conversion</td></tr><tr><td>Glue database</td><td><code>raw_fraud</code> (Account J from Project 51)</td><td>The database containing the table definition</td></tr><tr><td>Glue table</td><td><code>transactions_streaming</code></td><td>Pre-created table with expected schema</td></tr><tr><td>Glue table version</td><td>Latest</td><td>Always use latest schema version</td></tr></tbody></table>
+<p><strong>Why Convert to Parquet in Firehose?</strong></p>
+<table><thead><tr><th>Without Conversion</th><th>With Conversion</th></tr></thead><tbody><tr><td>JSON files in S3</td><td>Parquet files in S3</td></tr><tr><td>Athena scans ALL bytes (JSON is row-oriented)</td><td>Athena scans ONLY needed columns (Parquet is columnar)</td></tr><tr><td>1 TB JSON scan = $5.00</td><td>100 GB Parquet scan (same data) = $0.50</td></tr><tr><td>No compression</td><td>Snappy compression = 75% smaller</td></tr><tr><td>Schema-on-read (fragile)</td><td>Schema enforced at write time (robust)</td></tr></tbody></table>
+<p>→ Converting to Parquet at the Firehose level means ALL downstream consumers (Athena, Spectrum, Glue) benefit immediately<br>
+→ No additional ETL step needed for format conversion</p>
+<p><strong>Pre-requisite: Create Glue Table for Schema Reference:</strong></p>
+<p>→ Firehose needs a Glue table to know the Parquet schema<br>
+→ Create table in Glue Console (Account J) → Database: <code>raw_fraud</code></p>
+<table><thead><tr><th>Column</th><th>Type</th><th>Comment</th></tr></thead><tbody><tr><td>transaction_id</td><td>string</td><td>Unique transaction identifier</td></tr><tr><td>customer_id</td><td>string</td><td>Customer identifier</td></tr><tr><td>amount</td><td>double</td><td>Transaction amount</td></tr><tr><td>currency</td><td>string</td><td>Currency code</td></tr><tr><td>merchant_id</td><td>string</td><td>Merchant identifier</td></tr><tr><td>merchant_name</td><td>string</td><td>Merchant display name</td></tr><tr><td>merchant_category</td><td>string</td><td>Business category</td></tr><tr><td>city</td><td>string</td><td>Transaction city</td></tr><tr><td>country</td><td>string</td><td>Transaction country</td></tr><tr><td>status</td><td>string</td><td>Transaction status</td></tr><tr><td>payment_method</td><td>string</td><td>Payment type</td></tr><tr><td>card_last4</td><td>string</td><td>Last 4 digits of card</td></tr><tr><td>is_international</td><td>boolean</td><td>International transaction flag</td></tr><tr><td>is_high_amount</td><td>boolean</td><td>High amount flag</td></tr><tr><td>device_fingerprint</td><td>string</td><td>Device identifier</td></tr><tr><td>ip_country</td><td>string</td><td>IP geolocation country</td></tr><tr><td>event_timestamp</td><td>string</td><td>ISO 8601 timestamp</td></tr></tbody></table>
+<p>→ Partition columns: year (string), month (string), day (string), hour (string)<br>
+→ Table location: <code>s3://payscale-datalake-landing/domain=fraud/entity=transactions_streaming/</code><br>
+→ SerDe: Parquet (since Firehose converts to Parquet)</p>
+<hr>
+<p><strong>IAM Role for Firehose:</strong></p>
+<p>→ Create IAM Role: <code>FirehoseDeliveryRole</code></p>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity</td><td><code>firehose.amazonaws.com</code></td></tr></tbody></table>
+<p><strong>Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>kinesis:DescribeStream</code></td><td>Stream ARN</td><td>Describe source stream</td></tr><tr><td><code>kinesis:GetShardIterator</code></td><td>Stream ARN</td><td>Read from stream</td></tr><tr><td><code>kinesis:GetRecords</code></td><td>Stream ARN</td><td>Retrieve records</td></tr><tr><td><code>kinesis:ListShards</code></td><td>Stream ARN</td><td>List stream shards</td></tr><tr><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-datalake-landing/*</code></td><td>Write to S3 landing zone</td></tr><tr><td><code>s3:GetBucketLocation</code></td><td><code>arn:aws:s3:::payscale-datalake-landing</code></td><td>Determine bucket region</td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::payscale-datalake-landing</code></td><td>List bucket contents</td></tr><tr><td><code>glue:GetTable</code></td><td><code>arn:aws:glue:ap-south-1:*:table/raw_fraud/transactions_streaming</code></td><td>Read schema for Parquet conversion</td></tr><tr><td><code>glue:GetTableVersions</code></td><td>Same</td><td>Get latest schema version</td></tr><tr><td><code>glue:GetDatabase</code></td><td><code>arn:aws:glue:ap-south-1:*:database/raw_fraud</code></td><td>Access database</td></tr><tr><td><code>kms:Decrypt</code></td><td>KMS key ARN (from Project 36)</td><td>Decrypt Kinesis stream data</td></tr><tr><td><code>kms:GenerateDataKey</code></td><td>KMS key ARN</td><td>Encrypt S3 objects</td></tr><tr><td><code>logs:PutLogEvents</code></td><td>CloudWatch log group</td><td>Write delivery error logs</td></tr></tbody></table>
+<p><strong>Cross-Account S3 Write (Firehose in Account B → S3 in Account J):</strong></p>
+<p>→ If Firehose is in Account B and S3 is in Account J:<br>
+→ Option 1: Firehose role in Account B + S3 bucket policy in Account J allowing the role<br>
+→ Option 2: Firehose role assumes a role in Account J (cross-account)</p>
+<p>→ PayScale uses bucket policy approach (simpler):</p>
+<p><strong>Account J Bucket Policy Addition (payscale-datalake-landing):</strong></p>
+<table><thead><tr><th>Principal</th><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>arn:aws:iam::222222222222:role/FirehoseDeliveryRole</code></td><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-datalake-landing/domain=fraud/entity=transactions_streaming/*</code></td><td>Allow Firehose to write streaming data</td></tr></tbody></table>
+<p>→ Firehose can ONLY write to the streaming entity prefix — not to other domains or entities</p>
+<hr>
+<h3>STEP 4 — UNDERSTAND THE COMPLETE S3 OUTPUT STRUCTURE</h3>
+<p><strong>What Firehose Creates in S3:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://payscale-datalake-landing/
+</span>    └── domain=fraud/
+        └── entity=transactions_streaming/
+            ├── year=2025/
+            │   ├── month=01/
+            │   │   ├── day=15/
+            │   │   │   ├── hour=14/
+            │   │   │   │   ├── fraud-transactions-firehose-1-2025-01-15-14-32-00-abcdef.snappy.parquet
+            │   │   │   │   ├── fraud-transactions-firehose-1-2025-01-15-14-33-00-ghijkl.snappy.parquet
+            │   │   │   │   └── fraud-transactions-firehose-1-2025-01-15-14-34-00-mnopqr.snappy.parquet
+            │   │   │   ├── hour=15/
+            │   │   │   │   ├── ...
+            │   │   │   └── hour=16/
+            │   │   └── day=16/
+            │   └── month=02/
+            └── year=2024/</code></pre></div>
+<p><strong>File Naming:</strong><br>
+→ Firehose auto-generates file names: <code>{delivery-stream-name}-{shard}-{timestamp}-{uuid}.{format}</code><br>
+→ Each file contains 60 seconds worth of events (or up to 64 MB)<br>
+→ At 500 events/second × 1 KB = 500 KB per minute → ~30 KB Parquet (compressed)<br>
+→ Files are small during low traffic, larger during peak</p>
+<p><strong>File Count Estimation:</strong></p>
+<table><thead><tr><th>Time Period</th><th>Files Created</th><th>Rationale</th></tr></thead><tbody><tr><td>Per hour</td><td>60 (one per minute)</td><td>60-second buffer interval</td></tr><tr><td>Per day</td><td>1,440</td><td>24 hours × 60 files</td></tr><tr><td>Per month</td><td>~43,200</td><td>30 days × 1,440</td></tr><tr><td>Per year</td><td>~525,600</td><td>365 days × 1,440</td></tr></tbody></table>
+<p>→ 525,600 files per year is MANAGEABLE for Athena with partition projection<br>
+→ Without partitioning → Athena would LIST 525,600 files for every query → Slow<br>
+→ With hour-level partitioning → Athena for "last 1 hour" lists only 60 files → Fast</p>
+<hr>
+<h3>STEP 5 — CONFIGURE THE STREAMING-TO-CURATED PIPELINE</h3>
+<p><strong>The Landing zone receives raw streaming Parquet files from Firehose</strong><br>
+→ But the Curated zone (from Project 51) requires cleaned, enriched, deduplicated data<br>
+→ Two approaches:</p>
+<p><strong>Approach A — Micro-Batch ETL (Recommended for PayScale):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Firehose → S3 Landing (every 60s)
+</span>    |
+    ↓ EventBridge detects new files (from Project 38)
+    ↓ Step Functions triggers Glue ETL (from Project 49)
+    |
+Glue ETL: Landing → Curated
+    - Deduplicate (same transaction_id across multiple buffers)
+    - Enrich (join with customer/merchant dimensions)
+    - Quality check
+    |
+    ↓
+Curated Zone (queryable by analysts)</code></pre></div>
+<p>→ Runs every 5-15 minutes (not every 60 seconds — batch micro-ETL)<br>
+→ Provides 5-15 minute latency to curated data — acceptable for most analytics</p>
+<p><strong>Approach B — Direct Firehose to Curated (Simpler but Less Control):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Firehose → S3 Curated directly
+</span>    - No enrichment
+    - No deduplication
+    - No quality checks</code></pre></div>
+<p>→ Fastest (60-second latency) but no data quality gates<br>
+→ Acceptable for APPEND-ONLY datasets where deduplication isn't needed</p>
+<p>→ PayScale uses <strong>Approach A</strong> for the curated zone + <strong>direct Firehose output</strong> in landing for immediate near-real-time queries</p>
+<p><strong>The "Near-Real-Time" Query Pattern:</strong></p>
+<p>→ Analysts who need data within 60 seconds → Query the LANDING zone streaming table directly<br>
+→ Analysts who need cleaned, enriched data → Query the CURATED zone (5-15 minute delay)<br>
+→ Both are available through Athena — different tables, different freshness guarantees</p>
+<table><thead><tr><th>Table</th><th>Zone</th><th>Freshness</th><th>Quality</th><th>Use Case</th></tr></thead><tbody><tr><td><code>raw_fraud.transactions_streaming</code></td><td>Landing/Raw</td><td>&lt; 60 seconds</td><td>Raw (no enrichment)</td><td>Real-time fraud monitoring dashboard</td></tr><tr><td><code>curated_fraud.transactions_clean</code></td><td>Curated</td><td>5-15 minutes</td><td>Enriched, deduplicated</td><td>Analytical queries, reports</td></tr></tbody></table>
+<hr>
+<h3>STEP 6 — CONFIGURE ATHENA TO QUERY STREAMING + BATCH DATA TOGETHER</h3>
+<p><strong>The Unified Query Problem:</strong></p>
+<p>→ Historical batch data (3 years) is in: <code>curated_fraud.transactions_clean</code><br>
+→ Real-time streaming data (last 60 seconds) is in: <code>raw_fraud.transactions_streaming</code><br>
+→ An analyst wants to query: "Show me all transactions for customer X in the last 30 days including the latest ones"<br>
+→ This requires querying BOTH tables</p>
+<p><strong>Solution — Athena View (UNION ALL):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CREATE VIEW unified_fraud.all_transactions AS
+</span>SELECT 
+    transaction_id, customer_id, amount, currency,
+    merchant_id, merchant_name, city, country,
+    status, event_timestamp,
+    'batch' as data_source
+FROM curated_fraud.transactions_clean
+
+UNION ALL
+
+SELECT 
+    transaction_id, customer_id, amount, currency,
+    merchant_id, merchant_name, city, country,
+    status, event_timestamp,
+    'streaming' as data_source
+FROM raw_fraud.transactions_streaming
+WHERE year = CAST(YEAR(CURRENT_DATE) AS VARCHAR)
+    AND month = LPAD(CAST(MONTH(CURRENT_DATE) AS VARCHAR), 2, '0')
+    AND day = LPAD(CAST(DAY(CURRENT_DATE) AS VARCHAR), 2, '0');</code></pre></div>
+<p><strong>How the View Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Analyst queries:
+</span>    SELECT * FROM unified_fraud.all_transactions
+    WHERE customer_id = 'cust-88421'
+    AND event_timestamp &gt; DATE_ADD('day', -30, CURRENT_TIMESTAMP)
+    ORDER BY event_timestamp DESC;
+
+Athena expands the view:
+    ├── Scans curated_fraud.transactions_clean (last 30 days partitions)
+    │   → Returns batch records from yesterday and earlier
+    │
+    └── Scans raw_fraud.transactions_streaming (today's partitions)
+        → Returns streaming records from the last few hours
+    
+    UNION ALL combines both result sets
+    ORDER BY event_timestamp sorts them together
+    
+Result: Seamless timeline from 30 days ago to 60 seconds ago</code></pre></div>
+<p>→ The <code>data_source</code> column tells the analyst whether each row came from batch or streaming<br>
+→ This is useful for debugging and understanding data freshness</p>
+<p><strong>Deduplication in the View:</strong></p>
+<p>→ Some transactions may exist in BOTH batch (yesterday's ETL) and streaming (today's Firehose)<br>
+→ Overlap period: Events from the last batch run to the current streaming window</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Enhanced View with Deduplication:
+</span>CREATE VIEW unified_fraud.all_transactions_deduped AS
+SELECT * FROM (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY transaction_id 
+            ORDER BY 
+                CASE data_source 
+                    WHEN 'batch' THEN 1      -- Prefer batch (cleaned/enriched)
+                    WHEN 'streaming' THEN 2   -- Streaming as fallback
+                END
+        ) as row_num
+    FROM unified_fraud.all_transactions
+)
+WHERE row_num = 1;</code></pre></div>
+<p>→ If a transaction exists in both batch and streaming → Batch version wins (it's been cleaned and enriched)<br>
+→ If a transaction exists only in streaming → Streaming version is used (it's the only available)</p>
+<hr>
+<h3>STEP 7 — CONFIGURE LAMBDA CONSUMER FOR REAL-TIME FRAUD ALERTING</h3>
+<p><strong>Purpose:</strong> While Firehose delivers data to S3 for analytics, a Lambda consumer provides INSTANT fraud alerting</p>
+<p>→ This is the fan-out pattern — Kinesis Data Stream has MULTIPLE consumers</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Kinesis Data Stream
+</span>    |
+    ├──→ Consumer 1: Firehose → S3 (analytics — 60s latency)
+    |
+    └──→ Consumer 2: Lambda (fraud alerting — millisecond latency)</code></pre></div>
+<p><strong>Lambda Event Source Mapping:</strong></p>
+<p>→ Navigate to Lambda Console → Select fraud alerting function → Configuration → Triggers → Add trigger</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Trigger source</td><td>Kinesis</td><td>Reading from Kinesis Data Stream</td></tr><tr><td>Kinesis stream</td><td><code>fraud-transactions-stream</code></td><td>The source stream</td></tr><tr><td>Batch size</td><td>100</td><td>Process up to 100 events per invocation</td></tr><tr><td>Batch window</td><td>5 seconds</td><td>Wait up to 5 seconds to accumulate events</td></tr><tr><td>Starting position</td><td>LATEST</td><td>Only process new events (not historical)</td></tr><tr><td>Parallelization factor</td><td>10</td><td>Process 10 batches per shard concurrently</td></tr><tr><td>On-failure destination</td><td>SQS Dead Letter Queue (from Project 20)</td><td>Failed events go to DLQ</td></tr><tr><td>Retry attempts</td><td>3</td><td>Retry failed batches 3 times</td></tr><tr><td>Maximum age of record</td><td>3600 seconds (1 hour)</td><td>Skip events older than 1 hour</td></tr><tr><td>Split batch on error</td><td>✅ Enabled</td><td>If one record fails, split batch and retry individually</td></tr><tr><td>Concurrent batches per shard</td><td>10</td><td>Process multiple batches from same shard</td></tr></tbody></table>
+<p><strong>What Lambda Does (Conceptual — No Code):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda receives batch of 100 transaction events
+</span>    |
+    ↓
+For each event:
+    ├── Is amount &gt; $10,000? → High-value alert
+    ├── Is country different from customer's home country? → International alert
+    ├── Is this the 3rd transaction in 5 minutes for this customer? → Velocity alert
+    ├── Is merchant category in high-risk list? → Merchant risk alert
+    └── Is device fingerprint previously flagged? → Device risk alert
+    |
+    ↓
+If any alert triggered:
+    → Publish to SNS topic: "fraud-realtime-alerts" (from Project 6)
+    → Write alert to DynamoDB for tracking
+    → Optionally: Call payment gateway API to HOLD the transaction</code></pre></div>
+<p><strong>Lambda Execution Role Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>kinesis:GetRecords</code></td><td>Stream ARN</td><td>Read events from stream</td></tr><tr><td><code>kinesis:GetShardIterator</code></td><td>Stream ARN</td><td>Position in stream</td></tr><tr><td><code>kinesis:DescribeStream</code></td><td>Stream ARN</td><td>Stream metadata</td></tr><tr><td><code>kinesis:ListShards</code></td><td>Stream ARN</td><td>List shards</td></tr><tr><td><code>sns:Publish</code></td><td>Alert topic ARN</td><td>Send fraud alerts</td></tr><tr><td><code>dynamodb:PutItem</code></td><td>Alert tracking table ARN</td><td>Record alerts</td></tr><tr><td><code>sqs:SendMessage</code></td><td>DLQ ARN</td><td>Failed event routing</td></tr></tbody></table>
+<p><strong>Enhanced Fan-Out (Optional):</strong></p>
+<p>→ Standard consumers SHARE the 2 MB/s per shard read capacity<br>
+→ If Firehose + Lambda both read from the same shard → They share 2 MB/s<br>
+→ Enhanced Fan-Out provides DEDICATED 2 MB/s per consumer per shard</p>
+<table><thead><tr><th>Setting</th><th>Standard Consumer</th><th>Enhanced Fan-Out Consumer</th></tr></thead><tbody><tr><td>Read throughput</td><td>Shared 2 MB/s per shard</td><td>Dedicated 2 MB/s per consumer per shard</td></tr><tr><td>Latency</td><td>~200ms (polling)</td><td>~70ms (push-based)</td></tr><tr><td>Cost</td><td>Included in stream cost</td><td>$0.015/shard-hour + $0.013/GB</td></tr><tr><td>Best for</td><td>Cost-sensitive, latency-tolerant</td><td>Latency-sensitive, multiple consumers</td></tr></tbody></table>
+<p>→ For PayScale's fraud alerting Lambda → Enhanced Fan-Out is recommended<br>
+→ Millisecond latency matters for fraud prevention</p>
+<hr>
+<h3>STEP 8 — CONFIGURE MONITORING AND TUNING</h3>
+<p><strong>Kinesis Data Stream Metrics:</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th><th>Alarm Threshold</th></tr></thead><tbody><tr><td>IncomingBytes</td><td>Data volume entering the stream</td><td>Spike detection (unusual traffic)</td></tr><tr><td>IncomingRecords</td><td>Event count entering the stream</td><td>Spike or drop detection</td></tr><tr><td>WriteProvisionedThroughputExceeded</td><td>Writes exceeding shard capacity</td><td>&gt; 0 for 5 minutes (need more shards)</td></tr><tr><td>ReadProvisionedThroughputExceeded</td><td>Reads exceeding shard capacity</td><td>&gt; 0 for 5 minutes</td></tr><tr><td>GetRecords.IteratorAgeMilliseconds</td><td>How far behind consumers are from latest data</td><td>&gt; 60000ms (1 minute behind = consumer too slow)</td></tr><tr><td>GetRecords.Success</td><td>Successful read operations</td><td>Drop indicates consumer issues</td></tr></tbody></table>
+<p><strong>Critical Metric — IteratorAgeMilliseconds:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>IteratorAge = 0ms → Consumer is reading the latest data (real-time) ✅
+</span>IteratorAge = 5000ms → Consumer is 5 seconds behind (acceptable) ✅
+IteratorAge = 60000ms → Consumer is 1 minute behind (warning) ⚠️
+IteratorAge = 3600000ms → Consumer is 1 hour behind (critical) ❌
+IteratorAge increasing → Consumer is falling further behind → Needs scaling</code></pre></div>
+<p>→ Set CloudWatch alarm: IteratorAge &gt; 60000ms → Alert data engineering team<br>
+→ If Firehose's IteratorAge grows → Firehose cannot keep up → Data freshness SLA violated</p>
+<p><strong>Kinesis Firehose Metrics:</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th><th>Alarm Threshold</th></tr></thead><tbody><tr><td>DeliveryToS3.Success</td><td>Successful S3 deliveries</td><td>&lt; 100% indicates delivery failures</td></tr><tr><td>DeliveryToS3.DataFreshness</td><td>Seconds since oldest undelivered record</td><td>&gt; 120 seconds (2x buffer interval)</td></tr><tr><td>IncomingBytes / IncomingRecords</td><td>Data volume entering Firehose</td><td>Baseline + spike detection</td></tr><tr><td>DataReadFromKinesisStream.Bytes</td><td>Data read from source stream</td><td>Should match stream IncomingBytes</td></tr><tr><td>BackupToS3.Success</td><td>Backup delivery success (if configured)</td><td>Must be 100%</td></tr><tr><td>ExecuteProcessing.Success</td><td>Format conversion success rate</td><td>&lt; 100% indicates Parquet conversion failures</td></tr></tbody></table>
+<p><strong>Firehose Data Freshness:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DataFreshness = 30 seconds → Data is 30 seconds old (within buffer interval) ✅
+</span>DataFreshness = 60 seconds → Data just hit the buffer interval limit ✅
+DataFreshness = 120 seconds → 2x buffer interval → Firehose may be congested ⚠️
+DataFreshness = 300 seconds → 5x buffer interval → Firehose delivery issues ❌</code></pre></div>
+<p><strong>Athena Query Performance on Streaming Data:</strong></p>
+<table><thead><tr><th>Optimization</th><th>Configuration</th><th>Impact</th></tr></thead><tbody><tr><td>Partition projection (from Step 4/Project 25)</td><td>Enabled on streaming table</td><td>Eliminates Glue GetPartitions API calls</td></tr><tr><td>Hour-level partitioning</td><td><code>hour=HH/</code> in S3 prefix</td><td>Reduces scan for "last hour" queries from 1440 files to 60</td></tr><tr><td>Parquet format</td><td>Converted by Firehose</td><td>80% less data scanned vs JSON</td></tr><tr><td>Column projection</td><td><code>SELECT col1, col2</code> instead of <code>SELECT *</code></td><td>Only reads needed Parquet columns</td></tr><tr><td>Predicate pushdown</td><td><code>WHERE event_timestamp &gt; '2025-01-15T14:00:00'</code></td><td>Skips non-matching row groups</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use On-demand capacity mode unless traffic patterns are perfectly predictable<br>
+→ Always use a meaningful partition key (customer_id for fraud use cases) — never a constant value<br>
+→ Always enable format conversion in Firehose (JSON → Parquet) — reduces downstream query costs by 80%+<br>
+→ Always enable dynamic partitioning in Firehose — enables Athena partition pruning<br>
+→ Always add hour-level partitioning for streaming data — day-level is too coarse for real-time queries<br>
+→ Always create a Glue table BEFORE configuring Firehose format conversion — Firehose needs the schema<br>
+→ Always configure buffer interval based on latency requirements — 60s for near-real-time, 300s for cost optimization<br>
+→ Always monitor IteratorAgeMilliseconds — it tells you if consumers are falling behind<br>
+→ Always implement both analytics (Firehose → S3) and alerting (Lambda) consumers for fraud detection<br>
+→ Always use Enhanced Fan-Out for latency-sensitive Lambda consumers<br>
+→ Always create a unified view (UNION ALL) for querying batch + streaming data together<br>
+→ Always handle deduplication when batch and streaming data overlap<br>
+→ Always encrypt the Kinesis stream with KMS for PCI-DSS compliance<br>
+→ Always set maximum record age on Lambda triggers — prevents reprocessing very old events</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never write one S3 object per event — creates millions of tiny files → Athena performance nightmare<br>
+→ Never use a constant partition key — all events go to one shard → Hot shard → Throughput exceeded<br>
+→ Never skip Parquet conversion — JSON in S3 costs 10x more to query with Athena<br>
+→ Never set buffer interval to 900 seconds if real-time freshness is required — that's 15 minutes stale<br>
+→ Never forget the Glue table for Firehose format conversion — Firehose fails without schema reference<br>
+→ Never process streaming data through the full Curated ETL pipeline synchronously — adds latency<br>
+→ Never ignore IteratorAge metrics — growing IteratorAge means data is getting staler over time<br>
+→ Never use provisioned capacity without monitoring — under-provisioned shards drop events<br>
+→ Never hardcode shard count for variable workloads — use On-demand or auto-scaling<br>
+→ Never allow Lambda consumer to fall behind without alerting — fraud detection loses value if delayed<br>
+→ Never skip the DLQ for Lambda Kinesis triggers — failed events are silently lost without DLQ<br>
+→ Never query the streaming table without partition filters — full scan of 525,600 files/year is extremely expensive</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE THIS PATTERN</h2>
+<table><thead><tr><th>Scenario</th><th>Use Kinesis + Firehose + S3?</th><th>Why</th></tr></thead><tbody><tr><td>Need data in data lake within 60 seconds</td><td>✅ Yes</td><td>Firehose delivers in buffer intervals</td></tr><tr><td>Need real-time fraud/anomaly detection</td><td>✅ Yes</td><td>Lambda consumer provides millisecond alerting</td></tr><tr><td>Need to combine batch + streaming in same lake</td><td>✅ Yes</td><td>Same S3 zones, same Glue Catalog, same Athena</td></tr><tr><td>Need columnar format in S3 from streaming</td><td>✅ Yes</td><td>Firehose converts to Parquet natively</td></tr><tr><td>Need sub-second event processing</td><td>⚠️ Partially</td><td>Lambda consumer is sub-second, S3 delivery is 60s+</td></tr><tr><td>Need exactly-once processing guarantee</td><td>❌ No</td><td>Kinesis provides at-least-once — use DynamoDB for dedup</td></tr><tr><td>Need complex stream processing (windowing, joins)</td><td>⚠️ Consider</td><td>Use Kinesis Data Analytics (Flink) for complex stream processing</td></tr><tr><td>Need to process &gt; 1 GB/s sustained</td><td>✅ Yes</td><td>Kinesis scales to GB/s with multiple shards</td></tr><tr><td>Data volume is &lt; 100 events per day</td><td>❌ No</td><td>Overkill — use S3 event notifications (from Project 15)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE THIS PATTERN</h2>
+<p>→ When data freshness of hours/days is acceptable → Batch ETL (Project 24, 46) is simpler and cheaper<br>
+→ When event volume is &lt; 100/day → Direct S3 PutObject + event notification is sufficient<br>
+→ When you need exactly-once processing → Kinesis is at-least-once — consider SQS FIFO (from Project 7) for exactly-once<br>
+→ When you need complex stream processing (multi-stream joins, tumbling windows) → Use Kinesis Data Analytics with Apache Flink<br>
+→ When the organization already uses Apache Kafka → Use Amazon MSK instead of Kinesis<br>
+→ When cost is the primary concern and latency doesn't matter → Batch processing is 5-10x cheaper than streaming</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → KINESIS DATA STREAM INTERNAL ARCHITECTURE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Kinesis Data Stream: "fraud-transactions-stream"
+</span>    |
+    ├── Shard 0: Handles partition keys hashing to range [0, 170141183460469...]
+    │   ├── Record 1 (customer_id: cust-001 → hash → falls in shard 0)
+    │   ├── Record 2 (customer_id: cust-005 → hash → falls in shard 0)
+    │   └── Record 3 ...
+    │   Capacity: 1 MB/s write, 2 MB/s read
+    │   
+    ├── Shard 1: Handles partition keys hashing to range [170141183460470..., 340282366920938...]
+    │   ├── Record 4 (customer_id: cust-088 → hash → falls in shard 1)
+    │   └── Record 5 ...
+    │   Capacity: 1 MB/s write, 2 MB/s read
+    │
+    └── (On-demand: Shards auto-scale based on traffic)</code></pre></div>
+<p><strong>How Partition Key Determines Shard:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Producer sends event with partition_key = "cust-88421"
+</span>    |
+    ↓
+Kinesis computes MD5 hash: MD5("cust-88421") = 0x7A3F...
+    |
+    ↓
+Hash maps to a HASH KEY RANGE
+    |
+    ↓
+Each shard owns a CONTIGUOUS range of hash keys
+    Shard 0: [0x0000... to 0x7FFF...]
+    Shard 1: [0x8000... to 0xFFFF...]
+    |
+    ↓
+0x7A3F... falls in Shard 0's range → Event goes to Shard 0</code></pre></div>
+<p>→ All events for <code>cust-88421</code> ALWAYS go to the same shard<br>
+→ Within that shard → Events are ORDERED by arrival time<br>
+→ Across shards → NO ordering guarantee<br>
+→ This is why partition key choice matters (from Step 2)</p>
+<p><strong>Data Retention Mechanics:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Event arrives at Shard 0 at Time T
+</span>    |
+    ↓
+Event stored in Shard 0's buffer
+    |
+    ├── Retention = 24 hours → Event available until T + 24h
+    │   → After 24h → Event automatically deleted
+    │   → If consumer hasn't read it → Event is LOST
+    |
+    └── Consumer reads event at Time T + 5 seconds
+        → Event still available for other consumers until T + 24h
+        → Multiple consumers can read the SAME event independently</code></pre></div>
+<p>→ Kinesis is a RETENTION-BASED log — not a queue<br>
+→ Unlike SQS (from Project 7) where reading REMOVES the message<br>
+→ Kinesis events REMAIN in the stream until retention expires<br>
+→ Multiple consumers read independently at their own pace</p>
+<hr>
+<h3>2 → FIREHOSE DELIVERY MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Firehose reads from Kinesis Data Stream
+</span>    |
+    ↓
+Internal Buffer (managed by Firehose):
+    ├── Buffer accumulates events
+    ├── Buffer condition check (every second):
+    │   ├── Buffer size &gt;= 64 MB? → FLUSH
+    │   ├── Buffer time &gt;= 60 seconds? → FLUSH
+    │   └── Neither? → Continue accumulating
+    |
+    ↓ FLUSH triggered
+    |
+    ↓
+Format Conversion (if enabled):
+    ├── Read Glue table schema
+    ├── Parse JSON records
+    ├── Map JSON fields to Parquet columns
+    ├── Apply Snappy compression
+    └── Generate Parquet file in memory
+    |
+    ↓
+Dynamic Partitioning (if enabled):
+    ├── Extract partition keys from each record (JQ expressions)
+    ├── Group records by partition key values
+    ├── Route each group to appropriate S3 prefix
+    └── Write separate Parquet files per partition
+    |
+    ↓
+S3 Delivery:
+    ├── PutObject to each partition prefix
+    ├── Retry on failure (built-in exponential backoff)
+    ├── If persistent failure → Write to error prefix
+    └── Update delivery metrics</code></pre></div>
+<p><strong>Firehose Delivery Guarantees:</strong></p>
+<table><thead><tr><th>Guarantee</th><th>Value</th></tr></thead><tbody><tr><td>Delivery</td><td>At-least-once (same record may be delivered twice in rare cases)</td></tr><tr><td>Ordering</td><td>NOT guaranteed across buffer flushes</td></tr><tr><td>Durability</td><td>Records buffered in Firehose are replicated across 3 AZs</td></tr><tr><td>Failure handling</td><td>Automatic retry → Error prefix after exhaustion</td></tr></tbody></table>
+<hr>
+<h3>3 → HOW BATCH AND STREAMING DATA COEXIST IN THE SAME TABLE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Curated Zone Table: curated_fraud.transactions_clean
+</span>    |
+    ├── Partitions from BATCH ETL (nightly Glue job):
+    │   └── year=2025/month=01/day=14/ (yesterday's data — enriched, deduplicated)
+    │       ├── part-00001.snappy.parquet (50 MB — large, optimized file)
+    │       ├── part-00002.snappy.parquet
+    │       └── part-00003.snappy.parquet
+    |
+    └── Partitions from STREAMING micro-batch ETL (every 15 minutes):
+        └── year=2025/month=01/day=15/ (today's data — enriched from streaming)
+            ├── hour=14/
+            │   ├── micro-batch-14-00.snappy.parquet (small — 15 min of data)
+            │   ├── micro-batch-14-15.snappy.parquet
+            │   ├── micro-batch-14-30.snappy.parquet
+            │   └── micro-batch-14-45.snappy.parquet
+            └── hour=15/
+                ├── micro-batch-15-00.snappy.parquet
+                └── ...</code></pre></div>
+<p>→ Both batch and streaming data use the SAME partitioning scheme<br>
+→ Athena queries seamlessly span both — partition pruning works identically<br>
+→ The only difference: batch files are larger (optimized), streaming files are smaller (frequent writes)</p>
+<p><strong>File Compaction (Important for Long-Term Performance):</strong></p>
+<p>→ Over time → Streaming creates many small files (1440/day × 365 days = 525,600 files)<br>
+→ Many small files degrade Athena performance (each file = S3 GET request)<br>
+→ Solution: Nightly compaction job</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Nightly Compaction (Glue ETL):
+</span>    Input: yesterday's streaming micro-batch files (1440 small Parquet files)
+    Process: Read all → Merge → Write optimized large Parquet files
+    Output: 3-5 large Parquet files (100-500 MB each)
+    Cleanup: Delete the 1440 small files</code></pre></div>
+<p>→ Compaction runs AFTER the nightly batch ETL (which also processes yesterday's data from MariaDB)<br>
+→ After compaction → Yesterday's data exists as optimized large files<br>
+→ Today's data exists as streaming micro-batch files (small but fresh)<br>
+→ The table always has: Large files (historical) + Small files (today) — both queryable</p>
+<hr>
+<h3>4 → HOW MULTIPLE CONSUMERS READ FROM THE SAME STREAM</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Kinesis Data Stream: fraud-transactions-stream
+</span>    |
+    Shard 0: [Event1, Event2, Event3, Event4, Event5, ...]
+    |
+    ├── Consumer 1: Firehose
+    │   Iterator position: After Event3 (has read 1-3, processing 4-5)
+    │   Reading at: 1 MB/s (shared throughput)
+    │
+    ├── Consumer 2: Lambda (standard)
+    │   Iterator position: After Event5 (has read 1-5, caught up)
+    │   Reading at: 1 MB/s (shared throughput)
+    │
+    └── Consumer 3: Lambda (Enhanced Fan-Out)
+        Iterator position: After Event5 (has read 1-5, caught up)
+        Reading at: 2 MB/s (DEDICATED throughput — not shared)</code></pre></div>
+<p><strong>Standard vs Enhanced Fan-Out:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Standard (Polling):
+</span>    Consumer polls GetRecords every 200ms
+    All standard consumers SHARE 2 MB/s per shard
+    2 standard consumers = 1 MB/s each
+    5 standard consumers = 400 KB/s each → May cause IteratorAge growth
+
+Enhanced Fan-Out (Push):
+    Consumer subscribes via SubscribeToShard
+    Kinesis PUSHES records to consumer
+    Each EFO consumer gets DEDICATED 2 MB/s per shard
+    5 EFO consumers = 2 MB/s each (no sharing)
+    Latency: ~70ms vs ~200ms for standard</code></pre></div>
+<p>→ Firehose always uses standard consumer (built-in)<br>
+→ Lambda can use either standard or Enhanced Fan-Out<br>
+→ For PayScale: Firehose (standard) + Lambda fraud alerting (Enhanced Fan-Out)</p>
+<hr>
+<h3>5 → COST MODEL FOR STREAMING ARCHITECTURE</h3>
+<p><strong>Kinesis Data Stream (On-demand):</strong></p>
+<table><thead><tr><th>Component</th><th>Rate</th><th>PayScale Volume</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Data ingested</td><td>$0.08 per GB</td><td>500 events/s × 1KB × 86400s × 30d = ~1.3 TB</td><td>$104</td></tr><tr><td>Data retrieved</td><td>$0.05 per GB (standard)</td><td>~1.3 TB (Firehose) + ~1.3 TB (Lambda) = ~2.6 TB</td><td>$130</td></tr><tr><td>Enhanced Fan-Out</td><td>$0.015 per shard-hour + $0.013/GB</td><td>2 shards × 720h + 1.3 TB</td><td>$38.50</td></tr><tr><td><strong>Stream Total</strong></td><td></td><td></td><td><strong>~$272/month</strong></td></tr></tbody></table>
+<p><strong>Kinesis Firehose:</strong></p>
+<table><thead><tr><th>Component</th><th>Rate</th><th>PayScale Volume</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Data ingested</td><td>$0.029 per GB (first 500 TB)</td><td>~1.3 TB</td><td>$37.70</td></tr><tr><td>Format conversion</td><td>Included in ingestion price</td><td>—</td><td>$0</td></tr><tr><td>Dynamic partitioning</td><td>$0.20 per JQ processing-hour</td><td>~720 hours</td><td>$144</td></tr><tr><td><strong>Firehose Total</strong></td><td></td><td></td><td><strong>~$182/month</strong></td></tr></tbody></table>
+<p><strong>S3 Storage (Streaming Output):</strong></p>
+<table><thead><tr><th>Component</th><th>Rate</th><th>PayScale Volume</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Storage (Parquet, compressed)</td><td>$0.023 per GB</td><td>~130 GB/month (10:1 compression)</td><td>$3</td></tr><tr><td>PUT requests</td><td>$0.005 per 1000</td><td>~43,200 files/month</td><td>$0.22</td></tr><tr><td><strong>S3 Total</strong></td><td></td><td></td><td><strong>~$3.22/month</strong></td></tr></tbody></table>
+<p><strong>Lambda (Fraud Alerting):</strong></p>
+<table><thead><tr><th>Component</th><th>Rate</th><th>PayScale Volume</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Invocations</td><td>$0.20 per million</td><td>~13M events / 100 batch size = 130K invocations</td><td>$0.03</td></tr><tr><td>Duration</td><td>$0.0000166667 per GB-second</td><td>130K × 200ms × 256MB</td><td>$0.70</td></tr><tr><td><strong>Lambda Total</strong></td><td></td><td></td><td><strong>~$0.73/month</strong></td></tr></tbody></table>
+<p><strong>Total Streaming Architecture Cost:</strong></p>
+<table><thead><tr><th>Component</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Kinesis Data Stream</td><td>$272</td></tr><tr><td>Kinesis Firehose</td><td>$182</td></tr><tr><td>S3 Storage</td><td>$3</td></tr><tr><td>Lambda</td><td>$1</td></tr><tr><td><strong>Total</strong></td><td><strong>~$458/month</strong></td></tr></tbody></table>
+<p><strong>Cost vs Business Value:</strong></p>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody><tr><td>Streaming infrastructure cost</td><td>$458/month</td></tr><tr><td>Fraud losses PREVENTED (90% reduction)</td><td>$675,000/month savings</td></tr><tr><td>ROI</td><td>1,474:1</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Constant partition key (all events to one shard)</td><td>WriteProvisionedThroughputExceeded</td><td>All events hash to same shard</td><td>Use high-cardinality partition key (customer_id, transaction_id)</td></tr><tr><td>2</td><td>Firehose format conversion fails</td><td>Events go to error prefix, not main prefix</td><td>Glue table schema doesn't match JSON structure</td><td>Verify Glue table columns match JSON fields exactly</td></tr><tr><td>3</td><td>Tiny Parquet files in S3</td><td>Athena queries slow, high S3 GET request costs</td><td>Low event volume + short buffer interval</td><td>Increase buffer interval OR implement nightly compaction</td></tr><tr><td>4</td><td>IteratorAge growing continuously</td><td>Data freshness SLA violated — consumers falling behind</td><td>Consumer throughput &lt; stream throughput</td><td>Scale consumers (more Lambda concurrency, Enhanced Fan-Out)</td></tr><tr><td>5</td><td>No partition projection on streaming table</td><td>Athena queries scan ALL 525,600 files</td><td>Missing table properties for partition projection</td><td>Enable partition projection (from Project 25)</td></tr><tr><td>6</td><td>Firehose cross-account S3 write fails</td><td>Delivery failures, events accumulate in Firehose</td><td>Bucket policy missing or IAM role insufficient</td><td>Verify bucket policy allows Firehose role + verify IAM permissions</td></tr><tr><td>7</td><td>JSON → Parquet type mismatch</td><td>Conversion errors, records lost</td><td>JSON has string "1250.00" but Glue schema expects double</td><td>Ensure Glue schema types match actual JSON types</td></tr><tr><td>8</td><td>Lambda consumer timeout</td><td>Events not processed, IteratorAge grows</td><td>Lambda function takes too long per batch</td><td>Reduce batch size OR optimize Lambda processing OR increase timeout</td></tr><tr><td>9</td><td>No DLQ on Lambda Kinesis trigger</td><td>Failed events silently lost — fraud alerts missed</td><td>Missing on-failure destination</td><td>Configure SQS DLQ as on-failure destination</td></tr><tr><td>10</td><td>Streaming and batch data overlap without deduplication</td><td>Duplicate transactions in unified queries</td><td>Same events processed by both batch ETL and streaming</td><td>Implement deduplication view with ROW_NUMBER()</td></tr><tr><td>11</td><td>Firehose buffer interval too high (900s)</td><td>15-minute data freshness — violates 60s SLA</td><td>Buffer interval set to maximum</td><td>Reduce to 60 seconds</td></tr><tr><td>12</td><td>KMS key not authorized for Firehose role</td><td>Firehose cannot decrypt stream data</td><td>Missing kms:Decrypt on Firehose IAM role</td><td>Add KMS permissions to Firehose role</td></tr><tr><td>13</td><td>Dynamic partitioning JQ expression wrong</td><td>All events land in one partition</td><td>JQ expression doesn't match JSON structure</td><td>Test JQ expression with sample events before deployment</td></tr><tr><td>14</td><td>No file compaction strategy</td><td>Query performance degrades over months</td><td>Hundreds of thousands of small files accumulate</td><td>Implement nightly compaction Glue job</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Throughput Scalability</strong></p>
+<table><thead><tr><th>Mode</th><th>Scaling Mechanism</th><th>Maximum</th></tr></thead><tbody><tr><td>On-demand</td><td>Auto-scales shards based on traffic</td><td>Up to 200 MB/s write (can request higher)</td></tr><tr><td>Provisioned</td><td>Manual shard splitting/merging</td><td>Limited by shard count × 1 MB/s per shard</td></tr><tr><td>Firehose</td><td>Auto-scales internally</td><td>Up to 1 GB/s (can request higher)</td></tr></tbody></table>
+<p>→ <strong>Consumer Scalability</strong></p>
+<ul>
+<li>Standard consumers: Up to 5 per stream (sharing read throughput)</li>
+<li>Enhanced Fan-Out consumers: Up to 20 per stream (dedicated throughput)</li>
+<li>Lambda parallelization factor: Up to 10 concurrent batches per shard</li>
+<li>For PayScale (2 consumers): Well within limits</li>
+</ul>
+<p>→ <strong>Storage Scalability</strong></p>
+<ul>
+<li>S3 has no storage limit (from Project 1)</li>
+<li>Streaming data grows linearly with event volume</li>
+<li>Lifecycle policies (from Project 12, 51) manage cost over time</li>
+<li>Compaction reduces file count without data loss</li>
+</ul>
+<p>→ <strong>Query Scalability</strong></p>
+<ul>
+<li>Partition projection eliminates Glue API bottleneck</li>
+<li>Hour-level partitioning enables efficient time-range queries</li>
+<li>Parquet format reduces scan volume by 80%+</li>
+<li>Athena auto-scales query execution</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<table><thead><tr><th>Event Volume</th><th>Stream Cost</th><th>Firehose Cost</th><th>Total Monthly</th></tr></thead><tbody><tr><td>100/s (low)</td><td>$55</td><td>$37</td><td>~$100</td></tr><tr><td>500/s (PayScale)</td><td>$272</td><td>$182</td><td>~$458</td></tr><tr><td>5,000/s (high)</td><td>$2,720</td><td>$1,820</td><td>~$4,580</td></tr><tr><td>50,000/s (extreme)</td><td>$27,200</td><td>$18,200</td><td>~$45,800</td></tr></tbody></table>
+<p>→ Costs scale linearly with event volume<br>
+→ At extreme volumes → Consider Kinesis Data Analytics for pre-aggregation before S3 delivery (reduces storage and query costs)</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the streaming pipeline is working:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th></tr></thead><tbody><tr><td>Stream is active</td><td>Kinesis Console → Data Streams</td><td>Status: ACTIVE</td></tr><tr><td>Events arriving</td><td>Kinesis Console → Monitoring → IncomingRecords</td><td>&gt; 0 per second</td></tr><tr><td>Firehose delivering</td><td>Kinesis Console → Delivery Streams → Monitoring</td><td>DeliveryToS3.Success = 100%</td></tr><tr><td>S3 files appearing</td><td>S3 Console → Landing bucket → streaming prefix</td><td>New Parquet files every 60 seconds</td></tr><tr><td>Athena can query</td><td>Athena Console → Query streaming table</td><td>Results include recent events</td></tr><tr><td>Lambda processing</td><td>Lambda Console → Monitoring → Invocations</td><td>Invocations matching event rate</td></tr><tr><td>Data freshness</td><td>Athena: <code>SELECT MAX(event_timestamp) FROM streaming_table</code></td><td>Within 60 seconds of current time</td></tr><tr><td>No consumer lag</td><td>Kinesis Console → IteratorAgeMilliseconds</td><td>&lt; 60000ms (1 minute)</td></tr></tbody></table>
+<p>→ <strong>How to debug streaming issues:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Are events arriving in the stream?
+</span>    → Kinesis Console → Monitoring → IncomingRecords
+    → 0 records → Producer issue (application not sending events)
+    → Records present → Go to Step 2
+
+Step 2: Is Firehose reading from the stream?
+    → Firehose Console → Monitoring → DataReadFromKinesisStream
+    → 0 bytes → Firehose IAM role issue or stream ARN mismatch
+    → Bytes present → Go to Step 3
+
+Step 3: Is Firehose converting to Parquet?
+    → Firehose Console → Monitoring → ExecuteProcessing.Success
+    → &lt; 100% → Schema mismatch between Glue table and JSON structure
+    → 100% → Go to Step 4
+
+Step 4: Is Firehose delivering to S3?
+    → Firehose Console → Monitoring → DeliveryToS3.Success
+    → &lt; 100% → S3 permission issue or bucket policy
+    → Check error prefix for failed deliveries
+    → 100% → Go to Step 5
+
+Step 5: Are files in the correct S3 path?
+    → S3 Console → Check partition prefixes
+    → Wrong path → Dynamic partitioning JQ expression issue
+    → Correct path → Go to Step 6
+
+Step 6: Can Athena query the files?
+    → Run simple SELECT on streaming table
+    → "No data" → Glue table location doesn't match S3 prefix
+    → "SerDe error" → Parquet schema mismatch
+    → Data returns → Pipeline working ✅</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Kinesis Data Streams captures real-time events with millisecond latency and shard-based scaling<br>
+→ Kinesis Data Firehose delivers events to S3 in near-real-time (60-second buffer) with automatic Parquet conversion<br>
+→ The combination provides the "streaming layer" that complements the batch data lake (from Project 51)<br>
+→ Dynamic partitioning in Firehose creates Hive-style partitions automatically — enabling Athena partition pruning<br>
+→ Multiple consumers (Firehose for analytics, Lambda for alerting) read from the same stream independently<br>
+→ The partition key determines shard assignment — high-cardinality keys ensure even distribution<br>
+→ On-demand capacity mode eliminates shard management for variable workloads<br>
+→ File compaction is essential for long-term query performance — small streaming files must be merged nightly<br>
+→ A unified view (UNION ALL) bridges batch and streaming data for seamless analyst experience<br>
+→ Enhanced Fan-Out provides dedicated throughput for latency-sensitive consumers<br>
+→ The streaming architecture costs ~$458/month but prevents ~$675,000/month in fraud losses — 1,474:1 ROI</p>
+<p>→ <strong>Connection to previous projects:</strong></p>
+<ul>
+<li>S3 storage and zones (Project 1, 51) — streaming data lands in the same zone architecture</li>
+<li>Glue Catalog (Project 17) — Firehose uses Glue schema for Parquet conversion</li>
+<li>Athena (Project 18, 25) — queries both batch and streaming data</li>
+<li>EventBridge (Project 38) — triggers micro-batch ETL from streaming landing</li>
+<li>Step Functions (Project 49) — orchestrates streaming-to-curated pipeline</li>
+<li>Lambda (Project 26, 45) — real-time fraud alerting consumer</li>
+<li>SNS (Project 6) — fraud alert notifications</li>
+<li>SQS DLQ (Project 20) — failed event handling</li>
+<li>Lake Formation (Project 47) — governance applies to streaming tables too</li>
+<li>KMS (Project 36) — encryption for stream and S3</li>
+</ul>
+<p>→ <strong>Connection to next projects:</strong></p>
+<ul>
+<li>Redshift Serverless (Project ) will query the streaming data alongside warehouse data using Serverless RPUs</li>
+<li>Organizations and SCPs (Project 54) will govern which accounts can create Kinesis streams and access streaming data</li>
+<li>Cross-Region DR (Project 55) will replicate streaming infrastructure for disaster recovery</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale now has BOTH batch and streaming data flowing into the enterprise data lake<br>
+→ The Redshift data warehouse (from Project 16) has been running on a provisioned cluster:</p>
+<ul>
+<li>dc2.large nodes — fixed capacity</li>
+<li>Running 24/7 — even when no queries are executing (nights, weekends)</li>
+<li>$0.25/hour per node × 4 nodes × 24 hours × 30 days = $720/month</li>
+<li>During peak hours (9 AM - 6 PM) → Cluster is at 80% utilization</li>
+<li>During off-hours (6 PM - 9 AM + weekends) → Cluster is at 5% utilization</li>
+<li>75% of compute cost is WASTED on idle capacity</li>
+</ul>
+<p>→ The CFO asks: "Why are we paying $720/month for a warehouse that's busy only 9 hours a day?"<br>
+→ The data team says: "We also need Redshift to query the streaming data in S3 via Spectrum — but our dc2 nodes don't support Spectrum efficiently"<br>
+→ The analytics team says: "Some months we run 10x more queries during audits — the fixed cluster can't handle the spike"</p>
+<p>→ They need:</p>
+<ul>
+<li>Pay only for what they use — no idle compute charges</li>
+<li>Auto-scale during peak query periods</li>
+<li>Scale to zero during nights and weekends</li>
+<li>Support Spectrum queries on the data lake (from Project 28, 51, 52)</li>
+<li>No cluster management overhead</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 53 solves</strong><br>
+→ Project 53: "The Warehouse That Needed Zero Management — Redshift Serverless with Spectrum &amp; Auto-Scaling"<br>
+→ It introduces Redshift Serverless — the pay-per-query alternative to provisioned clusters<br>
+→ Workgroups and namespaces replace clusters and node counts<br>
+→ RPU (Redshift Processing Units) auto-scale based on query complexity<br>
+→ Cost drops from $720/month (always-on) to ~$150/month (query-time-only)<br>
+→ Combined with Spectrum → Serverless Redshift queries both warehouse tables AND the streaming data lake</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 53: "The Warehouse That Needed Zero Management — Redshift Serverless with Spectrum &amp; Auto-Scaling"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-51.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 52/60</span></div><a class="nav-btn next" href="project-53.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

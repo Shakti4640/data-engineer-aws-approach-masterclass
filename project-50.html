@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 50: THE ORGANIZATION WITH 20 VPCs THAT COULDN'T SCALE PEERING — Transit  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 50: THE ORGANIZATION WITH 20 VPCs THAT COULDN'T SCALE PEERING — Transit Gateway for Multi-VPC Multi-Account</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale has grown from 3 AWS accounts to 8 AWS accounts over 18 months<br>
+→ Each account has its own VPC (some accounts have multiple VPCs)<br>
+→ The network team has been using VPC Peering (from Project 44) for inter-VPC connectivity</p>
+<p><strong>Current Account &amp; VPC Landscape:</strong></p>
+<table><thead><tr><th>Account</th><th>Account ID</th><th>Purpose</th><th>VPC CIDR</th><th>Region</th></tr></thead><tbody><tr><td>Account A — Platform</td><td>111111111111</td><td>Core Payment Processing</td><td>10.0.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account B — Risk</td><td>222222222222</td><td>Fraud Detection + Data Lake</td><td>10.1.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account C — Analytics</td><td>333333333333</td><td>Reporting + Dashboards</td><td>10.2.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account D — Audit</td><td>444444444444</td><td>External Auditor Access</td><td>10.3.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account E — Compliance</td><td>555555555555</td><td>Regulatory Systems</td><td>10.4.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account F — Dev</td><td>666666666666</td><td>Development Environment</td><td>10.5.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account G — Staging</td><td>777777777777</td><td>Staging Environment</td><td>10.6.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account H — Shared Services</td><td>888888888888</td><td>DNS, Logging, Monitoring, NAT</td><td>10.7.0.0/16</td><td>ap-south-1</td></tr></tbody></table>
+<p><strong>Current VPC Peering Mesh (from Project 44 approach):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Required Connectivity:
+</span>    A ↔ B (fraud detection calls payment API)
+    A ↔ C (analytics reads from platform)
+    A ↔ H (platform uses shared DNS/logging)
+    B ↔ C (analytics queries fraud data lake)
+    B ↔ H (fraud uses shared logging)
+    C ↔ H (analytics uses shared monitoring)
+    D ↔ B (auditor accesses fraud data)
+    D ↔ H (auditor uses shared DNS)
+    E ↔ A (compliance monitors payments)
+    E ↔ B (compliance monitors fraud)
+    E ↔ H (compliance uses shared logging)
+    F ↔ H (dev uses shared services)
+    G ↔ H (staging uses shared services)
+    F ↔ A (dev tests against platform APIs)
+    G ↔ A (staging tests against platform APIs)</code></pre></div>
+<p>→ That's <strong>15 peering connections</strong> already<br>
+→ Each peering connection requires route table updates on BOTH sides (30 route table changes)<br>
+→ Each peering connection requires security group updates on BOTH sides (30+ SG changes)<br>
+→ Total management overhead: <strong>60+ configuration items to maintain</strong></p>
+<p><strong>The Scaling Problem:</strong></p>
+<table><thead><tr><th>Accounts</th><th>Full Mesh Peering Connections</th><th>Route Table Changes</th><th>SG Changes</th></tr></thead><tbody><tr><td>3 (original)</td><td>3</td><td>6</td><td>6+</td></tr><tr><td>5</td><td>10</td><td>20</td><td>20+</td></tr><tr><td>8 (current)</td><td>28 (max full mesh)</td><td>56</td><td>56+</td></tr><tr><td>10 (next quarter)</td><td>45</td><td>90</td><td>90+</td></tr><tr><td>15 (next year)</td><td>105</td><td>210</td><td>210+</td></tr><tr><td>20 (projected)</td><td>190</td><td>380</td><td>380+</td></tr></tbody></table>
+<p><strong>Operational Incidents in the Last 3 Months:</strong></p>
+<table><thead><tr><th>Incident</th><th>Root Cause</th><th>Impact</th><th>Time to Resolve</th></tr></thead><tbody><tr><td>Account E cannot reach Account A</td><td>Route table entry missing on Account A side</td><td>Compliance monitoring blind for 6 hours</td><td>6 hours</td></tr><tr><td>Account F dev environment routing to Account A production</td><td>Wrong peering connection referenced in route table</td><td>Dev traffic hitting production database</td><td>2 hours (emergency)</td></tr><tr><td>New Account G added — connectivity took 3 weeks</td><td>7 new peering connections, 14 route table updates, 14 SG updates</td><td>Staging environment delayed by 3 weeks</td><td>3 weeks</td></tr><tr><td>Account H shared services unreachable from Account D</td><td>NACL rule missing on Account H side (from Project 4)</td><td>Audit systems down for 4 hours</td><td>4 hours</td></tr><tr><td>Peering connection limit approaching</td><td>Account H has 13 peering connections (limit 50 default)</td><td>No immediate issue but approaching limits</td><td>—</td></tr></tbody></table>
+<p><strong>The CTO's Directive:</strong></p>
+<p>→ "Adding a new account should take HOURS not WEEKS"<br>
+→ "I want ONE place to manage all network connectivity — not 30 separate peering connections"<br>
+→ "Traffic from Account F (dev) to Account C (analytics) should route through a central point — not require a direct peering connection"<br>
+→ "Shared services in Account H should be reachable by ALL accounts without individual peering to each"<br>
+→ "We need centralized internet egress — every account's outbound traffic should go through ONE set of NAT Gateways in Account H"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand why VPC Peering fails at this scale</p>
+<table><thead><tr><th>VPC Peering Limitation</th><th>Impact at Scale</th></tr></thead><tbody><tr><td>Non-transitive routing (from Project 44)</td><td>A↔H and B↔H does NOT give A↔B — need direct peering</td></tr><tr><td>N×(N-1)/2 connections for full mesh</td><td>20 VPCs = 190 connections — unmanageable</td></tr><tr><td>Route tables on BOTH sides per connection</td><td>190 connections × 2 sides = 380 route updates</td></tr><tr><td>No centralized routing policy</td><td>Each peering connection is independent — no unified view</td></tr><tr><td>No centralized egress</td><td>Each VPC needs its own NAT Gateway — costly and fragmented</td></tr><tr><td>No route propagation</td><td>Every route must be manually added</td></tr><tr><td>Maximum 125 peering connections per VPC</td><td>Hard limit — cannot exceed even with request</td></tr></tbody></table>
+<p>→ AWS Transit Gateway (TGW) solves ALL of these limitations</p>
+<p><strong>Transit Gateway vs VPC Peering:</strong></p>
+<table><thead><tr><th>Feature</th><th>VPC Peering (Project 44)</th><th>Transit Gateway</th></tr></thead><tbody><tr><td>Topology</td><td>Point-to-point (mesh)</td><td>Hub-and-spoke (star)</td></tr><tr><td>Transitive routing</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Adding new VPC</td><td>N-1 new connections</td><td>1 new attachment</td></tr><tr><td>Route management</td><td>Per-connection, both sides</td><td>Centralized TGW route tables</td></tr><tr><td>Centralized egress</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Cross-account</td><td>Requester-accepter per connection</td><td>RAM sharing — one-time setup</td></tr><tr><td>Route propagation</td><td>❌ Manual</td><td>✅ Automatic</td></tr><tr><td>Bandwidth limit</td><td>No practical limit</td><td>50 Gbps per VPC attachment</td></tr><tr><td>Cost</td><td>Free (data transfer charges only)</td><td>$0.05/hour per attachment + $0.02/GB</td></tr><tr><td>Maximum connections per VPC</td><td>125 peering</td><td>5,000 attachments per TGW</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Design the Transit Gateway architecture</li>
+<li>Step 2 — Create Transit Gateway in the networking/shared services account</li>
+<li>Step 3 — Share Transit Gateway cross-account via RAM</li>
+<li>Step 4 — Create VPC attachments from each account</li>
+<li>Step 5 — Configure TGW route tables for traffic segmentation</li>
+<li>Step 6 — Update VPC route tables to point to TGW</li>
+<li>Step 7 — Configure centralized egress through shared services account</li>
+<li>Step 8 — Implement network segmentation (dev cannot reach production)</li>
+<li>Step 9 — Remove old VPC peering connections</li>
+<li>Step 10 — Monitor and audit Transit Gateway traffic</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — DESIGN THE TRANSIT GATEWAY ARCHITECTURE</h3>
+<p><strong>Architecture Decision: Where to Create the Transit Gateway?</strong></p>
+<table><thead><tr><th>Option</th><th>Account</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Option A</td><td>Account H — Shared Services (888888888888)</td><td>Centralized networking, already hosts DNS/logging</td><td>Single account controls all routing</td></tr><tr><td>Option B</td><td>Dedicated Networking Account (new)</td><td>Clean separation of concerns</td><td>Extra account to manage</td></tr><tr><td>Option C</td><td>Account A — Platform</td><td>Platform is the "core"</td><td>Mixes application and networking concerns</td></tr></tbody></table>
+<p>→ PayScale chooses <strong>Option A — Shared Services Account</strong> (Account H)<br>
+→ This account already manages DNS, logging, and monitoring — networking fits naturally</p>
+<p><strong>Network Segmentation Design:</strong></p>
+<p>→ Not all accounts should talk to all other accounts<br>
+→ PayScale defines THREE routing domains:</p>
+<table><thead><tr><th>Routing Domain</th><th>Accounts</th><th>Purpose</th><th>Can Communicate With</th></tr></thead><tbody><tr><td>Production</td><td>A (Platform), B (Risk), C (Analytics), D (Audit), E (Compliance)</td><td>Live business systems</td><td>Production + Shared Services</td></tr><tr><td>Non-Production</td><td>F (Dev), G (Staging)</td><td>Development and testing</td><td>Non-Production + Shared Services</td></tr><tr><td>Shared Services</td><td>H (Shared Services)</td><td>DNS, logging, NAT, monitoring</td><td>Production + Non-Production</td></tr></tbody></table>
+<p><strong>Segmentation Rules:</strong></p>
+<table><thead><tr><th>From → To</th><th>Allowed?</th><th>Why</th></tr></thead><tbody><tr><td>Production → Production</td><td>✅ Yes</td><td>Business systems need to communicate</td></tr><tr><td>Production → Shared Services</td><td>✅ Yes</td><td>All systems use shared DNS/logging</td></tr><tr><td>Non-Production → Shared Services</td><td>✅ Yes</td><td>Dev/staging need shared services</td></tr><tr><td>Non-Production → Production</td><td>❌ No</td><td>Dev must NEVER reach production databases</td></tr><tr><td>Production → Non-Production</td><td>❌ No</td><td>Production should not depend on dev systems</td></tr><tr><td>Non-Production → Non-Production</td><td>✅ Yes</td><td>Dev and staging may need to communicate</td></tr></tbody></table>
+<p>→ This segmentation is enforced through TGW Route Tables — not security groups<br>
+→ Security groups provide instance-level control (from Project 4)<br>
+→ TGW route tables provide NETWORK-level control — traffic is dropped before it even reaches the VPC</p>
+<hr>
+<h3>STEP 2 — CREATE TRANSIT GATEWAY IN SHARED SERVICES ACCOUNT</h3>
+<p><strong>Performed in: Account H (888888888888)</strong></p>
+<p>→ Navigate to VPC Console → Transit Gateways → Create Transit Gateway</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Name tag</td><td><code>tgw-payscale-central</code></td><td>Descriptive identification</td></tr><tr><td>Description</td><td>Central Transit Gateway for all PayScale accounts</td><td>Documentation</td></tr><tr><td>Amazon side ASN</td><td>64512 (default)</td><td>BGP ASN for the TGW — default is fine for most use cases</td></tr><tr><td>DNS support</td><td>✅ Enable</td><td>Allows VPCs to resolve private DNS across TGW</td></tr><tr><td>VPN ECMP support</td><td>❌ Disable</td><td>Not using VPN — disable to simplify</td></tr><tr><td>Default route table association</td><td>✅ Enable</td><td>New attachments auto-associate with default route table</td></tr><tr><td>Default route table propagation</td><td>✅ Enable</td><td>New attachments auto-propagate routes to default route table</td></tr><tr><td>Multicast support</td><td>❌ Disable</td><td>Not using multicast</td></tr><tr><td>Auto accept shared attachments</td><td>❌ Disable</td><td>Manual acceptance for security — prevents unauthorized VPCs from attaching</td></tr></tbody></table>
+<p>→ Click "Create Transit Gateway"<br>
+→ State changes from <code>pending</code> → <code>available</code> (takes 1-5 minutes)<br>
+→ TGW ID: <code>tgw-0aaaa1111bbbb2222</code></p>
+<p><strong>Understanding Key Settings:</strong></p>
+<p><strong>Amazon side ASN (64512):</strong><br>
+→ ASN = Autonomous System Number — used in BGP routing<br>
+→ Only relevant if you connect the TGW to on-premises via VPN or Direct Connect<br>
+→ For VPC-only connectivity → Default 64512 is fine<br>
+→ Must be in the private ASN range: 64512-65534 or 4200000000-4294967294</p>
+<p><strong>DNS Support:</strong><br>
+→ When enabled → VPCs attached to the TGW can resolve each other's private DNS names<br>
+→ Same concept as VPC Peering DNS resolution (from Project 44, Step 5)<br>
+→ Requires <code>enableDnsSupport</code> and <code>enableDnsHostnames</code> on each VPC (from Project 5)</p>
+<p><strong>Default Route Table Association vs Propagation:</strong></p>
+<table><thead><tr><th>Concept</th><th>What It Does</th></tr></thead><tbody><tr><td>Association</td><td>Links a VPC attachment to a specific TGW route table — determines which route table is used for OUTBOUND routing from that VPC</td></tr><tr><td>Propagation</td><td>Allows a VPC attachment to ADVERTISE its CIDR into a TGW route table — determines which route table knows about that VPC's CIDR</td></tr></tbody></table>
+<p>→ These are TWO separate concepts — confusion between them is the #1 TGW misconfiguration</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VPC A (10.0.0.0/16) attached to TGW
+</span>    |
+    ├── ASSOCIATED with Route Table X
+    |   → When traffic FROM VPC A enters TGW, Route Table X decides where it goes
+    |
+    └── PROPAGATED to Route Table Y
+        → Route Table Y now has entry: 10.0.0.0/16 → VPC A attachment
+        → Other VPCs associated with Route Table Y can now reach VPC A</code></pre></div>
+<hr>
+<h3>STEP 3 — SHARE TRANSIT GATEWAY CROSS-ACCOUNT VIA RAM</h3>
+<p><strong>Why RAM is Needed:</strong></p>
+<p>→ Transit Gateway is created in Account H<br>
+→ Other accounts (A, B, C, D, E, F, G) need to attach their VPCs to this TGW<br>
+→ They cannot see or use Account H's TGW unless it's SHARED with them<br>
+→ AWS Resource Access Manager (RAM) enables cross-account resource sharing</p>
+<p><strong>Performed in: Account H (888888888888)</strong></p>
+<p>→ Navigate to RAM Console → Resource shares → Create resource share</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Name</td><td><code>tgw-share-payscale</code></td><td>Descriptive</td></tr><tr><td>Resources</td><td>Select <code>tgw-0aaaa1111bbbb2222</code> (the Transit Gateway)</td><td>The resource being shared</td></tr><tr><td>Resource type</td><td>Transit Gateways</td><td>Specifies the resource type</td></tr></tbody></table>
+<p><strong>Principals (Who to share with):</strong></p>
+<table><thead><tr><th>Option</th><th>Value</th><th>When to Use</th></tr></thead><tbody><tr><td>Individual account IDs</td><td>111111111111, 222222222222, etc.</td><td>When NOT using AWS Organizations</td></tr><tr><td>Organization ID</td><td><code>o-xxxxxxxxxxxx</code></td><td>Share with ALL accounts in the Organization</td></tr><tr><td>Organizational Unit (OU)</td><td><code>ou-xxxx-xxxxxxxx</code></td><td>Share with specific OUs</td></tr></tbody></table>
+<p>→ If PayScale uses AWS Organizations (from Project 54 concepts):</p>
+<ul>
+<li>Share with the Organization → All current and FUTURE accounts automatically get access</li>
+<li>No RAM acceptance needed (auto-accept within Organization)</li>
+</ul>
+<p>→ If NOT using Organizations:</p>
+<ul>
+<li>Share with each account ID individually</li>
+<li>Each account must ACCEPT the RAM invitation (like VPC Peering acceptance from Project 44)</li>
+</ul>
+<p><strong>PayScale uses Organizations:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Allow external accounts</td><td>❌ No (only Organization members)</td></tr><tr><td>Principal</td><td>Organization ID: <code>o-payscale123</code></td></tr></tbody></table>
+<p>→ Click "Create resource share"<br>
+→ All accounts in the Organization can now see and attach to the TGW</p>
+<p><strong>What Each Account Sees After Sharing:</strong></p>
+<p>→ Navigate to VPC Console → Transit Gateways (in any account, e.g., Account A)<br>
+→ The shared TGW <code>tgw-0aaaa1111bbbb2222</code> appears with Owner: <code>888888888888</code><br>
+→ The account can now create attachments to this TGW</p>
+<hr>
+<h3>STEP 4 — CREATE VPC ATTACHMENTS FROM EACH ACCOUNT</h3>
+<p><strong>Understanding VPC Attachments:</strong></p>
+<p>→ A VPC attachment is the CONNECTION between a VPC and the Transit Gateway<br>
+→ Each VPC that needs TGW connectivity must create its own attachment<br>
+→ The attachment specifies WHICH SUBNETS in the VPC will be used for TGW traffic</p>
+<p><strong>Subnet Selection for TGW Attachment:</strong></p>
+<p>→ TGW creates an ENI (Elastic Network Interface) in each selected subnet<br>
+→ Best practice: Create DEDICATED subnets for TGW attachments</p>
+<table><thead><tr><th>Subnet Type</th><th>Use for TGW Attachment?</th><th>Why</th></tr></thead><tbody><tr><td>Public subnet</td><td>❌ No</td><td>TGW traffic should not flow through public subnets</td></tr><tr><td>Private application subnet</td><td>⚠️ Possible but not ideal</td><td>Mixes application and transit traffic</td></tr><tr><td>Private database subnet</td><td>❌ No</td><td>Database subnets should be isolated</td></tr><tr><td><strong>Dedicated TGW subnet</strong></td><td><strong>✅ Best practice</strong></td><td>Clean separation, small CIDR, clear purpose</td></tr></tbody></table>
+<p><strong>Create TGW Subnets (in each account's VPC):</strong></p>
+<p><strong>Example — Account A (10.0.0.0/16):</strong></p>
+<table><thead><tr><th>Subnet</th><th>CIDR</th><th>AZ</th><th>Purpose</th></tr></thead><tbody><tr><td>subnet-tgw-1a</td><td>10.0.100.0/28</td><td>ap-south-1a</td><td>TGW ENI — AZ A</td></tr><tr><td>subnet-tgw-1b</td><td>10.0.100.16/28</td><td>ap-south-1b</td><td>TGW ENI — AZ B</td></tr></tbody></table>
+<p>→ /28 = 16 IPs per subnet — TGW needs very few IPs (1 ENI per AZ)<br>
+→ Select subnets in at least 2 AZs for high availability</p>
+<p><strong>Create VPC Attachment — Account A (111111111111):</strong></p>
+<p>→ Navigate to VPC Console → Transit Gateway Attachments → Create Transit Gateway Attachment</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Name tag</td><td><code>tgw-attach-account-a-platform</code></td><td>Descriptive</td></tr><tr><td>Transit Gateway ID</td><td><code>tgw-0aaaa1111bbbb2222</code> (shared from Account H)</td><td>The central TGW</td></tr><tr><td>Attachment type</td><td>VPC</td><td>Attaching a VPC (not VPN or Direct Connect)</td></tr><tr><td>VPC ID</td><td>Account A's VPC (10.0.0.0/16)</td><td>The VPC to connect</td></tr><tr><td>Subnet IDs</td><td>subnet-tgw-1a, subnet-tgw-1b</td><td>Dedicated TGW subnets in 2 AZs</td></tr><tr><td>DNS support</td><td>✅ Enable</td><td>Allow DNS resolution across TGW</td></tr><tr><td>IPv6 support</td><td>❌ Disable</td><td>Not using IPv6</td></tr></tbody></table>
+<p>→ Click "Create Transit Gateway Attachment"<br>
+→ Status: <code>pending</code> (if auto-accept is disabled on TGW)</p>
+<p><strong>Accept Attachment — Account H (888888888888):</strong></p>
+<p>→ Navigate to VPC Console → Transit Gateway Attachments<br>
+→ The pending attachment from Account A appears<br>
+→ Select → Actions → Accept Transit Gateway Attachment</p>
+<p>→ Status changes to <code>available</code><br>
+→ Attachment ID: <code>tgw-attach-0aaaa1111</code></p>
+<p><strong>Repeat for ALL Accounts:</strong></p>
+<table><thead><tr><th>Account</th><th>VPC CIDR</th><th>TGW Subnets</th><th>Attachment ID</th></tr></thead><tbody><tr><td>A — Platform</td><td>10.0.0.0/16</td><td>10.0.100.0/28, 10.0.100.16/28</td><td>tgw-attach-0aaaa1111</td></tr><tr><td>B — Risk</td><td>10.1.0.0/16</td><td>10.1.100.0/28, 10.1.100.16/28</td><td>tgw-attach-0bbbb2222</td></tr><tr><td>C — Analytics</td><td>10.2.0.0/16</td><td>10.2.100.0/28, 10.2.100.16/28</td><td>tgw-attach-0cccc3333</td></tr><tr><td>D — Audit</td><td>10.3.0.0/16</td><td>10.3.100.0/28, 10.3.100.16/28</td><td>tgw-attach-0dddd4444</td></tr><tr><td>E — Compliance</td><td>10.4.0.0/16</td><td>10.4.100.0/28, 10.4.100.16/28</td><td>tgw-attach-0eeee5555</td></tr><tr><td>F — Dev</td><td>10.5.0.0/16</td><td>10.5.100.0/28, 10.5.100.16/28</td><td>tgw-attach-0ffff6666</td></tr><tr><td>G — Staging</td><td>10.6.0.0/16</td><td>10.6.100.0/28, 10.6.100.16/28</td><td>tgw-attach-0gggg7777</td></tr><tr><td>H — Shared Services</td><td>10.7.0.0/16</td><td>10.7.100.0/28, 10.7.100.16/28</td><td>tgw-attach-0hhhh8888</td></tr></tbody></table>
+<p>→ 8 attachments total — compared to 28 peering connections for full mesh<br>
+→ Adding a 9th account = 1 new attachment (not 8 new peering connections)</p>
+<hr>
+<h3>STEP 5 — CONFIGURE TGW ROUTE TABLES FOR TRAFFIC SEGMENTATION</h3>
+<p><strong>This is the CORE of Transit Gateway power — centralized routing with segmentation</strong></p>
+<p>→ From Step 1, we defined three routing domains:</p>
+<ol>
+<li>Production (A, B, C, D, E)</li>
+<li>Non-Production (F, G)</li>
+<li>Shared Services (H)</li>
+</ol>
+<p>→ We create THREE TGW route tables — one per domain</p>
+<p><strong>Performed in: Account H (888888888888)</strong></p>
+<p>→ Navigate to VPC Console → Transit Gateway Route Tables → Create Transit Gateway Route Table</p>
+<p><strong>Route Table 1: Production</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name tag</td><td><code>tgw-rtb-production</code></td></tr><tr><td>Transit Gateway ID</td><td><code>tgw-0aaaa1111bbbb2222</code></td></tr></tbody></table>
+<p><strong>Route Table 2: Non-Production</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name tag</td><td><code>tgw-rtb-nonprod</code></td></tr><tr><td>Transit Gateway ID</td><td><code>tgw-0aaaa1111bbbb2222</code></td></tr></tbody></table>
+<p><strong>Route Table 3: Shared Services</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name tag</td><td><code>tgw-rtb-shared</code></td></tr><tr><td>Transit Gateway ID</td><td><code>tgw-0aaaa1111bbbb2222</code></td></tr></tbody></table>
+<hr>
+<p><strong>Step 5a — Configure ASSOCIATIONS (Which route table governs outbound traffic from each VPC)</strong></p>
+<p>→ Navigate to each TGW Route Table → Associations tab → Create association</p>
+<p><strong>Production Route Table Associations:</strong></p>
+<table><thead><tr><th>Attachment</th><th>VPC</th><th>Association Meaning</th></tr></thead><tbody><tr><td>tgw-attach-0aaaa1111</td><td>Account A (Platform)</td><td>Traffic FROM Account A uses Production route table</td></tr><tr><td>tgw-attach-0bbbb2222</td><td>Account B (Risk)</td><td>Traffic FROM Account B uses Production route table</td></tr><tr><td>tgw-attach-0cccc3333</td><td>Account C (Analytics)</td><td>Traffic FROM Account C uses Production route table</td></tr><tr><td>tgw-attach-0dddd4444</td><td>Account D (Audit)</td><td>Traffic FROM Account D uses Production route table</td></tr><tr><td>tgw-attach-0eeee5555</td><td>Account E (Compliance)</td><td>Traffic FROM Account E uses Production route table</td></tr></tbody></table>
+<p><strong>Non-Production Route Table Associations:</strong></p>
+<table><thead><tr><th>Attachment</th><th>VPC</th><th>Association Meaning</th></tr></thead><tbody><tr><td>tgw-attach-0ffff6666</td><td>Account F (Dev)</td><td>Traffic FROM Account F uses Non-Prod route table</td></tr><tr><td>tgw-attach-0gggg7777</td><td>Account G (Staging)</td><td>Traffic FROM Account G uses Non-Prod route table</td></tr></tbody></table>
+<p><strong>Shared Services Route Table Association:</strong></p>
+<table><thead><tr><th>Attachment</th><th>VPC</th><th>Association Meaning</th></tr></thead><tbody><tr><td>tgw-attach-0hhhh8888</td><td>Account H (Shared)</td><td>Traffic FROM Account H uses Shared route table</td></tr></tbody></table>
+<p><strong>Key Rule: Each attachment can be associated with EXACTLY ONE route table</strong><br>
+→ An attachment cannot use two route tables simultaneously<br>
+→ This is how segmentation is enforced — the route table determines reachable destinations</p>
+<hr>
+<p><strong>Step 5b — Configure PROPAGATIONS (Which VPC CIDRs are advertised into each route table)</strong></p>
+<p>→ Navigate to each TGW Route Table → Propagations tab → Create propagation</p>
+<p><strong>Production Route Table Propagations:</strong></p>
+<table><thead><tr><th>Propagation From</th><th>CIDR Advertised</th><th>Effect</th></tr></thead><tbody><tr><td>tgw-attach-0aaaa1111 (Account A)</td><td>10.0.0.0/16</td><td>Production VPCs can reach Account A</td></tr><tr><td>tgw-attach-0bbbb2222 (Account B)</td><td>10.1.0.0/16</td><td>Production VPCs can reach Account B</td></tr><tr><td>tgw-attach-0cccc3333 (Account C)</td><td>10.2.0.0/16</td><td>Production VPCs can reach Account C</td></tr><tr><td>tgw-attach-0dddd4444 (Account D)</td><td>10.3.0.0/16</td><td>Production VPCs can reach Account D</td></tr><tr><td>tgw-attach-0eeee5555 (Account E)</td><td>10.4.0.0/16</td><td>Production VPCs can reach Account E</td></tr><tr><td>tgw-attach-0hhhh8888 (Account H)</td><td>10.7.0.0/16</td><td>Production VPCs can reach Shared Services</td></tr></tbody></table>
+<p><strong>Non-Production Route Table Propagations:</strong></p>
+<table><thead><tr><th>Propagation From</th><th>CIDR Advertised</th><th>Effect</th></tr></thead><tbody><tr><td>tgw-attach-0ffff6666 (Account F)</td><td>10.5.0.0/16</td><td>Non-Prod VPCs can reach Account F</td></tr><tr><td>tgw-attach-0gggg7777 (Account G)</td><td>10.6.0.0/16</td><td>Non-Prod VPCs can reach Account G</td></tr><tr><td>tgw-attach-0hhhh8888 (Account H)</td><td>10.7.0.0/16</td><td>Non-Prod VPCs can reach Shared Services</td></tr></tbody></table>
+<p><strong>Shared Services Route Table Propagations:</strong></p>
+<table><thead><tr><th>Propagation From</th><th>CIDR Advertised</th><th>Effect</th></tr></thead><tbody><tr><td>tgw-attach-0aaaa1111 (Account A)</td><td>10.0.0.0/16</td><td>Shared Services can reach Account A</td></tr><tr><td>tgw-attach-0bbbb2222 (Account B)</td><td>10.1.0.0/16</td><td>Shared Services can reach Account B</td></tr><tr><td>tgw-attach-0cccc3333 (Account C)</td><td>10.2.0.0/16</td><td>Shared Services can reach Account C</td></tr><tr><td>tgw-attach-0dddd4444 (Account D)</td><td>10.3.0.0/16</td><td>Shared Services can reach Account D</td></tr><tr><td>tgw-attach-0eeee5555 (Account E)</td><td>10.4.0.0/16</td><td>Shared Services can reach Account E</td></tr><tr><td>tgw-attach-0ffff6666 (Account F)</td><td>10.5.0.0/16</td><td>Shared Services can reach Account F</td></tr><tr><td>tgw-attach-0gggg7777 (Account G)</td><td>10.6.0.0/16</td><td>Shared Services can reach Account G</td></tr></tbody></table>
+<p>→ Shared Services route table has ALL VPC CIDRs — it can reach everything<br>
+→ Production route table has Production + Shared CIDRs — no Non-Prod<br>
+→ Non-Production route table has Non-Prod + Shared CIDRs — no Production</p>
+<p><strong>Resulting Segmentation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Production Route Table:                Non-Production Route Table:
+</span>┌─────────────────────┐               ┌─────────────────────┐
+│ 10.0.0.0/16 → A     │               │ 10.5.0.0/16 → F     │
+│ 10.1.0.0/16 → B     │               │ 10.6.0.0/16 → G     │
+│ 10.2.0.0/16 → C     │               │ 10.7.0.0/16 → H     │
+│ 10.3.0.0/16 → D     │               │                     │
+│ 10.4.0.0/16 → E     │               │ ❌ No 10.0-10.4     │
+│ 10.7.0.0/16 → H     │               │    (No Production)   │
+│                     │               └─────────────────────┘
+│ ❌ No 10.5-10.6     │
+│    (No Non-Prod)     │
+└─────────────────────┘
+
+Account F (Dev) sends packet to 10.0.0.0/16 (Account A Production):
+    → Non-Prod Route Table lookup → 10.0.0.0/16 NOT FOUND → BLACKHOLE → Packet dropped ❌
+
+Account A (Production) sends packet to 10.1.0.0/16 (Account B Risk):
+    → Production Route Table lookup → 10.1.0.0/16 → tgw-attach-0bbbb2222 → Delivered ✅
+
+Account F (Dev) sends packet to 10.7.0.0/16 (Account H Shared):
+    → Non-Prod Route Table lookup → 10.7.0.0/16 → tgw-attach-0hhhh8888 → Delivered ✅</code></pre></div>
+<p>→ Network segmentation achieved WITHOUT security groups or NACLs<br>
+→ Traffic is dropped at the TGW level — never even enters the destination VPC<br>
+→ This is defense-in-depth: TGW segmentation (network layer) + Security Groups (instance layer)</p>
+<hr>
+<h3>STEP 6 — UPDATE VPC ROUTE TABLES TO POINT TO TGW</h3>
+<p><strong>This step is performed in EACH account's VPC</strong></p>
+<p>→ Each VPC's private subnet route tables need to know: "For traffic destined to OTHER VPCs → send to TGW"</p>
+<p><strong>Account A (10.0.0.0/16) — Private Subnet Route Table:</strong></p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Purpose</th><th>Status</th></tr></thead><tbody><tr><td>10.0.0.0/16</td><td>local</td><td>Intra-VPC traffic</td><td>Existing (from Project 5)</td></tr><tr><td>pl-xxx (S3 prefix list)</td><td>vpce-xxx</td><td>S3 via VPC Endpoint</td><td>Existing (from Project 27)</td></tr><tr><td>0.0.0.0/0</td><td>nat-xxx</td><td>Internet via NAT Gateway</td><td>Existing (from Project 5)</td></tr><tr><td><strong>10.1.0.0/16</strong></td><td><strong>tgw-0aaaa1111bbbb2222</strong></td><td><strong>Account B via TGW</strong></td><td><strong>NEW</strong></td></tr><tr><td><strong>10.2.0.0/16</strong></td><td><strong>tgw-0aaaa1111bbbb2222</strong></td><td><strong>Account C via TGW</strong></td><td><strong>NEW</strong></td></tr><tr><td><strong>10.3.0.0/16</strong></td><td><strong>tgw-0aaaa1111bbbb2222</strong></td><td><strong>Account D via TGW</strong></td><td><strong>NEW</strong></td></tr><tr><td><strong>10.4.0.0/16</strong></td><td><strong>tgw-0aaaa1111bbbb2222</strong></td><td><strong>Account E via TGW</strong></td><td><strong>NEW</strong></td></tr><tr><td><strong>10.7.0.0/16</strong></td><td><strong>tgw-0aaaa1111bbbb2222</strong></td><td><strong>Account H Shared via TGW</strong></td><td><strong>NEW</strong></td></tr></tbody></table>
+<p><strong>Alternative — Supernet Route (Simpler):</strong></p>
+<p>Instead of individual /16 routes → Use a single supernet route:</p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Purpose</th></tr></thead><tbody><tr><td><strong>10.0.0.0/8</strong></td><td><strong>tgw-0aaaa1111bbbb2222</strong></td><td><strong>All 10.x.x.x traffic (except local) → TGW</strong></td></tr></tbody></table>
+<p>→ The <code>local</code> route (10.0.0.0/16) is MORE SPECIFIC than 10.0.0.0/8<br>
+→ Route table evaluation uses LONGEST PREFIX MATCH<br>
+→ Traffic to 10.0.x.x → Matches <code>local</code> (more specific) → Stays in VPC ✅<br>
+→ Traffic to 10.1.x.x → Matches <code>10.0.0.0/8</code> → Goes to TGW ✅<br>
+→ Traffic to 10.7.x.x → Matches <code>10.0.0.0/8</code> → Goes to TGW ✅</p>
+<p><strong>Supernet approach is simpler but less granular:</strong></p>
+<table><thead><tr><th>Approach</th><th>Routes Needed per VPC</th><th>Granularity</th><th>When to Use</th></tr></thead><tbody><tr><td>Individual /16 routes</td><td>5-7 routes per VPC</td><td>High — control exactly which VPCs are reachable</td><td>When strict per-VPC routing control is needed</td></tr><tr><td>Supernet /8 route</td><td>1 route per VPC</td><td>Low — all 10.x.x.x goes to TGW</td><td>When TGW route tables handle segmentation (recommended)</td></tr></tbody></table>
+<p>→ PayScale uses SUPERNET approach — segmentation is handled by TGW route tables (Step 5), not VPC route tables<br>
+→ This means: VPC route tables are simple, TGW route tables enforce policy</p>
+<p><strong>Repeat for ALL accounts — each VPC gets the supernet route:</strong></p>
+<table><thead><tr><th>Account</th><th>VPC Route Table Entry</th><th>Target</th></tr></thead><tbody><tr><td>A (10.0.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>B (10.1.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>C (10.2.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>D (10.3.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>E (10.4.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>F (10.5.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>G (10.6.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr><tr><td>H (10.7.0.0/16)</td><td>10.0.0.0/8 → TGW</td><td>tgw-0aaaa1111bbbb2222</td></tr></tbody></table>
+<p>→ ONE route per VPC — compared to N-1 routes per VPC with peering<br>
+→ For 8 accounts: 8 routes total vs 56 routes with peering</p>
+<hr>
+<h3>STEP 7 — CONFIGURE CENTRALIZED EGRESS THROUGH SHARED SERVICES</h3>
+<p><strong>The Cost Problem with Distributed NAT:</strong></p>
+<table><thead><tr><th>Account</th><th>NAT Gateways</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>A</td><td>2 (one per AZ)</td><td>$64</td></tr><tr><td>B</td><td>2</td><td>$64</td></tr><tr><td>C</td><td>2</td><td>$64</td></tr><tr><td>D</td><td>1</td><td>$32</td></tr><tr><td>E</td><td>1</td><td>$32</td></tr><tr><td>F</td><td>2</td><td>$64</td></tr><tr><td>G</td><td>2</td><td>$64</td></tr><tr><td>H</td><td>2</td><td>$64</td></tr><tr><td><strong>Total</strong></td><td><strong>14</strong></td><td><strong>$448/month</strong></td></tr></tbody></table>
+<p><strong>Centralized Egress — ALL internet traffic goes through Account H's NAT:</strong></p>
+<table><thead><tr><th>Account</th><th>NAT Gateways</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>A through G</td><td>0 (removed)</td><td>$0</td></tr><tr><td>H</td><td>2 (centralized)</td><td>$64</td></tr><tr><td><strong>Total</strong></td><td><strong>2</strong></td><td><strong>$64/month</strong></td></tr></tbody></table>
+<p>→ Savings: $384/month = $4,608/year</p>
+<p><strong>Configuration — Centralized Egress:</strong></p>
+<p><strong>Step 7a — Account H VPC Route Table:</strong></p>
+<p>→ Account H's public subnet already has an Internet Gateway (from Project 5)<br>
+→ Account H's NAT Gateways already exist<br>
+→ No changes needed in Account H's VPC routing</p>
+<p><strong>Step 7b — TGW Route Tables — Add Default Route:</strong></p>
+<p>→ Navigate to each TGW Route Table → Routes → Create static route</p>
+<p><strong>Production TGW Route Table — Default Route:</strong></p>
+<table><thead><tr><th>Destination</th><th>Attachment</th><th>Type</th><th>Purpose</th></tr></thead><tbody><tr><td>0.0.0.0/0</td><td>tgw-attach-0hhhh8888 (Account H)</td><td>Static</td><td>All internet-bound traffic → Account H</td></tr></tbody></table>
+<p><strong>Non-Production TGW Route Table — Default Route:</strong></p>
+<table><thead><tr><th>Destination</th><th>Attachment</th><th>Type</th><th>Purpose</th></tr></thead><tbody><tr><td>0.0.0.0/0</td><td>tgw-attach-0hhhh8888 (Account H)</td><td>Static</td><td>All internet-bound traffic → Account H</td></tr></tbody></table>
+<p><strong>Step 7c — Spoke VPC Route Tables — Remove NAT, Point to TGW:</strong></p>
+<p><strong>Account A Private Subnet Route Table (Updated):</strong></p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Purpose</th><th>Change</th></tr></thead><tbody><tr><td>10.0.0.0/16</td><td>local</td><td>Intra-VPC</td><td>Unchanged</td></tr><tr><td>pl-xxx</td><td>vpce-xxx</td><td>S3 via Endpoint</td><td>Unchanged</td></tr><tr><td>10.0.0.0/8</td><td>tgw-xxx</td><td>Inter-VPC via TGW</td><td>From Step 6</td></tr><tr><td><strong>0.0.0.0/0</strong></td><td><strong>tgw-xxx</strong></td><td><strong>Internet via TGW → Account H NAT</strong></td><td><strong>CHANGED from nat-xxx to tgw-xxx</strong></td></tr></tbody></table>
+<p>→ Previously: <code>0.0.0.0/0 → nat-xxx</code> (local NAT Gateway)<br>
+→ Now: <code>0.0.0.0/0 → tgw-xxx</code> (TGW → Account H → NAT Gateway)</p>
+<p><strong>Step 7d — Account H Shared Services Route Table — Return Path:</strong></p>
+<p>→ Account H's NAT Gateway processes the traffic and gets a response from the internet<br>
+→ The response needs to go BACK to the originating VPC (e.g., Account A)<br>
+→ Account H's route table must know how to reach Account A's CIDR</p>
+<p>→ Account H's private subnet route table:</p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Purpose</th></tr></thead><tbody><tr><td>10.7.0.0/16</td><td>local</td><td>Intra-VPC</td></tr><tr><td>10.0.0.0/8</td><td>tgw-xxx</td><td>Return traffic to ALL spoke VPCs via TGW</td></tr><tr><td>0.0.0.0/0</td><td>nat-xxx</td><td>Account H's own internet traffic</td></tr></tbody></table>
+<p><strong>Centralized Egress Traffic Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account A EC2 instance → wants to reach api.external.com (internet)
+</span>    |
+    | Packet: Source 10.0.1.50 → Destination 203.0.113.50
+    |
+    ↓
+VPC Route Table (Account A): 0.0.0.0/0 → tgw-xxx
+    |
+    ↓
+TGW Production Route Table: 0.0.0.0/0 → tgw-attach-0hhhh8888 (Account H)
+    |
+    ↓
+Account H VPC receives packet in TGW subnet
+    |
+    ↓
+Account H VPC Route Table: 0.0.0.0/0 → nat-xxx
+    |
+    ↓
+Account H NAT Gateway → Internet Gateway → Internet
+    |
+    ↓
+Response returns to Account H NAT → Account H VPC
+    |
+    ↓
+Account H Route Table: 10.0.0.0/8 → tgw-xxx (return to Account A)
+    |
+    ↓
+TGW Shared Services Route Table: 10.0.0.0/16 → tgw-attach-0aaaa1111 (Account A)
+    |
+    ↓
+Account A VPC receives response → EC2 instance gets the data ✅</code></pre></div>
+<p><strong>Important — NAT Gateway Subnet Routing:</strong></p>
+<p>→ The TGW subnets in Account H must route to the NAT Gateway<br>
+→ Create a SEPARATE route table for TGW subnets in Account H:</p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Purpose</th></tr></thead><tbody><tr><td>10.7.0.0/16</td><td>local</td><td>Local VPC traffic</td></tr><tr><td>0.0.0.0/0</td><td>nat-xxx</td><td>Internet-bound transit traffic → NAT</td></tr></tbody></table>
+<p>→ The NAT Gateway's subnet (public) routes to IGW (already configured from Project 5)</p>
+<hr>
+<h3>STEP 8 — IMPLEMENT NETWORK SEGMENTATION VERIFICATION</h3>
+<p><strong>Verify Production → Non-Production is BLOCKED:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account A (Production) sends packet to Account F (Dev): 10.5.0.0/16
+</span>    |
+    ↓
+VPC Route Table: 10.0.0.0/8 → tgw-xxx
+    |
+    ↓
+TGW → Production Route Table lookup:
+    10.0.0.0/16 → Account A ✅
+    10.1.0.0/16 → Account B ✅
+    10.2.0.0/16 → Account C ✅
+    10.3.0.0/16 → Account D ✅
+    10.4.0.0/16 → Account E ✅
+    10.7.0.0/16 → Account H ✅
+    10.5.0.0/16 → ❌ NOT FOUND (not propagated into Production route table)
+    |
+    ↓
+No matching route → BLACKHOLE → Packet dropped ❌</code></pre></div>
+<p>→ Account F's CIDR was never propagated into the Production route table<br>
+→ Therefore, no production VPC can route traffic to Account F<br>
+→ This is NETWORK-LEVEL isolation — stronger than security groups</p>
+<p><strong>Verify Dev → Shared Services is ALLOWED:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account F (Dev) sends packet to Account H (Shared): 10.7.0.0/16
+</span>    |
+    ↓
+VPC Route Table: 10.0.0.0/8 → tgw-xxx
+    |
+    ↓
+TGW → Non-Production Route Table lookup:
+    10.5.0.0/16 → Account F ✅
+    10.6.0.0/16 → Account G ✅
+    10.7.0.0/16 → Account H ✅ MATCH
+    |
+    ↓
+Route to tgw-attach-0hhhh8888 → Account H → Delivered ✅</code></pre></div>
+<hr>
+<h3>STEP 9 — REMOVE OLD VPC PEERING CONNECTIONS</h3>
+<p><strong>Migration Order (Critical):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 9a: Verify ALL traffic flows correctly through TGW (test every path)
+</span>Step 9b: Monitor for 1-2 weeks with BOTH peering and TGW active
+Step 9c: Remove VPC route table entries pointing to peering connections
+Step 9d: Delete peering connections
+Step 9e: Verify nothing broke</code></pre></div>
+<p>→ NEVER delete peering connections before verifying TGW routing works<br>
+→ Run both in parallel during migration — traffic follows the MOST SPECIFIC route</p>
+<p><strong>Route Table During Migration (Account A):</strong></p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Specificity</th><th>Which Wins?</th></tr></thead><tbody><tr><td>10.1.0.0/16</td><td>pcx-xxx (old peering)</td><td>/16 — more specific</td><td>✅ Peering wins</td></tr><tr><td>10.0.0.0/8</td><td>tgw-xxx (new TGW)</td><td>/8 — less specific</td><td>❌ TGW loses</td></tr></tbody></table>
+<p>→ During migration → Peering routes (/16) are more specific than TGW supernet (/8)<br>
+→ Traffic still flows through peering → Safe<br>
+→ To switch to TGW → Remove the /16 peering routes one at a time<br>
+→ Once /16 route is removed → /8 TGW route takes over</p>
+<p><strong>Cutover Process (per peering connection):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Remove route 10.1.0.0/16 → pcx-xxx from Account A's route table
+</span>2. Verify: Traffic to 10.1.0.0/16 now flows through TGW (10.0.0.0/8 → tgw-xxx)
+3. Remove route 10.0.0.0/16 → pcx-xxx from Account B's route table
+4. Verify: Return traffic from Account B flows through TGW
+5. Test bidirectional connectivity: A ↔ B via TGW
+6. If everything works → Delete the peering connection
+7. If something breaks → Re-add the /16 peering route (instant rollback)</code></pre></div>
+<p>→ Repeat for each of the 15 peering connections<br>
+→ One at a time — never remove all at once</p>
+<hr>
+<h3>STEP 10 — CONFIGURE TGW FLOW LOGS AND MONITORING</h3>
+<p><strong>TGW Flow Logs:</strong></p>
+<p>→ Navigate to VPC Console → Transit Gateways → Select TGW → Flow logs tab</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Filter</td><td>All (accepted + rejected)</td><td>See both allowed and blocked traffic</td></tr><tr><td>Destination</td><td>S3 bucket: <code>s3://payscale-network-logs/tgw-flow-logs/</code></td><td>Centralized log storage</td></tr><tr><td>Log format</td><td>Default or custom fields</td><td>Include src/dst addr, port, action, protocol</td></tr><tr><td>Maximum aggregation interval</td><td>1 minute</td><td>Near-real-time visibility</td></tr></tbody></table>
+<p><strong>CloudWatch Metrics for TGW:</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>BytesIn</td><td>Data entering TGW from attachments</td><td>Spike detection — unusual traffic patterns</td></tr><tr><td>BytesOut</td><td>Data leaving TGW to attachments</td><td>Spike detection</td></tr><tr><td>PacketsIn</td><td>Packet count entering</td><td>DDoS detection</td></tr><tr><td>PacketsOut</td><td>Packet count leaving</td><td>DDoS detection</td></tr><tr><td>PacketDropCountBlackhole</td><td>Packets dropped due to no matching route</td><td>&gt; 0 indicates routing misconfiguration</td></tr><tr><td>PacketDropCountNoRoute</td><td>Packets with no route</td><td>&gt; 0 indicates missing propagation</td></tr><tr><td>BytesDropCountBlackhole</td><td>Bytes dropped</td><td>Same as above but in bytes</td></tr></tbody></table>
+<p><strong>Critical Alert:</strong><br>
+→ <code>PacketDropCountBlackhole &gt; 0</code> → Something is trying to reach a destination with no route<br>
+→ This could indicate:</p>
+<ul>
+<li>Misconfigured route table (missing propagation)</li>
+<li>Legitimate traffic being blocked by segmentation (expected — but monitor)</li>
+<li>Attempted unauthorized cross-domain access (security concern)</li>
+</ul>
+<p><strong>Network Manager (Optional — Advanced):</strong></p>
+<p>→ AWS Network Manager provides a global view of your TGW topology<br>
+→ Navigate to Network Manager Console → Create global network → Register TGW<br>
+→ Provides:</p>
+<ul>
+<li>Visual topology map</li>
+<li>Cross-region TGW connectivity view</li>
+<li>Route analysis</li>
+<li>Events and alarms</li>
+</ul>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always plan CIDR blocks across ALL accounts BEFORE deploying TGW — overlapping CIDRs cause routing ambiguity<br>
+→ Always create DEDICATED TGW subnets — small /28 CIDRs, separate from application subnets<br>
+→ Always use RAM to share TGW — never try to create TGW in each account<br>
+→ Always use multiple TGW route tables for segmentation — never put all attachments in one route table<br>
+→ Always select subnets in 2+ AZs for each VPC attachment — single AZ = single point of failure<br>
+→ Always enable DNS support on TGW — without it, cross-VPC DNS resolution fails<br>
+→ Always use supernet routes in VPC route tables when TGW handles segmentation — simpler management<br>
+→ Always configure centralized egress to reduce NAT Gateway costs<br>
+→ Always enable TGW Flow Logs for security monitoring and troubleshooting<br>
+→ Always set up CloudWatch alarms for BlackholeDropCount — indicates routing issues<br>
+→ Always migrate from peering to TGW gradually — one connection at a time with rollback plan<br>
+→ Always tag TGW attachments with account name and purpose — 20 attachments without tags are unmanageable<br>
+→ Always verify segmentation by testing blocked paths (dev → prod) — not just allowed paths</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never create TGW in an application account — use a dedicated networking or shared services account<br>
+→ Never use the default TGW route table for production — create explicit route tables per domain<br>
+→ Never enable "auto accept shared attachments" in production — unauthorized VPCs could attach<br>
+→ Never forget to update VPC route tables — TGW attachments without VPC routes = no traffic flows<br>
+→ Never overlook the RETURN path — if Account H's NAT processes traffic from Account A, Account H must route the response BACK through TGW<br>
+→ Never delete all peering connections at once during migration — migrate one at a time<br>
+→ Never use TGW for same-VPC communication — TGW is for INTER-VPC, local route handles intra-VPC<br>
+→ Never ignore TGW costs — $0.05/hour per attachment × 8 attachments = $292/month<br>
+→ Never forget that TGW bandwidth per attachment is 50 Gbps — sufficient for most cases but be aware<br>
+→ Never create a single flat route table with all CIDRs — defeats the purpose of segmentation<br>
+→ Never skip TGW flow logs — without them, debugging cross-account traffic issues is nearly impossible<br>
+→ Never allow TGW subnets to have routes to the internet directly — TGW subnets should only route to NAT or stay local</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE TRANSIT GATEWAY</h2>
+<table><thead><tr><th>Scenario</th><th>Use Transit Gateway?</th><th>Why</th></tr></thead><tbody><tr><td>10+ VPCs needing inter-connectivity</td><td>✅ Yes</td><td>Peering doesn't scale beyond 10 VPCs</td></tr><tr><td>Need transitive routing (A→Hub→B)</td><td>✅ Yes</td><td>Peering is non-transitive</td></tr><tr><td>Need centralized internet egress</td><td>✅ Yes</td><td>Single NAT for all VPCs</td></tr><tr><td>Need network segmentation (prod vs dev)</td><td>✅ Yes</td><td>TGW route tables enforce isolation</td></tr><tr><td>Multi-account organization</td><td>✅ Yes</td><td>RAM sharing + centralized routing</td></tr><tr><td>Need to add new VPCs frequently</td><td>✅ Yes</td><td>1 attachment vs N-1 peering connections</td></tr><tr><td>Need centralized network monitoring</td><td>✅ Yes</td><td>TGW Flow Logs + CloudWatch</td></tr><tr><td>Only 2-3 VPCs with simple connectivity</td><td>❌ No</td><td>VPC Peering is simpler and free (Project 44)</td></tr><tr><td>Need to expose ONE service across VPCs</td><td>❌ No</td><td>PrivateLink (Project 27) is more targeted</td></tr><tr><td>Need maximum bandwidth with zero cost</td><td>❌ No</td><td>VPC Peering has no hourly charge</td></tr><tr><td>Single account, single VPC</td><td>❌ No</td><td>No inter-VPC connectivity needed</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE TRANSIT GATEWAY</h2>
+<p>→ When you have ≤ 3 VPCs with simple connectivity → VPC Peering (Project 44) is free and sufficient<br>
+→ When you need to expose a single service endpoint → PrivateLink (Project 27) is more appropriate<br>
+→ When cost is the primary concern → TGW charges $0.05/hour per attachment vs free peering<br>
+→ When you need &gt; 50 Gbps between two specific VPCs → VPC Peering has no bandwidth cap<br>
+→ When the use case is purely cross-account S3 access → Bucket policies (Project 39) don't need networking<br>
+→ When all communication is event-driven (SNS/SQS) → Cross-account messaging (Project 41) doesn't need VPC connectivity</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → TRANSIT GATEWAY ARCHITECTURE INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌─────────────────────────────────────────┐
+</span>                    │          TRANSIT GATEWAY                  │
+                    │     (Regional, Highly Available)          │
+                    │                                         │
+                    │  ┌──────────────┐  ┌──────────────┐    │
+                    │  │ Route Table  │  │ Route Table  │    │
+                    │  │ PRODUCTION   │  │ NON-PROD     │    │
+                    │  └──────┬───────┘  └──────┬───────┘    │
+                    │         │                  │            │
+                    │  ┌──────────────┐                      │
+                    │  │ Route Table  │                      │
+                    │  │ SHARED       │                      │
+                    │  └──────┬───────┘                      │
+                    │         │                              │
+                    └────┬────┬────┬────┬────┬────┬────┬────┘
+                         │    │    │    │    │    │    │    │
+                    Attachments (ENIs in each VPC):
+                         │    │    │    │    │    │    │    │
+                    VPC-A VPC-B VPC-C VPC-D VPC-E VPC-F VPC-G VPC-H</code></pre></div>
+<p>→ TGW is a REGIONAL resource — it exists in ONE region<br>
+→ TGW is HIGHLY AVAILABLE — AWS manages redundancy across AZs<br>
+→ Each VPC attachment creates ENIs in the VPC's TGW subnets<br>
+→ Traffic enters TGW through the ENI → TGW route table determines exit attachment → Traffic exits through destination VPC's ENI</p>
+<hr>
+<h3>2 → PACKET FLOW THROUGH TRANSIT GATEWAY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account A EC2 (10.0.1.50) → Account B MariaDB (10.1.4.20:3306)
+</span>
+Step 1: EC2 generates packet
+        Source: 10.0.1.50 → Destination: 10.1.4.20
+
+Step 2: VPC A Route Table evaluation
+        10.0.0.0/16 → local? NO (destination is 10.1.x.x)
+        10.0.0.0/8 → tgw-xxx? YES ✅
+        
+Step 3: Packet sent to TGW ENI in Account A's TGW subnet
+        ENI in subnet-tgw-1a (10.0.100.0/28)
+
+Step 4: TGW receives packet on VPC-A attachment
+        Looks up ASSOCIATED route table for VPC-A attachment → Production Route Table
+
+Step 5: Production Route Table evaluation
+        10.1.0.0/16 → tgw-attach-0bbbb2222 (Account B) ✅ MATCH
+
+Step 6: TGW forwards packet to Account B attachment
+        Packet exits through ENI in Account B's TGW subnet
+        ENI in subnet-tgw-1a (10.1.100.0/28)
+
+Step 7: Packet enters Account B's VPC
+        VPC B Route Table: 10.1.0.0/16 → local ✅
+        Packet routed to subnet-db-1a (10.1.4.0/24)
+
+Step 8: Security Group on MariaDB evaluated
+        Inbound TCP 3306 from 10.0.0.0/16 → ALLOW ✅
+        (Note: Source IP is PRESERVED — TGW does NOT NAT)
+
+Step 9: MariaDB receives connection ✅
+
+Step 10: Response follows REVERSE path
+         MariaDB → VPC B route table → TGW → Production route table → 
+         Account A attachment → VPC A → EC2</code></pre></div>
+<p><strong>Critical Detail — TGW Preserves Source IP:</strong><br>
+→ Unlike NAT Gateway which changes the source IP → TGW passes traffic TRANSPARENTLY<br>
+→ The destination sees the ORIGINAL source IP<br>
+→ This means security groups in Account B can filter by Account A's CIDR<br>
+→ This is important for security and audit — you always know the TRUE source</p>
+<hr>
+<h3>3 → ASSOCIATION vs PROPAGATION — DETAILED MECHANICS</h3>
+<p><strong>ASSOCIATION determines OUTBOUND routing:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VPC A sends packet → Enters TGW → Which route table to use?
+</span>    → TGW checks: "VPC A attachment is ASSOCIATED with Production Route Table"
+    → Uses Production Route Table for routing decision</code></pre></div>
+<p><strong>PROPAGATION determines INBOUND reachability:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VPC B wants to be reachable from Production VPCs
+</span>    → VPC B attachment is PROPAGATED to Production Route Table
+    → Production Route Table automatically gets: 10.1.0.0/16 → VPC B attachment
+    → Any VPC associated with Production Route Table can now reach VPC B</code></pre></div>
+<p><strong>The Relationship:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Association = "When I SEND traffic, which route table decides where it goes?"
+</span>Propagation = "Which route tables know I EXIST and can send traffic TO me?"
+
+For VPC A to reach VPC B:
+    1. VPC A must be ASSOCIATED with a route table that has VPC B's CIDR
+    2. VPC B must be PROPAGATED into that route table
+
+For VPC B to reach VPC A (return traffic):
+    1. VPC B must be ASSOCIATED with a route table that has VPC A's CIDR
+    2. VPC A must be PROPAGATED into that route table</code></pre></div>
+<p>→ Association and propagation are INDEPENDENT operations<br>
+→ A VPC can be associated with Route Table X but propagated into Route Table Y<br>
+→ This is the foundation of segmentation</p>
+<hr>
+<h3>4 → STATIC ROUTES vs PROPAGATED ROUTES</h3>
+<table><thead><tr><th>Route Type</th><th>How Created</th><th>Use Case</th><th>Priority</th></tr></thead><tbody><tr><td>Propagated</td><td>Automatic — from VPC attachment CIDR</td><td>Normal inter-VPC routing</td><td>Lower</td></tr><tr><td>Static</td><td>Manual — admin creates the route</td><td>Default routes (0.0.0.0/0), blackholes, specific overrides</td><td>Higher</td></tr></tbody></table>
+<p><strong>Priority Rule:</strong><br>
+→ If a static route and propagated route have the SAME destination CIDR → Static route WINS<br>
+→ If routes have different prefix lengths → Longest prefix match wins (regardless of static/propagated)</p>
+<p><strong>Blackhole Routes (Static):</strong></p>
+<p>→ You can create a STATIC route with target = "Blackhole"<br>
+→ Any traffic matching this route is SILENTLY DROPPED<br>
+→ Useful for explicitly blocking specific CIDRs</p>
+<table><thead><tr><th>Example</th><th>Use Case</th></tr></thead><tbody><tr><td>Static: 10.5.0.0/16 → Blackhole (in Production route table)</td><td>Explicitly block Production → Dev traffic</td></tr><tr><td>Static: 192.168.0.0/16 → Blackhole</td><td>Block RFC1918 traffic that shouldn't exist</td></tr></tbody></table>
+<hr>
+<h3>5 → CROSS-REGION TRANSIT GATEWAY PEERING</h3>
+<p>→ TGW is regional — a TGW in ap-south-1 cannot directly attach VPCs in eu-west-1<br>
+→ For cross-region connectivity → Peer two TGWs together</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TGW (ap-south-1)  ←── TGW Peering ──→  TGW (eu-west-1)
+</span>    |                                        |
+    ├── VPC A (Mumbai)                       ├── VPC X (Ireland)
+    ├── VPC B (Mumbai)                       ├── VPC Y (Ireland)
+    └── VPC H (Mumbai)                       └── VPC Z (Ireland)</code></pre></div>
+<p>→ TGW Peering uses AWS's private backbone (not the internet)<br>
+→ Static routes are required for cross-region TGW peering (no propagation across peered TGWs)<br>
+→ This is the pattern for global organizations with multi-region presence</p>
+<hr>
+<h3>6 → BANDWIDTH AND PERFORMANCE</h3>
+<table><thead><tr><th>Path</th><th>Bandwidth</th><th>Latency</th></tr></thead><tbody><tr><td>VPC to TGW (same AZ)</td><td>50 Gbps per attachment</td><td>Sub-millisecond</td></tr><tr><td>VPC to TGW (cross-AZ)</td><td>50 Gbps per attachment</td><td>~1ms additional</td></tr><tr><td>TGW to TGW (cross-region peering)</td><td>50 Gbps</td><td>Regional latency (50-200ms)</td></tr><tr><td>Aggregate TGW throughput</td><td>Multiple Tbps</td><td>—</td></tr></tbody></table>
+<p>→ 50 Gbps per attachment is a HARD LIMIT — cannot be increased<br>
+→ If you need &gt; 50 Gbps between two VPCs → Consider VPC Peering (no bandwidth cap) for that specific pair alongside TGW for everything else</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>VPC route table not updated</td><td>Traffic doesn't flow despite TGW attachment being active</td><td>VPC doesn't know to send traffic to TGW</td><td>Add 10.0.0.0/8 → tgw-xxx route to VPC route tables</td></tr><tr><td>2</td><td>Association missing</td><td>Traffic FROM a VPC enters TGW but gets dropped</td><td>VPC attachment not associated with any route table</td><td>Associate attachment with correct TGW route table</td></tr><tr><td>3</td><td>Propagation missing</td><td>TGW route table has no entry for destination VPC</td><td>Destination VPC not propagated into the route table</td><td>Add propagation for the destination attachment</td></tr><tr><td>4</td><td>Centralized egress return path missing</td><td>Outbound internet works but responses never arrive</td><td>Account H doesn't have return route through TGW</td><td>Add 10.0.0.0/8 → tgw-xxx in Account H's route table</td></tr><tr><td>5</td><td>TGW subnet routes to IGW instead of NAT</td><td>Transit traffic exits directly to internet without NAT</td><td>TGW subnet using public route table</td><td>Create separate route table for TGW subnets → point 0.0.0.0/0 to NAT</td></tr><tr><td>6</td><td>Overlapping CIDRs between VPCs</td><td>Ambiguous routing — traffic may go to wrong VPC</td><td>CIDR planning failure</td><td>Redesign CIDRs — TGW cannot handle overlapping routes</td></tr><tr><td>7</td><td>Security group blocks cross-VPC traffic</td><td>TGW routes correctly but destination SG rejects</td><td>SG doesn't allow source VPC CIDR</td><td>Add inbound rules allowing source VPC CIDR</td></tr><tr><td>8</td><td>Auto-accept enabled — unauthorized VPC attaches</td><td>Unknown VPC gains network access to all connected VPCs</td><td>Auto-accept shared attachments was enabled</td><td>Disable auto-accept — manually approve each attachment</td></tr><tr><td>9</td><td>Single AZ TGW subnet</td><td>Attachment fails when that AZ has issues</td><td>Only one subnet selected for attachment</td><td>Always select subnets in 2+ AZs</td></tr><tr><td>10</td><td>Forgot to remove old peering routes</td><td>Traffic still flows through peering (more specific /16) instead of TGW (/8)</td><td>VPC route table has both peering and TGW routes</td><td>Remove /16 peering routes to let /8 TGW route take over</td></tr><tr><td>11</td><td>TGW created in wrong region</td><td>VPCs in ap-south-1 cannot attach to TGW in us-east-1</td><td>TGW is regional</td><td>Create TGW in the same region as the VPCs</td></tr><tr><td>12</td><td>RAM share not accepted</td><td>Account cannot see the shared TGW</td><td>RAM invitation pending or rejected</td><td>Accept RAM invitation in the target account</td></tr><tr><td>13</td><td>BlackholeDropCount alarm fires</td><td>Legitimate traffic being dropped</td><td>Missing route or intentional segmentation</td><td>Check if the dropped traffic should be allowed — add route if yes</td></tr><tr><td>14</td><td>NAT Gateway in Account H overwhelmed</td><td>All accounts' internet traffic funnels through 2 NAT Gateways</td><td>Centralized egress concentrates load</td><td>Scale NAT Gateways (one per AZ) or add more in Account H</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Attachment Scalability</strong></p>
+<table><thead><tr><th>Metric</th><th>Limit</th><th>Extendable?</th></tr></thead><tbody><tr><td>VPC attachments per TGW</td><td>5,000</td><td>Yes — contact AWS</td></tr><tr><td>VPN attachments per TGW</td><td>5,000</td><td>Yes</td></tr><tr><td>Direct Connect Gateway attachments</td><td>20</td><td>Yes</td></tr><tr><td>Peering attachments (to other TGWs)</td><td>50</td><td>Yes</td></tr><tr><td>TGW route tables</td><td>20</td><td>Yes</td></tr><tr><td>Routes per TGW route table</td><td>10,000 (static) + 10,000 (propagated)</td><td>Yes</td></tr></tbody></table>
+<p>→ 5,000 VPC attachments = 5,000 VPCs connected to ONE TGW → Massive scale<br>
+→ Compared to VPC Peering: 125 connections per VPC max</p>
+<p>→ <strong>Cost Scalability</strong></p>
+<table><thead><tr><th>Attachments</th><th>Hourly Cost</th><th>Monthly Cost</th><th>Data Transfer (1 TB/month per attachment)</th></tr></thead><tbody>
+<tr><td>8</td><td>$0.40/hour</td><td>$292/month</td><td>$160/month</td></tr>
+<tr><td>20</td><td>$1.00/hour</td><td>$730/month</td><td>$400/month</td></tr>
+<tr><td>50</td><td>$2.50/hour</td><td>$1,825/month</td><td>$1,000/month</td></tr>
+<tr><td>100</td><td>$5.00/hour</td><td>$3,650/month</td><td>$2,000/month</td></tr>
+</tbody></table>
+
+<p>→ <strong>Cost Comparison: TGW vs VPC Peering</strong></p>
+<table><thead><tr><th>Accounts</th><th>VPC Peering Monthly Cost</th><th>TGW Monthly Cost</th><th>TGW NAT Savings</th><th>Net TGW Cost</th></tr></thead><tbody><tr><td>3</td><td>$0 (free) + $192 (3 NATs) = $192</td><td>$109 + $64 (1 central NAT) = $173</td><td>$128 saved</td><td>$173 (cheaper)</td></tr><tr><td>8</td><td>$0 (free) + $448 (14 NATs) = $448</td><td>$292 + $64 (1 central NAT) = $356</td><td>$384 saved</td><td>$356 (cheaper)</td></tr><tr><td>20</td><td>$0 (free) + $1,280 (40 NATs) = $1,280</td><td>$730 + $64 (1 central NAT) = $794</td><td>$1,216 saved</td><td>$794 (much cheaper)</td></tr><tr><td>50</td><td>$0 (free) + $3,200 (100 NATs) = $3,200</td><td>$1,825 + $128 (2 central NATs) = $1,953</td><td>$3,072 saved</td><td>$1,953 (far cheaper)</td></tr></tbody></table>
+<p>→ TGW costs MORE in hourly attachment fees but SAVES on NAT Gateway consolidation<br>
+→ At 8+ accounts → TGW becomes cost-neutral or cheaper than distributed NAT<br>
+→ At 20+ accounts → TGW saves significant money through centralized egress<br>
+→ The REAL savings are operational — engineer time managing 190 peering connections vs 20 TGW attachments</p>
+<p>→ <strong>Bandwidth Scalability</strong></p>
+<ul>
+<li>50 Gbps per VPC attachment — hard limit</li>
+<li>Aggregate TGW throughput is multi-terabit — no practical aggregate limit</li>
+<li>If one VPC pair needs &gt; 50 Gbps → Use BOTH TGW (for general connectivity) + VPC Peering (for high-bandwidth pair)</li>
+<li>Coexistence is fully supported — route table specificity determines which path is used</li>
+</ul>
+<p>→ <strong>Operational Scalability</strong></p>
+<table><thead><tr><th>Operation</th><th>VPC Peering (20 VPCs)</th><th>Transit Gateway (20 VPCs)</th></tr></thead><tbody><tr><td>Add new VPC</td><td>19 peering connections + 38 route updates + 38 SG updates</td><td>1 attachment + 1 VPC route + 1 propagation</td></tr><tr><td>Remove a VPC</td><td>Delete 19 peering connections + clean up 38 routes</td><td>Delete 1 attachment + remove 1 VPC route</td></tr><tr><td>Change segmentation policy</td><td>Modify routes on 190 peering connections</td><td>Modify 1-3 TGW route tables</td></tr><tr><td>Audit network topology</td><td>Check 190 individual peering connections</td><td>View 1 TGW with 20 attachments</td></tr><tr><td>Troubleshoot connectivity</td><td>Check route tables on 2 VPCs + peering status</td><td>Check TGW route table + VPC route + Flow Logs</td></tr></tbody></table>
+<p>→ TGW operational scalability is LINEAR — peering is EXPONENTIAL<br>
+→ At 20+ VPCs → TGW is the only viable option operationally</p>
+<p>→ <strong>Multi-Region Scalability</strong></p>
+<ul>
+<li>One TGW per region</li>
+<li>TGW Peering connects TGWs across regions</li>
+<li>Maximum 50 TGW peering connections per TGW</li>
+<li>Static routes required for cross-region TGW peering (no auto-propagation)</li>
+<li>For global organizations: Hub TGW in primary region + spoke TGWs in other regions</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify TGW is working correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected Value</th></tr></thead><tbody><tr><td>TGW state</td><td>VPC Console → Transit Gateways</td><td>State: <code>available</code></td></tr><tr><td>All attachments active</td><td>VPC Console → TGW Attachments</td><td>Each attachment: <code>available</code></td></tr><tr><td>Route tables have correct routes</td><td>VPC Console → TGW Route Tables → Routes tab</td><td>Propagated CIDRs for all expected VPCs</td></tr><tr><td>Associations correct</td><td>VPC Console → TGW Route Tables → Associations tab</td><td>Each attachment associated with correct route table</td></tr><tr><td>Propagations correct</td><td>VPC Console → TGW Route Tables → Propagations tab</td><td>Each attachment propagated to correct route tables</td></tr><tr><td>VPC route tables point to TGW</td><td>VPC Console → Route Tables (in each account)</td><td>10.0.0.0/8 → tgw-xxx</td></tr><tr><td>Segmentation enforced</td><td>Test: Dev account → Prod account</td><td>Connection times out (blocked at TGW)</td></tr><tr><td>Allowed paths work</td><td>Test: Prod account → Prod account</td><td>Connection succeeds</td></tr><tr><td>Centralized egress works</td><td>Test: Any account → internet</td><td>Internet reachable via Account H NAT</td></tr><tr><td>Flow logs capturing</td><td>S3 bucket / CloudWatch Logs</td><td>Log entries appearing for cross-VPC traffic</td></tr></tbody></table>
+<p>→ <strong>How to debug TGW connectivity issues:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Is the TGW attachment available?
+</span>    → VPC Console → TGW Attachments → Status
+    → Not available → Check RAM sharing, acceptance, subnet configuration
+    |
+    ↓
+Step 2: Does the source VPC route table point to TGW?
+    → VPC Console → Route Tables → Routes
+    → Missing TGW route → Add route (10.0.0.0/8 → tgw-xxx or specific /16)
+    |
+    ↓
+Step 3: Is the source attachment ASSOCIATED with a route table?
+    → VPC Console → TGW Route Tables → Associations
+    → Not associated → Create association
+    |
+    ↓
+Step 4: Does that route table have a route to the destination?
+    → VPC Console → TGW Route Tables → Routes
+    → Destination CIDR missing → Add propagation from destination attachment
+    |
+    ↓
+Step 5: Is the destination attachment PROPAGATED into the route table?
+    → VPC Console → TGW Route Tables → Propagations
+    → Not propagated → Create propagation
+    |
+    ↓
+Step 6: Does the destination VPC route table have a return path?
+    → Check destination VPC route table for source CIDR → TGW
+    → Missing → Add return route
+    |
+    ↓
+Step 7: Do security groups allow the traffic?
+    → EC2 Console → Security Groups → Inbound/Outbound rules
+    → Missing → Add rules for cross-VPC CIDRs (from Project 4)
+    |
+    ↓
+Step 8: Do NACLs allow the traffic?
+    → VPC Console → Network ACLs
+    → Both inbound AND outbound rules must allow (NACLs are stateless from Project 4)
+    |
+    ↓
+Step 9: Check TGW Flow Logs
+    → S3 bucket → Query with Athena (from Project 18)
+    → Look for ACCEPT vs REJECT entries
+    → REJECT at TGW = route table issue
+    → No entries at all = traffic never reached TGW = VPC route table issue
+    |
+    ↓
+Step 10: Check BlackholeDropCount metric in CloudWatch
+    → &gt; 0 means traffic is being dropped due to no matching route
+    → Identify which CIDR is being blackholed</code></pre></div>
+<p>→ <strong>Monitoring Dashboard (CloudWatch):</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alarm</th></tr></thead><tbody><tr><td>PacketDropCountBlackhole</td><td>TGW CloudWatch</td><td>Alert if &gt; 0 (routing misconfiguration)</td></tr><tr><td>PacketDropCountNoRoute</td><td>TGW CloudWatch</td><td>Alert if &gt; 0 (missing route)</td></tr><tr><td>BytesIn / BytesOut per attachment</td><td>TGW CloudWatch</td><td>Baseline + spike detection</td></tr><tr><td>NAT Gateway BytesProcessed (Account H)</td><td>NAT CloudWatch</td><td>Alert if approaching 45 Gbps</td></tr><tr><td>NAT Gateway ErrorPortAllocation (Account H)</td><td>NAT CloudWatch</td><td>Alert if &gt; 0 (NAT exhaustion)</td></tr><tr><td>Active Connections per NAT</td><td>NAT CloudWatch</td><td>Alert if &gt; 55,000 (approaching limit)</td></tr></tbody></table>
+<p>→ <strong>Audit and Compliance:</strong></p>
+<table><thead><tr><th>Audit Question</th><th>Answer Source</th></tr></thead><tbody><tr><td>Which accounts are connected to the network?</td><td>TGW Attachments list</td></tr><tr><td>Which accounts can communicate with which?</td><td>TGW Route Table associations + propagations</td></tr><tr><td>Is dev isolated from production?</td><td>TGW Route Table — verify dev CIDRs NOT in production route table</td></tr><tr><td>What traffic flowed between accounts?</td><td>TGW Flow Logs → Athena query</td></tr><tr><td>Who modified TGW configuration?</td><td>CloudTrail → Filter by ec2:CreateTransitGateway*, ec2:ModifyTransitGateway*</td></tr><tr><td>Is centralized egress working?</td><td>Account H NAT Gateway CloudWatch metrics</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Transit Gateway replaces the unscalable mesh of VPC Peering connections with a centralized hub-and-spoke model<br>
+→ ONE TGW connects ALL VPCs — adding a new VPC requires 1 attachment instead of N-1 peering connections<br>
+→ TRANSITIVE routing is the fundamental advantage — A↔TGW↔B works, unlike peering where A↔B requires a direct connection<br>
+→ TGW Route Tables enable NETWORK-LEVEL segmentation — production and dev are isolated at the routing fabric, not just security groups<br>
+→ Association determines WHERE outbound traffic goes — Propagation determines WHO can reach you<br>
+→ Centralized egress through a shared services account consolidates NAT Gateways — reducing cost by 50-80%<br>
+→ The migration from peering to TGW must be gradual — route specificity (/16 peering vs /8 TGW) enables safe coexistence during transition<br>
+→ TGW Flow Logs + CloudWatch BlackholeDropCount provide visibility that peering connections cannot match<br>
+→ TGW costs money ($0.05/hour per attachment + $0.02/GB) but saves more through NAT consolidation and operational efficiency<br>
+→ Connection to previous projects:</p>
+<ul>
+<li>VPC fundamentals (Project 5) — CIDRs, subnets, route tables — the foundation TGW builds on</li>
+<li>Security Groups and NACLs (Project 4) — still required for instance-level filtering even with TGW</li>
+<li>VPC Peering (Project 44) — the predecessor TGW replaces at scale</li>
+<li>VPC Endpoints (Project 27) — still needed for S3/DynamoDB access within each VPC</li>
+<li>Cross-account IAM (Project 40) — RAM sharing uses similar trust concepts</li>
+<li>NAT Gateway architecture (Project 5) — centralized egress consolidates this<br>
+→ Connection to next projects:</li>
+<li>Enterprise Data Lake (Project 51) — multi-account networking is the foundation for cross-account data access</li>
+<li>AWS Organizations and SCPs (Project 54) — governance policies complement TGW network segmentation</li>
+<li>Zero-trust security (Project 57) — TGW + PrivateLink + endpoint policies create defense-in-depth</li>
+<li>Data Mesh (Project 60) — multi-account producer-consumer pattern requires TGW or PrivateLink for private connectivity</li>
+</ul>
+<hr>
+<hr>
+<h2>💡 TRANSIT GATEWAY DECISION FRAMEWORK — FINAL SUMMARY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Do you have inter-VPC connectivity needs?
+</span>    |
+    ├── NO → No TGW or Peering needed
+    |
+    └── YES → How many VPCs?
+                |
+                ├── 2-5 VPCs → VPC Peering (Project 44) — simpler, free
+                |
+                ├── 5-10 VPCs → EVALUATE
+                |   ├── Need transitive routing? → TGW
+                |   ├── Need centralized egress? → TGW
+                |   ├── Need segmentation? → TGW
+                |   └── Simple point-to-point? → Peering still works
+                |
+                └── 10+ VPCs → Transit Gateway (this project) — mandatory
+                    |
+                    ├── Single region → One TGW
+                    └── Multi-region → TGW per region + TGW Peering</code></pre></div>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale now has enterprise-grade networking:</p>
+<ul>
+<li>Transit Gateway connecting 8 accounts with segmentation</li>
+<li>Centralized egress reducing costs</li>
+<li>Flow logs providing visibility</li>
+<li>Production isolated from non-production at the network level</li>
+</ul>
+<p>→ But the data architecture team is now designing the COMPLETE enterprise data lake<br>
+→ They need to combine EVERYTHING built so far:</p>
+<ul>
+<li>S3 storage zones (raw, curated, refined) across accounts (Project 1, 12)</li>
+<li>Glue Catalog with cross-account sharing (Project 17, 42)</li>
+<li>Athena for self-service analytics (Project 18, 25)</li>
+<li>Lake Formation for fine-grained governance (Project 47)</li>
+<li>Cross-account access patterns (Project 39, 40)</li>
+<li>Network connectivity via Transit Gateway (this project)</li>
+</ul>
+<p>→ They want a data lake that:</p>
+<ul>
+<li>Has clearly defined data zones (landing, raw, curated, refined)</li>
+<li>Supports multiple producer teams writing data</li>
+<li>Supports multiple consumer teams reading data with different access levels</li>
+<li>Enforces column-level and row-level security via Lake Formation</li>
+<li>Enables cross-account data sharing without data duplication</li>
+<li>Scales to hundreds of datasets without governance overhead</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 51 solves</strong><br>
+→ Project 51: "The Enterprise Data Lake — S3 + Glue + Athena + Lake Formation + Cross-Account Access"<br>
+→ It is the ARCHITECTURE project — combining Projects 1, 17, 18, 25, 39, 42, 47 into a cohesive enterprise pattern<br>
+→ No new services are introduced — only the DESIGN PATTERN of how they work together at scale</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 51: "The Enterprise Data Lake — S3 + Glue + Athena + Lake Formation + Cross-Account Access"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-49.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 50/60</span></div><a class="nav-btn next" href="project-51.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

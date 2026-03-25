@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 22: THE DATA WAREHOUSE THAT NEEDED BULK LOADING — Redshift COPY from S3 — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 22: THE DATA WAREHOUSE THAT NEEDED BULK LOADING — Redshift COPY from S3</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's data team has built an impressive pipeline so far:</p>
+<ul>
+<li>Raw CSV/JSON lands in S3 (Project 1)</li>
+<li>Glue Crawler catalogs it (Project 17)</li>
+<li>Glue ETL converts it to optimized Parquet (Project 21)</li>
+<li>Athena queries the data lake directly (Project 18)</li>
+</ul>
+<p>→ But the business analysts have new requirements that Athena cannot efficiently handle:</p>
+<p>→ Problem 1: COMPLEX JOINS AT SCALE</p>
+<ul>
+<li>The CFO wants a report joining orders + customers + products + clickstream</li>
+<li>4-table JOIN across 50 GB of data</li>
+<li>Athena can do it — but it takes 8 minutes and costs $0.25 per execution</li>
+<li>The report runs 20 times/day (analysts tweaking parameters) = $5/day = $150/month for ONE report</li>
+</ul>
+<p>→ Problem 2: DASHBOARD CONCURRENCY</p>
+<ul>
+<li>15 analysts run queries simultaneously against the same data</li>
+<li>Athena has per-account concurrency limits (default 20-25 concurrent queries)</li>
+<li>During morning standup — everyone runs their dashboards at 9 AM → queries queue up</li>
+<li>Some queries timeout → dashboards show stale data</li>
+</ul>
+<p>→ Problem 3: SUB-SECOND AGGREGATIONS</p>
+<ul>
+<li>The VP of Sales wants a dashboard that refreshes every 30 seconds</li>
+<li>Athena's minimum query time is 2-5 seconds even for simple queries (S3 scan overhead)</li>
+<li>Redshift stores data locally on compute nodes → sub-second for pre-loaded data</li>
+</ul>
+<p>→ Problem 4: HISTORICAL ANALYTICS WITH COMPLEX WINDOW FUNCTIONS</p>
+<ul>
+<li>"Show me the rolling 90-day average revenue per customer segment, ranked by growth rate"</li>
+<li>Complex window functions across billions of rows</li>
+<li>Athena can do this but extremely slowly — Redshift is purpose-built for it</li>
+</ul>
+<p>→ The data engineering lead decides: "We need to LOAD our optimized Parquet data from S3 into Redshift for high-performance analytics"</p>
+<p>→ The Redshift cluster from Project 16 is running — but the tables are empty<br>
+→ The question: How do we efficiently bulk-load terabytes of data from S3 into Redshift?</p>
+<p>→ The naive approach: INSERT statements one row at a time<br>
+→ Result: 38 GB of data would take ~72 hours to load row-by-row<br>
+→ The correct approach: Redshift COPY command — designed for massively parallel bulk loading</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand why COPY is fundamentally different from INSERT</p>
+<table><thead><tr><th>Approach</th><th>Mechanism</th><th>Speed for 38 GB</th><th>Why</th></tr></thead><tbody><tr><td>INSERT (row-by-row)</td><td>Single leader node processes each row sequentially</td><td>~72 hours</td><td>No parallelism, network round-trip per row</td></tr><tr><td>INSERT via multi-row batches</td><td>Leader node processes batches</td><td>~12 hours</td><td>Better but still single-node bottleneck</td></tr><tr><td>COPY from S3</td><td>ALL compute nodes read from S3 in PARALLEL</td><td>~15 minutes</td><td>Massively parallel — each node loads its portion</td></tr></tbody></table>
+<p>→ COPY is not just "faster INSERT" — it's a completely different loading architecture<br>
+→ Every compute node in the Redshift cluster reaches directly into S3 and pulls data simultaneously</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand Redshift's architecture for data loading (Leader vs Compute nodes)</li>
+<li>Step 2 — Create IAM Role for Redshift to access S3</li>
+<li>Step 3 — Associate the IAM Role with the Redshift cluster</li>
+<li>Step 4 — Create target tables in Redshift (schema design)</li>
+<li>Step 5 — Configure and execute the COPY command</li>
+<li>Step 6 — Understand COPY parameters for different formats</li>
+<li>Step 7 — Handle errors and validation</li>
+<li>Step 8 — Optimize loading performance (file splitting, sort keys, distribution)</li>
+<li>Step 9 — Automate the loading process</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND REDSHIFT DATA LOADING ARCHITECTURE</h3>
+<p>→ Recall from Project 16: Redshift has a Leader Node and Compute Nodes</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                     ┌─────────────────┐
+</span>                     │   LEADER NODE    │
+                     │                  │
+                     │  Receives COPY   │
+                     │  command         │
+                     │  Plans loading   │
+                     │  Distributes     │
+                     │  work to compute │
+                     │  nodes           │
+                     └────────┬─────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+     ┌────────▼──────┐ ┌─────▼───────┐ ┌─────▼───────┐
+     │ COMPUTE NODE 1│ │COMPUTE NODE 2│ │COMPUTE NODE 3│
+     │               │ │              │ │              │
+     │  Reads files  │ │ Reads files  │ │ Reads files  │
+     │  from S3      │ │ from S3      │ │ from S3      │
+     │  directly     │ │ directly     │ │ directly     │
+     │               │ │              │ │              │
+     │  Parses data  │ │ Parses data  │ Parses data   │
+     │  Loads into   │ │ Loads into   │ │ Loads into   │
+     │  local slices │ │ local slices │ │ local slices │
+     └───────────────┘ └──────────────┘ └──────────────┘
+              │               │               │
+              ▼               ▼               ▼
+         S3 Bucket (multiple files read in parallel)</code></pre></div>
+<p>→ Key insight: Compute nodes read DIRECTLY from S3<br>
+→ The Leader Node does NOT funnel data through itself<br>
+→ Each compute node has multiple "slices" (processing units)<br>
+→ Each slice can read one file independently</p>
+<p>→ This means: <strong>more files in S3 = more parallelism = faster loading</strong></p>
+<p><strong>Optimal file count for COPY:</strong></p>
+<table><thead><tr><th>Cluster Configuration</th><th>Slices per Node</th><th>Total Slices</th><th>Optimal File Count</th></tr></thead><tbody><tr><td>2 × dc2.large</td><td>2</td><td>4</td><td>4 or multiples of 4</td></tr><tr><td>4 × dc2.large</td><td>2</td><td>8</td><td>8 or multiples of 8</td></tr><tr><td>2 × ra3.xlplus</td><td>2</td><td>4</td><td>4 or multiples of 4</td></tr><tr><td>2 × ra3.4xlarge</td><td>4</td><td>8</td><td>8 or multiples of 8</td></tr><tr><td>4 × ra3.4xlarge</td><td>4</td><td>16</td><td>16 or multiples of 16</td></tr></tbody></table>
+<p>→ Rule: Number of input files should be a MULTIPLE of the total number of slices<br>
+→ This ensures every slice gets equal work — no idle slices while others are still loading</p>
+<p>→ From Project 21 — Glue ETL writes multiple Parquet files per partition<br>
+→ If Glue wrote 12 files and cluster has 4 slices → 12/4 = 3 files per slice → good distribution<br>
+→ If Glue wrote 1 giant file → only 1 slice reads it → 3 slices idle → 4x slower</p>
+<hr>
+<h3>STEP 2 — CREATE IAM ROLE FOR REDSHIFT</h3>
+<p>→ Redshift needs an IAM Role to access S3 — same pattern as EC2 (Project 11) and Glue (Project 21)<br>
+→ But Redshift has its OWN trust policy — it's not EC2 or Glue assuming the role</p>
+<p>→ Navigate to IAM → Roles → Create Role</p>
+<p><strong>Trust Relationship:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity type</td><td>AWS Service</td></tr><tr><td>Service</td><td>Redshift</td></tr><tr><td>Use case</td><td>Redshift - Customizable</td></tr></tbody></table>
+<p>→ This creates trust policy: <code>"Service": "redshift.amazonaws.com"</code> can AssumeRole</p>
+<p><strong>Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td>Read Parquet files from S3</td></tr><tr><td><code>s3:ListBucket</code></td><td>List files in the source prefix</td></tr><tr><td><code>s3:GetBucketLocation</code></td><td>Determine S3 bucket region</td></tr></tbody></table>
+<p><strong>S3 Policy for the Role:</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>s3:GetObject</code></td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake/transformed/*</code></td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>s3:ListBucket</code>, <code>s3:GetBucketLocation</code></td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake</code></td></tr></tbody></table>
+<p><strong>Role Name:</strong> <code>Redshift-S3-ReadOnly-Role</code></p>
+<p>→ If loading from multiple buckets → add all bucket ARNs<br>
+→ If Redshift also needs to UNLOAD to S3 (Project 23) → add <code>s3:PutObject</code> on the target bucket</p>
+<hr>
+<h3>STEP 3 — ASSOCIATE IAM ROLE WITH REDSHIFT CLUSTER</h3>
+<p>→ Unlike EC2 (where you modify the instance), Redshift has a specific association mechanism</p>
+<p>→ Navigate to Redshift Console → Select Cluster → Actions → Manage IAM roles</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Available roles</td><td><code>Redshift-S3-ReadOnly-Role</code></td></tr><tr><td>Action</td><td>Add role → Set as default</td></tr></tbody></table>
+<p>→ Click "Associate IAM roles" → Save</p>
+<p><strong>"Set as default" meaning:</strong><br>
+→ When the COPY command doesn't specify a role ARN, Redshift uses the default role<br>
+→ A cluster can have multiple roles associated — but only one default<br>
+→ Best practice: Set the most commonly used role as default</p>
+<p><strong>Timing:</strong><br>
+→ Role association takes 1-2 minutes<br>
+→ No cluster restart required<br>
+→ Role is available to all databases and users on the cluster</p>
+<p><strong>Maximum roles per cluster:</strong> 10</p>
+<hr>
+<h3>STEP 4 — CREATE TARGET TABLES IN REDSHIFT</h3>
+<p>→ Before loading data — the target table must exist<br>
+→ Redshift table design is CRITICAL for query performance</p>
+<p>→ Connect to Redshift via Query Editor V2 (Redshift Console → Query Editor V2)</p>
+<p><strong>Table: orders</strong></p>
+<p>→ Key design decisions:</p>
+<table><thead><tr><th>Column</th><th>Data Type</th><th>Notes</th></tr></thead><tbody><tr><td><code>order_id</code></td><td>VARCHAR(50)</td><td>Primary identifier — not auto-increment (comes from source)</td></tr><tr><td><code>customer_id</code></td><td>VARCHAR(50)</td><td>FK to customers</td></tr><tr><td><code>customer_name</code></td><td>VARCHAR(200)</td><td>Denormalized for query speed</td></tr><tr><td><code>product_id</code></td><td>VARCHAR(50)</td><td>FK to products</td></tr><tr><td><code>order_date</code></td><td>DATE</td><td>Critical for time-series queries</td></tr><tr><td><code>ship_date</code></td><td>DATE</td><td>May be null for unshipped orders</td></tr><tr><td><code>total_amount</code></td><td>DECIMAL(12,2)</td><td>Precise monetary values — never use FLOAT for money</td></tr><tr><td><code>quantity</code></td><td>INTEGER</td><td>Order quantity</td></tr><tr><td><code>discount_pct</code></td><td>DECIMAL(5,2)</td><td>Percentage discount</td></tr><tr><td><code>category</code></td><td>VARCHAR(100)</td><td>Product category — denormalized</td></tr><tr><td><code>region</code></td><td>VARCHAR(50)</td><td>Customer region</td></tr><tr><td><code>payment_method</code></td><td>VARCHAR(50)</td><td>Credit card, PayPal, etc.</td></tr></tbody></table>
+<hr>
+<p><strong>Redshift-Specific Table Properties (Critical for Performance):</strong></p>
+<p><strong>Property 1: DISTSTYLE (Distribution Style)</strong></p>
+<p>→ How Redshift distributes rows across compute nodes</p>
+<table><thead><tr><th>DISTSTYLE</th><th>Behavior</th><th>Best For</th></tr></thead><tbody><tr><td>AUTO</td><td>Redshift chooses based on table size</td><td>Default — good starting point</td></tr><tr><td>EVEN</td><td>Rows distributed round-robin across all slices</td><td>Large tables not frequently joined</td></tr><tr><td>KEY</td><td>Rows with same key value go to same node</td><td>Tables frequently joined on that key</td></tr><tr><td>ALL</td><td>Entire table copied to every node</td><td>Small dimension tables (&lt; 5 million rows)</td></tr></tbody></table>
+<p>→ For <code>orders</code> table: <strong>DISTSTYLE KEY</strong> with DISTKEY <code>customer_id</code><br>
+→ Why? Most analytical queries join orders with customers on <code>customer_id</code><br>
+→ If both tables use <code>customer_id</code> as DISTKEY → joined rows are on the SAME node → no network shuffle</p>
+<p>→ For <code>products</code> table (small — 50,000 rows): <strong>DISTSTYLE ALL</strong><br>
+→ Every node has a complete copy → joins with any table require no network transfer</p>
+<p><strong>Property 2: SORTKEY</strong></p>
+<p>→ How data is physically ordered on disk within each slice</p>
+<table><thead><tr><th>SORTKEY Type</th><th>Behavior</th><th>Best For</th></tr></thead><tbody><tr><td>COMPOUND</td><td>Data sorted by key1, then key2, then key3</td><td>Queries that filter by leading key columns</td></tr><tr><td>INTERLEAVED</td><td>Equal weight to all key columns</td><td>Queries that filter by any combination of keys</td></tr><tr><td>AUTO</td><td>Redshift chooses</td><td>Default — reasonable starting point</td></tr></tbody></table>
+<p>→ For <code>orders</code> table: <strong>COMPOUND SORTKEY</strong> (<code>order_date</code>)<br>
+→ Why? Most queries filter by date range: "Show me orders from last 30 days"<br>
+→ With date as sort key:</p>
+<ul>
+<li>Redshift stores data sorted by date on disk</li>
+<li>Zone maps (min/max per block) allow skipping entire blocks</li>
+<li>"Last 30 days" query reads only recent blocks — skips 95% of data</li>
+</ul>
+<p>→ For <code>clickstream</code> table: <strong>COMPOUND SORTKEY</strong> (<code>event_date</code>, <code>user_id</code>)<br>
+→ Primary filter is date, secondary filter is user</p>
+<p><strong>Property 3: ENCODE (Compression)</strong></p>
+<p>→ Redshift compresses columns individually</p>
+<table><thead><tr><th>Setting</th><th>Behavior</th></tr></thead><tbody><tr><td>AUTO</td><td>Redshift chooses best encoding per column during COPY</td></tr><tr><td>RAW</td><td>No compression (wastes space)</td></tr><tr><td>Specific (AZ64, LZO, ZSTD, etc.)</td><td>Manual override</td></tr></tbody></table>
+<p>→ Use <strong>AUTO</strong> — Redshift analyzes the first 100,000 rows during COPY and chooses optimal encoding<br>
+→ This is called "automatic compression analysis"</p>
+<p><strong>Table Creation Summary:</strong></p>
+<table><thead><tr><th>Table</th><th>DISTSTYLE</th><th>DISTKEY</th><th>SORTKEY</th><th>ENCODE</th></tr></thead><tbody><tr><td><code>orders</code></td><td>KEY</td><td><code>customer_id</code></td><td>COMPOUND (<code>order_date</code>)</td><td>AUTO</td></tr><tr><td><code>customers</code></td><td>KEY</td><td><code>customer_id</code></td><td>COMPOUND (<code>registration_date</code>)</td><td>AUTO</td></tr><tr><td><code>products</code></td><td>ALL</td><td>—</td><td>COMPOUND (<code>category</code>)</td><td>AUTO</td></tr><tr><td><code>clickstream</code></td><td>KEY</td><td><code>user_id</code></td><td>COMPOUND (<code>event_date</code>, <code>user_id</code>)</td><td>AUTO</td></tr></tbody></table>
+<hr>
+<h3>STEP 5 — CONFIGURE AND EXECUTE THE COPY COMMAND</h3>
+<p>→ The COPY command is executed within Redshift (via Query Editor V2, or any SQL client connected to Redshift)</p>
+<p><strong>COPY Configuration for Orders Table:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Target table</td><td><code>orders</code></td><td>Table created in Step 4</td></tr><tr><td>Source</td><td><code>s3://shopnow-data-lake/transformed/orders/</code></td><td>S3 path with Parquet files</td></tr><tr><td>IAM Role</td><td><code>arn:aws:iam::123456789012:role/Redshift-S3-ReadOnly-Role</code></td><td>Or use <code>default</code> if set as default</td></tr><tr><td>FORMAT</td><td>PARQUET</td><td>Tells COPY to expect Parquet files</td></tr></tbody></table>
+<p>→ That's it for Parquet — the COPY command for Parquet is remarkably simple<br>
+→ Parquet files contain schema information → Redshift auto-maps columns by name<br>
+→ No delimiter, no header, no date format needed — Parquet handles all of this</p>
+<p><strong>What happens internally when COPY executes:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COPY command received by Leader Node
+</span>       ↓
+Leader reads S3 file listing from the specified path
+       ↓
+Leader identifies all Parquet files (recursively in subfolders)
+       ↓
+Leader distributes files across compute node slices
+  ├── Slice 1 → files [1, 5, 9, ...]
+  ├── Slice 2 → files [2, 6, 10, ...]
+  ├── Slice 3 → files [3, 7, 11, ...]
+  └── Slice 4 → files [4, 8, 12, ...]
+       ↓
+Each slice reads its assigned files from S3 IN PARALLEL
+       ↓
+Each slice parses Parquet → extracts rows
+       ↓
+Automatic compression analysis (first COPY only):
+  ├── Analyze first 100,000 rows
+  ├── Choose optimal encoding per column
+  └── Apply compression
+       ↓
+Each slice applies distribution:
+  ├── Rows matching this node's DISTKEY range → stored locally
+  └── Rows for other nodes → sent via network (redistribution)
+       ↓
+Each slice sorts data by SORTKEY within its portion
+       ↓
+Data is written to Redshift's columnar storage
+       ↓
+COPY completes → returns row count</code></pre></div>
+<hr>
+<h3>STEP 6 — COPY PARAMETERS FOR DIFFERENT FORMATS</h3>
+<p>→ Parquet is the simplest — but you may need to load CSV or JSON too</p>
+<p><strong>COPY from CSV:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>FORMAT</td><td>CSV</td><td>Comma-separated values</td></tr><tr><td>DELIMITER</td><td><code>','</code></td><td>Column separator (default comma)</td></tr><tr><td>IGNOREHEADER</td><td>1</td><td>Skip first row (header)</td></tr><tr><td>DATEFORMAT</td><td><code>'auto'</code></td><td>Auto-detect date formats</td></tr><tr><td>TIMEFORMAT</td><td><code>'auto'</code></td><td>Auto-detect time formats</td></tr><tr><td>ACCEPTINVCHAR</td><td><code>'?'</code></td><td>Replace invalid UTF-8 characters with <code>?</code></td></tr><tr><td>MAXERROR</td><td>100</td><td>Allow up to 100 errors before aborting</td></tr><tr><td>BLANKSASNULL</td><td>—</td><td>Treat blank fields as NULL</td></tr><tr><td>EMPTYASNULL</td><td>—</td><td>Treat empty strings as NULL</td></tr><tr><td>TRIMBLANKS</td><td>—</td><td>Remove trailing whitespace from VARCHAR</td></tr><tr><td>REGION</td><td><code>'ap-south-1'</code></td><td>S3 bucket region (if different from Redshift region)</td></tr></tbody></table>
+<p><strong>COPY from JSON:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>FORMAT</td><td>JSON</td><td>JSON format</td></tr><tr><td>JSON path</td><td><code>'auto'</code></td><td>Auto-map JSON keys to column names</td></tr><tr><td>Alternative</td><td><code>'s3://bucket/jsonpaths.json'</code></td><td>Custom mapping file for nested JSON</td></tr><tr><td>MAXERROR</td><td>100</td><td>Error tolerance</td></tr></tbody></table>
+<p><strong>COPY from Parquet:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>FORMAT</td><td>PARQUET</td><td>Parquet format</td></tr><tr><td>(no other format parameters needed)</td><td>—</td><td>Schema embedded in Parquet file</td></tr></tbody></table>
+<p>→ This is why Project 21 (converting to Parquet) was done FIRST<br>
+→ Loading Parquet into Redshift is simpler, faster, and more reliable than loading CSV</p>
+<hr>
+<h3>STEP 7 — HANDLE ERRORS AND VALIDATION</h3>
+<p><strong>Understanding MAXERROR:</strong></p>
+<table><thead><tr><th>MAXERROR Value</th><th>Behavior</th></tr></thead><tbody><tr><td>0 (default)</td><td>ANY error aborts the entire COPY — zero tolerance</td></tr><tr><td>100</td><td>Up to 100 rows can fail — rest still loads</td></tr><tr><td>-1</td><td>No limit — load whatever you can (dangerous in production)</td></tr></tbody></table>
+<p>→ For initial data load: <strong>MAXERROR = 0</strong> — catch ALL issues<br>
+→ For ongoing incremental loads: <strong>MAXERROR = 100</strong> — tolerate occasional bad records<br>
+→ Never use -1 in production — silently ignoring thousands of errors = data quality disaster</p>
+<p><strong>When COPY fails — how to investigate:</strong></p>
+<p>→ Redshift stores error details in system tables:</p>
+<p><strong>STL_LOAD_ERRORS table:</strong></p>
+<table><thead><tr><th>Column</th><th>Shows</th></tr></thead><tbody><tr><td><code>starttime</code></td><td>When the error occurred</td></tr><tr><td><code>filename</code></td><td>Which S3 file caused the error</td></tr><tr><td><code>line_number</code></td><td>Which line in the file</td></tr><tr><td><code>colname</code></td><td>Which column failed</td></tr><tr><td><code>type</code></td><td>Expected data type</td></tr><tr><td><code>raw_field_value</code></td><td>Actual value that caused the error</td></tr><tr><td><code>err_reason</code></td><td>Description of the error</td></tr></tbody></table>
+<p>→ Common error reasons:</p>
+<table><thead><tr><th>Error</th><th>Cause</th><th>Fix</th></tr></thead><tbody><tr><td><code>Delimiter not found</code></td><td>Wrong delimiter specified</td><td>Check CSV delimiter</td></tr><tr><td><code>Invalid digit</code></td><td>String in a numeric column</td><td>Fix source data or use VARCHAR</td></tr><tr><td><code>Value too long for type</code></td><td>String exceeds VARCHAR length</td><td>Increase column width</td></tr><tr><td><code>Extra column(s) found</code></td><td>More columns in file than table</td><td>Add IGNOREHEADER or fix schema</td></tr><tr><td><code>Missing column(s)</code></td><td>Fewer columns in file than table</td><td>Check source file completeness</td></tr><tr><td><code>Invalid Date format</code></td><td>Date doesn't match expected format</td><td>Use DATEFORMAT 'auto' or specify exact format</td></tr></tbody></table>
+<p><strong>STL_LOAD_COMMITS table:</strong></p>
+<table><thead><tr><th>Column</th><th>Shows</th></tr></thead><tbody><tr><td><code>query</code></td><td>Query ID of the COPY command</td></tr><tr><td><code>filename</code></td><td>Files that were successfully loaded</td></tr><tr><td><code>lines_scanned</code></td><td>Total rows scanned per file</td></tr><tr><td><code>lines_loaded</code></td><td>Rows actually loaded (after error filtering)</td></tr></tbody></table>
+<p>→ Compare <code>lines_scanned</code> vs <code>lines_loaded</code> — difference = skipped rows</p>
+<p><strong>COPY validation without loading (DRY RUN):</strong></p>
+<p>→ Use <code>NOLOAD</code> parameter<br>
+→ COPY runs all validation checks but does NOT actually load data<br>
+→ Perfect for testing before committing to a full load</p>
+<hr>
+<h3>STEP 8 — OPTIMIZE LOADING PERFORMANCE</h3>
+<hr>
+<p><strong>Optimization 1: File Splitting</strong></p>
+<table><thead><tr><th>Scenario</th><th>Files</th><th>Load Time</th><th>Why</th></tr></thead><tbody><tr><td>1 giant 8 GB file</td><td>1</td><td>25 minutes</td><td>Only 1 slice reads — others idle</td></tr><tr><td>4 files × 2 GB each</td><td>4</td><td>8 minutes</td><td>4 slices read in parallel</td></tr><tr><td>16 files × 500 MB each</td><td>16</td><td>4 minutes</td><td>All slices busy, good parallelism</td></tr><tr><td>1000 files × 8 MB each</td><td>1000</td><td>6 minutes</td><td>Slight overhead from file listing/opening</td></tr></tbody></table>
+<p>→ Optimal: File count = multiple of total slices, each file 100 MB – 1 GB<br>
+→ From Project 21 — Glue can be configured to output specific file counts using repartition</p>
+<p><strong>Optimization 2: Compression</strong></p>
+<p>→ COPY can read compressed files directly — no need to decompress first</p>
+<table><thead><tr><th>Compression</th><th>Parameter</th><th>Speed</th><th>Ratio</th></tr></thead><tbody><tr><td>GZIP</td><td><code>GZIP</code></td><td>Slower (CPU-intensive decompress)</td><td>High</td></tr><tr><td>LZO</td><td><code>LZOP</code></td><td>Fast decompress</td><td>Moderate</td></tr><tr><td>BZIP2</td><td><code>BZIP2</code></td><td>Slowest</td><td>Highest</td></tr><tr><td>ZSTD</td><td><code>ZSTD</code></td><td>Fast</td><td>High</td></tr><tr><td>Snappy (in Parquet)</td><td>Automatic</td><td>Fast</td><td>Moderate</td></tr><tr><td>None</td><td>Default</td><td>Fastest decompress, more S3 read</td><td>None</td></tr></tbody></table>
+<p>→ Parquet with Snappy (from Project 21) → COPY handles this automatically<br>
+→ No compression parameter needed for Parquet — it's embedded in the file</p>
+<p><strong>Optimization 3: Manifest File</strong></p>
+<p>→ A manifest file explicitly lists which S3 files to load<br>
+→ Without manifest: COPY loads ALL files in the specified path (including accidentally placed files)<br>
+→ With manifest: COPY loads ONLY files listed in the manifest</p>
+<p><strong>Manifest file format (JSON):</strong></p>
+<table><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody><tr><td><code>url</code></td><td>S3 path to each specific file</td></tr><tr><td><code>mandatory</code></td><td><code>true</code> = COPY fails if file missing; <code>false</code> = skip if missing</td></tr></tbody></table>
+<p><strong>When to use manifests:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Use Manifest?</th></tr></thead><tbody><tr><td>Simple path with all valid files</td><td>❌ Not needed</td></tr><tr><td>Path contains files from different dates/jobs</td><td>✅ Yes — load only specific files</td></tr><tr><td>Need guaranteed file list (compliance)</td><td>✅ Yes — explicit control</td></tr><tr><td>Cross-bucket loading</td><td>✅ Yes — list files from multiple buckets</td></tr><tr><td>Incremental load (specific new files only)</td><td>✅ Yes — list only new files</td></tr></tbody></table>
+<p><strong>Optimization 4: COMPUPDATE and STATUPDATE</strong></p>
+<table><thead><tr><th>Parameter</th><th>Purpose</th><th>Recommendation</th></tr></thead><tbody><tr><td>COMPUPDATE ON</td><td>Analyze data and set column compression during COPY</td><td>ON for first load, OFF for subsequent loads</td></tr><tr><td>COMPUPDATE OFF</td><td>Skip compression analysis</td><td>Faster for incremental loads (compression already set)</td></tr><tr><td>STATUPDATE ON</td><td>Update table statistics after COPY</td><td>ON — helps query optimizer</td></tr><tr><td>STATUPDATE OFF</td><td>Skip statistics update</td><td>Only if running ANALYZE manually afterward</td></tr></tbody></table>
+<p>→ First load: COMPUPDATE ON, STATUPDATE ON<br>
+→ Subsequent loads: COMPUPDATE OFF, STATUPDATE ON</p>
+<hr>
+<h3>STEP 9 — LOADING ALL FOUR TABLES</h3>
+<p><strong>Load Order Matters:</strong></p>
+<table><thead><tr><th>Order</th><th>Table</th><th>Size</th><th>Reason for Order</th></tr></thead><tbody><tr><td>1</td><td><code>products</code></td><td>0.5 GB</td><td>Smallest — quick to load, validate process</td></tr><tr><td>2</td><td><code>customers</code></td><td>0.7 GB</td><td>Small — validate DISTKEY distribution</td></tr><tr><td>3</td><td><code>orders</code></td><td>2 GB</td><td>Medium — validate join performance after load</td></tr><tr><td>4</td><td><code>clickstream</code></td><td>5 GB</td><td>Largest — load last, longest running</td></tr></tbody></table>
+<p>→ Loading smaller tables first validates the entire process before committing time to large tables</p>
+<p><strong>Post-Load Verification for Each Table:</strong></p>
+<table><thead><tr><th>Check</th><th>Method</th><th>Expected</th></tr></thead><tbody><tr><td>Row count correct?</td><td>Query: count from table</td><td>Matches source record count</td></tr><tr><td>Sample data correct?</td><td>Query: select top 10 rows</td><td>Data looks correct</td></tr><tr><td>NULL handling correct?</td><td>Query: count where column is null</td><td>Expected null count</td></tr><tr><td>Distribution even?</td><td>System table: <code>svv_table_info</code> → check <code>skew_rows</code></td><td>Skew &lt; 2.0 (ideally &lt; 1.5)</td></tr><tr><td>Sort key applied?</td><td>System table: <code>svv_table_info</code> → check <code>sortkey1</code></td><td>Shows configured sort key</td></tr><tr><td>Compression applied?</td><td>System table: <code>pg_table_def</code> → check <code>encoding</code></td><td>Not RAW (should show AZ64, LZO, ZSTD, etc.)</td></tr><tr><td>Load errors?</td><td>System table: <code>stl_load_errors</code></td><td>No errors for this COPY</td></tr></tbody></table>
+<hr>
+<h3>STEP 10 — POST-LOAD MAINTENANCE</h3>
+<p><strong>VACUUM:</strong><br>
+→ After large loads, run VACUUM to reclaim space and re-sort data</p>
+<table><thead><tr><th>VACUUM Type</th><th>Purpose</th><th>When to Use</th></tr></thead><tbody><tr><td>VACUUM FULL</td><td>Re-sort ALL rows + reclaim deleted space</td><td>After initial bulk load</td></tr><tr><td>VACUUM SORT ONLY</td><td>Re-sort unsorted rows</td><td>After incremental loads</td></tr><tr><td>VACUUM DELETE ONLY</td><td>Reclaim space from deleted rows</td><td>After large DELETE operations</td></tr><tr><td>VACUUM REINDEX</td><td>Rebuild interleaved sort key index</td><td>After loads into interleaved sort key tables</td></tr></tbody></table>
+<p>→ After initial load → VACUUM FULL on each table<br>
+→ After daily incremental loads → VACUUM SORT ONLY</p>
+<p><strong>ANALYZE:</strong><br>
+→ Updates table statistics used by the query optimizer</p>
+<p>→ After every COPY → run ANALYZE on loaded tables<br>
+→ Without fresh statistics → query optimizer makes poor decisions → slow queries</p>
+<p>→ If STATUPDATE ON was used in COPY → ANALYZE was already done automatically<br>
+→ Still good practice to run ANALYZE explicitly after large loads</p>
+<hr>
+<h3>STEP 11 — AUTOMATE THE LOADING PROCESS</h3>
+<p><strong>Option A: Scheduled via Redshift Query Scheduler</strong><br>
+→ Redshift Query Editor V2 → Scheduled Queries<br>
+→ Schedule COPY commands to run daily</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Schedule</td><td>Daily at 04:00 UTC (after Glue ETL completes at ~03:30)</td></tr><tr><td>IAM Role</td><td>Redshift scheduler execution role</td></tr><tr><td>SQL</td><td>COPY command</td></tr></tbody></table>
+<p><strong>Option B: EventBridge → Lambda → Redshift Data API (Project 34)</strong><br>
+→ More flexible — can chain with Glue job completion events<br>
+→ Explored in detail in Project 34</p>
+<p><strong>Option C: Glue Workflow (Project 31)</strong><br>
+→ Orchestrate: Glue ETL → Glue Crawler → Redshift COPY in a single workflow<br>
+→ Explored in Project 31</p>
+<p><strong>Option D: Step Functions (Project 32)</strong><br>
+→ Full orchestration with error handling, retries, parallel branches<br>
+→ Explored in Project 32</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use COPY for bulk loading — never INSERT for large datasets<br>
+→ Always use an IAM Role for S3 access — never embed access keys in the COPY command<br>
+→ Always split source data into multiple files — one file per slice minimum<br>
+→ Always use Parquet as source format when possible — schema embedded, compressed, fastest loading<br>
+→ Always set MAXERROR appropriately — 0 for initial loads, small number for incremental<br>
+→ Always check <code>stl_load_errors</code> after every COPY — even "successful" loads may have skipped rows<br>
+→ Always run VACUUM and ANALYZE after large loads<br>
+→ Always design tables with appropriate DISTKEY and SORTKEY BEFORE loading<br>
+→ Always load smallest tables first to validate the process<br>
+→ Always use COMPUPDATE ON for first load, OFF for subsequent loads<br>
+→ Always verify row counts match between source (S3/Athena) and target (Redshift)<br>
+→ Always consider file sizes — 100 MB to 1 GB per file is optimal</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use INSERT for bulk loading — COPY is 100x+ faster<br>
+→ Never embed AWS credentials in the COPY command — use IAM Roles<br>
+→ Never load from a single giant file — it eliminates parallelism<br>
+→ Never skip error checking after COPY — <code>stl_load_errors</code> reveals silent data issues<br>
+→ Never forget VACUUM after loads — unsorted data degrades query performance over time<br>
+→ Never set MAXERROR to -1 in production — you'll silently lose data<br>
+→ Never load CSV when Parquet is available — CSV requires more configuration and is slower<br>
+→ Never ignore DISTKEY design — wrong distribution causes data skew → slow queries<br>
+→ Never load into a table without SORTKEY — full table scans become necessary<br>
+→ Never run COPY during peak query hours if avoidable — COPY consumes cluster resources<br>
+→ Never assume COPY is atomic across all files — if one file fails with MAXERROR exceeded, partial data may be loaded</p>
+<table><thead><tr><th>Behavior</th><th>MAXERROR Not Exceeded</th><th>MAXERROR Exceeded</th></tr></thead><tbody><tr><td>Successfully loaded rows</td><td>Committed</td><td>Rolled back — nothing loaded</td></tr><tr><td>Error rows</td><td>Skipped (logged in stl_load_errors)</td><td>N/A — entire COPY aborted</td></tr></tbody></table>
+<p>→ Never use FLOAT/REAL for monetary values — use DECIMAL for precision</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE REDSHIFT COPY</h2>
+<table><thead><tr><th>Scenario</th><th>Use COPY?</th><th>Why</th></tr></thead><tbody><tr><td>Initial bulk load from S3 (GBs-TBs)</td><td>✅ Yes</td><td>Purpose-built for parallel S3 loading</td></tr><tr><td>Daily/hourly incremental loads from S3</td><td>✅ Yes</td><td>Efficient for batch increments</td></tr><tr><td>Loading Parquet from Glue ETL output</td><td>✅ Yes</td><td>Natural pipeline: Glue → S3 → COPY → Redshift</td></tr><tr><td>Loading from DynamoDB</td><td>✅ Yes</td><td>COPY supports DynamoDB as source</td></tr><tr><td>Loading from EMR/HDFS</td><td>✅ Yes</td><td>COPY supports EMR HDFS</td></tr><tr><td>Loading from remote hosts via SSH</td><td>✅ Yes</td><td>COPY supports SSH manifest</td></tr><tr><td>Single row inserts from application</td><td>❌ No</td><td>Use INSERT — COPY overhead for 1 row is wasteful</td></tr><tr><td>Real-time streaming ingestion</td><td>❌ No</td><td>Use Kinesis Firehose → Redshift (micro-batch)</td></tr><tr><td>Loading &lt; 1000 rows</td><td>❌ No</td><td>INSERT is simpler for tiny loads</td></tr><tr><td>Querying S3 without loading</td><td>❌ No</td><td>Use Redshift Spectrum (Project 28)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE REDSHIFT COPY</h2>
+<p>→ When you only need to QUERY S3 data without loading → Use Redshift Spectrum (Project 28)<br>
+→ When you need real-time row-by-row ingestion → Use Kinesis Data Firehose delivery to Redshift<br>
+→ When data is already in another Redshift cluster → Use cross-cluster data sharing<br>
+→ When data is in RDS/Aurora → Use federated query (Project 48) or Glue ETL (Project 43)<br>
+→ When data volumes are tiny (&lt; 1000 rows) → Simple INSERT is faster to configure</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → COPY EXECUTION PHASES</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PHASE 1: PLANNING (Leader Node)
+</span>  ├── Parse COPY command syntax
+  ├── Validate IAM Role permissions
+  ├── Connect to S3 and list files in specified path
+  ├── If manifest specified → read manifest → validate files exist
+  ├── Count total files → plan distribution across slices
+  └── Send file assignments to compute nodes
+
+PHASE 2: READING (Compute Nodes — Parallel)
+  ├── Each slice opens connection to S3
+  ├── Each slice reads its assigned files
+  ├── For Parquet: read file footer → identify relevant row groups
+  ├── For CSV: read line by line, split by delimiter
+  ├── For compressed files: decompress on-the-fly
+  └── Parse into columnar format
+
+PHASE 3: DISTRIBUTING (Compute Nodes)
+  ├── For each row, compute DISTKEY hash
+  ├── If row belongs to this node → store locally
+  ├── If row belongs to another node → send via interconnect
+  └── Receive rows from other nodes destined for this node
+
+PHASE 4: SORTING (Compute Nodes)
+  ├── Sort received rows by SORTKEY within each slice
+  ├── Merge sorted runs
+  └── Write to columnar storage blocks (1 MB each)
+
+PHASE 5: COMPRESSION (First COPY only, if COMPUPDATE ON)
+  ├── Analyze first 100,000 rows per column
+  ├── Test multiple encoding algorithms
+  ├── Choose encoding with best compression ratio
+  └── Apply chosen encoding to all data
+
+PHASE 6: COMMIT (Leader Node)
+  ├── Verify all slices completed successfully
+  ├── Check error count vs MAXERROR threshold
+  ├── If within threshold → COMMIT transaction
+  ├── If exceeded → ROLLBACK entire load
+  ├── Update table statistics (if STATUPDATE ON)
+  └── Return row count to client</code></pre></div>
+<hr>
+<h3>2 → HOW PARQUET COPY DIFFERS FROM CSV COPY</h3>
+<table><thead><tr><th>Phase</th><th>CSV COPY</th><th>Parquet COPY</th></tr></thead><tbody><tr><td>Schema discovery</td><td>Uses table DDL + COPY parameters</td><td>Reads Parquet file footer (schema embedded)</td></tr><tr><td>Column mapping</td><td>By position (1st column → 1st table column)</td><td>By name (Parquet column name → table column name)</td></tr><tr><td>Type conversion</td><td>String parsing (slow, error-prone)</td><td>Native type (fast, reliable)</td></tr><tr><td>Null handling</td><td>Requires BLANKSASNULL, EMPTYASNULL params</td><td>Parquet has native null representation</td></tr><tr><td>Date parsing</td><td>Requires DATEFORMAT parameter</td><td>Date stored as native type in Parquet</td></tr><tr><td>Compression</td><td>Separate parameter (GZIP, ZSTD, etc.)</td><td>Embedded in Parquet (automatic)</td></tr><tr><td>Partial column read</td><td>Not possible — must read all columns</td><td>Possible — only reads columns matching table</td></tr></tbody></table>
+<p>→ Parquet COPY is:</p>
+<ul>
+<li>Faster (no string parsing)</li>
+<li>Simpler (fewer parameters)</li>
+<li>More reliable (schema embedded, types pre-validated)</li>
+<li>More efficient (columnar read — only needed columns)</li>
+</ul>
+<p>→ This is why Project 21 (CSV → Parquet conversion) is a prerequisite for optimal Redshift loading</p>
+<hr>
+<h3>3 → DISTRIBUTION KEY MECHANICS DURING COPY</h3>
+<p>→ When COPY loads data into a table with DISTSTYLE KEY:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Row arrives: {customer_id: "CUST-1234", order_id: "ORD-5678", ...}
+</span>       ↓
+Hash function applied to DISTKEY value:
+  hash("CUST-1234") = 7482931
+       ↓
+Hash mapped to slice:
+  7482931 mod 4 (total slices) = slice 3
+       ↓
+Row sent to slice 3 on compute node 2
+       ↓
+If the reading slice IS slice 3 → store locally (fast)
+If the reading slice is NOT slice 3 → send over network (slower)</code></pre></div>
+<p>→ This redistribution happens during COPY<br>
+→ If source files are already organized by DISTKEY → less redistribution → faster load<br>
+→ If source files are random → significant redistribution → still fast but slightly slower</p>
+<p>→ For tables with DISTSTYLE ALL (like <code>products</code>):</p>
+<ul>
+<li>Every row is copied to EVERY node</li>
+<li>Load time is slightly longer</li>
+<li>But ALL subsequent joins with this table are local (no network)</li>
+</ul>
+<hr>
+<h3>4 → ZONE MAPS AND SORTKEY DURING COPY</h3>
+<p>→ As data is loaded and sorted by SORTKEY, Redshift creates "zone maps"</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SORTKEY = order_date
+</span>
+Block 1: [2024-01-01 to 2024-01-15] ← zone map: min=2024-01-01, max=2024-01-15
+Block 2: [2024-01-16 to 2024-01-31] ← zone map: min=2024-01-16, max=2024-01-31
+Block 3: [2024-02-01 to 2024-02-14] ← zone map: min=2024-02-01, max=2024-02-14
+...
+Block 24: [2025-01-01 to 2025-01-15] ← zone map: min=2025-01-01, max=2025-01-15</code></pre></div>
+<p>→ Query: "WHERE order_date &gt;= '2025-01-01'"<br>
+→ Redshift checks zone maps:</p>
+<ul>
+<li>Block 1: max = 2024-01-15 &lt; 2025-01-01 → SKIP</li>
+<li>Block 2: max = 2024-01-31 &lt; 2025-01-01 → SKIP</li>
+<li>... (skip blocks 1-23)</li>
+<li>Block 24: min = 2025-01-01 → READ<br>
+→ 23 out of 24 blocks skipped → 96% less I/O</li>
+</ul>
+<p>→ This is why SORTKEY on the most filtered column is critical<br>
+→ Without SORTKEY → every query reads every block → no zone map benefit</p>
+<hr>
+<h3>5 → AUTOMATIC COMPRESSION ANALYSIS DETAILS</h3>
+<p>→ When COMPUPDATE ON (first load):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COPY reads first 100,000 rows
+</span>       ↓
+For each column, Redshift tests multiple encodings:
+  ├── RAW (no compression)
+  ├── AZ64 (Amazon's proprietary — best for numeric/date)
+  ├── LZO (fast, moderate ratio)
+  ├── ZSTD (balanced speed and ratio)
+  ├── BYTEDICT (for low-cardinality columns — &lt; 256 unique values)
+  ├── DELTA (for sequential values — timestamps, auto-increment)
+  ├── MOSTLY8/16/32 (for integers that mostly fit in smaller types)
+  ├── RUNLENGTH (for columns with many consecutive repeated values)
+  └── TEXT255/TEXT32K (for short/long text columns)
+       ↓
+For each column, compare compressed size
+       ↓
+Choose encoding with smallest compressed size
+       ↓
+Apply to the column for ALL data (not just sample)</code></pre></div>
+<p><strong>Typical compression results:</strong></p>
+<table><thead><tr><th>Column</th><th>Data Type</th><th>Chosen Encoding</th><th>Compression Ratio</th></tr></thead><tbody><tr><td><code>order_date</code></td><td>DATE</td><td>AZ64</td><td>4:1</td></tr><tr><td><code>customer_id</code></td><td>VARCHAR</td><td>LZO</td><td>3:1</td></tr><tr><td><code>total_amount</code></td><td>DECIMAL</td><td>AZ64</td><td>5:1</td></tr><tr><td><code>quantity</code></td><td>INTEGER</td><td>MOSTLY8</td><td>4:1</td></tr><tr><td><code>region</code></td><td>VARCHAR</td><td>BYTEDICT</td><td>10:1 (few unique values)</td></tr><tr><td><code>payment_method</code></td><td>VARCHAR</td><td>BYTEDICT</td><td>12:1 (5 unique values)</td></tr></tbody></table>
+<p>→ Overall table compression: 5:1 to 10:1 is common<br>
+→ 2 GB Parquet → 200-400 MB in Redshift compressed storage</p>
+<hr>
+<h3>6 → COST OF COPY OPERATION</h3>
+<p>→ COPY itself has NO separate charge<br>
+→ You pay for:</p>
+<table><thead><tr><th>Cost Component</th><th>Details</th></tr></thead><tbody><tr><td>Redshift cluster time</td><td>Cluster runs during COPY (already paying for it)</td></tr><tr><td>S3 GET requests</td><td>One GET per file read</td></tr><tr><td>S3 data transfer</td><td>Free if Redshift and S3 are in same region</td></tr><tr><td>S3 data transfer</td><td>Charged if cross-region</td></tr></tbody></table>
+<p>→ COPY is effectively FREE if cluster and S3 are in the same region<br>
+→ This is why region alignment (Project 1 region choice + Project 16 region choice) matters</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>COPY returns "Access Denied"</td><td>S3 permission error</td><td>IAM Role missing S3 permissions OR role not associated with cluster</td><td>Check role permissions + cluster association</td></tr><tr><td>2</td><td>COPY is extremely slow</td><td>Takes hours for a few GB</td><td>Single large file — no parallelism</td><td>Split into multiple files (multiples of slice count)</td></tr><tr><td>3</td><td>Data skew after loading</td><td>Queries slow, one node always busy</td><td>Bad DISTKEY choice — most data has same DISTKEY value</td><td>Choose higher-cardinality DISTKEY or use DISTSTYLE EVEN</td></tr><tr><td>4</td><td>Column mapping errors with CSV</td><td>Columns misaligned — wrong data in wrong columns</td><td>CSV column order doesn't match table column order</td><td>Use column list in COPY or switch to Parquet (name-based mapping)</td></tr><tr><td>5</td><td>Date parsing errors with CSV</td><td><code>Invalid Date format</code> errors</td><td>Source dates in unexpected format</td><td>Use DATEFORMAT 'auto' or specify exact format</td></tr><tr><td>6</td><td>COPY loads 0 rows with no error</td><td>"0 rows loaded" but no error message</td><td>S3 path is wrong — no files found (trailing slash issue or wrong prefix)</td><td>Verify exact S3 path — check for trailing slashes</td></tr><tr><td>7</td><td>Duplicate data after re-running COPY</td><td>Same data loaded twice</td><td>COPY appends — it doesn't check for duplicates</td><td>Use staging table → MERGE/UPSERT pattern, or delete before reload</td></tr><tr><td>8</td><td>Query performance poor after COPY</td><td>Queries scan too much data</td><td>Forgot to run VACUUM (data unsorted) or ANALYZE (stale statistics)</td><td>Run VACUUM FULL then ANALYZE</td></tr><tr><td>9</td><td>COPY fails with "String length exceeds DDL length"</td><td>VARCHAR too short</td><td>Column defined as VARCHAR(50) but data has 60-character values</td><td>Increase VARCHAR length in table DDL</td></tr><tr><td>10</td><td>COPY succeeds but row count doesn't match</td><td>Fewer rows than expected</td><td>MAXERROR allowed some rows to be skipped</td><td>Check <code>stl_load_errors</code> — fix source data or increase VARCHAR/adjust types</td></tr><tr><td>11</td><td>Cross-region COPY is slow and expensive</td><td>High latency, data transfer charges</td><td>Redshift in us-east-1, S3 in ap-south-1</td><td>Keep Redshift and S3 in the same region</td></tr><tr><td>12</td><td>Parquet column names don't match table</td><td>"Column not found" error</td><td>Parquet uses case-sensitive names; Redshift is lowercase</td><td>Ensure Parquet column names are lowercase (handle in Glue ETL — Project 21)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scaling</strong></p>
+<table><thead><tr><th>Data Size</th><th>Cluster Size</th><th>Files</th><th>Expected Load Time</th></tr></thead><tbody><tr><td>1 GB</td><td>2 × dc2.large (4 slices)</td><td>4-8 files</td><td>1-2 minutes</td></tr><tr><td>10 GB</td><td>2 × dc2.large (4 slices)</td><td>8-16 files</td><td>5-10 minutes</td></tr><tr><td>100 GB</td><td>4 × ra3.xlplus (8 slices)</td><td>16-32 files</td><td>15-30 minutes</td></tr><tr><td>1 TB</td><td>8 × ra3.4xlarge (32 slices)</td><td>32-64 files</td><td>30-60 minutes</td></tr><tr><td>10 TB</td><td>16 × ra3.4xlarge (64 slices)</td><td>64-128 files</td><td>2-4 hours</td></tr></tbody></table>
+<p>→ COPY scales linearly with cluster size — double the nodes = half the load time</p>
+<p>→ <strong>Incremental Loading Pattern</strong></p>
+<table><thead><tr><th>Pattern</th><th>Mechanism</th><th>Complexity</th></tr></thead><tbody><tr><td>Full reload</td><td>TRUNCATE → COPY all data</td><td>Simple but slow for large tables</td></tr><tr><td>Append only</td><td>COPY new files only (using manifest or bookmark)</td><td>Simple if data is append-only</td></tr><tr><td>Upsert (merge)</td><td>COPY to staging table → DELETE matching → INSERT from staging</td><td>Complex but handles updates and inserts</td></tr><tr><td>Partition swap</td><td>Load new partition → swap with old partition</td><td>Efficient for date-partitioned data</td></tr></tbody></table>
+<p>→ For ShopNow daily loads:</p>
+<ul>
+<li>Orders: Append + occasional upsert (order status updates)</li>
+<li>Clickstream: Append only (events never change)</li>
+<li>Products: Full reload (small table, changes unpredictably)</li>
+<li>Customers: Upsert (customer info updates)</li>
+</ul>
+<p>→ <strong>Concurrent COPY Operations</strong></p>
+<table><thead><tr><th>Scenario</th><th>Behavior</th></tr></thead><tbody><tr><td>Two COPY into different tables</td><td>Run in parallel — no conflict</td></tr><tr><td>Two COPY into same table</td><td>Run in parallel — but may cause lock contention</td></tr><tr><td>COPY during queries</td><td>Both run — but COPY consumes cluster resources</td></tr></tbody></table>
+<p>→ Best practice: Schedule COPY during low-query periods<br>
+→ If loading multiple tables → run COPY commands in parallel (different tables)</p>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Component</th><th>Scales With</th></tr></thead><tbody><tr><td>Cluster cost</td><td>Node count × hours running</td></tr><tr><td>S3 requests</td><td>Number of files loaded</td></tr><tr><td>S3 data transfer</td><td>0 (same region)</td></tr><tr><td>COPY execution</td><td>Cluster resources (already paid for)</td></tr></tbody></table>
+<p>→ The dominant cost is the Redshift cluster itself — COPY adds negligible marginal cost</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Pre-COPY Verification Checklist:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th><th>Expected</th></tr></thead><tbody><tr><td>IAM Role associated?</td><td>Redshift Console → Cluster → Properties → IAM roles</td><td>Role listed</td></tr><tr><td>Target table exists?</td><td>Query: <code>SELECT * FROM information_schema.tables</code></td><td>Table found</td></tr><tr><td>S3 files exist?</td><td>S3 Console or AWS CLI → list objects in path</td><td>Files present</td></tr><tr><td>File count optimal?</td><td>Count files vs slice count</td><td>Multiple of slice count</td></tr><tr><td>File format correct?</td><td>Check file extensions</td><td><code>.parquet</code> or <code>.csv.gz</code> etc.</td></tr><tr><td>Same region?</td><td>Compare Redshift cluster region vs S3 bucket region</td><td>Must match</td></tr></tbody></table>
+<p>→ <strong>Post-COPY Verification Checklist:</strong></p>
+<table><thead><tr><th>Check</th><th>Method</th><th>Expected</th></tr></thead><tbody><tr><td>Row count matches source?</td><td>Athena count on S3 vs Redshift count</td><td>Match (within MAXERROR tolerance)</td></tr><tr><td>No load errors?</td><td>Query <code>stl_load_errors</code> for this COPY</td><td>0 rows</td></tr><tr><td>Data sample correct?</td><td>Query top 10 rows</td><td>Data looks right</td></tr><tr><td>Compression applied?</td><td>Query <code>pg_table_def</code> → encoding column</td><td>Not RAW</td></tr><tr><td>Distribution balanced?</td><td>Query <code>svv_table_info</code> → skew_rows</td><td>&lt; 2.0</td></tr><tr><td>Sort key effective?</td><td>Run a filtered query → check execution plan</td><td>Zone map filtering shown</td></tr><tr><td>VACUUM completed?</td><td>Run VACUUM FULL after load</td><td>Returns successfully</td></tr><tr><td>ANALYZE completed?</td><td>Run ANALYZE after load</td><td>Returns successfully</td></tr></tbody></table>
+<p>→ <strong>Monitoring Dashboard Additions:</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>COPY duration trend</td><td>Log COPY start/end times</td><td>Detect degradation as data grows</td></tr><tr><td>Row count per load</td><td>Track daily loaded rows</td><td>Detect anomalies (sudden drop = data issue)</td></tr><tr><td>Load errors per run</td><td>Count from <code>stl_load_errors</code></td><td>Detect data quality issues</td></tr><tr><td>Table size growth</td><td>Query <code>svv_table_info</code> weekly</td><td>Capacity planning</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ COPY is the ONLY way to efficiently bulk-load data into Redshift — INSERT is 100x+ slower for large datasets<br>
+→ COPY's power comes from PARALLEL reading — every compute node slice reads from S3 simultaneously<br>
+→ The pipeline is now: Raw CSV → Glue ETL (Project 21) → Parquet in S3 → COPY → Redshift<br>
+→ Parquet is the ideal COPY source — schema embedded, compressed, name-based column mapping, fastest loading<br>
+→ Table design (DISTKEY, SORTKEY, ENCODE) is as important as the COPY command itself — wrong design = slow queries despite fast loading<br>
+→ Post-load maintenance (VACUUM, ANALYZE) is mandatory — not optional<br>
+→ File splitting strategy directly impacts load speed — match file count to slice count</p>
+<p>→ This project connects the storage layer to the compute layer:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 1 (S3)</td><td>S3 is the source — COPY reads from S3</td></tr><tr><td>Project 16 (Redshift setup)</td><td>Cluster must exist before COPY</td></tr><tr><td>Project 21 (Glue ETL)</td><td>Parquet files from Glue are what COPY loads</td></tr><tr><td>Project 23 (UNLOAD)</td><td>Reverse of COPY — extract data FROM Redshift TO S3</td></tr><tr><td>Project 28 (Spectrum)</td><td>Alternative to COPY — query S3 without loading</td></tr><tr><td>Project 34 (Lambda → Redshift)</td><td>Automate COPY via Lambda + Redshift Data API</td></tr><tr><td>Project 43 (Redshift → MariaDB)</td><td>After data is in Redshift, sync back to operational DB</td></tr><tr><td>Project 49 (Complex Pipeline)</td><td>COPY becomes one step in multi-service orchestration</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ Data now flows INTO Redshift efficiently via COPY<br>
+→ But what about the reverse? What about getting data OUT of Redshift?</p>
+<p>→ The marketing team runs a complex segmentation query in Redshift<br>
+→ They want the results as a CSV file in S3 to share with an external advertising partner<br>
+→ The finance team needs monthly aggregated reports exported to S3 for archival<br>
+→ The data science team wants Redshift query results in Parquet format in S3 for ML training</p>
+<p>→ Manually exporting query results row-by-row via SELECT → application → S3 upload is slow<br>
+→ Just like COPY is the parallel loader INTO Redshift, UNLOAD is the parallel exporter OUT OF Redshift</p>
+<p>→ <strong>This is exactly what Project 23 solves</strong><br>
+→ Project 23 introduces the UNLOAD command — the mirror image of COPY<br>
+→ You will learn how to efficiently export Redshift query results to S3 in various formats, with partitioning, compression, and encryption</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 23: "The Analytics Export Nobody Could Automate — Redshift UNLOAD to S3"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-21.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 22/60</span></div><a class="nav-btn next" href="project-23.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

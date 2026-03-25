@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 38: THE SYSTEM THAT NEEDED SMART EVENT ROUTING — EventBridge Rule-Based  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 38: THE SYSTEM THAT NEEDED SMART EVENT ROUTING — EventBridge Rule-Based Service Integration</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's infrastructure has grown significantly across 37 projects<br>
+→ Multiple services generate events, trigger actions, and notify teams<br>
+→ But the event management is SCATTERED across different mechanisms:</p>
+<p><strong>Current Event Sources and Their Routing (Fragmented):</strong></p>
+<table><thead><tr><th>Event Source</th><th>Current Mechanism</th><th>Limitation</th></tr></thead><tbody><tr><td>S3 file upload</td><td>S3 Event Notification → SNS (Project 15)</td><td>Only supports prefix/suffix filters — no content-based routing</td></tr><tr><td>CloudWatch alarm fires</td><td>CloudWatch Alarm → SNS (Project 8)</td><td>Only sends to SNS — cannot conditionally route to different targets</td></tr><tr><td>Glue ETL job completes</td><td>No notification configured</td><td>Team manually checks Glue console every morning</td></tr><tr><td>Glue ETL job fails</td><td>No notification configured</td><td>Failures discovered hours later</td></tr><tr><td>Secrets Manager rotation fails</td><td>CloudTrail event only (Project 37)</td><td>Nobody monitors CloudTrail in real-time</td></tr><tr><td>RDS failover occurs</td><td>RDS Event Subscription → SNS (basic)</td><td>Limited event detail — cannot filter by specific failure type</td></tr><tr><td>Lambda function errors</td><td>CloudWatch Logs (Project 19)</td><td>Requires manual log search — no proactive alerting</td></tr><tr><td>Redshift COPY completes</td><td>No notification</td><td>Downstream processes wait or poll</td></tr><tr><td>New account created in Organization</td><td>No notification</td><td>Security team unaware until next audit</td></tr><tr><td>EC2 instance state change</td><td>No notification</td><td>Auto Scaling handles some — but no custom routing</td></tr></tbody></table>
+<p><strong>Specific Problems the Operations Team Faces:</strong></p>
+<p><strong>Problem 1 — S3 Upload Routing Complexity:</strong><br>
+→ Three types of files land in the <code>shopnow-datalake-raw</code> bucket:</p>
+<ul>
+<li><code>orders/*.csv</code> → Should trigger Glue ETL Job A</li>
+<li><code>inventory/*.json</code> → Should trigger Glue ETL Job B</li>
+<li><code>reports/*.pdf</code> → Should trigger SNS notification to finance team<br>
+→ S3 Event Notification (Project 15) can filter by prefix<br>
+→ But it cannot route to DIFFERENT targets based on prefix in a single notification configuration<br>
+→ Current workaround: One Lambda function receives ALL events → inspects prefix → routes manually<br>
+→ This Lambda is a maintenance nightmare — every new file type requires code change</li>
+</ul>
+<p><strong>Problem 2 — Glue Job Completion Orchestration:</strong><br>
+→ When Glue ETL Job A completes:</p>
+<ul>
+<li>If SUCCEEDED → trigger Glue Crawler → then trigger Athena CTAS query → then notify data team</li>
+<li>If FAILED → notify DevOps team → create incident ticket<br>
+→ Glue Workflow (Project 31) handles linear sequences but NOT conditional branching with external services<br>
+→ Step Functions (Project 32) can do this but needs a TRIGGER to start the state machine<br>
+→ Nobody triggers the Step Function when Glue completes — there's no event bridge</li>
+</ul>
+<p><strong>Problem 3 — Security Event Response:</strong><br>
+→ When Secrets Manager rotation fails (Project 37) → should automatically:</p>
+<ul>
+<li>Send PagerDuty alert to security team</li>
+<li>Trigger a remediation Lambda</li>
+<li>Log the incident in a centralized audit bucket<br>
+→ Currently → RotationFailed event sits in CloudTrail → discovered 3 days later</li>
+</ul>
+<p><strong>Problem 4 — Scheduled Tasks Fragmentation:</strong><br>
+→ Multiple scheduled tasks exist:</p>
+<ul>
+<li>CloudWatch Events rule triggering Lambda at 2 AM (legacy)</li>
+<li>Glue Trigger running crawler at 6 AM (Project 31)</li>
+<li>Cron job on EC2 running cleanup at midnight (unreliable)<br>
+→ No central view of all scheduled tasks<br>
+→ No central monitoring of schedule execution</li>
+</ul>
+<p><strong>The CTO asks:</strong></p>
+<blockquote>
+<p>"I need ONE system that captures ALL events from ALL services,<br>
+routes them intelligently based on content,<br>
+supports both real-time reactions and scheduled triggers,<br>
+and gives us a single pane of glass for all event-driven workflows."</p>
+</blockquote>
+<p>→ This requires Amazon EventBridge — the central nervous system of AWS event-driven architecture</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what EventBridge IS and what it REPLACES</p>
+<p><strong>EventBridge is the evolution of CloudWatch Events:</strong><br>
+→ CloudWatch Events was the original event routing service<br>
+→ EventBridge is a SUPERSET — everything CloudWatch Events did, EventBridge does better<br>
+→ CloudWatch Events rules are visible in EventBridge console (they're the same underlying service)<br>
+→ New features (custom event buses, schema registry, archives, partner integrations) are EventBridge-only</p>
+<p><strong>What EventBridge provides that previous projects' mechanisms don't:</strong></p>
+<table><thead><tr><th>Capability</th><th>Previous Approach</th><th>EventBridge Approach</th></tr></thead><tbody><tr><td>Content-based routing</td><td>Lambda inspects event → manual routing</td><td>Event Pattern matching → automatic routing</td></tr><tr><td>Multi-target fan-out</td><td>SNS fan-out (Project 13) — all subscribers get same event</td><td>Rules with different patterns → different targets</td></tr><tr><td>Cross-service event capture</td><td>Each service has its own notification mechanism</td><td>ALL AWS services emit to default event bus automatically</td></tr><tr><td>Scheduled execution</td><td>CloudWatch Events (legacy), Glue Triggers, EC2 cron</td><td>Centralized schedules with monitoring</td></tr><tr><td>Event replay</td><td>Not possible</td><td>Archive events → replay for debugging or reprocessing</td></tr><tr><td>Schema discovery</td><td>Manual — inspect event JSON yourself</td><td>Schema Registry auto-discovers event shapes</td></tr><tr><td>Cross-account events</td><td>Complex SNS/SQS cross-account (Project 41 preview)</td><td>Cross-account event bus rules</td></tr><tr><td>Third-party integration</td><td>Custom webhook → Lambda → process</td><td>Partner event sources (Datadog, PagerDuty, Auth0)</td></tr></tbody></table>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Understand EventBridge architecture (Event Bus, Rules, Targets)</li>
+<li>Step 2 — Explore the Default Event Bus and AWS service events</li>
+<li>Step 3 — Create rules for S3 events with content-based routing</li>
+<li>Step 4 — Create rules for Glue job state changes</li>
+<li>Step 5 — Create rules for Secrets Manager rotation events</li>
+<li>Step 6 — Configure scheduled rules replacing fragmented cron jobs</li>
+<li>Step 7 — Configure event archive and replay</li>
+<li>Step 8 — Create a custom event bus for application events</li>
+<li>Step 9 — Configure input transformation for clean target payloads</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND EVENTBRIDGE ARCHITECTURE</h3>
+<p><strong>Three Core Components:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────┐
+</span>│                    EVENT BUS                              │
+│  (the highway where events flow)                         │
+│                                                          │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐          │
+│  │  Event 1  │    │  Event 2  │    │  Event 3  │         │
+│  │  (S3 Put) │    │ (Glue    │    │ (Rotation │         │
+│  │           │    │  Failed) │    │  Failed)  │         │
+│  └─────┬─────┘    └─────┬─────┘   └─────┬─────┘        │
+│        │                │                │               │
+│  ┌─────▼─────────────────▼────────────────▼──────────┐  │
+│  │                 RULES ENGINE                        │  │
+│  │  Rule 1: IF source=s3 AND prefix=orders → Target A │  │
+│  │  Rule 2: IF source=glue AND state=FAILED → Target B│  │
+│  │  Rule 3: IF source=secretsmanager AND              │  │
+│  │           detail.eventName=RotationFailed → Target C│  │
+│  └─────┬──────────────────┬───────────────┬──────────┘  │
+│        │                  │               │              │
+│  ┌─────▼─────┐    ┌──────▼─────┐   ┌────▼──────┐      │
+│  │  Target A  │    │  Target B   │   │  Target C  │     │
+│  │  (Lambda)  │    │  (SNS)      │   │  (Lambda)  │     │
+│  └────────────┘    └─────────────┘   └────────────┘     │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>Component 1 — Event Bus:</strong><br>
+→ A channel where events are published and consumed<br>
+→ Three types of event buses:</p>
+<table><thead><tr><th>Bus Type</th><th>Name</th><th>Purpose</th><th>Cost</th></tr></thead><tbody><tr><td>Default</td><td><code>default</code></td><td>Receives ALL AWS service events automatically</td><td>Events from AWS services are FREE</td></tr><tr><td>Custom</td><td>You name it (e.g., <code>shopnow-app-events</code>)</td><td>Application-generated events</td><td>$1.00 per million events published</td></tr><tr><td>Partner</td><td>Third-party name (e.g., <code>aws.partner/datadog.com/...</code>)</td><td>Events from SaaS partners</td><td>Varies</td></tr></tbody></table>
+<p>→ CRITICAL: AWS service events (S3, Glue, RDS, etc.) ONLY go to the <code>default</code> event bus<br>
+→ You CANNOT redirect AWS service events to a custom bus directly<br>
+→ Custom buses are for YOUR application events</p>
+<p><strong>Component 2 — Rules:</strong><br>
+→ A rule matches events based on a pattern and routes them to targets<br>
+→ Each rule has:</p>
+<ul>
+<li>An event pattern (what to match) OR a schedule expression (when to trigger)</li>
+<li>One or more targets (where to send matching events)</li>
+<li>An IAM role (permissions to invoke the target)</li>
+<li>Optional input transformation (modify the event before sending to target)</li>
+</ul>
+<p><strong>Component 3 — Targets:</strong><br>
+→ The destination service that receives the matched event</p>
+<table><thead><tr><th>Supported Target</th><th>Use Case</th></tr></thead><tbody><tr><td>Lambda function</td><td>Custom processing, transformation, orchestration</td></tr><tr><td>SNS topic</td><td>Fan-out notifications (Project 6, 13)</td></tr><tr><td>SQS queue</td><td>Buffered processing (Project 7)</td></tr><tr><td>Step Functions state machine</td><td>Complex workflow orchestration (Project 32)</td></tr><tr><td>Glue Workflow</td><td>Trigger ETL pipeline (Project 31)</td></tr><tr><td>Kinesis Data Stream</td><td>Real-time streaming (Project 52 preview)</td></tr><tr><td>ECS task</td><td>Container-based processing</td></tr><tr><td>CodePipeline</td><td>CI/CD trigger</td></tr><tr><td>Systems Manager Automation</td><td>Operational remediation</td></tr><tr><td>Another EventBridge bus</td><td>Cross-account or cross-region routing</td></tr><tr><td>API Gateway</td><td>HTTP endpoint invocation</td></tr><tr><td>Redshift Data API</td><td>Execute Redshift queries</td></tr><tr><td>CloudWatch Logs</td><td>Log events for analysis</td></tr></tbody></table>
+<p>→ A single rule can have up to 5 targets<br>
+→ All targets receive the SAME event (fan-out within a rule)<br>
+→ For different targets based on different patterns → use separate rules</p>
+<hr>
+<h3>STEP 2 — EXPLORE THE DEFAULT EVENT BUS AND AWS SERVICE EVENTS</h3>
+<p>→ Navigate to Amazon EventBridge → "Event buses"<br>
+→ The <code>default</code> bus already exists — you don't create it</p>
+<p><strong>Understanding What Events Flow Through Default Bus:</strong></p>
+<p>→ EVERY AWS service state change automatically emits an event to the default bus<br>
+→ You don't need to "enable" this — it happens automatically<br>
+→ Examples of events flowing RIGHT NOW:</p>
+<table><thead><tr><th>Source Service</th><th>Event Example</th><th>detail-type</th></tr></thead><tbody><tr><td>S3 (via CloudTrail)</td><td>Object created</td><td><code>AWS API Call via CloudTrail</code></td></tr><tr><td>S3 (native)</td><td>Object created notification</td><td><code>Object Created</code></td></tr><tr><td>Glue</td><td>Job state change</td><td><code>Glue Job State Change</code></td></tr><tr><td>Glue</td><td>Crawler state change</td><td><code>Glue Crawler State Change</code></td></tr><tr><td>RDS</td><td>Instance state change</td><td><code>RDS DB Instance Event</code></td></tr><tr><td>Redshift</td><td>Cluster state change</td><td><code>Redshift Cluster State Change</code></td></tr><tr><td>Secrets Manager</td><td>Rotation event</td><td><code>AWS API Call via CloudTrail</code></td></tr><tr><td>EC2</td><td>Instance state change</td><td><code>EC2 Instance State-change Notification</code></td></tr><tr><td>Lambda</td><td>Function configuration change</td><td><code>AWS API Call via CloudTrail</code></td></tr><tr><td>Auto Scaling</td><td>Instance launch/terminate</td><td><code>EC2 Instance Launch Successful</code></td></tr><tr><td>KMS</td><td>Key state change</td><td><code>KMS Key State Change</code></td></tr><tr><td>CloudFormation</td><td>Stack status change</td><td><code>CloudFormation Stack Status Change</code></td></tr></tbody></table>
+<p><strong>CRITICAL DISTINCTION: Native Events vs CloudTrail Events</strong></p>
+<table><thead><tr><th>Type</th><th>How They Work</th><th>Event Structure</th><th>Latency</th></tr></thead><tbody><tr><td>Native Service Events</td><td>Service emits directly to EventBridge</td><td>Clean, purpose-built structure</td><td>Near real-time (seconds)</td></tr><tr><td>CloudTrail API Events</td><td>CloudTrail captures API call → EventBridge receives</td><td>Wrapped in CloudTrail format</td><td>5-15 minutes delay</td></tr></tbody></table>
+<p>→ S3 has BOTH:</p>
+<ul>
+<li>Native: <code>Object Created</code>, <code>Object Deleted</code> (near real-time) — requires S3 → EventBridge notification configuration</li>
+<li>CloudTrail: <code>PutObject</code>, <code>DeleteObject</code> (delayed) — automatic if CloudTrail is enabled</li>
+</ul>
+<p>→ Glue has native events: <code>Glue Job State Change</code> — near real-time<br>
+→ Secrets Manager rotation events → CloudTrail-based (slight delay)</p>
+<p><strong>Enabling S3 Native EventBridge Notifications:</strong><br>
+→ Navigate to S3 → <code>shopnow-datalake-raw</code> bucket → Properties tab<br>
+→ Scroll to "Amazon EventBridge" section<br>
+→ Click "Edit" → ✅ Enable "Send notifications to Amazon EventBridge"</p>
+<p>→ This is SEPARATE from S3 Event Notifications (Project 15)<br>
+→ S3 Event Notifications → go to SNS/SQS/Lambda directly<br>
+→ S3 EventBridge Notifications → go to EventBridge default bus → then routed by rules</p>
+<table><thead><tr><th>Feature</th><th>S3 Event Notification (Project 15)</th><th>S3 → EventBridge</th></tr></thead><tbody><tr><td>Routing complexity</td><td>Simple prefix/suffix filter</td><td>Full content-based pattern matching</td></tr><tr><td>Multiple targets</td><td>One target per notification</td><td>Multiple rules, multiple targets</td></tr><tr><td>Archive &amp; replay</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Input transformation</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Cross-account routing</td><td>Complex</td><td>Simple (bus-to-bus)</td></tr><tr><td>Filtering by object metadata</td><td>❌ No</td><td>✅ Yes (object size, key pattern, etc.)</td></tr></tbody></table>
+<p>→ For ShopNow's requirement (different targets based on prefix) → EventBridge is the right choice</p>
+<hr>
+<h3>STEP 3 — CREATE RULES FOR S3 EVENTS WITH CONTENT-BASED ROUTING</h3>
+<p>→ Navigate to EventBridge → "Rules" → Select <code>default</code> event bus → "Create rule"</p>
+<hr>
+<p><strong>Rule 1: Orders CSV Upload → Trigger Glue ETL Job A</strong></p>
+<p><strong>Page 1 — Define rule detail:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-s3-orders-csv-to-glue-etl-a</code></td></tr><tr><td>Description</td><td><code>Routes order CSV uploads from S3 raw bucket to Glue ETL Job A for processing</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Rule type</td><td>"Rule with an event pattern"</td></tr><tr><td>Status</td><td>Enabled</td></tr></tbody></table>
+<p><strong>Page 2 — Build event pattern:</strong></p>
+<p>→ This is where the POWER of EventBridge lives — pattern matching</p>
+<p><strong>Event Pattern Configuration (Console Builder):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event source</td><td>AWS services</td></tr><tr><td>AWS service</td><td>S3</td></tr><tr><td>Event type</td><td><code>Amazon S3 Event Notification</code></td></tr><tr><td>Specific event(s)</td><td><code>Object Created</code></td></tr><tr><td>Specific bucket(s)</td><td><code>shopnow-datalake-raw</code></td></tr></tbody></table>
+<p>→ But we need MORE filtering — only <code>orders/*.csv</code> files<br>
+→ Switch to "Custom pattern (JSON editor)"</p>
+<p><strong>Event Pattern (Conceptual JSON structure — settings view):</strong></p>
+<table><thead><tr><th>Pattern Field</th><th>Match Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>aws.s3</code></td><td>Events from S3</td></tr><tr><td><code>detail-type</code></td><td><code>Object Created</code></td><td>Only creation events</td></tr><tr><td><code>detail.bucket.name</code></td><td><code>shopnow-datalake-raw</code></td><td>Specific bucket</td></tr><tr><td><code>detail.object.key</code></td><td>Prefix match: <code>orders/</code> AND Suffix match: <code>.csv</code></td><td>Only orders CSVs</td></tr></tbody></table>
+<p><strong>Understanding Event Pattern Matching Operators:</strong></p>
+<table><thead><tr><th>Operator</th><th>Syntax</th><th>Example</th><th>What It Matches</th></tr></thead><tbody><tr><td>Exact match</td><td><code>"value"</code></td><td><code>"source": ["aws.s3"]</code></td><td>Exact string</td></tr><tr><td>Prefix match</td><td><code>{"prefix": "value"}</code></td><td><code>"detail.object.key": [{"prefix": "orders/"}]</code></td><td>Strings starting with "orders/"</td></tr><tr><td>Suffix match</td><td><code>{"suffix": "value"}</code></td><td><code>"detail.object.key": [{"suffix": ".csv"}]</code></td><td>Strings ending with ".csv"</td></tr><tr><td>Anything-but</td><td><code>{"anything-but": "value"}</code></td><td><code>{"anything-but": "test"}</code></td><td>Everything except "test"</td></tr><tr><td>Numeric match</td><td><code>{"numeric": ["&gt;=", 100]}</code></td><td><code>"detail.object.size": [{"numeric": ["&gt;=", 1024]}]</code></td><td>Objects &gt;= 1 KB</td></tr><tr><td>Exists match</td><td><code>{"exists": true}</code></td><td><code>"detail.object.key": [{"exists": true}]</code></td><td>Field must exist</td></tr><tr><td>OR logic</td><td>Multiple values in array</td><td><code>"source": ["aws.s3", "aws.glue"]</code></td><td>Either S3 or Glue</td></tr><tr><td>AND logic</td><td>Multiple fields</td><td>Both <code>prefix</code> and <code>suffix</code> specified</td><td>Must match ALL conditions</td></tr></tbody></table>
+<p>→ Combining prefix AND suffix for orders CSVs:</p>
+<table><thead><tr><th>Field</th><th>Condition 1</th><th>Condition 2</th><th>Combined Meaning</th></tr></thead><tbody><tr><td><code>detail.object.key</code></td><td><code>{"prefix": "orders/"}</code></td><td><code>{"suffix": ".csv"}</code></td><td>Files matching <code>orders/*.csv</code></td></tr></tbody></table>
+<p><strong>Page 3 — Select target(s):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target type</td><td>AWS service</td></tr><tr><td>Target</td><td>Glue</td></tr><tr><td>Glue job name</td><td><code>shopnow-orders-etl-job-a</code></td></tr></tbody></table>
+<p>→ BUT Glue Job is not a direct EventBridge target for job execution<br>
+→ EventBridge can trigger Glue WORKFLOWS (Project 31) but not individual jobs directly<br>
+→ Alternative targets:</p>
+<p><strong>Option A — Lambda function as intermediary:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target type</td><td>AWS service</td></tr><tr><td>Target</td><td>Lambda function</td></tr><tr><td>Function</td><td><code>shopnow-trigger-glue-job-a</code></td></tr></tbody></table>
+<p>→ Lambda receives the event → calls Glue StartJobRun API<br>
+→ This adds flexibility (can pass parameters, validate event, add logging)</p>
+<p><strong>Option B — Step Functions as orchestrator:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target type</td><td>AWS service</td></tr><tr><td>Target</td><td>Step Functions state machine</td></tr><tr><td>State machine</td><td><code>shopnow-orders-pipeline-statemachine</code> (from Project 32 concepts)</td></tr></tbody></table>
+<p>→ Step Functions receives the event → starts the full pipeline (Glue → Crawler → Athena → notification)<br>
+→ This is the PREFERRED approach for complex multi-step workflows</p>
+<p><strong>Option C — Glue Workflow trigger:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target type</td><td>AWS service</td></tr><tr><td>Target</td><td>Glue Workflow</td></tr><tr><td>Workflow</td><td><code>shopnow-orders-workflow</code> (from Project 31)</td></tr></tbody></table>
+<p>→ EventBridge CAN trigger Glue Workflows via the API action target</p>
+<p>→ For ShopNow → Choose Option B (Step Functions) for orders pipeline</p>
+<p><strong>IAM Role for Rule:</strong><br>
+→ EventBridge needs permission to invoke the target<br>
+→ Select "Create a new role for this specific resource" or use existing</p>
+<p><strong>Role permissions needed:</strong></p>
+<table><thead><tr><th>Target</th><th>Permission Required</th></tr></thead><tbody><tr><td>Lambda</td><td><code>lambda:InvokeFunction</code> on the function ARN</td></tr><tr><td>Step Functions</td><td><code>states:StartExecution</code> on the state machine ARN</td></tr><tr><td>SNS</td><td><code>sns:Publish</code> on the topic ARN</td></tr><tr><td>SQS</td><td><code>sqs:SendMessage</code> on the queue ARN</td></tr><tr><td>Glue</td><td><code>glue:notifyEvent</code> on the workflow ARN</td></tr></tbody></table>
+<p>→ Click "Create rule" → Rule 1 is active</p>
+<hr>
+<p><strong>Rule 2: Inventory JSON Upload → Trigger Glue ETL Job B</strong></p>
+<p>→ Same process — Create new rule</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-s3-inventory-json-to-glue-etl-b</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Event pattern source</td><td><code>aws.s3</code></td></tr><tr><td>detail-type</td><td><code>Object Created</code></td></tr><tr><td>Bucket</td><td><code>shopnow-datalake-raw</code></td></tr><tr><td>Object key filter</td><td><code>{"prefix": "inventory/"}</code> AND <code>{"suffix": ".json"}</code></td></tr><tr><td>Target</td><td>Lambda function → <code>shopnow-trigger-glue-job-b</code></td></tr></tbody></table>
+<hr>
+<p><strong>Rule 3: Reports PDF Upload → Notify Finance Team</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-s3-reports-pdf-to-finance-sns</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Event pattern source</td><td><code>aws.s3</code></td></tr><tr><td>detail-type</td><td><code>Object Created</code></td></tr><tr><td>Bucket</td><td><code>shopnow-datalake-raw</code></td></tr><tr><td>Object key filter</td><td><code>{"prefix": "reports/"}</code> AND <code>{"suffix": ".pdf"}</code></td></tr><tr><td>Target</td><td>SNS topic → <code>shopnow-finance-notifications</code> (from Project 6 concepts)</td></tr></tbody></table>
+<hr>
+<p><strong>Architecture Achieved:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 bucket: shopnow-datalake-raw
+</span>        │
+        ├── orders/jan-2025.csv uploaded
+        │       ↓
+        │   EventBridge Rule 1 matches (prefix=orders/, suffix=.csv)
+        │       ↓
+        │   Step Functions → Glue ETL Job A → Crawler → Athena
+        │
+        ├── inventory/electronics.json uploaded
+        │       ↓
+        │   EventBridge Rule 2 matches (prefix=inventory/, suffix=.json)
+        │       ↓
+        │   Lambda → Glue ETL Job B
+        │
+        └── reports/q4-2024.pdf uploaded
+                ↓
+            EventBridge Rule 3 matches (prefix=reports/, suffix=.pdf)
+                ↓
+            SNS → Finance team email</code></pre></div>
+<p>→ THREE different routing paths from ONE S3 bucket<br>
+→ No custom Lambda router needed<br>
+→ Adding a new file type = adding a new EventBridge rule (no code changes)</p>
+<hr>
+<h3>STEP 4 — CREATE RULES FOR GLUE JOB STATE CHANGES</h3>
+<p>→ This solves Problem 2 — Glue job completion orchestration</p>
+<p><strong>Understanding Glue State Change Events:</strong></p>
+<p>→ Glue automatically emits events to the default EventBridge bus<br>
+→ No configuration needed — this is always active</p>
+<p><strong>Glue Job State Change Event Structure:</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>aws.glue</code></td></tr><tr><td><code>detail-type</code></td><td><code>Glue Job State Change</code></td></tr><tr><td><code>detail.jobName</code></td><td>The Glue job name</td></tr><tr><td><code>detail.state</code></td><td><code>STARTING</code>, <code>RUNNING</code>, <code>STOPPING</code>, <code>STOPPED</code>, <code>SUCCEEDED</code>, <code>FAILED</code>, <code>TIMEOUT</code>, <code>ERROR</code></td></tr><tr><td><code>detail.severity</code></td><td><code>INFO</code>, <code>WARN</code>, <code>ERROR</code></td></tr><tr><td><code>detail.message</code></td><td>Human-readable description</td></tr><tr><td><code>detail.jobRunId</code></td><td>Unique run identifier</td></tr></tbody></table>
+<hr>
+<p><strong>Rule 4: Glue ETL Job A Succeeds → Notify Data Team</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-glue-job-a-success-notify</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Event pattern source</td><td><code>aws.glue</code></td></tr><tr><td>detail-type</td><td><code>Glue Job State Change</code></td></tr><tr><td>detail.jobName</td><td><code>shopnow-orders-etl-job-a</code></td></tr><tr><td>detail.state</td><td><code>SUCCEEDED</code></td></tr><tr><td>Target</td><td>SNS topic → <code>shopnow-data-team-notifications</code></td></tr></tbody></table>
+<hr>
+<p><strong>Rule 5: Glue ETL Job A Fails → Alert DevOps + Trigger Incident</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-glue-job-a-failure-alert</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Event pattern source</td><td><code>aws.glue</code></td></tr><tr><td>detail-type</td><td><code>Glue Job State Change</code></td></tr><tr><td>detail.jobName</td><td><code>shopnow-orders-etl-job-a</code></td></tr><tr><td>detail.state</td><td><code>FAILED</code> OR <code>TIMEOUT</code> OR <code>ERROR</code></td></tr><tr><td>Target 1</td><td>SNS topic → <code>shopnow-devops-pagerduty</code></td></tr><tr><td>Target 2</td><td>Lambda → <code>shopnow-create-incident-ticket</code></td></tr></tbody></table>
+<p>→ Multiple states matched using OR logic: <code>"detail.state": ["FAILED", "TIMEOUT", "ERROR"]</code><br>
+→ Multiple targets (up to 5) on same rule — BOTH SNS and Lambda triggered simultaneously</p>
+<hr>
+<p><strong>Rule 6: ANY Glue Job Fails → Centralized Failure Logging</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-all-glue-failures-log</code></td></tr><tr><td>Event pattern source</td><td><code>aws.glue</code></td></tr><tr><td>detail-type</td><td><code>Glue Job State Change</code></td></tr><tr><td>detail.state</td><td><code>FAILED</code> OR <code>TIMEOUT</code> OR <code>ERROR</code></td></tr><tr><td>Target</td><td>CloudWatch Log Group → <code>/shopnow/events/glue-failures</code></td></tr></tbody></table>
+<p>→ Notice: No <code>detail.jobName</code> filter → matches ALL Glue job failures<br>
+→ This creates a centralized failure log for all Glue jobs</p>
+<hr>
+<p><strong>Glue Crawler State Change Events:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>aws.glue</code></td></tr><tr><td><code>detail-type</code></td><td><code>Glue Crawler State Change</code></td></tr><tr><td><code>detail.crawlerName</code></td><td>Crawler name</td></tr><tr><td><code>detail.state</code></td><td><code>Succeeded</code>, <code>Failed</code></td></tr></tbody></table>
+<p><strong>Rule 7: Glue Crawler Completes → Trigger Downstream Process</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-crawler-success-trigger-athena</code></td></tr><tr><td>Event pattern source</td><td><code>aws.glue</code></td></tr><tr><td>detail-type</td><td><code>Glue Crawler State Change</code></td></tr><tr><td>detail.crawlerName</td><td><code>shopnow-orders-crawler</code></td></tr><tr><td>detail.state</td><td><code>Succeeded</code></td></tr><tr><td>Target</td><td>Lambda → <code>shopnow-run-athena-ctas-query</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 5 — CREATE RULES FOR SECRETS MANAGER ROTATION EVENTS</h3>
+<p>→ This solves Problem 3 — Security event response</p>
+<p><strong>Understanding Secrets Manager Events in EventBridge:</strong></p>
+<p>→ Secrets Manager emits events for rotation lifecycle:</p>
+<table><thead><tr><th>detail-type</th><th>When</th></tr></thead><tbody><tr><td><code>AWS API Call via CloudTrail</code></td><td>Any API call (GetSecretValue, etc.) — via CloudTrail integration</td></tr><tr><td><code>Secret Rotation Started</code></td><td>Rotation process begins (native event)</td></tr><tr><td><code>Secret Rotation Succeeded</code></td><td>Rotation completed successfully (native event)</td></tr><tr><td><code>Secret Rotation Failed</code></td><td>Rotation failed (native event)</td></tr><tr><td><code>Secret Rotation Abandoned</code></td><td>Rotation abandoned after retries</td></tr></tbody></table>
+<p>→ Native Secrets Manager events (not CloudTrail-based) are faster and have cleaner structure</p>
+<hr>
+<p><strong>Rule 8: Rotation Failed → Emergency Alert + Remediation</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-secret-rotation-failure-alert</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Event pattern source</td><td><code>aws.secretsmanager</code></td></tr><tr><td>detail-type</td><td><code>Secret Rotation Failed</code></td></tr><tr><td>Target 1</td><td>SNS topic → <code>shopnow-security-alerts-critical</code></td></tr><tr><td>Target 2</td><td>Lambda → <code>shopnow-rotation-failure-remediation</code></td></tr><tr><td>Target 3</td><td>CloudWatch Log Group → <code>/shopnow/events/security-critical</code></td></tr></tbody></table>
+<p>→ Three targets simultaneously:</p>
+<ol>
+<li>Page the security team via SNS</li>
+<li>Lambda attempts automated remediation (retry rotation, check Lambda health)</li>
+<li>Log the event for audit trail</li>
+</ol>
+<hr>
+<p><strong>Rule 9: Rotation Succeeded → Audit Log</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-secret-rotation-success-log</code></td></tr><tr><td>Event pattern source</td><td><code>aws.secretsmanager</code></td></tr><tr><td>detail-type</td><td><code>Secret Rotation Succeeded</code></td></tr><tr><td>Target</td><td>CloudWatch Log Group → <code>/shopnow/events/security-audit</code></td></tr></tbody></table>
+<p>→ Success events don't need alerts but should be logged for compliance reporting</p>
+<hr>
+<h3>STEP 6 — CONFIGURE SCHEDULED RULES</h3>
+<p>→ This solves Problem 4 — Scheduled tasks fragmentation</p>
+<p><strong>EventBridge supports two schedule expression types:</strong></p>
+<p><strong>Type 1 — Rate Expression:</strong></p>
+<table><thead><tr><th>Expression</th><th>Meaning</th></tr></thead><tbody><tr><td><code>rate(5 minutes)</code></td><td>Every 5 minutes</td></tr><tr><td><code>rate(1 hour)</code></td><td>Every hour</td></tr><tr><td><code>rate(1 day)</code></td><td>Every day</td></tr><tr><td><code>rate(7 days)</code></td><td>Every 7 days</td></tr></tbody></table>
+<p><strong>Type 2 — Cron Expression:</strong></p>
+<table><thead><tr><th>Field</th><th>Values</th><th>Allowed</th></tr></thead><tbody><tr><td>Minute</td><td>0-59</td><td></td></tr><tr><td>Hour</td><td>0-23</td><td></td></tr><tr><td>Day-of-month</td><td>1-31</td><td></td></tr><tr><td>Month</td><td>1-12 or JAN-DEC</td><td></td></tr><tr><td>Day-of-week</td><td>1-7 or SUN-SAT</td><td></td></tr><tr><td>Year</td><td>1970-2199</td><td></td></tr></tbody></table>
+<table><thead><tr><th>Expression</th><th>Meaning</th></tr></thead><tbody><tr><td><code>cron(0 2 * * ? *)</code></td><td>Every day at 2:00 AM UTC</td></tr><tr><td><code>cron(0 6 ? * MON-FRI *)</code></td><td>Every weekday at 6:00 AM UTC</td></tr><tr><td><code>cron(0 0 1 * ? *)</code></td><td>First day of every month at midnight</td></tr><tr><td><code>cron(0/15 * * * ? *)</code></td><td>Every 15 minutes</td></tr><tr><td><code>cron(0 18 ? * FRI *)</code></td><td>Every Friday at 6:00 PM UTC</td></tr></tbody></table>
+<p><strong>CRITICAL: Cron uses <code>?</code> for either day-of-month or day-of-week</strong><br>
+→ You cannot specify BOTH day-of-month and day-of-week<br>
+→ One must be <code>?</code> (no value)<br>
+→ <code>cron(0 2 15 * ? *)</code> = 15th of every month at 2 AM ✅<br>
+→ <code>cron(0 2 ? * MON *)</code> = Every Monday at 2 AM ✅<br>
+→ <code>cron(0 2 15 * MON *)</code> = ❌ Invalid — cannot specify both</p>
+<p><strong>CRITICAL: All schedule times are UTC</strong><br>
+→ If ShopNow is in India (IST = UTC+5:30)<br>
+→ 2:00 AM IST = 8:30 PM previous day UTC<br>
+→ Cron expression for 2 AM IST: <code>cron(30 20 * * ? *)</code></p>
+<hr>
+<p><strong>Rule 10: Daily Glue ETL Trigger (Replacing EC2 Cron Job)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-daily-etl-trigger</code></td></tr><tr><td>Rule type</td><td>Schedule</td></tr><tr><td>Schedule expression</td><td><code>cron(30 20 * * ? *)</code> (2:00 AM IST)</td></tr><tr><td>Target</td><td>Lambda → <code>shopnow-trigger-daily-etl-pipeline</code></td></tr></tbody></table>
+<p>→ This replaces the unreliable EC2 cron job<br>
+→ EventBridge schedules are managed by AWS — no instance to maintain<br>
+→ If Lambda fails → CloudWatch alarm triggers (from Project 8 concepts)</p>
+<hr>
+<p><strong>Rule 11: Hourly Data Quality Check</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-hourly-data-quality-check</code></td></tr><tr><td>Rule type</td><td>Schedule</td></tr><tr><td>Schedule expression</td><td><code>rate(1 hour)</code></td></tr><tr><td>Target</td><td>Step Functions → <code>shopnow-data-quality-statemachine</code></td></tr></tbody></table>
+<hr>
+<p><strong>Rule 12: Weekly Reporting (Every Monday 9 AM IST)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-weekly-report-trigger</code></td></tr><tr><td>Rule type</td><td>Schedule</td></tr><tr><td>Schedule expression</td><td><code>cron(30 3 ? * MON *)</code> (9:00 AM IST = 3:30 AM UTC)</td></tr><tr><td>Target</td><td>Lambda → <code>shopnow-generate-weekly-report</code></td></tr></tbody></table>
+<hr>
+<p><strong>Centralized Schedule Dashboard:</strong></p>
+<p>→ Navigate to EventBridge → Rules → Filter by "Schedule"<br>
+→ ALL scheduled tasks are now visible in one place:</p>
+<table><thead><tr><th>Rule Name</th><th>Schedule</th><th>Target</th><th>Status</th></tr></thead><tbody><tr><td><code>shopnow-daily-etl-trigger</code></td><td>Daily 2 AM IST</td><td>Lambda</td><td>Enabled</td></tr><tr><td><code>shopnow-hourly-data-quality-check</code></td><td>Every hour</td><td>Step Functions</td><td>Enabled</td></tr><tr><td><code>shopnow-weekly-report-trigger</code></td><td>Monday 9 AM IST</td><td>Lambda</td><td>Enabled</td></tr></tbody></table>
+<p>→ No more hunting across EC2 crontabs, Glue triggers, and CloudWatch Events<br>
+→ Single pane of glass for all schedules</p>
+<hr>
+<h3>STEP 7 — CONFIGURE EVENT ARCHIVE AND REPLAY</h3>
+<p>→ One of EventBridge's most powerful features — impossible with S3 notifications or CloudWatch alarms</p>
+<p><strong>Why Archive Matters:</strong><br>
+→ A Glue job failed 3 days ago → You fixed the bug → Now you want to reprocess the SAME S3 events that triggered the failure<br>
+→ Without archive → Those events are gone — you'd have to manually re-upload files or create fake events<br>
+→ With archive → Replay the exact events from 3 days ago → pipeline reprocesses naturally</p>
+<p><strong>Create an Archive:</strong></p>
+<p>→ Navigate to EventBridge → "Archives" → "Create archive"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Archive name</td><td><code>shopnow-default-bus-archive</code></td></tr><tr><td>Source event bus</td><td><code>default</code></td></tr><tr><td>Description</td><td><code>Archive all events from default bus for replay capability</code></td></tr><tr><td>Retention period</td><td>90 days (configurable: 0 = indefinite)</td></tr><tr><td>Event pattern filter</td><td>(Leave blank to archive ALL events) OR filter specific patterns</td></tr></tbody></table>
+<p><strong>Filtering Archive (Optional — to reduce storage cost):</strong></p>
+<table><thead><tr><th>Strategy</th><th>Archive Pattern</th><th>Use Case</th></tr></thead><tbody><tr><td>Archive everything</td><td>No filter</td><td>Full replay capability — higher storage cost</td></tr><tr><td>Archive S3 events only</td><td>Filter: <code>source = aws.s3</code></td><td>Only need to replay data pipeline triggers</td></tr><tr><td>Archive failures only</td><td>Filter: <code>detail.state = FAILED</code></td><td>Only need to replay failed workflows</td></tr></tbody></table>
+<p>→ For ShopNow → Archive everything with 90-day retention<br>
+→ Storage cost is minimal — events are small JSON documents</p>
+<hr>
+<p><strong>How to Replay Events:</strong></p>
+<p>→ Navigate to EventBridge → "Replays" → "Start new replay"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Replay name</td><td><code>replay-glue-failures-jan-15</code></td></tr><tr><td>Source archive</td><td><code>shopnow-default-bus-archive</code></td></tr><tr><td>Start time</td><td><code>2025-01-15T00:00:00Z</code></td></tr><tr><td>End time</td><td><code>2025-01-15T23:59:59Z</code></td></tr><tr><td>Destination event bus</td><td><code>default</code> (same bus — rules will re-trigger)</td></tr><tr><td>Event pattern filter</td><td>Filter to only replay specific events (e.g., S3 orders uploads)</td></tr></tbody></table>
+<p><strong>What Happens During Replay:</strong><br>
+→ EventBridge reads events from the archive for the specified time window<br>
+→ Events are re-published to the destination event bus<br>
+→ Rules on that bus match and trigger targets as if the events just happened<br>
+→ Replayed events have a <code>replay-name</code> field added — so targets can distinguish replay from live</p>
+<p><strong>Replay Considerations:</strong></p>
+<table><thead><tr><th>Consideration</th><th>Detail</th></tr></thead><tbody><tr><td>Idempotency</td><td>Targets MUST handle duplicate processing — replay sends the same event again</td></tr><tr><td>Order</td><td>Events are replayed approximately in order but NOT guaranteed exactly in order</td></tr><tr><td>Rate</td><td>Replay rate is throttled — not instantaneous for large time windows</td></tr><tr><td>Live events</td><td>Live events continue processing normally during replay — they coexist</td></tr></tbody></table>
+<hr>
+<h3>STEP 8 — CREATE A CUSTOM EVENT BUS FOR APPLICATION EVENTS</h3>
+<p>→ AWS service events go to <code>default</code> bus automatically<br>
+→ But ShopNow's application also generates events:</p>
+<ul>
+<li>"Order placed" — from the order processing microservice</li>
+<li>"Payment confirmed" — from the payment gateway integration</li>
+<li>"Inventory threshold breached" — from the inventory monitoring service</li>
+</ul>
+<p>→ These are CUSTOM application events — they should go to a SEPARATE bus</p>
+<p><strong>Why separate bus?</strong><br>
+→ Isolation: Application events don't pollute the AWS service event stream<br>
+→ Access control: Different IAM policies for who can publish to each bus<br>
+→ Cost tracking: Custom bus events are billed separately<br>
+→ Cross-account: Custom buses can accept events from other AWS accounts (Project 41 preview)</p>
+<p><strong>Create Custom Event Bus:</strong></p>
+<p>→ Navigate to EventBridge → "Event buses" → "Create event bus"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-application-events</code></td></tr><tr><td>Event archive</td><td>✅ Enable (optional — for replay of app events)</td></tr><tr><td>Schema discovery</td><td>✅ Enable (auto-discovers event shapes)</td></tr><tr><td>Resource policy</td><td>(Configure for cross-account access if needed — Project 41)</td></tr><tr><td>Tags — Environment</td><td>Production</td></tr><tr><td>Tags — Team</td><td>Engineering</td></tr></tbody></table>
+<hr>
+<p><strong>Publishing Custom Events to the Bus:</strong></p>
+<p>→ Application services publish events using the EventBridge PutEvents API</p>
+<p><strong>Event Structure (Conceptual):</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Source</td><td><code>shopnow.order-service</code></td><td>Identifies the publishing service</td></tr><tr><td>DetailType</td><td><code>Order Placed</code></td><td>Human-readable event type</td></tr><tr><td>Detail</td><td>JSON: <code>{"orderId": "ORD-12345", "customerId": "CUST-789", "amount": 299.99, "items": 3}</code></td><td>Event payload</td></tr><tr><td>EventBusName</td><td><code>shopnow-application-events</code></td><td>Target bus</td></tr></tbody></table>
+<p>→ The publishing service (EC2 app, Lambda, ECS) needs IAM permission:</p>
+<ul>
+<li><code>events:PutEvents</code> on <code>arn:aws:events:ap-south-1:123456789012:event-bus/shopnow-application-events</code></li>
+</ul>
+<hr>
+<p><strong>Create Rules on Custom Bus:</strong></p>
+<p><strong>Rule 13: High-Value Order → VIP Processing</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-high-value-order-vip</code></td></tr><tr><td>Event bus</td><td><code>shopnow-application-events</code> (custom bus)</td></tr><tr><td>Event pattern source</td><td><code>shopnow.order-service</code></td></tr><tr><td>detail-type</td><td><code>Order Placed</code></td></tr><tr><td>detail.amount</td><td><code>{"numeric": ["&gt;=", 1000]}</code></td></tr><tr><td>Target</td><td>SQS queue → <code>shopnow-vip-orders-queue</code></td></tr></tbody></table>
+<p>→ Only orders &gt;= $1,000 are routed to VIP processing queue<br>
+→ Numeric filtering is ONLY possible in EventBridge — not in S3 notifications or SNS filtering</p>
+<p><strong>Rule 14: Any Order → Analytics Pipeline</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-all-orders-to-analytics</code></td></tr><tr><td>Event bus</td><td><code>shopnow-application-events</code></td></tr><tr><td>Event pattern source</td><td><code>shopnow.order-service</code></td></tr><tr><td>detail-type</td><td><code>Order Placed</code></td></tr><tr><td>Target</td><td>Kinesis Data Firehose → <code>shopnow-orders-firehose</code> (Project 52 preview)</td></tr></tbody></table>
+<p>→ ALL orders flow to analytics regardless of amount</p>
+<hr>
+<h3>STEP 9 — CONFIGURE INPUT TRANSFORMATION</h3>
+<p>→ Targets often don't need the full EventBridge event envelope<br>
+→ Input transformation lets you reshape the event before it reaches the target</p>
+<p><strong>Without Input Transformation:</strong><br>
+→ Lambda receives the ENTIRE EventBridge event envelope:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "version": "0",
+  "id": "abc-123",
+  "source": "aws.s3",
+  "account"[REDACTED:BANK_ACCOUNT_NUMBER]012",
+  "time": "2025-01-15T02:00:00Z",
+  "region": "ap-south-1",
+  "detail-type": "Object Created",
+  "detail": {
+    "bucket": {"name": "shopnow-datalake-raw"},
+    "object": {"key": "orders/jan-2025.csv", "size": 1048576}
+  }
+}</code></pre></div>
+<p>→ Lambda must parse through nested structure to get the bucket and key</p>
+<p><strong>With Input Transformation:</strong><br>
+→ Lambda receives ONLY what it needs</p>
+<p><strong>Configuration (on the Target settings):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Configure target input</td><td>Input transformer</td></tr><tr><td>Input path</td><td>Extract variables from the event</td></tr><tr><td>Input template</td><td>Build the output format using extracted variables</td></tr></tbody></table>
+<p><strong>Input Path (Variable extraction):</strong></p>
+<table><thead><tr><th>Variable</th><th>Path</th></tr></thead><tbody><tr><td><code>$.detail.bucket.name</code></td><td>Extracts bucket name → assigns to <code>&lt;bucket&gt;</code></td></tr><tr><td><code>$.detail.object.key</code></td><td>Extracts object key → assigns to <code>&lt;key&gt;</code></td></tr><tr><td><code>$.detail.object.size</code></td><td>Extracts object size → assigns to <code>&lt;size&gt;</code></td></tr><tr><td><code>$.time</code></td><td>Extracts event time → assigns to <code>&lt;eventTime&gt;</code></td></tr></tbody></table>
+<p><strong>Input Template (Output format):</strong></p>
+<table><thead><tr><th>Template</th><th>Result</th></tr></thead><tbody><tr><td><code>{"s3Bucket": "&lt;bucket&gt;", "s3Key": "&lt;key&gt;", "fileSizeBytes": &lt;size&gt;, "uploadedAt": "&lt;eventTime&gt;"}</code></td><td>Clean, flat JSON sent to Lambda</td></tr></tbody></table>
+<p><strong>What Lambda now receives:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "s3Bucket": "shopnow-datalake-raw",
+  "s3Key": "orders/jan-2025.csv",
+  "fileSizeBytes": 1048576,
+  "uploadedAt": "2025-01-15T02:00:00Z"
+}</code></pre></div>
+<p>→ Lambda code is simpler — no nested parsing<br>
+→ Target receives only relevant data — less noise<br>
+→ Works for ALL target types — Lambda, SQS, SNS, Step Functions</p>
+<p><strong>Input Transformation for SNS (Human-Readable Notification):</strong></p>
+<p>→ For Rule 3 (PDF upload → Finance team notification):</p>
+<p><strong>Input Template:</strong></p>
+<code>"A new financial report has been uploaded: &lt;key&gt; (Size: &lt;size&gt; bytes) at &lt;eventTime&gt;. Please review in the S3 console."</code>
+<p>→ Finance team receives a clean, readable email instead of raw JSON</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable S3 EventBridge notifications on buckets that need content-based routing<br>
+→ Always use the default event bus for AWS service events — it's free and automatic<br>
+→ Always use custom event buses for application-generated events — isolation and access control<br>
+→ Always use input transformations to simplify payloads for targets<br>
+→ Always enable event archiving for critical event flows — replay is invaluable for debugging<br>
+→ Always use descriptive rule names following a convention: <code>{company}-{source}-{event}-{action}</code><br>
+→ Always set up rules for FAILURE events (Glue failed, rotation failed) — not just success<br>
+→ Always use UTC in cron expressions — convert from local timezone carefully<br>
+→ Always create separate rules for different routing paths — don't overload one rule with complex logic<br>
+→ Always attach tags to rules and custom buses for cost tracking and organization<br>
+→ Always configure dead-letter queues on rules for failed target invocations (see DLQ section below)</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never rely on CloudTrail-based events for time-sensitive workflows — 5-15 minute delay<br>
+→ Never put application events on the default bus — use custom buses for separation<br>
+→ Never create overly broad rules (e.g., match ALL S3 events) without specific need — noisy targets<br>
+→ Never forget that scheduled rules use UTC — IST 2:00 AM ≠ UTC 2:00 AM<br>
+→ Never use <code>?</code> incorrectly in cron — one of day-of-month or day-of-week MUST be <code>?</code><br>
+→ Never assume events are delivered in strict order — EventBridge is near real-time but not ordered<br>
+→ Never use EventBridge for high-throughput streaming (&gt;millions of events/second) — use Kinesis (Project 52)<br>
+→ Never skip DLQ configuration on rules — failed target invocations are silently lost without DLQ<br>
+→ Never hardcode event patterns — use variables and templates for maintainability<br>
+→ Never create duplicate rules that route the same event to the same target — causes double processing<br>
+→ Never forget that EventBridge rules have a 5-target limit per rule — use multiple rules if needed<br>
+→ Never skip input transformation when targets only need a subset of the event — reduces payload size and processing complexity</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Use EventBridge?</th><th>Alternative</th></tr></thead><tbody><tr><td>Route S3 events to different targets based on content</td><td>✅ Yes — content-based routing</td><td>S3 Notifications only support prefix/suffix to single target</td></tr><tr><td>React to Glue job completion/failure</td><td>✅ Yes — native Glue events</td><td>Glue Workflow triggers (limited to linear flow — Project 31)</td></tr><tr><td>Alert on Secrets Manager rotation failure</td><td>✅ Yes — native SM events</td><td>CloudTrail + manual monitoring (delayed, unreliable)</td></tr><tr><td>Replace EC2 cron jobs with managed schedules</td><td>✅ Yes — scheduled rules</td><td>CloudWatch Events (same underlying service, legacy console)</td></tr><tr><td>Fan-out one event to multiple different services</td><td>✅ Yes — multiple rules with different targets</td><td>SNS fan-out (Project 13 — all subscribers get same event)</td></tr><tr><td>Complex multi-step workflow orchestration</td><td>⚠️ EventBridge as TRIGGER → Step Functions for orchestration</td><td>Step Functions alone (needs a trigger — EventBridge provides it)</td></tr><tr><td>Real-time streaming at millions of events/second</td><td>❌ No — not designed for streaming</td><td>Kinesis Data Streams (Project 52)</td></tr><tr><td>Simple notification when file uploaded</td><td>⚠️ Either works</td><td>S3 Event Notification → SNS (Project 15 — simpler for basic cases)</td></tr><tr><td>Cross-account event routing</td><td>✅ Yes — cross-account event bus rules</td><td>Cross-account SNS/SQS (Project 41 — more complex)</td></tr><tr><td>Application-to-application messaging with queue semantics</td><td>❌ No — EventBridge is event routing, not queuing</td><td>SQS (Project 7) for queue semantics</td></tr><tr><td>Guaranteed exactly-once processing</td><td>❌ No — at-least-once delivery</td><td>SQS FIFO (Project 7) for exactly-once</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use EventBridge as a message queue — it does not support consumers pulling messages, visibility timeout, or DLQ semantics like SQS<br>
+→ Do NOT use EventBridge for guaranteed ordering — events may arrive out of order<br>
+→ Do NOT use EventBridge for high-frequency data ingestion (sensor data, clickstream) — use Kinesis<br>
+→ Do NOT use EventBridge when you need request-response pattern — it is fire-and-forget<br>
+→ Do NOT use EventBridge scheduled rules for sub-minute precision — minimum granularity is 1 minute<br>
+→ Do NOT use EventBridge as a data store — events are transient, archive has retention limits<br>
+→ Do NOT use EventBridge for large payloads — maximum event size is 256 KB</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — EVENT FLOW ARCHITECTURE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Event Source (S3, Glue, Application)
+</span>        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│              EVENT BUS (default or custom)            │
+│                                                       │
+│   Event arrives → stored in internal buffer            │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐    │
+│   │          RULES ENGINE                         │    │
+│   │                                               │    │
+│   │   For EACH active rule on this bus:           │    │
+│   │     1. Evaluate event against rule pattern    │    │
+│   │     2. If match → apply input transformation  │    │
+│   │     3. Invoke target(s) asynchronously        │    │
+│   │     4. If target fails → retry (see below)    │    │
+│   │     5. If retry exhausted → send to DLQ       │    │
+│   │                                               │    │
+│   │   Rules are evaluated IN PARALLEL             │    │
+│   │   One event can match MULTIPLE rules          │    │
+│   │   Each matching rule invokes its targets       │    │
+│   └─────────────────────────────────────────────┘    │
+│                                                       │
+│   If archive configured → event also written to       │
+│   archive storage (S3-backed internally)              │
+└─────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h3>MECHANIC 2 — EVENT PATTERN MATCHING ENGINE</h3>
+<p><strong>How EventBridge evaluates patterns:</strong><br>
+→ Pattern matching is PREFIX-based comparison at each level of the JSON tree<br>
+→ Only fields SPECIFIED in the pattern are checked — unspecified fields are ignored<br>
+→ This means: An empty pattern <code>{}</code> matches ALL events</p>
+<p><strong>Evaluation logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>For each field in the event pattern:
+</span>    Find the corresponding field in the event
+    If field doesn't exist in event → NO MATCH
+    If field exists → compare value:
+        String: exact match or prefix/suffix/anything-but
+        Number: numeric comparison (&gt;, &lt;, &gt;=, &lt;=, =, range)
+        Array: event value must match AT LEAST ONE pattern value
+    All fields must match → OVERALL MATCH</code></pre></div>
+<p><strong>Important matching behaviors:</strong></p>
+<table><thead><tr><th>Behavior</th><th>Example</th><th>Result</th></tr></thead><tbody><tr><td>Array = OR logic</td><td>Pattern: <code>"state": ["FAILED", "ERROR"]</code> → Event: <code>"state": "FAILED"</code></td><td>✅ Match</td></tr><tr><td>Missing field</td><td>Pattern has <code>"detail.severity"</code> but event has no <code>severity</code> field</td><td>❌ No Match</td></tr><tr><td>Extra fields</td><td>Event has <code>detail.extraField</code> not in pattern</td><td>✅ Match (ignored)</td></tr><tr><td>Nested matching</td><td>Pattern: <code>"detail": {"bucket": {"name": ["my-bucket"]}}</code></td><td>Matches nested structure</td></tr><tr><td>Null matching</td><td>Pattern: <code>"detail.value": [null]</code></td><td>Matches events where value IS null</td></tr><tr><td>Exists matching</td><td>Pattern: <code>"detail.value": [{"exists": true}]</code></td><td>Matches events where field exists (any value)</td></tr></tbody></table>
+<hr>
+<h3>MECHANIC 3 — RETRY AND DEAD-LETTER QUEUE (DLQ) FOR RULES</h3>
+<p>→ When a target invocation FAILS — EventBridge retries automatically</p>
+<p><strong>Default Retry Behavior:</strong></p>
+<table><thead><tr><th>Setting</th><th>Default Value</th></tr></thead><tbody><tr><td>Maximum age of event</td><td>24 hours</td></tr><tr><td>Retry attempts</td><td>185 (exponential backoff)</td></tr></tbody></table>
+<p>→ EventBridge retries with exponential backoff for up to 24 hours<br>
+→ After 185 attempts over 24 hours → event is DROPPED unless DLQ is configured</p>
+<p><strong>Configuring DLQ on a Rule:</strong></p>
+<p>→ When creating/editing a rule → Target configuration → "Dead-letter queue"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Dead-letter queue</td><td>Select SQS queue (from Project 7, 20 concepts)</td></tr><tr><td>Queue</td><td><code>shopnow-eventbridge-dlq</code></td></tr></tbody></table>
+<p>→ Create a dedicated SQS queue for EventBridge DLQ:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Queue name</td><td><code>shopnow-eventbridge-dlq</code></td></tr><tr><td>Queue type</td><td>Standard (not FIFO — EventBridge doesn't support FIFO DLQ)</td></tr><tr><td>Retention period</td><td>14 days (maximum)</td></tr><tr><td>Visibility timeout</td><td>300 seconds</td></tr></tbody></table>
+<p>→ Events that fail all retries → sent to this DLQ<br>
+→ Set up CloudWatch alarm on DLQ <code>ApproximateNumberOfMessagesVisible &gt; 0</code> → alert operations team</p>
+<p><strong>EventBridge IAM role needs SQS permission:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th></tr></thead><tbody><tr><td><code>sqs:SendMessage</code></td><td>DLQ queue ARN</td></tr></tbody></table>
+<p><strong>Customizing Retry Policy:</strong></p>
+<p>→ On each target → "Additional settings" → "Retry policy"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>When to Customize</th></tr></thead><tbody><tr><td>Maximum event age</td><td>1 hour (instead of 24)</td><td>Time-sensitive events that become stale</td></tr><tr><td>Retry attempts</td><td>3 (instead of 185)</td><td>When you want fast failure detection</td></tr></tbody></table>
+<hr>
+<h3>MECHANIC 4 — EVENT SIZE AND THROUGHPUT LIMITS</h3>
+<table><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody><tr><td>Maximum event size</td><td>256 KB</td></tr><tr><td>Maximum PutEvents batch</td><td>10 events per API call</td></tr><tr><td>Default throughput (PutEvents)</td><td>Varies by region — typically 10,000+ events/second</td></tr><tr><td>Maximum rules per event bus</td><td>300 (soft limit — can increase to 2,000+)</td></tr><tr><td>Maximum targets per rule</td><td>5</td></tr><tr><td>Maximum event buses per account</td><td>100</td></tr><tr><td>Maximum archives per account</td><td>20</td></tr><tr><td>Minimum schedule granularity</td><td>1 minute</td></tr></tbody></table>
+<p><strong>When you hit the 256 KB limit:</strong><br>
+→ For S3 events — not an issue (events are small metadata, not the file content)<br>
+→ For application events with large payloads:</p>
+<ul>
+<li>Store the payload in S3</li>
+<li>Include only the S3 reference (bucket + key) in the EventBridge event</li>
+<li>Target fetches the full payload from S3</li>
+<li>This is the "claim check" pattern</li>
+</ul>
+<hr>
+<h3>MECHANIC 5 — DELIVERY GUARANTEES</h3>
+<table><thead><tr><th>Guarantee</th><th>Detail</th></tr></thead><tbody><tr><td>Delivery model</td><td>At-least-once</td></tr><tr><td>Ordering</td><td>NOT guaranteed</td></tr><tr><td>Duplication</td><td>Rare but possible — targets must be idempotent</td></tr><tr><td>Latency</td><td>Typically &lt; 1 second for native events</td></tr><tr><td>CloudTrail events latency</td><td>5-15 minutes</td></tr></tbody></table>
+<p><strong>At-least-once means:</strong><br>
+→ EventBridge guarantees every event is delivered to matching targets AT LEAST once<br>
+→ In rare cases (network issues, service errors) → the same event may be delivered TWICE<br>
+→ Targets MUST handle duplicate events gracefully<br>
+→ For Lambda targets → use idempotency keys (event ID + timestamp)<br>
+→ For SQS targets → SQS deduplication (FIFO) or application-level deduplication</p>
+<hr>
+<h3>MECHANIC 6 — EVENTBRIDGE SCHEDULER (Enhanced Scheduling)</h3>
+<p>→ In addition to rule-based schedules, EventBridge has a dedicated Scheduler service<br>
+→ Navigate to EventBridge → "Schedules" (separate from Rules)</p>
+<p><strong>EventBridge Scheduler vs Rule-Based Schedules:</strong></p>
+<table><thead><tr><th>Feature</th><th>Rule-Based Schedule</th><th>EventBridge Scheduler</th></tr></thead><tbody><tr><td>One-time execution</td><td>❌ No</td><td>✅ Yes (schedule once at specific time)</td></tr><tr><td>Timezone support</td><td>❌ No (UTC only)</td><td>✅ Yes (specify timezone directly)</td></tr><tr><td>Flexible time windows</td><td>❌ No</td><td>✅ Yes (spread invocations over a window)</td></tr><tr><td>Maximum schedules</td><td>300 (rules limit)</td><td>1,000,000+</td></tr><tr><td>Templated targets</td><td>❌ No</td><td>✅ Yes (200+ targets)</td></tr><tr><td>At-rest encryption</td><td>❌ No</td><td>✅ Yes (KMS)</td></tr></tbody></table>
+<p>→ For ShopNow's timezone requirement (IST) → EventBridge Scheduler is cleaner:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Schedule name</td><td><code>shopnow-daily-etl-trigger-v2</code></td></tr><tr><td>Schedule expression</td><td><code>cron(0 2 * * ? *)</code></td></tr><tr><td>Timezone</td><td><code>Asia/Kolkata</code></td></tr><tr><td>Flexible time window</td><td>Off (exact time)</td></tr><tr><td>Target</td><td>Lambda → <code>shopnow-trigger-daily-etl-pipeline</code></td></tr></tbody></table>
+<p>→ No manual UTC conversion needed — Scheduler handles timezone + daylight saving time</p>
+<hr>
+<h3>MECHANIC 7 — SCHEMA REGISTRY (Auto-Discovery)</h3>
+<p>→ Navigate to EventBridge → "Schemas" → "Discovered schemas"</p>
+<p><strong>What Schema Registry does:</strong><br>
+→ When events flow through an event bus with schema discovery enabled<br>
+→ EventBridge automatically infers the JSON schema of each event type<br>
+→ Schemas are versioned — as event structure changes, new versions are created</p>
+<p><strong>Why it matters:</strong><br>
+→ When building new rules → you can browse the schema to know exactly what fields are available<br>
+→ When building consumers → you know the exact event structure to expect<br>
+→ Prevents trial-and-error when writing event patterns</p>
+<p><strong>Schema Example for S3 Object Created:</strong></p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Always Present</th></tr></thead><tbody><tr><td><code>source</code></td><td>String</td><td>✅</td></tr><tr><td><code>detail-type</code></td><td>String</td><td>✅</td></tr><tr><td><code>detail.bucket.name</code></td><td>String</td><td>✅</td></tr><tr><td><code>detail.object.key</code></td><td>String</td><td>✅</td></tr><tr><td><code>detail.object.size</code></td><td>Integer</td><td>✅</td></tr><tr><td><code>detail.object.etag</code></td><td>String</td><td>✅</td></tr><tr><td><code>detail.request-id</code></td><td>String</td><td>✅</td></tr></tbody></table>
+<p>→ Browse this in the Schema Registry before writing event patterns<br>
+→ Ensures your pattern matches real event structure</p>
+<hr>
+<h3>MECHANIC 8 — COST MODEL</h3>
+<table><thead><tr><th>Component</th><th>Cost</th><th>Notes</th></tr></thead><tbody><tr><td>AWS service events on default bus</td><td>FREE</td><td>S3, Glue, RDS, EC2 events — no charge</td></tr><tr><td>Custom events (PutEvents)</td><td>$1.00 per million events</td><td>Application-published events</td></tr><tr><td>Scheduled rule invocations</td><td>FREE</td><td>The schedule itself is free — target cost applies</td></tr><tr><td>Cross-account events</td><td>$1.00 per million events sent</td><td>Sending to another account's bus</td></tr><tr><td>Schema Registry discovery</td><td>$0.10 per million events ingested</td><td>Only when discovery is enabled</td></tr><tr><td>Archive storage</td><td>$0.023 per GB per month</td><td>Same as S3 Standard pricing</td></tr><tr><td>Replay</td><td>FREE</td><td>No charge for replaying archived events</td></tr><tr><td>EventBridge Pipes</td><td>$0.40 per million events</td><td>Advanced feature — not covered in this project</td></tr></tbody></table>
+<p><strong>ShopNow Cost Estimate:</strong></p>
+<table><thead><tr><th>Item</th><th>Volume</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>AWS service events (S3, Glue, SM)</td><td>~500,000/month</td><td>FREE</td></tr><tr><td>Application events (orders, payments)</td><td>~2,000,000/month</td><td>$2.00</td></tr><tr><td>Scheduled rule invocations</td><td>~2,000/month</td><td>FREE</td></tr><tr><td>Archive storage</td><td>~5 GB</td><td>$0.12</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~$2.12/month</strong></td></tr></tbody></table>
+<p>→ EventBridge is extremely cost-effective for the orchestration power it provides</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>S3 events not arriving in EventBridge</td><td>Rules never trigger on S3 uploads</td><td>S3 EventBridge notification not enabled on bucket</td><td>S3 → Properties → Amazon EventBridge → Enable</td></tr><tr><td>2</td><td>Cron schedule fires at wrong time</td><td>ETL runs at 2 AM UTC instead of 2 AM IST</td><td>Forgot to convert timezone to UTC</td><td>Use EventBridge Scheduler with timezone OR convert manually</td></tr><tr><td>3</td><td>Rule matches but target not invoked</td><td>Event matches pattern but nothing happens</td><td>IAM role on rule missing target invocation permission</td><td>Add <code>lambda:InvokeFunction</code>, <code>states:StartExecution</code>, etc. to rule role</td></tr><tr><td>4</td><td>Rule doesn't match expected events</td><td>No events trigger the rule</td><td>Event pattern has wrong field name or structure</td><td>Use Schema Registry to verify event structure → fix pattern</td></tr><tr><td>5</td><td>Events delivered twice to target</td><td>Lambda processes same event twice</td><td>At-least-once delivery → rare duplicates</td><td>Implement idempotency in target (use event ID as deduplication key)</td></tr><tr><td>6</td><td>DLQ fills up with failed events</td><td>Alerts firing on DLQ messages</td><td>Target Lambda failing (timeout, error, permission)</td><td>Fix Lambda error → replay DLQ messages</td></tr><tr><td>7</td><td>No DLQ configured → events silently lost</td><td>Events fail delivery → no trace</td><td>DLQ not configured on rule</td><td>Always configure DLQ on every rule</td></tr><tr><td>8</td><td>Cron expression invalid</td><td>"Parameter ScheduleExpression is not valid"</td><td>Both day-of-month and day-of-week specified (neither is <code>?</code>)</td><td>Use <code>?</code> for one of them</td></tr><tr><td>9</td><td>Custom event not appearing on custom bus</td><td>Rule on custom bus never triggers</td><td>Application publishing to wrong bus name OR default bus</td><td>Verify <code>EventBusName</code> in PutEvents matches custom bus name</td></tr><tr><td>10</td><td>Rule limit reached</td><td>"LimitExceededException" when creating new rule</td><td>300 rules per bus (default limit)</td><td>Request limit increase OR consolidate rules</td></tr><tr><td>11</td><td>Event too large</td><td>"EventSize exceeds maximum"</td><td>Event payload &gt; 256 KB</td><td>Use claim check pattern — store payload in S3, reference in event</td></tr><tr><td>12</td><td>CloudTrail-based events arrive too late</td><td>Security response delayed by 15 minutes</td><td>Secrets Manager events via CloudTrail have inherent delay</td><td>Use native Secrets Manager events (<code>Secret Rotation Failed</code>) — much faster</td></tr><tr><td>13</td><td>Archive not capturing events</td><td>Replay returns empty results</td><td>Archive event pattern too restrictive OR archive not enabled</td><td>Verify archive filter pattern → broaden or remove filter</td></tr><tr><td>14</td><td>Input transformation breaks target</td><td>Target receives malformed JSON</td><td>Template syntax error — missing quotes, wrong variable name</td><td>Test transformation with sample event in console before deploying</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Event Throughput Scaling</strong></p>
+<ul>
+<li>Default bus: Effectively unlimited for AWS service events</li>
+<li>Custom bus: Default 10,000+ events/second (can request increase)</li>
+<li>For &gt; 100,000 events/second → consider Kinesis Data Streams (Project 52) as event source with EventBridge as routing layer</li>
+<li>EventBridge is NOT designed for millions of events/second — that's Kinesis territory</li>
+</ul>
+<p>→ <strong>Rule Count Scaling</strong></p>
+<ul>
+<li>Default: 300 rules per bus (soft limit)</li>
+<li>Can increase to 2,000+ via support request</li>
+<li>If you need &gt; 2,000 rules → reconsider architecture</li>
+<li>Consolidate rules with broader patterns → use target Lambda to sub-route</li>
+</ul>
+<p>→ <strong>Target Scaling</strong></p>
+<ul>
+<li>5 targets per rule — use multiple rules for more targets</li>
+<li>Each target invocation is independent — one slow target doesn't block others</li>
+<li>Lambda targets scale automatically (concurrency)</li>
+<li>SQS targets scale automatically (unlimited writes)</li>
+<li>SNS targets scale automatically</li>
+<li>Step Functions: Default 1,300 state machine starts/second (can increase)</li>
+</ul>
+<p>→ <strong>Archive Scaling</strong></p>
+<ul>
+<li>Archive storage scales automatically (S3-backed internally)</li>
+<li>No limit on archive size — limited only by retention period and storage cost</li>
+<li>Replay throughput is throttled — not suitable for replaying millions of events quickly</li>
+</ul>
+<p>→ <strong>Cross-Account Scaling (Preview for Project 41)</strong></p>
+<ul>
+<li>Custom bus can receive events from up to 100 AWS accounts (configurable via resource policy)</li>
+<li>Default bus can send events to other accounts via cross-account rules</li>
+<li>Organizational event bus pattern: Central account collects events from all accounts</li>
+</ul>
+<p>→ <strong>Multi-Region Scaling</strong></p>
+<ul>
+<li>EventBridge is regional — rules and buses exist in one region</li>
+<li>For cross-region: Use EventBridge Global Endpoints (active-active)</li>
+<li>Or configure rules that target another region's event bus</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify rules are working:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>How</th><th>Expected Result</th></tr></thead><tbody><tr><td>Rule exists and is enabled</td><td>EventBridge → Rules → Status column</td><td>"Enabled"</td></tr><tr><td>Event pattern is correct</td><td>Click rule → "Event pattern" tab → use "Test pattern" feature</td><td>Test event matches pattern</td></tr><tr><td>Target is configured</td><td>Click rule → "Targets" tab</td><td>Correct target service and resource</td></tr><tr><td>IAM role has permissions</td><td>Click rule → Target → IAM role → check policy</td><td>Required permissions present</td></tr><tr><td>Events are matching</td><td>CloudWatch Metrics → EventBridge → <code>TriggeredRules</code></td><td>Count &gt; 0 for your rule</td></tr><tr><td>Target is invoked</td><td>CloudWatch Metrics → EventBridge → <code>Invocations</code></td><td>Count &gt; 0</td></tr><tr><td>Target invocation succeeds</td><td>CloudWatch Metrics → EventBridge → <code>FailedInvocations</code></td><td>Count = 0</td></tr><tr><td>DLQ is empty</td><td>SQS Console → DLQ → Messages available</td><td>0 messages</td></tr></tbody></table>
+<p>→ <strong>Key CloudWatch Metrics for EventBridge:</strong></p>
+<table><thead><tr><th>Metric</th><th>Dimension</th><th>What It Tells You</th></tr></thead><tbody><tr><td><code>TriggeredRules</code></td><td>RuleName</td><td>How many times a specific rule matched an event</td></tr><tr><td><code>Invocations</code></td><td>RuleName</td><td>How many times targets were invoked</td></tr><tr><td><code>FailedInvocations</code></td><td>RuleName</td><td>How many target invocations failed</td></tr><tr><td><code>ThrottledRules</code></td><td>RuleName</td><td>Rule was throttled (too many matches)</td></tr><tr><td><code>MatchedEvents</code></td><td>EventBusName</td><td>Total events matched by any rule on this bus</td></tr><tr><td><code>DeadLetterInvocations</code></td><td>RuleName</td><td>Events sent to DLQ</td></tr></tbody></table>
+<p>→ <strong>Recommended CloudWatch Alarms:</strong></p>
+<table><thead><tr><th>Alarm</th><th>Threshold</th><th>Action</th></tr></thead><tbody><tr><td><code>FailedInvocations</code> &gt; 0 for any rule</td><td>Any failure</td><td>SNS → DevOps team</td></tr><tr><td><code>DeadLetterInvocations</code> &gt; 0</td><td>Any DLQ message</td><td>SNS → DevOps team (CRITICAL)</td></tr><tr><td><code>TriggeredRules</code> = 0 for scheduled rule (over expected period)</td><td>Schedule didn't fire</td><td>SNS → DevOps team — schedule may be misconfigured</td></tr><tr><td><code>ThrottledRules</code> &gt; 0</td><td>Throttling detected</td><td>Request limit increase or reduce event volume</td></tr><tr><td>DLQ <code>ApproximateNumberOfMessagesVisible</code> &gt; 0</td><td>Messages accumulating in DLQ</td><td>Investigate target failures → fix → replay DLQ</td></tr><tr><td><code>MatchedEvents</code> sudden spike (&gt; 3x normal)</td><td>Unusual event volume</td><td>Possible runaway process or event storm</td></tr><tr><td><code>MatchedEvents</code> sudden drop to 0</td><td>No events matching any rule</td><td>Source service may have stopped emitting or S3 EventBridge notification disabled</td></tr></tbody></table>
+<p>→ <strong>How to debug when a rule doesn't trigger:</strong></p>
+<table><thead><tr><th>Debug Step</th><th>What to Check</th><th>Common Finding</th></tr></thead><tbody><tr><td>Step 1</td><td>Is the event actually being emitted?</td><td>S3 EventBridge notification not enabled on bucket</td></tr><tr><td>Step 2</td><td>Is the event arriving at the correct bus?</td><td>AWS service events → default bus only. Custom app events → verify bus name in PutEvents</td></tr><tr><td>Step 3</td><td>Does the event pattern match?</td><td>Use EventBridge console "Sandbox" → paste sample event → test against pattern</td></tr><tr><td>Step 4</td><td>Is the rule enabled?</td><td>Rules can be disabled accidentally</td></tr><tr><td>Step 5</td><td>Does the IAM role have target permissions?</td><td>Missing <code>lambda:InvokeFunction</code> or <code>states:StartExecution</code></td></tr><tr><td>Step 6</td><td>Is the target healthy?</td><td>Lambda function deleted, SQS queue deleted, SNS topic deleted</td></tr><tr><td>Step 7</td><td>Is the target throttled?</td><td>Lambda concurrency limit reached → invocation queued or dropped</td></tr><tr><td>Step 8</td><td>Check CloudWatch metrics</td><td><code>TriggeredRules</code> = 0 means pattern doesn't match. <code>FailedInvocations</code> &gt; 0 means target problem</td></tr></tbody></table>
+<p>→ <strong>How to use EventBridge Sandbox for testing:</strong></p>
+<p>→ Navigate to EventBridge → Left sidebar → "Event pattern" sandbox (under Developer tools)</p>
+<table><thead><tr><th>Step</th><th>Action</th></tr></thead><tbody><tr><td>1</td><td>Select "AWS events" or paste custom event JSON</td></tr><tr><td>2</td><td>Select the event source (e.g., S3, Glue)</td></tr><tr><td>3</td><td>Select the event type (e.g., Object Created, Job State Change)</td></tr><tr><td>4</td><td>Console generates a SAMPLE event</td></tr><tr><td>5</td><td>Paste your event pattern in the pattern editor</td></tr><tr><td>6</td><td>Click "Test pattern"</td></tr><tr><td>7</td><td>Console shows "Event pattern matches" or "Event pattern does NOT match"</td></tr></tbody></table>
+<p>→ ALWAYS test patterns in sandbox before deploying rules<br>
+→ This prevents the "rule deployed but never triggers" problem</p>
+<p>→ <strong>How to present EventBridge architecture to stakeholders:</strong></p>
+<table><thead><tr><th>Stakeholder Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"Where can I see all event-driven workflows?"</td><td>EventBridge → Rules → shows all rules, their patterns, and targets</td></tr><tr><td>"Where can I see all scheduled tasks?"</td><td>EventBridge → Rules → filter by "Schedule" OR Scheduler → Schedules</td></tr><tr><td>"What happens when something fails?"</td><td>Show DLQ configuration → failed events are captured, not lost</td></tr><tr><td>"Can we replay events from last week?"</td><td>Show Archive → demonstrate replay with specific time window</td></tr><tr><td>"How do I know if rules are working?"</td><td>Show CloudWatch metrics → TriggeredRules, Invocations, FailedInvocations</td></tr><tr><td>"What events does each service emit?"</td><td>Show Schema Registry → auto-discovered event schemas</td></tr><tr><td>"How much does this cost?"</td><td>Show: AWS service events are FREE, custom events ~$1/million, archive ~$0.023/GB</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ EventBridge is the CENTRAL NERVOUS SYSTEM of AWS event-driven architecture<br>
+→ It replaces fragmented notification mechanisms (S3 Event Notifications, CloudWatch Alarms → SNS, manual polling) with ONE unified routing system<br>
+→ The three pillars are: Event Bus (where events flow), Rules (what to match), Targets (where to send)<br>
+→ Content-based routing via event patterns enables INTELLIGENT routing — different file types → different pipelines from the same S3 bucket<br>
+→ Scheduled rules replace unreliable EC2 cron jobs and fragmented CloudWatch Events with centralized, managed schedules<br>
+→ Event archiving + replay provides debugging and reprocessing capability that NO other notification mechanism offers<br>
+→ Input transformation simplifies target payloads — targets receive ONLY what they need<br>
+→ DLQ configuration on rules is ESSENTIAL — without it, failed target invocations are silently lost<br>
+→ Custom event buses isolate application events from AWS service events — separate access control and billing<br>
+→ EventBridge is at-least-once delivery — targets MUST be idempotent<br>
+→ EventBridge is NOT a message queue (SQS), NOT a streaming platform (Kinesis), NOT an orchestrator (Step Functions) — it is a ROUTER that connects sources to the right targets</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 15 introduced S3 Event Notifications → SNS — EventBridge replaces this with richer routing<br>
+→ Project 8 introduced CloudWatch Alarms → SNS — EventBridge provides content-based alarm routing<br>
+→ Project 13 introduced SNS → SQS fan-out — EventBridge provides selective fan-out (different rules → different targets)<br>
+→ Project 31 introduced Glue Workflows — EventBridge can trigger workflows AND react to their completion<br>
+→ Project 32 introduced Step Functions — EventBridge is the ideal TRIGGER for state machines<br>
+→ Project 37 introduced Secrets Manager rotation — EventBridge enables real-time alerting on rotation failures<br>
+→ Project 7 introduced SQS — EventBridge uses SQS as DLQ for failed target invocations<br>
+→ Project 6 introduced SNS — EventBridge uses SNS as a target for human notifications</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 39 will introduce cross-account S3 access — EventBridge cross-account event bus rules extend this pattern<br>
+→ Project 41 will implement inter-account SNS → SQS notifications — EventBridge provides an alternative cross-account event routing pattern<br>
+→ Project 49 will build the complex multi-service pipeline (S3 → EventBridge → Step Functions → Glue → Redshift → SNS) — EventBridge is the TRIGGER that starts the entire pipeline<br>
+→ Project 52 will introduce Kinesis for real-time streaming — EventBridge handles routing, Kinesis handles volume<br>
+→ Project 60 will use EventBridge as the central event bus in the Data Mesh architecture — cross-account event routing for producer-consumer patterns</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow's event-driven architecture is now centralized through EventBridge<br>
+→ Rules route S3 events intelligently, Glue failures trigger alerts, rotation failures trigger remediation<br>
+→ But the CTO notices something during an architecture review:</p>
+<blockquote>
+<p>"Our subsidiary company 'ShopNow Europe' has their own AWS account.<br>
+They need to read product catalog data from OUR S3 data lake.<br>
+Currently, we're COPYING the data to their account every night via a cron job.<br>
+That means their data is always 24 hours stale.<br>
+Can they just read directly from OUR S3 bucket in real-time?"</p>
+</blockquote>
+<p>→ This is the first CROSS-ACCOUNT requirement<br>
+→ Until now — all 38 projects operated within a SINGLE AWS account<br>
+→ The subsidiary has Account ID <code>987654321098</code> — different from ShopNow HQ's <code>123456789012</code><br>
+→ By default — AWS accounts are completely isolated from each other<br>
+→ No account can access another account's resources unless EXPLICITLY granted</p>
+<p>→ <strong>This is the exact problem Project 39 solves</strong><br>
+→ Project 39 introduces inter-account S3 access via Bucket Policy and IAM Role assumption<br>
+→ It establishes the foundational cross-account access pattern that ALL subsequent inter-account projects (40, 41, 42, 44, 50, 51, 54, 57, 60) build upon<br>
+→ Understanding bucket policy cross-account principals AND cross-account IAM role trust relationships is PREREQUISITE for everything that follows in Phase 4 and Phase 5</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 39: "The Subsidiary That Needed Access to HQ's Data — Inter-Account S3 Access via Bucket Policy &amp; IAM Role"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-37.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 38/60</span></div><a class="nav-btn next" href="project-39.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

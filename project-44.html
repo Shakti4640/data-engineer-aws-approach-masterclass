@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 44: THE MICROSERVICES ACROSS ACCOUNTS THAT NEEDED TO COMMUNICATE — Multi — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 44: THE MICROSERVICES ACROSS ACCOUNTS THAT NEEDED TO COMMUNICATE — Multi-Account VPC Peering</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ A fintech company "PayScale" operates a microservices architecture<br>
+→ They have grown to 3 AWS accounts for isolation and billing separation</p>
+<table><thead><tr><th>Account</th><th>Purpose</th><th>VPC CIDR</th><th>Region</th></tr></thead><tbody><tr><td>Account A — Platform Team (111111111111)</td><td>Core Payment Processing Service</td><td>10.0.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account B — Risk Team (222222222222)</td><td>Fraud Detection Service</td><td>10.1.0.0/16</td><td>ap-south-1</td></tr><tr><td>Account C — Analytics Team (333333333333)</td><td>Reporting Dashboard + MariaDB (from Project 9)</td><td>10.2.0.0/16</td><td>ap-south-1</td></tr></tbody></table>
+<p>→ The Fraud Detection Service in Account B needs to call the Payment Processing API in Account A over private IPs<br>
+→ The Reporting Dashboard in Account C needs to read from the MariaDB in Account A's private subnet<br>
+→ Currently — all inter-service communication goes over the PUBLIC INTERNET<br>
+→ This means:</p>
+<ul>
+<li>Traffic leaves AWS → traverses the internet → re-enters AWS</li>
+<li>Adds 15–30ms latency per hop</li>
+<li>Exposes traffic to potential interception even with TLS</li>
+<li>Compliance team flagged it — PCI-DSS requires private network communication for payment data</li>
+<li>Data transfer costs are higher (internet egress charges)<br>
+→ The CTO says: "All microservice communication must happen over private AWS networking — no internet traversal"<br>
+→ They need Account A ↔ Account B and Account A ↔ Account C private connectivity<br>
+→ They do NOT need Account B ↔ Account C direct communication</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what private inter-VPC communication options exist</p>
+<table><thead><tr><th>Option</th><th>What It Does</th><th>When to Use</th></tr></thead><tbody><tr><td>VPC Peering</td><td>1-to-1 private connection between two VPCs</td><td>Small number of VPC pairs (&lt; 20 connections)</td></tr><tr><td>Transit Gateway</td><td>Hub-and-spoke model — central router for many VPCs</td><td>Many VPCs (10+), mesh connectivity needed (Project 50)</td></tr><tr><td>PrivateLink</td><td>Expose a specific service endpoint across VPCs/accounts</td><td>Service-to-service, not full network access (covered in Project 27)</td></tr><tr><td>VPN over Internet</td><td>Encrypted tunnel over public internet</td><td>Hybrid cloud, on-premises connectivity</td></tr></tbody></table>
+<p>→ PayScale needs only 2 connections (A↔B and A↔C)<br>
+→ VPC Peering is the right choice — simple, no extra infrastructure cost, no hourly charge<br>
+→ Transit Gateway would be overkill for 2 connections (explored in Project 50 when they grow to 20 VPCs)</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Validate CIDR blocks do NOT overlap across all three VPCs</li>
+<li>Step 2 — Create VPC Peering Connection (Requester side)</li>
+<li>Step 3 — Accept VPC Peering Connection (Accepter side — different account)</li>
+<li>Step 4 — Update Route Tables on BOTH sides</li>
+<li>Step 5 — Update Security Groups on BOTH sides to allow peered traffic</li>
+<li>Step 6 — Enable DNS Resolution across the peering connection</li>
+<li>Step 7 — Test private connectivity</li>
+<li>Step 8 — Repeat for second peering connection (A↔C)</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>PRE-REQUISITE VALIDATION — CIDR OVERLAP CHECK</h3>
+<p>→ This is the MOST CRITICAL step — if CIDRs overlap, peering is IMPOSSIBLE</p>
+<table><thead><tr><th>Account</th><th>VPC CIDR</th><th>IP Range</th></tr></thead><tbody><tr><td>A</td><td>10.0.0.0/16</td><td>10.0.0.0 → 10.0.255.255 (65,536 IPs)</td></tr><tr><td>B</td><td>10.1.0.0/16</td><td>10.1.0.0 → 10.1.255.255 (65,536 IPs)</td></tr><tr><td>C</td><td>10.2.0.0/16</td><td>10.2.0.0 → 10.2.255.255 (65,536 IPs)</td></tr></tbody></table>
+<p>→ No overlap ✅ — Peering is possible<br>
+→ If Account B was also 10.0.0.0/16 → PEERING WOULD FAIL<br>
+→ AWS checks this during peering creation and REJECTS overlapping CIDRs<br>
+→ This is why VPC CIDR planning (from Project 5) is foundational — mistakes here are unfixable without VPC recreation</p>
+<hr>
+<h3>STEP 1 — CREATE VPC PEERING CONNECTION (Account A → Account B)</h3>
+<p><strong>Performed in: Account A (111111111111) — The Requester</strong></p>
+<p>→ Navigate to VPC Console → Peering Connections → Create Peering Connection</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Peering connection name tag</td><td><code>pcx-accountA-to-accountB</code></td><td>Descriptive naming for identification</td></tr><tr><td>VPC (Requester)</td><td>Select Account A's VPC (10.0.0.0/16)</td><td>This is the local VPC initiating the request</td></tr><tr><td>Account</td><td>Select "Another account"</td><td>Because Account B is a different AWS account</td></tr><tr><td>Account ID[REDACTED:BANK_ACCOUNT_NUMBER]222</td><td>Account B's 12-digit account ID</td><td></td></tr><tr><td>Region</td><td>Select "This Region (ap-south-1)"</td><td>Both VPCs are in the same region (same-region peering)</td></tr><tr><td>VPC ID (Accepter)</td><td>Enter Account B's VPC ID (e.g., vpc-0bbbb1234567890)</td><td>The target VPC in Account B</td></tr></tbody></table>
+<p>→ Click "Create Peering Connection"<br>
+→ Status becomes: <strong>"Pending Acceptance"</strong></p>
+<p><strong>Critical Understanding:</strong><br>
+→ The requester CANNOT force a peering connection<br>
+→ The accepter account MUST explicitly accept it<br>
+→ This is a security mechanism — prevents unauthorized accounts from peering into your VPC<br>
+→ The peering request expires after 7 days if not accepted</p>
+<hr>
+<h3>STEP 2 — ACCEPT VPC PEERING CONNECTION (Account B)</h3>
+<p><strong>Performed in: Account B (222222222222) — The Accepter</strong></p>
+<p>→ Navigate to VPC Console → Peering Connections<br>
+→ The pending request from Account A appears with status "Pending Acceptance"<br>
+→ Select it → Actions → Accept Request</p>
+<table><thead><tr><th>Verification Before Accepting</th><th>Check</th></tr></thead><tbody><tr><td>Requester Account ID matches expected?</td><td>111111111111 (Account A) ✅</td></tr><tr><td>Requester VPC CIDR makes sense?</td><td>10.0.0.0/16 ✅</td></tr><tr><td>You trust this account?</td><td>Yes — same organization ✅</td></tr></tbody></table>
+<p>→ Click "Accept"<br>
+→ Status changes to: <strong>"Active"</strong><br>
+→ Peering connection ID: <code>pcx-0aaabbb1234567890</code></p>
+<p><strong>BUT — traffic still does NOT flow</strong><br>
+→ Peering is "Active" means the TUNNEL exists<br>
+→ But neither VPC knows to ROUTE traffic through it<br>
+→ This is the #1 mistake — people create peering and assume it works immediately</p>
+<hr>
+<h3>STEP 3 — UPDATE ROUTE TABLES (BOTH SIDES)</h3>
+<p><strong>This is where the actual connectivity happens</strong></p>
+<hr>
+<p><strong>In Account A — Route Table Update</strong></p>
+<p>→ Navigate to VPC Console → Route Tables<br>
+→ Select the route table(s) associated with subnets that need to reach Account B</p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Meaning</th></tr></thead><tbody><tr><td>10.0.0.0/16</td><td>local</td><td>Traffic within Account A's VPC (already exists — from Project 5)</td></tr><tr><td>0.0.0.0/0</td><td>igw-xxx</td><td>Internet-bound traffic (already exists — from Project 5)</td></tr><tr><td><strong>10.1.0.0/16</strong></td><td><strong>pcx-0aaabbb1234567890</strong></td><td><strong>NEW — Route traffic destined for Account B's CIDR through the peering connection</strong></td></tr></tbody></table>
+<p>→ Add Route → Destination: <code>10.1.0.0/16</code> → Target: Select peering connection <code>pcx-0aaabbb1234567890</code><br>
+→ Save</p>
+<p><strong>Which route tables to update?</strong></p>
+<table><thead><tr><th>Subnet Type in Account A</th><th>Needs Route to Account B?</th><th>Why</th></tr></thead><tbody><tr><td>Private subnet hosting Payment API</td><td>✅ Yes</td><td>Fraud Detection service needs to reach this</td></tr><tr><td>Public subnet hosting bastion/NAT</td><td>❌ Probably not</td><td>No direct service communication needed</td></tr><tr><td>Database subnet</td><td>Depends on use case</td><td>Only if Account B needs direct DB access</td></tr></tbody></table>
+<p>→ Be SELECTIVE — do not add peering routes to every route table<br>
+→ Principle of least privilege applies to networking too</p>
+<hr>
+<p><strong>In Account B — Route Table Update</strong></p>
+<p>→ Navigate to VPC Console → Route Tables<br>
+→ Select the route table(s) associated with subnets that need to reach Account A</p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Meaning</th></tr></thead><tbody><tr><td>10.1.0.0/16</td><td>local</td><td>Traffic within Account B's VPC</td></tr><tr><td>0.0.0.0/0</td><td>nat-xxx</td><td>Internet-bound traffic from private subnets</td></tr><tr><td><strong>10.0.0.0/16</strong></td><td><strong>pcx-0aaabbb1234567890</strong></td><td><strong>NEW — Route traffic destined for Account A's CIDR through the peering connection</strong></td></tr></tbody></table>
+<p>→ Add Route → Destination: <code>10.0.0.0/16</code> → Target: Select peering connection <code>pcx-0aaabbb1234567890</code><br>
+→ Save</p>
+<p><strong>BOTH sides must have routes — peering is NOT automatic routing</strong><br>
+→ If only Account A adds the route but Account B doesn't → traffic from A reaches B, but B's responses have no route back → connection times out</p>
+<hr>
+<h3>STEP 4 — UPDATE SECURITY GROUPS (BOTH SIDES)</h3>
+<p>→ Route tables define WHERE traffic goes<br>
+→ Security Groups define WHETHER traffic is ALLOWED (from Project 4)</p>
+<hr>
+<p><strong>In Account A — Security Group for Payment API EC2 instances</strong></p>
+<p>→ Navigate to EC2 Console → Security Groups → Select the SG attached to Payment API instances</p>
+<table><thead><tr><th>Rule Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Why</th></tr></thead><tbody><tr><td>Existing rules</td><td>TCP</td><td>443</td><td>10.0.0.0/16</td><td>Internal VPC traffic (already exists)</td></tr><tr><td><strong>NEW Inbound Rule</strong></td><td><strong>TCP</strong></td><td><strong>443</strong></td><td><strong>10.1.0.0/16</strong></td><td><strong>Allow HTTPS from Account B's entire VPC CIDR</strong></td></tr></tbody></table>
+<p>→ Add the inbound rule → Save</p>
+<p><strong>More restrictive alternative (recommended):</strong></p>
+<table><thead><tr><th>Rule Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Why</th></tr></thead><tbody><tr><td><strong>NEW Inbound Rule</strong></td><td><strong>TCP</strong></td><td><strong>443</strong></td><td><strong>10.1.2.0/24</strong></td><td><strong>Allow only from Account B's specific private subnet hosting Fraud Detection</strong></td></tr></tbody></table>
+<p>→ Using the specific subnet CIDR instead of the entire VPC CIDR follows least privilege</p>
+<hr>
+<p><strong>In Account B — Security Group for Fraud Detection EC2 instances</strong></p>
+<p>→ Outbound rules typically allow all traffic by default (0.0.0.0/0)<br>
+→ If outbound is restricted → Add:</p>
+<table><thead><tr><th>Rule Type</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Why</th></tr></thead><tbody><tr><td><strong>NEW Outbound Rule</strong></td><td><strong>TCP</strong></td><td><strong>443</strong></td><td><strong>10.0.1.0/24</strong></td><td><strong>Allow HTTPS to Account A's Payment API subnet</strong></td></tr></tbody></table>
+<hr>
+<p><strong>IMPORTANT — Cross-Account Security Group Referencing:</strong></p>
+<p>→ In SAME-ACCOUNT peering → You can reference a security group ID directly (e.g., <code>sg-0abc123</code>)<br>
+→ In CROSS-ACCOUNT peering → You CANNOT reference the other account's security group ID<br>
+→ You MUST use CIDR blocks as the source/destination in security group rules<br>
+→ This is a hard AWS limitation for cross-account peering</p>
+<hr>
+<h3>STEP 5 — ENABLE DNS RESOLUTION ACROSS PEERING</h3>
+<p><strong>Why this matters:</strong></p>
+<p>→ Account B's Fraud Detection service wants to call Account A's Payment API<br>
+→ The API is behind an internal DNS name: <code>payment-api.internal.payscale.com</code><br>
+→ This DNS name resolves to a private IP like <code>10.0.1.45</code><br>
+→ Without DNS resolution enabled on the peering connection → Account B cannot resolve Account A's private DNS names<br>
+→ The DNS query returns nothing or a public IP</p>
+<p><strong>Configuration:</strong></p>
+<p>→ Navigate to VPC Console → Peering Connections → Select the peering connection<br>
+→ Actions → Edit DNS Settings</p>
+<table><thead><tr><th>Setting</th><th>Account A Side</th><th>Account B Side</th></tr></thead><tbody><tr><td>Allow VPC-A to resolve VPC-B private DNS</td><td>✅ Enable</td><td>—</td></tr><tr><td>Allow VPC-B to resolve VPC-A private DNS</td><td>—</td><td>✅ Enable</td></tr></tbody></table>
+<p>→ BOTH sides must enable DNS resolution independently<br>
+→ Each account owner enables their own side</p>
+<p><strong>Pre-requisite for DNS resolution:</strong><br>
+→ Both VPCs must have these VPC settings enabled (from Project 5):</p>
+<ul>
+<li><code>enableDnsSupport</code> = true</li>
+<li><code>enableDnsHostnames</code> = true<br>
+→ If either is false → DNS resolution across peering will not work</li>
+</ul>
+<hr>
+<h3>STEP 6 — REPEAT FOR ACCOUNT A ↔ ACCOUNT C PEERING</h3>
+<p>→ Exact same process:</p>
+<ul>
+<li>Account A creates peering request to Account C's VPC (10.2.0.0/16)</li>
+<li>Account C accepts the request</li>
+<li>Account A adds route: <code>10.2.0.0/16 → pcx-newpeeringid</code></li>
+<li>Account C adds route: <code>10.0.0.0/16 → pcx-newpeeringid</code></li>
+<li>Security groups updated on both sides</li>
+<li>DNS resolution enabled on both sides</li>
+</ul>
+<p>→ Now the topology looks like:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account B (10.1.0.0/16)
+</span>        |
+        | pcx-1 (Peering)
+        |
+Account A (10.0.0.0/16) ← Central Hub
+        |
+        | pcx-2 (Peering)
+        |
+Account C (10.2.0.0/16)</code></pre></div>
+<hr>
+<h3>STEP 7 — UNDERSTANDING THE TRANSITIVE LIMITATION</h3>
+<p>→ Account B can reach Account A ✅<br>
+→ Account C can reach Account A ✅<br>
+→ Can Account B reach Account C through Account A? ❌ <strong>NO</strong></p>
+<p><strong>This is the NON-TRANSITIVE nature of VPC Peering</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account B → Account A → Account C
+</span>              ↑
+         TRAFFIC STOPS HERE
+         A does NOT forward B's traffic to C</code></pre></div>
+<p>→ VPC Peering is a DIRECT 1-to-1 connection<br>
+→ Traffic entering through one peering connection CANNOT exit through another peering connection<br>
+→ AWS enforces this at the network fabric level — not configurable</p>
+<p><strong>If Account B needs to reach Account C:</strong><br>
+→ Option 1: Create a THIRD peering connection (B ↔ C directly)<br>
+→ Option 2: Use Transit Gateway (Project 50) — which DOES support transitive routing</p>
+<p><strong>The Scaling Problem:</strong><br>
+→ 3 VPCs needing full mesh = 3 peering connections<br>
+→ 5 VPCs needing full mesh = 10 peering connections<br>
+→ 10 VPCs needing full mesh = 45 peering connections<br>
+→ 20 VPCs needing full mesh = 190 peering connections<br>
+→ Formula: n × (n-1) / 2<br>
+→ This is exactly why Transit Gateway exists (Project 50)</p>
+<hr>
+<h3>STEP 8 — CROSS-REGION VPC PEERING (Bonus Configuration)</h3>
+<p>→ What if Account C's Analytics Team moves their workload to <code>eu-west-1</code> (Ireland) for GDPR compliance?<br>
+→ VPC Peering supports CROSS-REGION peering</p>
+<p>→ The process is identical EXCEPT:</p>
+<table><thead><tr><th>Difference</th><th>Same-Region Peering</th><th>Cross-Region Peering</th></tr></thead><tbody><tr><td>Region selection during creation</td><td>"This Region"</td><td>"Another Region" → Select the target region</td></tr><tr><td>Data transfer cost</td><td>Free (within same AZ), minimal (cross-AZ)</td><td>Per-GB inter-region data transfer charges</td></tr><tr><td>Latency</td><td>Sub-millisecond to low milliseconds</td><td>50–200ms depending on regions</td></tr><tr><td>Security group referencing</td><td>CIDR only (cross-account)</td><td>CIDR only</td></tr><tr><td>DNS resolution</td><td>Supported</td><td>Supported</td></tr><tr><td>Maximum bandwidth</td><td>No practical limit</td><td>No practical limit (but latency is higher)</td></tr><tr><td>IPv6 support</td><td>Yes</td><td>Yes</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Plan VPC CIDR blocks across ALL accounts BEFORE creating any VPCs — overlapping CIDRs are unfixable<br>
+→ Use a centralized IP Address Management (IPAM) spreadsheet or AWS VPC IPAM service<br>
+→ Document every peering connection with both account IDs, VPC IDs, and CIDRs<br>
+→ Update route tables on BOTH sides — forgetting one side is the #1 debugging nightmare<br>
+→ Use the most specific CIDR possible in security group rules (subnet CIDR, not entire VPC CIDR)<br>
+→ Enable DNS resolution on both sides if services use private DNS names<br>
+→ Tag peering connections with source/destination account names for visibility<br>
+→ Use NACLs (from Project 4) as an additional layer — NACLs are stateless so add BOTH inbound AND outbound rules<br>
+→ Monitor peering connection metrics in CloudWatch:</p>
+<ul>
+<li><code>BytesIn</code> / <code>BytesOut</code> — traffic volume</li>
+<li><code>PacketsIn</code> / <code>PacketsOut</code> — packet counts<br>
+→ Set up CloudWatch Alarms (from Project 8) for unexpected traffic spikes across peering<br>
+→ Use VPC Flow Logs (enable on both VPCs) to audit cross-account traffic</li>
+</ul>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never assume peering is "active = working" — routes and security groups are mandatory<br>
+→ Never peer VPCs with overlapping CIDRs — AWS rejects it but some secondary CIDRs can cause partial overlap confusion<br>
+→ Never use 0.0.0.0/0 as destination pointing to a peering connection — AWS rejects this (peering cannot be a default route)<br>
+→ Never expect transitive routing — VPC A peered with B and C does NOT make B↔C connected<br>
+→ Never reference cross-account security group IDs in rules — use CIDR blocks only<br>
+→ Never forget to update NACL rules if NACLs are customized — NACLs are stateless (from Project 4), so both inbound AND outbound rules must allow the traffic AND the return traffic<br>
+→ Never create peering connections without the accepter account's knowledge — this is a security anti-pattern even within the same organization<br>
+→ Never rely on peering for more than ~20-30 VPC pairs — use Transit Gateway (Project 50) instead<br>
+→ Never peer just to access a single service — use PrivateLink (from Project 27) for service-specific access<br>
+→ Never leave unused peering connections active — they don't cost money but create security surface area</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE VPC PEERING</h2>
+<table><thead><tr><th>Scenario</th><th>Use VPC Peering?</th><th>Better Alternative</th></tr></thead><tbody><tr><td>2 VPCs in same account need private connectivity</td><td>✅ Yes</td><td>—</td></tr><tr><td>2 VPCs in different accounts, same region</td><td>✅ Yes</td><td>—</td></tr><tr><td>2 VPCs in different accounts, different regions</td><td>✅ Yes (cross-region peering)</td><td>—</td></tr><tr><td>5 VPCs needing selective 1-to-1 connections</td><td>✅ Yes</td><td>—</td></tr><tr><td>15+ VPCs needing full mesh connectivity</td><td>❌ No</td><td>Transit Gateway (Project 50)</td></tr><tr><td>Need transitive routing (A→B→C)</td><td>❌ No</td><td>Transit Gateway (Project 50)</td></tr><tr><td>Only need to expose ONE specific service across VPCs</td><td>❌ No</td><td>PrivateLink / VPC Endpoint Service (Project 27)</td></tr><tr><td>Need connectivity to on-premises data center</td><td>❌ No</td><td>VPN or Direct Connect</td></tr><tr><td>Need centralized egress through one VPC's NAT</td><td>❌ No</td><td>Transit Gateway (Project 50)</td></tr><tr><td>Need overlapping CIDR connectivity</td><td>❌ Impossible</td><td>PrivateLink (works with overlapping CIDRs)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE VPC PEERING</h2>
+<p>→ When you need more than ~20-30 peering connections — management becomes exponential → Transit Gateway<br>
+→ When VPC CIDRs overlap — peering physically cannot work → PrivateLink<br>
+→ When you need hub-and-spoke with transitive routing → Transit Gateway<br>
+→ When you only need access to a specific service, not full network access → PrivateLink<br>
+→ When you need bandwidth guarantees or dedicated throughput → Direct Connect<br>
+→ When you need to centralize internet egress for compliance → Transit Gateway with shared NAT<br>
+→ When the communication is purely event-driven (no direct IP calls) → SNS/SQS cross-account (from Project 41)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE PEERING CONNECTION IS NOT A VPN OR PHYSICAL LINK</h3>
+<p>→ VPC Peering is a LOGICAL networking construct within the AWS backbone network<br>
+→ There is no physical cable or tunnel created<br>
+→ AWS's internal network fabric (which interconnects all VPCs in a region) simply allows traffic between the two VPCs based on the peering configuration<br>
+→ For cross-region peering → AWS uses its private inter-region backbone (NOT the public internet)<br>
+→ This backbone is the same one used for S3 cross-region replication (from Project 30) and other AWS inter-region services</p>
+<hr>
+<h3>2 → THE REQUESTER-ACCEPTER HANDSHAKE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>REQUESTER (Account A)                          ACCEPTER (Account B)
+</span>        |                                               |
+        |  1. CreateVpcPeeringConnection API call        |
+        | -------------------------------------------→  |
+        |     (specifies accepter account + VPC ID)     |
+        |                                               |
+        |  2. Peering object created in BOTH accounts   |
+        |     Status: "pending-acceptance"               |
+        |                                               |
+        |  3. AcceptVpcPeeringConnection API call       |
+        |  ←------------------------------------------- |
+        |                                               |
+        |  4. Status changes to "active" in BOTH        |
+        |     AWS updates internal routing fabric        |
+        |                                               |</code></pre></div>
+<p>→ The peering object is visible in BOTH accounts simultaneously<br>
+→ Either side can DELETE the peering connection — it's immediately torn down on both sides<br>
+→ No approval needed from the other side to delete</p>
+<hr>
+<h3>3 → HOW ROUTING WORKS INTERNALLY</h3>
+<p>→ When Account B sends a packet to <code>10.0.1.45</code> (Account A):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Application in Account B generates packet
+</span>        Source: 10.1.2.100 → Destination: 10.0.1.45
+
+Step 2: OS routing table sends packet to the ENI (Elastic Network Interface)
+
+Step 3: VPC route table evaluation in Account B:
+        - 10.1.0.0/16 → local (no match — destination is 10.0.x.x)
+        - 10.0.0.0/16 → pcx-0aaabbb1234567890 ✅ MATCH
+        
+Step 4: Packet enters the peering connection
+
+Step 5: AWS network fabric validates:
+        - Is peering connection active? ✅
+        - Does source IP belong to requester/accepter VPC? ✅
+        - Does destination IP fall within the peer VPC's CIDR? ✅
+        
+Step 6: Packet arrives at Account A's VPC
+
+Step 7: Account A's route table evaluation:
+        - 10.0.0.0/16 → local ✅ MATCH (destination 10.0.1.45 is local)
+        
+Step 8: Packet delivered to the target ENI
+
+Step 9: Security Group on target ENI evaluated:
+        - Inbound rule allows TCP 443 from 10.1.0.0/16? ✅
+        
+Step 10: Packet reaches the application</code></pre></div>
+<p>→ Return traffic follows the REVERSE path<br>
+→ Security Groups are STATEFUL (from Project 4) — so return traffic is automatically allowed if the initial request was allowed<br>
+→ NACLs are STATELESS — so return traffic MUST have explicit outbound rules on the destination side AND explicit inbound rules on the source side for the ephemeral port range</p>
+<hr>
+<h3>4 → WHY TRANSITIVE ROUTING IS IMPOSSIBLE</h3>
+<p>→ When AWS processes a packet entering through a peering connection:</p>
+<ul>
+<li>It checks: "Is the destination IP within the LOCAL VPC CIDR?"</li>
+<li>If YES → deliver locally</li>
+<li>If NO → DROP the packet</li>
+<li>It does NOT check other route table entries pointing to other peering connections<br>
+→ This is a deliberate security design — prevents one peered VPC from becoming an unauthorized router<br>
+→ AWS enforces this at the hypervisor/network fabric level — no configuration can override it</li>
+</ul>
+<hr>
+<h3>5 → PEERING CONNECTION LIMITS</h3>
+<table><thead><tr><th>Limit</th><th>Value</th><th>Modifiable?</th></tr></thead><tbody><tr><td>Active peering connections per VPC</td><td>50 (default)</td><td>Yes — can request increase to 125</td></tr><tr><td>Outstanding peering requests per account</td><td>25</td><td>Yes</td></tr><tr><td>Peering connection expiry if not accepted</td><td>7 days</td><td>No</td></tr><tr><td>Bandwidth limit</td><td>No fixed limit — uses underlying AWS backbone</td><td>—</td></tr><tr><td>Packet size</td><td>Standard MTU 1500 bytes (same region), 1500 bytes (cross-region — jumbo frames NOT supported cross-region)</td><td>No</td></tr></tbody></table>
+<hr>
+<h3>6 → DNS RESOLUTION MECHANICS</h3>
+<p>→ When DNS resolution is enabled on the peering connection:</p>
+<ul>
+<li>Account B makes a DNS query for <code>ip-10-0-1-45.ap-south-1.compute.internal</code></li>
+<li>Normally → This resolves ONLY within Account A's VPC</li>
+<li>With DNS resolution enabled → AWS Route 53 Resolver forwards the query through the peering connection</li>
+<li>Account A's VPC DNS resolver responds with the private IP</li>
+<li>Account B receives the private IP and routes traffic through the peering connection</li>
+</ul>
+<p>→ For custom private hosted zones (Route 53):</p>
+<ul>
+<li>If Account A has a private hosted zone <code>internal.payscale.com</code> associated with its VPC</li>
+<li>Account B CANNOT automatically resolve these names even with peering DNS enabled</li>
+<li>Account A must ALSO associate the private hosted zone with Account B's VPC (cross-account hosted zone association)</li>
+<li>This requires a separate authorization flow in Route 53</li>
+</ul>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Created peering but forgot route tables</td><td>Peering shows "Active" but no traffic flows — connection timeouts</td><td>Always add routes on BOTH sides immediately after peering is active</td></tr><tr><td>2</td><td>Added route on one side only</td><td>Traffic flows one way — requests reach destination but responses have no route back</td><td>Treat route table updates as an atomic pair — always both sides</td></tr><tr><td>3</td><td>Security group still blocks peered traffic</td><td>Routes work but packets are dropped at the instance level — "connection refused" or timeout</td><td>Add inbound rules allowing the peer VPC CIDR on the correct ports</td></tr><tr><td>4</td><td>NACL blocks return traffic</td><td>Requests arrive but responses are dropped — intermittent timeouts</td><td>Add outbound rules for the peer CIDR AND inbound rules for ephemeral ports (1024-65535) on both NACLs</td></tr><tr><td>5</td><td>Overlapping CIDRs discovered after VPC creation</td><td>Peering creation fails — must recreate one VPC with new CIDR</td><td>Plan CIDRs centrally BEFORE any VPC creation across all accounts</td></tr><tr><td>6</td><td>Tried to reference cross-account security group ID</td><td>"sg-xxx does not exist" error</td><td>Use CIDR blocks for cross-account security group rules</td></tr><tr><td>7</td><td>Assumed transitive routing works</td><td>Account B → Account A → Account C traffic is silently dropped</td><td>Create direct peering or use Transit Gateway (Project 50)</td></tr><tr><td>8</td><td>Forgot DNS resolution enablement</td><td>Private DNS names don't resolve across peering — applications fail with DNS errors</td><td>Enable DNS resolution on BOTH sides of the peering connection</td></tr><tr><td>9</td><td>Peering request expired after 7 days</td><td>Must create a new peering request from scratch</td><td>Coordinate with accepter account — accept within hours, not days</td></tr><tr><td>10</td><td>Added too-broad CIDR in security groups</td><td>Entire peer VPC can access all ports — violates least privilege</td><td>Use specific subnet CIDRs and specific ports only</td></tr><tr><td>11</td><td>VPC has secondary CIDR that overlaps</td><td>Peering succeeds for primary CIDR but secondary CIDR routing fails or conflicts</td><td>Audit ALL CIDRs (primary + secondary) across all VPCs before peering</td></tr><tr><td>12</td><td>Deleted peering from one side accidentally</td><td>Peering immediately becomes "deleted" on BOTH sides — must recreate + re-add all routes</td><td>Restrict <code>ec2:DeleteVpcPeeringConnection</code> IAM permission (from Project 2) to senior engineers only</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Connection Scalability</strong></p>
+<ul>
+<li>50 peering connections per VPC (default), extendable to 125</li>
+<li>Full mesh formula: n × (n-1) / 2 connections</li>
+<li>10 VPCs = 45 connections → Manageable</li>
+<li>20 VPCs = 190 connections → Exceeds per-VPC limit → Transit Gateway required</li>
+<li>50 VPCs = 1,225 connections → Completely unmanageable with peering</li>
+</ul>
+<p>→ <strong>Bandwidth Scalability</strong></p>
+<ul>
+<li>No aggregate bandwidth limit on a peering connection</li>
+<li>Individual instance bandwidth is the bottleneck (e.g., m5.xlarge = ~10 Gbps)</li>
+<li>Cross-region peering bandwidth is limited by inter-region backbone capacity</li>
+<li>No throttling or QoS configuration available</li>
+</ul>
+<p>→ <strong>Latency Scalability</strong></p>
+<ul>
+<li>Same-region peering: Sub-millisecond to low milliseconds (same as intra-VPC)</li>
+<li>Cross-region peering: Regional latency (e.g., Mumbai ↔ Ireland ≈ 120ms)</li>
+<li>Peering adds negligible overhead — it's the DISTANCE that adds latency</li>
+</ul>
+<p>→ <strong>Route Table Scalability</strong></p>
+<ul>
+<li>Each route table supports 50 routes (default), extendable to 1,000</li>
+<li>Each peering connection needs at least one route per route table</li>
+<li>With 50 peering connections → 50 routes consumed just for peering</li>
+<li>Plan route table capacity early</li>
+</ul>
+<p>→ <strong>Operational Scalability</strong></p>
+<ul>
+<li>Each peering connection requires manual route + SG updates on both sides</li>
+<li>No "auto-propagation" of routes (unlike Transit Gateway)</li>
+<li>For 45 peering connections → 90 route table updates + 90 security group updates</li>
+<li>Infrastructure as Code (CloudFormation/Terraform) becomes mandatory at scale</li>
+</ul>
+<p>→ <strong>When to Graduate to Transit Gateway (Project 50)</strong></p>
+<table><thead><tr><th>Metric</th><th>VPC Peering Comfortable</th><th>Time for Transit Gateway</th></tr></thead><tbody><tr><td>Number of VPCs</td><td>≤ 10</td><td>&gt; 10</td></tr><tr><td>Peering connections</td><td>≤ 20</td><td>&gt; 20</td></tr><tr><td>Need transitive routing</td><td>No</td><td>Yes</td></tr><tr><td>Need centralized egress</td><td>No</td><td>Yes</td></tr><tr><td>Need route propagation</td><td>No</td><td>Yes</td></tr><tr><td>Operational team size</td><td>Small (can manage manually)</td><td>Need automation</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify peering is working correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected Value</th></tr></thead><tbody><tr><td>Peering status</td><td>VPC Console → Peering Connections</td><td>"Active"</td></tr><tr><td>Routes exist on both sides</td><td>VPC Console → Route Tables → Routes tab</td><td>Peer CIDR → pcx-xxx on BOTH sides</td></tr><tr><td>Security groups allow traffic</td><td>EC2 Console → Security Groups → Inbound Rules</td><td>Peer CIDR on correct ports</td></tr><tr><td>DNS resolution enabled</td><td>Peering Connection → DNS tab</td><td>Enabled on both sides</td></tr><tr><td>Traffic flowing</td><td>VPC Flow Logs → Filter by peer CIDR</td><td>ACCEPT entries for cross-VPC IPs</td></tr><tr><td>No traffic flowing</td><td>VPC Flow Logs → Filter by peer CIDR</td><td>REJECT entries indicate SG/NACL blocking</td></tr></tbody></table>
+<p>→ <strong>Debugging Flow (when traffic doesn't work):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Is peering Active?
+</span>        → No → Accept the peering / recreate
+        → Yes → Go to Step 2
+
+Step 2: Do route tables on BOTH sides have the correct routes?
+        → No → Add the missing route(s)
+        → Yes → Go to Step 3
+
+Step 3: Do Security Groups allow the traffic (correct port + CIDR)?
+        → No → Add the inbound/outbound rules
+        → Yes → Go to Step 4
+
+Step 4: Do NACLs allow the traffic (if NACLs are customized)?
+        → No → Add inbound + outbound rules (NACLs are stateless!)
+        → Yes → Go to Step 5
+
+Step 5: Is the application actually listening on the expected port?
+        → No → Application-level issue, not networking
+        → Yes → Go to Step 6
+
+Step 6: Enable VPC Flow Logs on both VPCs
+        → Check for REJECT entries → Identifies which layer is blocking
+        → Check for ACCEPT entries → Traffic is flowing but application may have issues</code></pre></div>
+<p>→ <strong>Monitoring:</strong></p>
+<ul>
+<li>CloudWatch Metrics for peering connections → <code>BytesIn</code>, <code>BytesOut</code>, <code>PacketsIn</code>, <code>PacketsOut</code></li>
+<li>Set up CloudWatch Alarms (from Project 8) for:
+<ul>
+<li>Zero traffic (peering might be broken)</li>
+<li>Unexpected traffic spikes (potential security concern)</li>
+</ul>
+</li>
+<li>VPC Flow Logs → Ship to S3 (from Project 1) → Query with Athena (from Project 18) for traffic analysis</li>
+</ul>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ VPC Peering is a 1-to-1 private networking construct between exactly two VPCs<br>
+→ It works ACROSS accounts (using the requester-accepter handshake from this project) and ACROSS regions<br>
+→ Three things must ALL be configured for traffic to flow: <strong>Peering Active + Routes Added + Security Groups Allow</strong><br>
+→ Peering is NON-TRANSITIVE — A↔B and A↔C does NOT give B↔C<br>
+→ CIDR overlap = peering impossible — plan CIDRs before creating VPCs (from Project 5)<br>
+→ Cross-account security group rules MUST use CIDR blocks — no SG ID referencing<br>
+→ VPC Peering has zero hourly cost — you pay only for data transfer<br>
+→ This approach works perfectly for small-scale (2-10 VPCs) cross-account connectivity<br>
+→ Connection to previous projects:</p>
+<ul>
+<li>VPC fundamentals (Project 5) — CIDR, subnets, route tables</li>
+<li>Security Groups &amp; NACLs (Project 4) — traffic filtering at instance and subnet level</li>
+<li>Cross-Account IAM (Project 40) — understanding multi-account trust models</li>
+<li>VPC Endpoints (Project 27) — alternative for service-specific access<br>
+→ Connection to next projects:</li>
+<li>When PayScale grows to 20+ VPCs → VPC Peering becomes unmanageable</li>
+<li>Transit Gateway (Project 50) solves the full-mesh and transitive routing problem</li>
+<li>Lambda in VPC (Project 45) needs to understand VPC networking to access peered resources</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale's cross-account networking is working<br>
+→ But the Risk Team's Lambda functions (from Project 26) need to:</p>
+<ul>
+<li>Access the MariaDB in a private subnet (from Project 9, 14)</li>
+<li>Also write results to S3 (from Project 1)<br>
+→ Lambda by default runs OUTSIDE any VPC — it can access S3 but NOT private RDS<br>
+→ If you put Lambda INSIDE a VPC — it can access RDS but LOSES internet access (and S3 access)<br>
+→ This creates a paradox: Lambda needs BOTH private DB access AND public S3 access</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 45 solves</strong><br>
+→ Project 45: "The Lambda That Needed Private Database and Public Bucket" combines:</p>
+<ul>
+<li>Lambda VPC configuration (ENI attachment)</li>
+<li>NAT Gateway for internet access (from Project 5)</li>
+<li>VPC Endpoints for S3 (from Project 27)</li>
+<li>Security Group configuration for RDS access (from Project 4, 14)</li>
+<li>The VPC peering knowledge from THIS project for cross-account Lambda→RDS scenarios</li>
+</ul>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 45: "The Lambda That Needed Private Database and Public Bucket — Lambda in VPC Accessing RDS + S3"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-43.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 44/60</span></div><a class="nav-btn next" href="project-45.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

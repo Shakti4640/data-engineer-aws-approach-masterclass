@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 6: THE TEAM THAT MISSED EVERY ALERT — SNS Topic Creation &amp; Email Sub — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 6: THE TEAM THAT MISSED EVERY ALERT — SNS Topic Creation &amp; Email Subscription</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-5) now has:</p>
+<ul>
+<li>S3 bucket for product images (Project 1)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instances in a properly architected VPC (Projects 3, 4, 5)</li>
+</ul>
+<p>→ Last Friday at 11 PM — the web server's disk filled up → application crashed<br>
+→ Nobody noticed until Monday morning → 60 hours of downtime<br>
+→ Customers couldn't browse products → estimated revenue loss: ₹4,00,000</p>
+<p>→ The CTO asks: "Why didn't anyone know the server was down?"<br>
+→ Answer: There was no alerting system — nobody was watching at 11 PM</p>
+<p>→ Then Tuesday — the marketing team uploaded 200 new product images to S3<br>
+→ The catalog team didn't know → the images sat in S3 for 3 days before being processed<br>
+→ Marketing says: "We emailed the catalog team" — but the email went to spam</p>
+<p>→ Then Wednesday — a batch job failed at 3 AM<br>
+→ The developer who owns it was asleep → the failed job blocked the morning reports<br>
+→ The finance team discovered the issue at 10 AM → 7 hours wasted</p>
+<p>→ Three problems — ONE root cause: No automated notification system</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>When the server has issues → notify the on-call engineer IMMEDIATELY</li>
+<li>When files are uploaded to S3 → notify the catalog team AUTOMATICALLY</li>
+<li>When batch jobs fail → notify the responsible developer AND the ops team</li>
+<li>ONE notification → MULTIPLE recipients → different channels (email, SMS, potentially more)</li>
+</ul>
+<p>→ The team needs a PUBLISH-SUBSCRIBE messaging service</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a PUB/SUB (Publish-Subscribe) problem<br>
+→ PUB/SUB means:</p>
+<ul>
+<li>A PUBLISHER sends a message to a central TOPIC</li>
+<li>All SUBSCRIBERS to that topic receive the message</li>
+<li>The publisher doesn't know or care who the subscribers are</li>
+<li>Subscribers don't know or care who the publisher is</li>
+<li>The TOPIC is the decoupling layer between them</li>
+</ul>
+<p>→ AWS SNS (Simple Notification Service) is purpose-built for this pattern</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PUBLISHER(S)                    TOPIC                    SUBSCRIBER(S)
+</span>┌──────────────┐           ┌───────────┐           ┌──────────────┐
+│ CloudWatch   │──────────►│           │──────────►│ Email        │
+│ Alarm        │           │           │           │ (ops team)   │
+└──────────────┘           │           │           └──────────────┘
+                           │   SNS     │           
+┌──────────────┐           │   TOPIC   │           ┌──────────────┐
+│ S3 Event     │──────────►│           │──────────►│ SMS          │
+│ Notification │           │           │           │ (on-call)    │
+└──────────────┘           │           │           └──────────────┘
+                           │           │           
+┌──────────────┐           │           │           ┌──────────────┐
+│ Application  │──────────►│           │──────────►│ SQS Queue    │
+│ Code         │           │           │           │ (processing) │
+└──────────────┘           └───────────┘           └──────────────┘
+                                                   
+                                                   ┌──────────────┐
+                                                   │ Lambda       │
+                                                   │ Function     │
+                                                   └──────────────┘</code></pre></div>
+<p>→ ONE message published → ALL subscribers receive it simultaneously<br>
+→ This is called FAN-OUT</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Create an SNS Topic</li>
+<li>Step 2 — Understand topic types (Standard vs FIFO)</li>
+<li>Step 3 — Create subscriptions (Email, SMS, and other protocols)</li>
+<li>Step 4 — Understand subscription confirmation workflow</li>
+<li>Step 5 — Configure message attributes and filtering</li>
+<li>Step 6 — Understand topic access policies</li>
+<li>Step 7 — Publish messages and verify delivery</li>
+<li>Step 8 — Configure delivery retry policies and DLQ for failed deliveries</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE AN SNS TOPIC</h3>
+<p>→ SNS Console → "Topics" → "Create topic"</p>
+<p><strong>First Decision: Topic Type</strong></p>
+<table><thead><tr><th>Type</th><th>Behavior</th><th>Throughput</th><th>Use Case</th></tr></thead><tbody><tr><td>Standard</td><td>Best-effort ordering, at-least-once delivery</td><td>Nearly unlimited (millions of messages/second)</td><td>Alerts, notifications, fan-out to SQS</td></tr><tr><td>FIFO</td><td>Strict ordering, exactly-once delivery</td><td>300 messages/second (3,000 with batching)</td><td>Order-sensitive workflows, deduplication needed</td></tr></tbody></table>
+<p>→ For ShopNow alerts → Standard (order doesn't matter for alerts, need high throughput)<br>
+→ FIFO is for scenarios where message ORDER matters (e.g., financial transactions)</p>
+<p><strong>Topic Creation Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>Alert notifications — order not critical</td></tr><tr><td>Name</td><td><code>shopnow-ops-alerts</code></td><td>Descriptive name for operations alerts</td></tr><tr><td>Display name</td><td><code>ShopNow Ops</code></td><td>Appears as sender name in SMS messages (max 10 characters for SMS)</td></tr></tbody></table>
+<hr>
+<p><strong>Encryption Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Encryption</td><td>Enable</td><td>Encrypts messages at rest</td></tr><tr><td>KMS key</td><td>aws/sns (AWS managed key)</td><td>Simplest option — AWS manages the key</td></tr></tbody></table>
+<p>→ When encryption is enabled → messages stored by SNS are encrypted with KMS<br>
+→ For cross-account publishing → use Customer Managed KMS key (Project 36 reference) with key policy granting other accounts access<br>
+→ For same-account → AWS managed key (<code>aws/sns</code>) is sufficient</p>
+<hr>
+<p><strong>Access Policy Settings:</strong></p>
+<p>→ This defines WHO can publish to and subscribe to this topic<br>
+→ Default policy: Only the topic owner (your AWS account) can publish and subscribe</p>
+<p><strong>Default Access Policy (auto-generated):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: DefaultPolicy
+  Effect: Allow
+  Principal:
+    AWS: "*"
+  Action:
+    - sns:GetTopicAttributes
+    - sns:SetTopicAttributes
+    - sns:AddPermission
+    - sns:RemovePermission
+    - sns:DeleteTopic
+    - sns:Subscribe
+    - sns:ListSubscriptionsByTopic
+    - sns:Publish
+  Resource: arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts
+  Condition:
+    StringEquals:
+      AWS:SourceOwner: "123456789012"</code></pre></div>
+<p>→ The condition <code>AWS:SourceOwner: "123456789012"</code> restricts ALL actions to only your account<br>
+→ Even though Principal is <code>*</code> → the condition limits it to your account ID<br>
+→ To allow other AWS services (S3, CloudWatch) to publish → modify this policy (covered in Step 6)</p>
+<hr>
+<p><strong>Delivery Retry Policy (HTTP/S endpoints):</strong></p>
+<table><thead><tr><th>Setting</th><th>Default Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Number of retries</td><td>3</td><td>How many times SNS retries failed deliveries</td></tr><tr><td>Retry-backoff function</td><td>Linear</td><td>Time between retries increases linearly</td></tr><tr><td>Minimum delay</td><td>20 seconds</td><td>Wait before first retry</td></tr><tr><td>Maximum delay</td><td>20 seconds</td><td>Maximum wait between retries</td></tr></tbody></table>
+<p>→ This applies ONLY to HTTP/HTTPS endpoint subscriptions<br>
+→ Email and SMS have their own delivery mechanisms (explained in internal mechanics)<br>
+→ For now → keep defaults</p>
+<hr>
+<p><strong>Delivery Status Logging:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Protocol</td><td>Select protocols to log (HTTP, Lambda, SQS, etc.)</td><td>Which subscription types to log delivery status for</td></tr><tr><td>IAM Role</td><td>Create or select role</td><td>SNS needs permission to write to CloudWatch Logs</td></tr><tr><td>Sample rate</td><td>100% (for debugging) or 1-5% (for production)</td><td>Percentage of deliveries to log</td></tr></tbody></table>
+<p>→ Enabling this creates CloudWatch Log Groups showing: MessageID, delivery status, timestamp, endpoint<br>
+→ Essential for debugging "why didn't they receive the notification?"<br>
+→ For ShopNow → Enable for all protocols at 100% initially → reduce to 10% once stable</p>
+<p>→ Click "Create topic"</p>
+<hr>
+<p><strong>Create Additional Topics for ShopNow:</strong></p>
+<table><thead><tr><th>Topic Name</th><th>Type</th><th>Purpose</th></tr></thead><tbody><tr><td><code>shopnow-ops-alerts</code></td><td>Standard</td><td>Server/infrastructure alerts</td></tr><tr><td><code>shopnow-s3-events</code></td><td>Standard</td><td>S3 upload/delete notifications</td></tr><tr><td><code>shopnow-batch-alerts</code></td><td>Standard</td><td>Batch job success/failure notifications</td></tr></tbody></table>
+<p>→ Separate topics for separate concerns → subscribers choose which topics to subscribe to<br>
+→ The ops team subscribes to <code>shopnow-ops-alerts</code><br>
+→ The catalog team subscribes to <code>shopnow-s3-events</code><br>
+→ Developers subscribe to <code>shopnow-batch-alerts</code></p>
+<hr>
+<h3>STEP 2 — UNDERSTAND SNS TOPIC ARN</h3>
+<p>→ Every topic gets a unique ARN upon creation</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts
+</span>     │       │          │              │
+     │       │          │              └── Topic name
+     │       │          └── AWS account ID
+     │       └── Region (SNS topics are REGIONAL — unlike IAM which is global)
+     └── Service name</code></pre></div>
+<p>→ CRITICAL: SNS topics are REGIONAL<br>
+→ A topic in <code>ap-south-1</code> does NOT exist in <code>us-east-1</code><br>
+→ If you need alerts across regions → create topics in each region OR use cross-region event patterns<br>
+→ The ARN is used when other services (S3, CloudWatch, Lambda) publish to this topic</p>
+<hr>
+<h3>STEP 3 — CREATE SUBSCRIPTIONS</h3>
+<p>→ SNS Console → Select <code>shopnow-ops-alerts</code> → "Create subscription"</p>
+<p><strong>Subscription = Connecting a RECEIVER to the TOPIC</strong></p>
+<p><strong>Available Protocols:</strong></p>
+<table><thead><tr><th>Protocol</th><th>Endpoint Format</th><th>Use Case</th><th>Confirmation Required?</th></tr></thead><tbody><tr><td>Email</td><td><code>ops-team@shopnow.com</code></td><td>Human notification via email</td><td>YES — must click confirmation link</td></tr><tr><td>Email-JSON</td><td><code>ops-team@shopnow.com</code></td><td>Email with raw JSON payload</td><td>YES</td></tr><tr><td>SMS</td><td><code>+919876543210</code></td><td>Text message to phone</td><td>NO (auto-confirmed)</td></tr><tr><td>HTTP</td><td><code>http://api.shopnow.com/webhook</code></td><td>Webhook to HTTP endpoint</td><td>YES — endpoint must respond to confirmation</td></tr><tr><td>HTTPS</td><td><code>https://api.shopnow.com/webhook</code></td><td>Secure webhook</td><td>YES</td></tr><tr><td>SQS</td><td><code>arn:aws:sqs:ap-south-1:123456789012:queue-name</code></td><td>Message queuing (Project 7, 13)</td><td>NO (auto-confirmed if same account)</td></tr><tr><td>Lambda</td><td><code>arn:aws:lambda:ap-south-1:123456789012:function:name</code></td><td>Trigger serverless function (Project 26)</td><td>NO (auto-confirmed if same account)</td></tr><tr><td>Firehose</td><td>Kinesis Firehose delivery stream ARN</td><td>Stream to S3/Redshift (Project 52)</td><td>NO (auto-confirmed)</td></tr><tr><td>Application</td><td>Platform endpoint ARN</td><td>Mobile push notifications (iOS/Android)</td><td>NO</td></tr></tbody></table>
+<hr>
+<p><strong>Subscription 1: Email to Ops Team</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Topic ARN</td><td>arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts</td></tr><tr><td>Protocol</td><td>Email</td></tr><tr><td>Endpoint</td><td><a href="mailto:ops-team@shopnow.com">ops-team@shopnow.com</a></td></tr></tbody></table>
+<p>→ Click "Create subscription"<br>
+→ Status shows: "Pending confirmation"</p>
+<hr>
+<p><strong>Subscription 2: Email to CTO</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Topic ARN</td><td>arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts</td></tr><tr><td>Protocol</td><td>Email</td></tr><tr><td>Endpoint</td><td><a href="mailto:rahul-cto@shopnow.com">rahul-cto@shopnow.com</a></td></tr></tbody></table>
+<p>→ Status: "Pending confirmation"</p>
+<hr>
+<p><strong>Subscription 3: SMS to On-Call Engineer</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Topic ARN</td><td>arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts</td></tr><tr><td>Protocol</td><td>SMS</td></tr><tr><td>Endpoint</td><td>+919876543210</td></tr></tbody></table>
+<p>→ Status: "Confirmed" (SMS subscriptions auto-confirm)</p>
+<hr>
+<p><strong>Subscription 4: Email to Catalog Team (different topic)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Topic ARN</td><td>arn:aws:sns:ap-south-1:123456789012:shopnow-s3-events</td></tr><tr><td>Protocol</td><td>Email</td></tr><tr><td>Endpoint</td><td><a href="mailto:catalog-team@shopnow.com">catalog-team@shopnow.com</a></td></tr></tbody></table>
+<p>→ Status: "Pending confirmation"</p>
+<hr>
+<h3>STEP 4 — SUBSCRIPTION CONFIRMATION WORKFLOW</h3>
+<p>→ For Email and HTTP/HTTPS protocols → SNS requires EXPLICIT confirmation<br>
+→ This prevents abuse — you can't subscribe someone else's email without their consent</p>
+<p><strong>Email Confirmation Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: You create subscription → SNS sends confirmation email to endpoint
+</span>        │
+        ▼
+Step 2: Email arrives with subject: "AWS Notification - Subscription Confirmation"
+        Body contains a "Confirm subscription" link
+        │
+        ▼
+Step 3: Recipient clicks the link
+        │
+        ├── Link leads to AWS SNS endpoint
+        ├── SNS marks subscription as "Confirmed"
+        └── Subscription status changes: "Pending confirmation" → "Confirmed"
+        │
+        ▼
+Step 4: Subscription is ACTIVE — future messages will be delivered
+
+IF recipient never clicks the link:
+        │
+        ▼
+Subscription stays "Pending" for 3 days → then AUTOMATICALLY DELETED
+Messages published during "Pending" state are NOT delivered to this subscriber</code></pre></div>
+<p>→ CRITICAL: Until the email recipient clicks "Confirm" → they receive NOTHING<br>
+→ This is the #1 reason people think SNS "isn't working" → they forgot to confirm</p>
+<p><strong>HTTP/HTTPS Confirmation Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: SNS sends HTTP POST to the endpoint URL with:
+</span>        - Type: "SubscriptionConfirmation"
+        - SubscribeURL: URL to visit to confirm
+        - Token: Confirmation token
+        │
+        ▼
+Step 2: Your application must:
+        Option A: Make a GET request to the SubscribeURL
+        Option B: Call SNS ConfirmSubscription API with the Token
+        │
+        ▼
+Step 3: SNS marks subscription as "Confirmed"</code></pre></div>
+<p>→ HTTP/HTTPS endpoints must be programmed to handle the confirmation<br>
+→ This is why automated integrations (SQS, Lambda) auto-confirm — they're AWS-internal</p>
+<p><strong>Unsubscribe:</strong><br>
+→ Every email notification includes an "Unsubscribe" link at the bottom<br>
+→ Clicking it removes the subscription immediately<br>
+→ This is AWS's compliance with anti-spam requirements</p>
+<hr>
+<h3>STEP 5 — MESSAGE ATTRIBUTES AND SUBSCRIPTION FILTERING</h3>
+<p>→ Not every subscriber wants EVERY message<br>
+→ The ops team wants CRITICAL alerts but not INFO messages<br>
+→ The CTO wants only CRITICAL alerts</p>
+<p><strong>Message Attributes:</strong></p>
+<p>→ When publishing a message → you can attach key-value metadata called "Message Attributes"<br>
+→ These attributes do NOT appear in the message body — they are metadata used for filtering</p>
+<p><strong>Example Message Attributes:</strong></p>
+<table><thead><tr><th>Attribute Name</th><th>Type</th><th>Example Value</th></tr></thead><tbody><tr><td>severity</td><td>String</td><td>CRITICAL</td></tr><tr><td>service</td><td>String</td><td>web-server</td></tr><tr><td>environment</td><td>String</td><td>production</td></tr><tr><td>error_code</td><td>Number</td><td>500</td></tr></tbody></table>
+<hr>
+<p><strong>Subscription Filter Policy:</strong></p>
+<p>→ A filter policy tells SNS: "Only deliver messages to this subscriber IF the message attributes match"</p>
+<p>→ SNS Console → Select subscription → "Edit" → Subscription filter policy</p>
+<p><strong>Filter Policy for CTO (only CRITICAL alerts):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Filter Policy:
+</span>{
+  "severity": ["CRITICAL"]
+}</code></pre></div>
+<p>→ This means: Only deliver messages to the CTO's email if <code>severity</code> attribute = <code>CRITICAL</code><br>
+→ Messages with <code>severity: WARNING</code> or <code>severity: INFO</code> are NOT delivered to the CTO<br>
+→ Messages with NO severity attribute are also NOT delivered (unless policy uses <code>exists: false</code>)</p>
+<p><strong>Filter Policy for Ops Team (CRITICAL and WARNING):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Filter Policy:
+</span>{
+  "severity": ["CRITICAL", "WARNING"]
+}</code></pre></div>
+<p>→ Ops team gets CRITICAL and WARNING but not INFO</p>
+<p><strong>Filter Policy for Developer (specific service):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Filter Policy:
+</span>{
+  "severity": ["CRITICAL", "WARNING", "INFO"],
+  "service": ["batch-processor"]
+}</code></pre></div>
+<p>→ Developer gets all severities BUT only for the batch-processor service<br>
+→ Multiple attributes = AND logic (both conditions must match)<br>
+→ Multiple values within an attribute = OR logic (any value matches)</p>
+<p><strong>Advanced Filter Operators:</strong></p>
+<table><thead><tr><th>Operator</th><th>Example</th><th>Meaning</th></tr></thead><tbody><tr><td>Exact match</td><td><code>"severity": ["CRITICAL"]</code></td><td>severity must be exactly "CRITICAL"</td></tr><tr><td>Anything-but</td><td><code>"severity": [{"anything-but": ["INFO"]}]</code></td><td>severity can be anything EXCEPT "INFO"</td></tr><tr><td>Prefix</td><td><code>"service": [{"prefix": "web-"}]</code></td><td>service must start with "web-"</td></tr><tr><td>Numeric match</td><td><code>"error_code": [{"numeric": ["&gt;=", 500]}]</code></td><td>error_code must be &gt;= 500</td></tr><tr><td>Exists</td><td><code>"severity": [{"exists": true}]</code></td><td>Message must HAVE a severity attribute</td></tr><tr><td>Not exists</td><td><code>"severity": [{"exists": false}]</code></td><td>Message must NOT have a severity attribute</td></tr></tbody></table>
+<p><strong>Filter Policy Scope:</strong></p>
+<table><thead><tr><th>Scope</th><th>Filters On</th><th>Default</th></tr></thead><tbody><tr><td>MessageAttributes</td><td>Message metadata (attributes)</td><td>YES (default)</td></tr><tr><td>MessageBody</td><td>Actual message content (JSON body)</td><td>Must explicitly set</td></tr></tbody></table>
+<p>→ Filtering on MessageBody allows filtering on the actual JSON payload<br>
+→ Example: Filter on <code>{"status": "FAILED"}</code> in the message body<br>
+→ Set via: Subscription → Edit → "Filter policy scope" → "Message body"</p>
+<hr>
+<h3>STEP 6 — TOPIC ACCESS POLICY (WHO CAN PUBLISH)</h3>
+<p>→ The topic access policy controls:</p>
+<ul>
+<li>Who can PUBLISH messages to the topic</li>
+<li>Who can SUBSCRIBE to the topic</li>
+<li>Who can manage the topic</li>
+</ul>
+<p>→ For ShopNow → we need S3 and CloudWatch to publish to our topics<br>
+→ These are AWS services — not IAM users — so we need resource-based policies</p>
+<p><strong>Allowing S3 to Publish to SNS Topic:</strong></p>
+<p>→ SNS Console → Select <code>shopnow-s3-events</code> → "Edit" → Access policy</p>
+<p><strong>Policy to Allow S3 Events (needed for Project 15):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowS3ToPublish
+  Effect: Allow
+  Principal:
+    Service: s3.amazonaws.com
+  Action: sns:Publish
+  Resource: arn:aws:sns:ap-south-1:123456789012:shopnow-s3-events
+  Condition:
+    ArnLike:
+      aws:SourceArn: arn:aws:s3:::shopnow-productimages-prod-aps1
+    StringEquals:
+      aws:SourceAccount: "123456789012"</code></pre></div>
+<p>→ <code>Principal: Service: s3.amazonaws.com</code> → allows the S3 service to publish<br>
+→ <code>Condition: ArnLike: aws:SourceArn</code> → only from the specific bucket (not ANY bucket)<br>
+→ <code>Condition: StringEquals: aws:SourceAccount</code> → only from your account (prevents confused deputy)</p>
+<p><strong>Why Both Conditions:</strong><br>
+→ Without <code>SourceArn</code> → ANY S3 bucket in your account could publish → too broad<br>
+→ Without <code>SourceAccount</code> → an S3 bucket in ANOTHER account could publish if they know your topic ARN → security risk<br>
+→ Both together = defense in depth</p>
+<hr>
+<p><strong>Allowing CloudWatch to Publish to SNS Topic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowCloudWatchToPublish
+  Effect: Allow
+  Principal:
+    Service: cloudwatch.amazonaws.com
+  Action: sns:Publish
+  Resource: arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts
+  Condition:
+    ArnLike:
+      aws:SourceArn: arn:aws:cloudwatch:ap-south-1:123456789012:alarm:*</code></pre></div>
+<p>→ This allows CloudWatch alarms (Project 8) to send notifications to this topic<br>
+→ The wildcard <code>alarm:*</code> allows any alarm in the account to publish</p>
+<hr>
+<p><strong>Allowing Another AWS Account to Publish (Preview for Project 41):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowCrossAccountPublish
+  Effect: Allow
+  Principal:
+    AWS: "arn:aws:iam::987654321098:root"
+  Action: sns:Publish
+  Resource: arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts</code></pre></div>
+<p>→ This allows account <code>987654321098</code> to publish to your topic<br>
+→ Used in inter-account notification patterns (Project 41)</p>
+<hr>
+<h3>STEP 7 — PUBLISH MESSAGES AND VERIFY DELIVERY</h3>
+<p>→ SNS Console → Select <code>shopnow-ops-alerts</code> → "Publish message"</p>
+<p><strong>Message Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Subject</td><td>"ALERT: Web Server Disk Full"</td></tr><tr><td>Message body</td><td>"Disk usage on shopnow-web-01 has reached 95%. Immediate action required."</td></tr></tbody></table>
+<p><strong>Message Structure Options:</strong></p>
+<table><thead><tr><th>Option</th><th>Behavior</th></tr></thead><tbody><tr><td>Identical payload for all delivery protocols</td><td>Same message goes to Email, SMS, SQS, etc.</td></tr><tr><td>Custom payload for each delivery protocol</td><td>Different message per protocol</td></tr></tbody></table>
+<p><strong>Custom Payload Example:</strong></p>
+<p>→ When you select "Custom payload" → you can specify different messages:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>For Email:
+</span>  "Subject: CRITICAL ALERT - Disk Full
+   
+   Server: shopnow-web-01
+   Metric: DiskUsage
+   Current Value: 95%
+   Threshold: 90%
+   Time: 2025-01-15 23:45:00 UTC
+   
+   Please investigate immediately."
+
+For SMS:
+  "CRITICAL: shopnow-web-01 disk 95% full. Act now."
+
+For SQS/Lambda (JSON):
+  {
+    "server": "shopnow-web-01",
+    "metric": "DiskUsage",
+    "value": 95,
+    "threshold": 90,
+    "timestamp": "2025-01-15T23:45:00Z"
+  }</code></pre></div>
+<p>→ Email gets a detailed formatted message<br>
+→ SMS gets a short message (160 character limit for SMS)<br>
+→ SQS/Lambda gets structured JSON for programmatic processing</p>
+<p><strong>Message Attributes (for filtering):</strong></p>
+<p>→ Add attributes:</p>
+<table><thead><tr><th>Key</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td>severity</td><td>String</td><td>CRITICAL</td></tr><tr><td>service</td><td>String</td><td>web-server</td></tr><tr><td>environment</td><td>String</td><td>production</td></tr></tbody></table>
+<p>→ Click "Publish message"</p>
+<p><strong>What Happens After Publish:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message published to shopnow-ops-alerts
+</span>        │
+        ▼
+SNS evaluates all CONFIRMED subscriptions
+        │
+        ├── Subscription 1: Email → ops-team@shopnow.com
+        │   Filter policy: severity IN [CRITICAL, WARNING]
+        │   severity = CRITICAL → MATCH → Deliver
+        │
+        ├── Subscription 2: Email → rahul-cto@shopnow.com
+        │   Filter policy: severity IN [CRITICAL]
+        │   severity = CRITICAL → MATCH → Deliver
+        │
+        ├── Subscription 3: SMS → +919876543210
+        │   No filter policy → Deliver ALL messages
+        │   → Deliver
+        │
+        └── All deliveries happen SIMULTANEOUSLY (fan-out)</code></pre></div>
+<p>→ Message ID is returned: <code>a1b2c3d4-5678-90ab-cdef-EXAMPLE11111</code><br>
+→ This ID is used for tracking delivery status in CloudWatch Logs</p>
+<hr>
+<h3>STEP 8 — DELIVERY RETRY AND DEAD LETTER QUEUE</h3>
+<p><strong>What Happens When Delivery Fails:</strong></p>
+<p>→ SNS attempts to deliver → endpoint is unavailable → delivery fails<br>
+→ SNS retries based on the delivery protocol:</p>
+<p><strong>Retry Policies by Protocol:</strong></p>
+<table><thead><tr><th>Protocol</th><th>Retry Behavior</th></tr></thead><tbody><tr><td>HTTP/HTTPS</td><td>Configurable: 0-100 retries over minutes/hours</td></tr><tr><td>SQS</td><td>3 retries immediately (SQS is almost always available)</td></tr><tr><td>Lambda</td><td>3 retries (2 internal + 1 SNS)</td></tr><tr><td>Email</td><td>No retries — one attempt only (relies on email infrastructure)</td></tr><tr><td>SMS</td><td>No retries — one attempt only</td></tr></tbody></table>
+<p>→ Email and SMS: If delivery fails → message is LOST<br>
+→ HTTP/SQS/Lambda: SNS retries multiple times</p>
+<hr>
+<p><strong>Dead Letter Queue (DLQ) for Failed Deliveries:</strong></p>
+<p>→ For critical notifications → configure a DLQ to capture failed deliveries<br>
+→ The DLQ is an SQS queue (Project 7) that receives messages SNS couldn't deliver</p>
+<p><strong>Configuration:</strong></p>
+<p>→ SNS Console → Select subscription → "Edit" → "Redrive policy (dead-letter queue)"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Dead-letter queue</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-sns-dlq</td></tr></tbody></table>
+<p>→ The SQS queue must have a policy allowing SNS to send messages to it:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowSNSToSendToDLQ
+  Effect: Allow
+  Principal:
+    Service: sns.amazonaws.com
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-sns-dlq
+  Condition:
+    ArnEquals:
+      aws:SourceArn: arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts</code></pre></div>
+<p>→ Now if SNS can't deliver to an HTTP endpoint after all retries → message goes to DLQ<br>
+→ You can monitor the DLQ for failed deliveries and investigate<br>
+→ DLQ is NOT supported for Email and SMS subscriptions (they don't retry)</p>
+<hr>
+<h3>STEP 9 — SMS SPECIFIC CONFIGURATION</h3>
+<p>→ SMS through SNS has additional settings and costs</p>
+<p><strong>SMS Sandbox (New Accounts):</strong></p>
+<p>→ New AWS accounts are placed in SMS SANDBOX mode<br>
+→ In sandbox: You can ONLY send SMS to verified phone numbers<br>
+→ To verify: SNS Console → Mobile → Text messaging → Sandbox → Add phone number → Enter OTP<br>
+→ To exit sandbox: Submit request to AWS Support (requires use case justification)</p>
+<p><strong>SMS Preferences:</strong></p>
+<p>→ SNS Console → Mobile → Text messaging (SMS) → "Edit text messaging preferences"</p>
+<table><thead><tr><th>Setting</th><th>Options</th><th>Explanation</th></tr></thead><tbody><tr><td>Default message type</td><td>Transactional / Promotional</td><td>Transactional: Higher delivery priority, higher cost. Promotional: Lower priority, lower cost</td></tr><tr><td>Account spend limit</td><td>Dollar amount per month</td><td>Prevents runaway SMS costs</td></tr><tr><td>Default sender ID</td><td>Up to 11 alphanumeric characters</td><td>Appears as sender name (not supported in all countries)</td></tr><tr><td>CloudWatch Logs IAM Role</td><td>IAM role ARN</td><td>For logging SMS delivery status</td></tr></tbody></table>
+<p>→ For ShopNow ops alerts → Use Transactional (critical alerts need guaranteed delivery)<br>
+→ For marketing notifications → Use Promotional (non-urgent, cheaper)</p>
+<p><strong>SMS Costs:</strong></p>
+<table><thead><tr><th>Country</th><th>Approximate Cost per SMS</th></tr></thead><tbody><tr><td>India</td><td>$0.00223</td></tr><tr><td>USA</td><td>$0.00645</td></tr><tr><td>UK</td><td>$0.03504</td></tr></tbody></table>
+<p>→ Costs vary significantly by country → set account spend limits to prevent surprises</p>
+<hr>
+<h3>STEP 10 — MESSAGE FORMAT DEEP DIVE</h3>
+<p><strong>What Email Subscribers Actually Receive:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>From: ShopNow Ops &lt;no-reply@sns.amazonaws.com&gt;
+</span>Subject: ALERT: Web Server Disk Full
+Body:
+─────────────────────────────────
+Disk usage on shopnow-web-01 has reached 95%. Immediate action required.
+
+─────────────────────────────────
+If you wish to stop receiving notifications from this topic, please click 
+or visit the link below to unsubscribe:
+https://sns.ap-south-1.amazonaws.com/unsubscribe.html?...
+
+Please do not reply directly to this email...</code></pre></div>
+<p>→ The "From" address is always <code>no-reply@sns.amazonaws.com</code><br>
+→ You CANNOT customize the sender email address in standard SNS<br>
+→ The subject comes from the "Subject" field during publish<br>
+→ The unsubscribe link is automatically appended</p>
+<p><strong>What Email-JSON Subscribers Receive:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Type": "Notification",
+  "MessageId": "a1b2c3d4-5678-90ab-cdef-EXAMPLE11111",
+  "TopicArn": "arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts",
+  "Subject": "ALERT: Web Server Disk Full",
+  "Message": "Disk usage on shopnow-web-01 has reached 95%...",
+  "Timestamp": "2025-01-15T23:45:00.000Z",
+  "SignatureVersion": "1",
+  "Signature": "EXAMPLEpH+...",
+  "SigningCertURL": "https://sns.ap-south-1.amazonaws.com/...",
+  "UnsubscribeURL": "https://sns.ap-south-1.amazonaws.com/unsubscribe.html?...",
+  "MessageAttributes": {
+    "severity": {
+      "Type": "String",
+      "Value": "CRITICAL"
+    },
+    "service": {
+      "Type": "String",
+      "Value": "web-server"
+    }
+  }
+}</code></pre></div>
+<p>→ Email-JSON provides the FULL structured message including metadata<br>
+→ Useful for email integrations that parse JSON (PagerDuty, Slack via email)<br>
+→ The Signature and SigningCertURL allow recipients to VERIFY the message came from AWS SNS</p>
+<p><strong>What SQS Subscribers Receive:</strong></p>
+<p>→ SQS receives the FULL JSON envelope (same as Email-JSON format)<br>
+→ The message is placed in the SQS queue (Project 7)<br>
+→ A consumer application reads the SQS message → parses the JSON → processes it<br>
+→ This is the foundation of the SNS-SQS fan-out pattern (Project 13)</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create separate topics for separate concerns (ops alerts, business events, batch notifications)<br>
+→ Always use subscription filter policies to reduce noise for each subscriber<br>
+→ Always confirm email subscriptions immediately — pending subscriptions auto-delete after 3 days<br>
+→ Always use message attributes for categorization (severity, service, environment)<br>
+→ Always configure access policies with conditions (SourceArn, SourceAccount) when allowing services to publish<br>
+→ Always enable delivery status logging for debugging<br>
+→ Always set SMS account spend limits to prevent cost surprises<br>
+→ Always use custom payloads per protocol when email and programmatic consumers need different formats<br>
+→ Always configure DLQ for HTTP/SQS/Lambda subscriptions to capture failed deliveries<br>
+→ Always encrypt topics with KMS when messages contain sensitive data<br>
+→ Always use descriptive topic names that indicate their purpose<br>
+→ Always test the full flow: Publish → Confirm delivery → Verify filter policies</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never create one giant topic for ALL notifications — subscribers get overwhelmed with irrelevant messages<br>
+→ Never skip subscription confirmation — unconfirmed subscriptions receive nothing and auto-delete<br>
+→ Never allow <code>sns:Publish</code> to a topic without conditions — anyone who knows the ARN could publish<br>
+→ Never rely solely on SMS for critical alerts — SMS has no retry and can fail silently<br>
+→ Never use Promotional SMS type for critical operational alerts — lower delivery priority<br>
+→ Never assume message order in Standard topics — messages may arrive out of order<br>
+→ Never publish sensitive data (passwords, PII) in SNS messages without encryption<br>
+→ Never ignore the SNS SMS sandbox for new accounts — messages won't deliver to unverified numbers<br>
+→ Never forget that SNS is REGIONAL — a topic in <code>ap-south-1</code> cannot be subscribed to from <code>us-east-1</code> directly<br>
+→ Never use SNS for large payloads — maximum message size is 256 KB<br>
+→ Never assume email delivery is instant — email goes through standard email infrastructure with possible delays</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>SNS Solution</th></tr></thead><tbody><tr><td>Server alert → notify multiple people</td><td>SNS Topic with Email + SMS subscriptions</td></tr><tr><td>S3 upload → trigger processing</td><td>SNS Topic → SQS subscription → consumer processes (Project 13, 15)</td></tr><tr><td>CloudWatch alarm → page on-call</td><td>SNS Topic with SMS subscription (Project 8)</td></tr><tr><td>One event → trigger multiple systems</td><td>SNS Fan-out → multiple SQS queues as subscribers (Project 13)</td></tr><tr><td>Send mobile push notifications</td><td>SNS Platform Application → device endpoints</td></tr><tr><td>Filtered delivery — different teams get different alerts</td><td>Message Attributes + Subscription Filter Policies</td></tr><tr><td>Cross-account notifications</td><td>Topic access policy allowing other account (Project 41)</td></tr><tr><td>Critical alerts — must not be lost</td><td>DLQ on subscription + monitoring DLQ depth</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use SNS for message QUEUING (store and process later) → Use SQS (Project 7)<br>
+→ Do NOT use SNS for large file transfer → messages max 256 KB → Use S3 with presigned URLs<br>
+→ Do NOT use SNS for guaranteed message ordering → Standard topics don't guarantee order → Use SQS FIFO<br>
+→ Do NOT use SNS for point-to-point messaging (one sender → one receiver) → Use SQS directly<br>
+→ Do NOT use SNS for real-time streaming data → Use Kinesis (Project 52)<br>
+→ Do NOT use SNS for complex event processing / routing → Use EventBridge (Project 38)<br>
+→ Do NOT use SNS for workflow orchestration → Use Step Functions (Project 32)<br>
+→ Do NOT use SNS when you need custom sender email addresses → Use SES (Simple Email Service)<br>
+→ Do NOT use SNS for chat/interactive messaging → Use Amazon Chime or third-party services</p>
+<p><strong>SNS vs EventBridge (Common Confusion):</strong></p>
+<table><thead><tr><th>Feature</th><th>SNS</th><th>EventBridge</th></tr></thead><tbody><tr><td>Pattern</td><td>Simple pub/sub fan-out</td><td>Event bus with content-based routing</td></tr><tr><td>Filtering</td><td>Message attributes only</td><td>Full event body JSON matching</td></tr><tr><td>Targets</td><td>Protocols (Email, SMS, SQS, Lambda, HTTP)</td><td>20+ AWS services as direct targets</td></tr><tr><td>Third-party integration</td><td>Limited</td><td>Built-in (Datadog, PagerDuty, Zendesk, etc.)</td></tr><tr><td>Schema registry</td><td>No</td><td>Yes</td></tr><tr><td>Archive and replay</td><td>No</td><td>Yes</td></tr><tr><td>Use when</td><td>Simple fan-out, email/SMS alerts</td><td>Complex event routing, multiple event sources</td></tr></tbody></table>
+<p>→ SNS is simpler and better for basic alerting<br>
+→ EventBridge (Project 38) is more powerful for event-driven architectures</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → SNS ARCHITECTURE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PUBLISHERS                    SNS SERVICE                     SUBSCRIBERS
+</span>                         ┌─────────────────────┐
+┌────────────┐           │                     │           ┌────────────┐
+│ CloudWatch │──Publish─►│   Topic:            │──Email───►│ SMTP       │
+│ Alarm      │           │   shopnow-ops-alerts│           │ Service    │
+└────────────┘           │                     │           └────────────┘
+                         │   ┌───────────────┐ │
+┌────────────┐           │   │ Subscription  │ │           ┌────────────┐
+│ S3 Event   │──Publish─►│   │ Registry      │ │──SMS────►│ SMS        │
+│            │           │   │               │ │           │ Gateway    │
+└────────────┘           │   │ - Email sub 1 │ │           └────────────┘
+                         │   │ - Email sub 2 │ │
+┌────────────┐           │   │ - SMS sub 1   │ │           ┌────────────┐
+│ Application│──Publish─►│   │ - SQS sub 1   │ │──SQS────►│ SQS Queue  │
+│ Code       │           │   │ - Lambda sub 1│ │           │            │
+└────────────┘           │   └───────────────┘ │           └────────────┘
+                         │                     │
+                         │   ┌───────────────┐ │           ┌────────────┐
+                         │   │ Filter Engine │ │──Lambda──►│ Lambda     │
+                         │   │ (per sub)     │ │           │ Function   │
+                         │   └───────────────┘ │           └────────────┘
+                         │                     │
+                         └─────────────────────┘</code></pre></div>
+<p>→ SNS is a FULLY MANAGED service — no servers to provision<br>
+→ Runs across multiple AZs within a region automatically<br>
+→ Messages are stored redundantly until delivered or expired</p>
+<hr>
+<h3>2 → WHAT HAPPENS WHEN A MESSAGE IS PUBLISHED</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Publisher calls sns:Publish API
+</span>        │
+        ▼
+Step 1: SNS authenticates the request (IAM — Project 2)
+        │
+        ▼
+Step 2: SNS checks Topic Access Policy
+        Does the publisher have permission to publish to this topic?
+        │
+        ├── IAM policy says Allow? AND Topic policy doesn't Deny? → Proceed
+        │
+        └── Denied → Return 403 error
+        │
+        ▼
+Step 3: Message stored redundantly across multiple AZs
+        (ensures message is not lost if one AZ fails)
+        │
+        ▼
+Step 4: SNS retrieves ALL confirmed subscriptions for the topic
+        │
+        ▼
+Step 5: For EACH subscription:
+        │
+        ├── Step 5a: Evaluate filter policy (if any)
+        │   Does message attributes match filter? 
+        │   ├── YES → Proceed to delivery
+        │   └── NO → Skip this subscription (message filtered out)
+        │
+        ├── Step 5b: Format message for the protocol
+        │   Email → Subject + Body + Unsubscribe link
+        │   SMS → Truncated to 160 chars (or multi-part for longer)
+        │   SQS → Full JSON envelope
+        │   Lambda → Full JSON envelope (invoked asynchronously)
+        │   HTTP → Full JSON POST to endpoint URL
+        │
+        └── Step 5c: Deliver to endpoint
+            │
+            ├── Success → Log delivery status (if enabled)
+            │
+            └── Failure → Retry based on protocol policy
+                │
+                ├── Retries exhausted → Send to DLQ (if configured)
+                │
+                └── No DLQ → Message LOST for this subscription
+        │
+        ▼
+Step 6: Return MessageId to publisher
+        (Publisher gets MessageId BEFORE all deliveries complete)
+        (Publishing is ASYNCHRONOUS — publisher doesn't wait for all deliveries)</code></pre></div>
+<p>→ KEY: Publishing is ASYNCHRONOUS<br>
+→ The Publish API returns immediately after the message is stored<br>
+→ Actual delivery to subscribers happens in the background<br>
+→ Publisher does NOT know if all subscribers received the message</p>
+<hr>
+<h3>3 → HOW FILTER POLICIES WORK INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message arrives with attributes:
+</span>  severity = "CRITICAL"
+  service = "web-server"
+
+Subscription filter policy:
+  {"severity": ["CRITICAL", "WARNING"]}
+
+Evaluation:
+  1. Message has attribute "severity"? → YES
+  2. Value "CRITICAL" in allowed list ["CRITICAL", "WARNING"]? → YES
+  3. All filter conditions satisfied? → YES
+  4. RESULT: DELIVER
+
+Another subscription filter:
+  {"severity": ["INFO"], "service": ["batch-processor"]}
+
+Evaluation:
+  1. Message has "severity"? → YES. Value "CRITICAL" in ["INFO"]? → NO
+  2. RESULT: DO NOT DELIVER (first condition failed — short-circuit)</code></pre></div>
+<p>→ Filter evaluation happens INSIDE the SNS service — BEFORE delivery<br>
+→ Filtered-out messages are NOT counted as delivery failures<br>
+→ Filtered-out messages are NOT sent to DLQ<br>
+→ They simply don't match → SNS skips that subscription silently</p>
+<p><strong>Filter Policy Limits:</strong></p>
+<table><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody><tr><td>Filter policies per topic</td><td>200 (one per subscription)</td></tr><tr><td>Filter policy size</td><td>256 KB</td></tr><tr><td>Attributes per filter policy</td><td>5 (can request increase to 10)</td></tr><tr><td>Values per attribute</td><td>150</td></tr><tr><td>Nesting depth</td><td>4 levels for message body filtering</td></tr></tbody></table>
+<hr>
+<h3>4 → HOW EMAIL DELIVERY WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SNS decides to deliver to email subscription
+</span>        │
+        ▼
+Step 1: SNS formats the email
+        From: no-reply@sns.amazonaws.com
+        To: ops-team@shopnow.com
+        Subject: [from Publish call]
+        Body: [message + unsubscribe link]
+        │
+        ▼
+Step 2: SNS sends via AWS's internal SMTP infrastructure
+        │
+        ▼
+Step 3: Email enters standard internet email routing
+        SNS → AWS SMTP → Recipient's MX server → Recipient's inbox
+        │
+        ▼
+Step 4: Email may be:
+        ├── Delivered to inbox ✓
+        ├── Delivered to spam/junk folder (common with automated emails)
+        ├── Bounced (invalid email address)
+        └── Silently dropped by recipient's email server</code></pre></div>
+<p>→ SNS has NO visibility into whether the email actually reached the inbox<br>
+→ "Delivery status logging" for email shows SNS sent it — not that recipient read it<br>
+→ Email delivery is BEST-EFFORT — no retries, no DLQ support<br>
+→ For reliable email delivery → use Amazon SES (Simple Email Service) with bounce/complaint handling</p>
+<hr>
+<h3>5 → HOW SMS DELIVERY WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SNS decides to deliver SMS
+</span>        │
+        ▼
+Step 1: SNS determines message type (Transactional/Promotional)
+        │
+        ▼
+Step 2: SNS routes through carrier aggregator
+        │
+        ├── Transactional: Higher priority route → faster delivery
+        └── Promotional: Standard route → may be slower, may be filtered
+        │
+        ▼
+Step 3: Carrier aggregator → Mobile carrier → Recipient's phone
+        │
+        ▼
+Step 4: SMS may be:
+        ├── Delivered ✓
+        ├── Failed (phone off, invalid number)
+        ├── Blocked by carrier (DND — Do Not Disturb registry in India)
+        └── Delayed (carrier congestion)</code></pre></div>
+<p>→ India has DND (Do Not Disturb) regulations<br>
+→ Promotional SMS to DND-registered numbers are BLOCKED by carriers<br>
+→ Transactional SMS can bypass DND (for OTPs, alerts) but requires proper sender ID registration<br>
+→ SMS delivery rates vary by country and carrier</p>
+<hr>
+<h3>6 → SNS LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>Topics per account per region</td><td>100,000</td></tr><tr><td>Subscriptions per topic</td><td>12,500,000</td></tr><tr><td>Messages published per second (Standard)</td><td>Virtually unlimited</td></tr><tr><td>Messages published per second (FIFO)</td><td>300 (3,000 with batching)</td></tr><tr><td>Message size</td><td>256 KB</td></tr><tr><td>Message attribute count</td><td>10 per message</td></tr><tr><td>Filter policies per account</td><td>200 per topic</td></tr><tr><td>SMS messages per second</td><td>1 (US) — varies by country</td></tr><tr><td>Email deliveries per second</td><td>No hard limit but throttled by SES infrastructure</td></tr></tbody></table>
+<p>→ 256 KB message size limit is important<br>
+→ If you need to send larger data → send a REFERENCE (S3 key, database ID) not the actual data<br>
+→ This is the "claim check" pattern — publish small message with pointer → consumer retrieves full data from S3</p>
+<hr>
+<h3>7 → PRICING MODEL</h3>
+<table><thead><tr><th>Component</th><th>Cost</th></tr></thead><tbody><tr><td>First 1 million SNS requests/month</td><td>Free</td></tr><tr><td>Subsequent SNS requests</td><td>$0.50 per million</td></tr><tr><td>Email notifications</td><td>$2.00 per 100,000</td></tr><tr><td>SMS notifications</td><td>Varies by country ($0.00223 for India)</td></tr><tr><td>HTTP/HTTPS notifications</td><td>$0.06 per 100,000</td></tr><tr><td>SQS notifications</td><td>No additional SNS charge (SQS charges apply)</td></tr><tr><td>Lambda notifications</td><td>No additional SNS charge (Lambda charges apply)</td></tr><tr><td>Data transfer</td><td>First 1 GB free, then standard rates</td></tr></tbody></table>
+<p>→ SNS is very cheap for most use cases<br>
+→ SMS is the most expensive delivery method — budget accordingly<br>
+→ SQS and Lambda deliveries are essentially free from SNS side</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Forgot to confirm email subscription</td><td>Subscription stays "Pending" → auto-deletes in 3 days → no notifications</td><td>Confirm immediately, check spam folder for confirmation email</td></tr><tr><td>2</td><td>SNS emails going to spam</td><td>Recipients never see alerts</td><td>Add <code>no-reply@sns.amazonaws.com</code> to safe senders, use SES for important emails</td></tr><tr><td>3</td><td>Topic access policy missing service principal</td><td>S3/CloudWatch can't publish → silent failure</td><td>Add service principal with SourceArn condition</td></tr><tr><td>4</td><td>Filter policy too restrictive</td><td>Subscriber receives no messages — thinks SNS is broken</td><td>Test filter policies by publishing test messages with various attributes</td></tr><tr><td>5</td><td>SMS sandbox not exited</td><td>SMS only reaches verified numbers → on-call doesn't get alerts</td><td>Request production SMS access from AWS Support</td></tr><tr><td>6</td><td>No DLQ configured for HTTP endpoints</td><td>Failed deliveries lost forever</td><td>Always configure DLQ for HTTP/Lambda/SQS subscriptions</td></tr><tr><td>7</td><td>Message exceeds 256 KB</td><td>Publish API returns error</td><td>Use claim-check pattern — publish S3 key, consumer retrieves full data</td></tr><tr><td>8</td><td>Using Standard topic expecting message ordering</td><td>Messages arrive out of order → processing logic breaks</td><td>Use FIFO topic if ordering matters, or design consumer to be order-independent</td></tr><tr><td>9</td><td>Single subscriber for critical alerts</td><td>That person is on vacation → alerts go unseen</td><td>Multiple subscribers + multiple channels (email + SMS + Slack)</td></tr><tr><td>10</td><td>Publishing without message attributes</td><td>Cannot use filter policies → all subscribers get all messages</td><td>Always include relevant attributes even if not filtering today</td></tr><tr><td>11</td><td>Encryption with AWS managed key + cross-account subscriber</td><td>Cross-account SQS can't decrypt → delivery fails silently</td><td>Use Customer Managed KMS key with cross-account key policy (Project 36)</td></tr><tr><td>12</td><td>SMS spend limit too low</td><td>Monthly limit reached → all SMS stops → critical alerts not sent</td><td>Monitor SMS spend, set appropriate limits, have email backup</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Message Throughput</strong></p>
+<ul>
+<li>Standard topics: Virtually unlimited publishing rate</li>
+<li>FIFO topics: 300 msg/sec (3,000 with batching) — significant limitation</li>
+<li>Fan-out to millions of subscribers is supported</li>
+<li>SNS scales automatically — no capacity planning needed</li>
+</ul>
+<p>→ <strong>Subscription Scalability</strong></p>
+<ul>
+<li>12.5 million subscriptions per topic</li>
+<li>Filter policies allow selective delivery without creating multiple topics</li>
+<li>For very different subscriber groups → use separate topics (cleaner than complex filters)</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Email/HTTP are extremely cheap → scale freely</li>
+<li>SMS costs scale linearly with volume → budget carefully for large-scale SMS</li>
+<li>SQS/Lambda deliveries add minimal SNS cost → most cost is on the SQS/Lambda side</li>
+</ul>
+<p>→ <strong>Multi-Region Scalability</strong></p>
+<ul>
+<li>Topics are regional → create topics in each region where publishers exist</li>
+<li>Cross-region: Publisher in us-east-1 can publish to topic in ap-south-1 (higher latency)</li>
+<li>For global architectures → consider EventBridge global endpoints</li>
+</ul>
+<p>→ <strong>Operational Scalability</strong></p>
+<ul>
+<li>Hundreds of topics per account are manageable</li>
+<li>Use naming conventions: <code>{team}-{env}-{purpose}</code></li>
+<li>Use tags for cost allocation and organizational management</li>
+<li>Infrastructure as Code (CloudFormation/Terraform) for managing topics at scale</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify SNS is working correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Topic exists</td><td>SNS Console → Topics → Verify topic listed</td></tr><tr><td>Subscriptions confirmed</td><td>SNS Console → Subscriptions → Status column: "Confirmed"</td></tr><tr><td>Access policy correct</td><td>Select topic → Edit → Access policy → Verify service principals and conditions</td></tr><tr><td>Filter policies correct</td><td>Select subscription → Details → Filter policy → Verify JSON</td></tr><tr><td>Messages delivered</td><td>Publish test message → Check email/SMS/SQS for receipt</td></tr><tr><td>Delivery status logged</td><td>CloudWatch Logs → Log group: <code>sns/{region}/{account}/{topic}</code></td></tr></tbody></table>
+<p>→ <strong>How to debug "subscriber didn't receive message":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Is the subscription confirmed?
+</span>        SNS Console → Subscriptions → Status
+        If "Pending confirmation" → Not confirmed → Click resend confirmation
+
+STEP 2: Is there a filter policy filtering out the message?
+        Check subscription filter policy
+        Compare with message attributes used during publish
+        If mismatch → message was filtered → not a bug
+
+STEP 3: Did SNS attempt delivery?
+        Check delivery status logs in CloudWatch
+        If no log entry → message was filtered or subscription wasn't matched
+
+STEP 4: Did delivery fail?
+        Check CloudWatch delivery status for failures
+        Check DLQ (if configured) for failed messages
+
+STEP 5: For email — check spam/junk folder
+        AWS SNS emails are often flagged as spam
+
+STEP 6: For SMS — check SMS delivery logs
+        SNS Console → Mobile → Text messaging → Statistics
+        Check for failures by country/carrier
+
+STEP 7: For SQS — check the SQS queue
+        SQS Console → Select queue → Check "Messages available"
+        If message is in queue → SNS delivered successfully → issue is on consumer side
+
+STEP 8: For cross-service publishing (S3, CloudWatch)
+        Check topic access policy → Verify service principal and conditions
+        Check CloudTrail for SNS:Publish calls → Look for errors</code></pre></div>
+<p>→ <strong>Monitoring Dashboards:</strong></p>
+<table><thead><tr><th>Metric</th><th>CloudWatch Metric Name</th><th>What It Tells You</th></tr></thead><tbody><tr><td>Messages published</td><td>NumberOfMessagesPublished</td><td>How many messages sent to topic</td></tr><tr><td>Notifications delivered</td><td>NumberOfNotificationsDelivered</td><td>Successful deliveries</td></tr><tr><td>Notifications failed</td><td>NumberOfNotificationsFailed</td><td>Failed deliveries</td></tr><tr><td>Notifications filtered</td><td>NumberOfNotificationsFilteredOut</td><td>Messages filtered by subscription policies</td></tr><tr><td>SMS success rate</td><td>SMSSuccessRate</td><td>Percentage of SMS delivered</td></tr><tr><td>Publish size</td><td>PublishSize</td><td>Average message size in bytes</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ SNS is the PUB/SUB backbone of AWS — one message published, many subscribers notified simultaneously<br>
+→ Topics are the central routing point — publishers and subscribers are completely decoupled<br>
+→ Subscription confirmation is MANDATORY for Email/HTTP — unconfirmed = no delivery<br>
+→ Filter policies enable surgical message delivery without creating many topics<br>
+→ Topic access policies control which AWS services and accounts can publish<br>
+→ SNS is asynchronous — publisher doesn't wait for delivery, gets MessageId immediately<br>
+→ Standard topics have virtually unlimited throughput but no ordering guarantee<br>
+→ FIFO topics guarantee ordering but are limited to 300 msg/sec</p>
+<p>→ Connection to Project 2: IAM policies control who can publish/subscribe (<code>sns:Publish</code>, <code>sns:Subscribe</code>)<br>
+→ Connection to Project 1: S3 can publish events to SNS topics (Project 15)<br>
+→ Connection to Project 4: SNS itself doesn't need VPC/SG — it's a managed service accessed via API endpoints</p>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 7: SQS queues — often paired with SNS in fan-out pattern</li>
+<li>Project 8: CloudWatch alarms publish to SNS topics for notifications</li>
+<li>Project 13: SNS → SQS fan-out pattern (one event → multiple processing queues)</li>
+<li>Project 15: S3 event notifications → SNS → multiple subscribers</li>
+<li>Project 26: SNS → SQS → Lambda event-driven pipeline</li>
+<li>Project 41: Cross-account SNS → SQS notification pattern</li>
+<li>Project 49: Complex pipeline with SNS alerts on success/failure</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has SNS topics for notifications<br>
+→ But the catalog team says: "We don't just want to be NOTIFIED about new images — we want to PROCESS them"<br>
+→ When a notification comes in — they need to:</p>
+<ul>
+<li>Resize the image</li>
+<li>Generate a thumbnail</li>
+<li>Update the product catalog database<br>
+→ But what if 1,000 images are uploaded simultaneously?</li>
+<li>The processing system can only handle 10 images per second</li>
+<li>The remaining 990 messages need to WAIT in line</li>
+<li>If the processor crashes — the messages should NOT be lost</li>
+<li>When the processor restarts — it should pick up where it left off</li>
+</ul>
+<p>→ This is NOT a notification problem — this is a QUEUING problem<br>
+→ SNS says "here's a message — deal with it NOW"<br>
+→ What they need is: "here's a message — hold it until I'm READY to process it"</p>
+<p>→ <strong>This is exactly what Project 7 solves</strong><br>
+→ Project 7 introduces SQS (Simple Queue Service) — the message queuing service<br>
+→ SQS holds messages until a consumer is ready to process them<br>
+→ It provides durability (messages survive consumer crashes), ordering (FIFO), and backpressure (queue absorbs spikes)<br>
+→ Together, SNS + SQS (Project 13) form the most powerful messaging pattern in AWS</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 7: "The Orders That Disappeared During Peak Hours — SQS Queue &amp; Message Lifecycle"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-5.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 6/60</span></div><a class="nav-btn next" href="project-7.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

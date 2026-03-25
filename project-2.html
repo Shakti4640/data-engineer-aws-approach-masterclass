@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 2: THE INTERN WHO DELETED PRODUCTION — IAM Users, Groups, Policies &amp; — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 2: THE INTERN WHO DELETED PRODUCTION — IAM Users, Groups, Policies &amp; Permission Boundaries</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Project 1) now has their S3 bucket running with product images and invoices<br>
+→ The company has 15 employees sharing ONE AWS root account login<br>
+→ Everyone logs in with the same email and password<br>
+→ Last Tuesday — an intern was exploring the AWS console<br>
+→ He saw the S3 bucket <code>shopnow-productimages-prod-aps1</code><br>
+→ He thought it was a test bucket → Clicked "Delete" → Confirmed deletion<br>
+→ 6 months of product images — gone<br>
+→ The CTO screams: "WHO DID THIS?"<br>
+→ Nobody knows — because everyone used the same login — no audit trail<br>
+→ The CEO asks three questions:</p>
+<ul>
+<li>How do we give each person their OWN login?</li>
+<li>How do we RESTRICT what each person can do?</li>
+<li>How do we TRACK who did what?<br>
+→ Additionally — the marketing team should ONLY see the <code>marketing/</code> prefix in S3<br>
+→ The finance team should ONLY access the <code>invoices/</code> prefix<br>
+→ Developers should have broader access but NEVER be able to delete buckets<br>
+→ The intern should have READ-ONLY access to everything</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is an Identity and Access Management (IAM) problem<br>
+→ IAM answers THREE fundamental questions in AWS:</p>
+<table><thead><tr><th>Question</th><th>IAM Concept</th></tr></thead><tbody><tr><td>WHO is making the request?</td><td>Identity (User, Role, Federated Identity)</td></tr><tr><td>WHAT are they trying to do?</td><td>Action (s3:GetObject, s3:DeleteBucket, ec2:StartInstances)</td></tr><tr><td>ON WHICH resource?</td><td>Resource (specific bucket ARN, specific EC2 instance ARN)</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Secure the root account (never use it for daily work)</li>
+<li>Step 2 — Create IAM users (individual identities)</li>
+<li>Step 3 — Create IAM groups (logical grouping by role/department)</li>
+<li>Step 4 — Create/attach IAM policies (permission documents)</li>
+<li>Step 5 — Understand policy evaluation logic (how AWS decides Allow/Deny)</li>
+<li>Step 6 — Understand ARN format (how resources are identified)</li>
+<li>Step 7 — Understand Permission Boundaries (ceiling on permissions)</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — SECURE THE ROOT ACCOUNT</h3>
+<p>→ Navigate to AWS Console → Click account name (top-right) → "Security credentials"</p>
+<p><strong>What is the Root Account?</strong><br>
+→ The email address used to CREATE the AWS account<br>
+→ It has UNLIMITED access to EVERYTHING — no policy can restrict it<br>
+→ It can close the account, change billing, delete all resources<br>
+→ It is the single most dangerous credential in your entire AWS environment</p>
+<p><strong>Configuration Actions:</strong></p>
+<table><thead><tr><th>Action</th><th>Where</th><th>Setting</th></tr></thead><tbody><tr><td>Enable MFA on root</td><td>Security credentials → MFA → Assign MFA device</td><td>Virtual MFA (Google Authenticator / Authy) or Hardware MFA key</td></tr><tr><td>Create strong password</td><td>Security credentials → Change password</td><td>20+ characters, random, stored in password manager</td></tr><tr><td>Do NOT create access keys for root</td><td>Security credentials → Access keys</td><td>Should show "No access keys" — NEVER create them</td></tr><tr><td>Store root credentials in vault</td><td>Offline</td><td>Physical safe or enterprise vault (not a sticky note)</td></tr></tbody></table>
+<p>→ After this — the root account should be used ONLY for:</p>
+<ul>
+<li>Changing account-level settings (billing, closing account)</li>
+<li>Restoring IAM access if all IAM admins are locked out</li>
+<li>Specific tasks that ONLY root can do (very few exist)</li>
+</ul>
+<p>→ For ALL daily work — use IAM users (next step)</p>
+<hr>
+<h3>STEP 2 — CREATE IAM USERS</h3>
+<p>→ Navigate to IAM Console → Users → "Create user"</p>
+<p><strong>ShopNow needs these users:</strong></p>
+<table><thead><tr><th>User</th><th>Department</th><th>Access Needed</th></tr></thead><tbody><tr><td>rahul-cto</td><td>Technology</td><td>Full admin access</td></tr><tr><td>priya-dev</td><td>Development</td><td>Broad access, no bucket deletion</td></tr><tr><td>amit-finance</td><td>Finance</td><td>S3 invoices prefix only</td></tr><tr><td>neha-marketing</td><td>Marketing</td><td>S3 marketing prefix only</td></tr><tr><td>arjun-intern</td><td>Intern</td><td>Read-only everything</td></tr></tbody></table>
+<p><strong>For each user — Creation Settings:</strong></p>
+<p><strong>Setting 1: User name</strong><br>
+→ Convention: <code>firstname-role</code> or <code>firstname-department</code><br>
+→ Must be unique within the AWS account<br>
+→ Example: <code>priya-dev</code></p>
+<p><strong>Setting 2: Access Type</strong></p>
+<table><thead><tr><th>Access Type</th><th>What It Provides</th><th>When to Enable</th></tr></thead><tbody><tr><td>AWS Management Console access</td><td>Username + password login to console</td><td>For humans who need to click around the console</td></tr><tr><td>Programmatic access (Access Keys)</td><td>Access Key ID + Secret Access Key</td><td>For CLI, SDK, API calls — NOT for console login</td></tr></tbody></table>
+<p>→ For ShopNow employees → Enable Console access<br>
+→ Programmatic access → Only for <code>priya-dev</code> who uses AWS CLI<br>
+→ Access Keys are covered later in this project</p>
+<p><strong>Setting 3: Console password</strong></p>
+<table><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody><tr><td>Autogenerated password</td><td>AWS creates a random password</td></tr><tr><td>Custom password</td><td>You define the password</td></tr><tr><td>Require password reset on first sign-in</td><td>User MUST change password on first login</td></tr></tbody></table>
+<p>→ Choose: Autogenerated + Require reset = YES<br>
+→ This ensures each user sets their own password</p>
+<p><strong>Setting 4: Permissions</strong><br>
+→ Skip for now — we will attach via Groups (Step 3)<br>
+→ NEVER attach policies directly to individual users (explained in Should Not Do)</p>
+<p><strong>Setting 5: Tags</strong></p>
+<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody><tr><td>Department</td><td>Development</td></tr><tr><td>CostCenter</td><td>CC-1001</td></tr><tr><td>Manager</td><td>rahul-cto</td></tr></tbody></table>
+<p>→ Click "Create user"<br>
+→ CRITICAL: Download or copy the sign-in URL, username, and temporary password<br>
+→ The sign-in URL format: <code>https://{account-id}.signin.aws.amazon.com/console</code><br>
+→ Or create an account alias: <code>https://shopnow.signin.aws.amazon.com/console</code></p>
+<p><strong>Setting Account Alias:</strong><br>
+→ IAM Console → Dashboard → "Account Alias" → Create alias → <code>shopnow</code><br>
+→ Now users sign in at <code>https://shopnow.signin.aws.amazon.com/console</code></p>
+<hr>
+<h3>STEP 3 — CREATE IAM GROUPS</h3>
+<p>→ IAM Console → User groups → "Create group"</p>
+<p><strong>Why Groups?</strong><br>
+→ Imagine ShopNow grows from 15 to 150 employees<br>
+→ If you attach policies to each user individually → 150 separate policy attachments to manage<br>
+→ If 50 developers all need the same permissions → change policy once on the group → all 50 inherit it<br>
+→ Groups are the management layer between users and policies</p>
+<p><strong>ShopNow Group Structure:</strong></p>
+<table><thead><tr><th>Group Name</th><th>Members</th><th>Purpose</th></tr></thead><tbody><tr><td><code>admins</code></td><td>rahul-cto</td><td>Full AWS access</td></tr><tr><td><code>developers</code></td><td>priya-dev</td><td>Broad access with restrictions</td></tr><tr><td><code>finance-team</code></td><td>amit-finance</td><td>S3 invoices only</td></tr><tr><td><code>marketing-team</code></td><td>neha-marketing</td><td>S3 marketing only</td></tr><tr><td><code>read-only-users</code></td><td>arjun-intern</td><td>View everything, change nothing</td></tr></tbody></table>
+<p><strong>Creation Settings per Group:</strong></p>
+<p>→ Group name: <code>developers</code><br>
+→ Attach policies: (next step — we create the policies first)<br>
+→ Click "Create group"</p>
+<p><strong>Important Rules about Groups:</strong></p>
+<table><thead><tr><th>Rule</th><th>Detail</th></tr></thead><tbody><tr><td>A user can belong to multiple groups</td><td><code>priya-dev</code> can be in both <code>developers</code> and <code>read-only-users</code></td></tr><tr><td>Groups CANNOT be nested</td><td>You cannot put <code>developers</code> group inside <code>admins</code> group</td></tr><tr><td>Groups are NOT identities</td><td>You cannot use a group as a "Principal" in a resource policy</td></tr><tr><td>Maximum groups per account</td><td>300 (soft limit)</td></tr><tr><td>Maximum groups per user</td><td>10</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — UNDERSTAND IAM POLICY STRUCTURE (THE CORE OF IAM)</h3>
+<p>→ Before creating policies — you MUST understand the JSON structure<br>
+→ Every permission in AWS is defined as a JSON policy document</p>
+<p><strong>The Anatomy of an IAM Policy:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowReadProductImages",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::shopnow-productimages-prod-aps1",
+        "arn:aws:s3:::shopnow-productimages-prod-aps1/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["marketing/*"]
+        }
+      }
+    }
+  ]
+}</code></pre></div>
+<p><strong>Every field explained:</strong></p>
+<hr>
+<p><strong>Field 1: Version</strong><br>
+→ Always <code>"2012-10-17"</code> — this is the policy language version<br>
+→ There is an older version <code>"2008-10-17"</code> — NEVER use it<br>
+→ The old version doesn't support policy variables like <code>${aws:username}</code><br>
+→ This is NOT the date you created the policy</p>
+<hr>
+<p><strong>Field 2: Statement</strong><br>
+→ An array of permission rules<br>
+→ A single policy can have multiple statements<br>
+→ Each statement is independently evaluated</p>
+<hr>
+<p><strong>Field 3: Sid (Statement ID)</strong><br>
+→ Optional — human-readable label for the statement<br>
+→ Must be unique within the policy<br>
+→ Example: <code>"AllowReadProductImages"</code>, <code>"DenyBucketDeletion"</code><br>
+→ Has NO functional impact — purely for readability and debugging</p>
+<hr>
+<p><strong>Field 4: Effect</strong></p>
+<table><thead><tr><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td><code>"Allow"</code></td><td>Grants the specified permissions</td></tr><tr><td><code>"Deny"</code></td><td>Explicitly blocks the specified permissions</td></tr></tbody></table>
+<p>→ There are ONLY two values — no "Maybe" or "Conditional Allow"<br>
+→ Explicit Deny ALWAYS wins over Allow (critical — explained in evaluation logic)</p>
+<hr>
+<p><strong>Field 5: Action</strong><br>
+→ The specific AWS API operations being allowed or denied<br>
+→ Format: <code>service:APIOperation</code></p>
+<table><thead><tr><th>Example Action</th><th>What It Permits</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td>Download an object from S3</td></tr><tr><td><code>s3:PutObject</code></td><td>Upload an object to S3</td></tr><tr><td><code>s3:DeleteObject</code></td><td>Delete an object from S3</td></tr><tr><td><code>s3:DeleteBucket</code></td><td>Delete an entire S3 bucket</td></tr><tr><td><code>s3:ListBucket</code></td><td>List objects inside a bucket</td></tr><tr><td><code>s3:*</code></td><td>ALL S3 actions (wildcard)</td></tr><tr><td><code>*</code></td><td>ALL actions on ALL services (God mode)</td></tr></tbody></table>
+<p>→ Wildcards are powerful but dangerous<br>
+→ <code>s3:Get*</code> matches <code>s3:GetObject</code>, <code>s3:GetBucketPolicy</code>, <code>s3:GetBucketLocation</code>, etc.<br>
+→ Always prefer specific actions over wildcards for security</p>
+<hr>
+<p><strong>Field 6: Resource</strong><br>
+→ The specific AWS resource(s) the action applies to<br>
+→ Uses ARN (Amazon Resource Name) format</p>
+<p><strong>ARN Format Deep Dive:</strong></p>
+<code>arn:partition:service:region:account-id:resource-type/resource-id</code>
+<table><thead><tr><th>Component</th><th>Example</th><th>Explanation</th></tr></thead><tbody><tr><td><code>arn</code></td><td><code>arn</code></td><td>Fixed prefix — always "arn"</td></tr><tr><td><code>partition</code></td><td><code>aws</code></td><td><code>aws</code> for standard regions, <code>aws-cn</code> for China, <code>aws-us-gov</code> for GovCloud</td></tr><tr><td><code>service</code></td><td><code>s3</code></td><td>The AWS service name</td></tr><tr><td><code>region</code></td><td>`` (empty for S3)</td><td>S3 buckets are globally named, so region is omitted</td></tr><tr><td><code>account-id</code></td><td>`` (empty for S3)</td><td>S3 bucket names are globally unique, so account is omitted</td></tr><tr><td><code>resource-type/resource-id</code></td><td><code>shopnow-productimages-prod-aps1</code></td><td>The bucket name</td></tr></tbody></table>
+<p><strong>S3 ARN Patterns — CRITICAL to understand:</strong></p>
+<table><thead><tr><th>ARN</th><th>What It Refers To</th></tr></thead><tbody><tr><td><code>arn:aws:s3:::shopnow-productimages-prod-aps1</code></td><td>The BUCKET itself (for bucket-level operations like ListBucket)</td></tr><tr><td><code>arn:aws:s3:::shopnow-productimages-prod-aps1/*</code></td><td>ALL OBJECTS inside the bucket (for object-level operations like GetObject)</td></tr><tr><td><code>arn:aws:s3:::shopnow-productimages-prod-aps1/invoices/*</code></td><td>Only objects under the <code>invoices/</code> prefix</td></tr><tr><td><code>arn:aws:s3:::*</code></td><td>ALL buckets in ALL accounts (extremely broad)</td></tr></tbody></table>
+<p>→ Most common mistake: Forgetting that bucket-level and object-level ARNs are DIFFERENT<br>
+→ <code>s3:ListBucket</code> needs the bucket ARN (without <code>/*</code>)<br>
+→ <code>s3:GetObject</code> needs the object ARN (with <code>/*</code>)<br>
+→ If you mix them → "Access Denied" errors that are very hard to debug</p>
+<hr>
+<p><strong>Field 7: Condition (Optional)</strong><br>
+→ Adds extra requirements that must be true for the statement to apply</p>
+<table><thead><tr><th>Condition Operator</th><th>Example</th><th>Meaning</th></tr></thead><tbody><tr><td><code>StringEquals</code></td><td><code>"aws:RequestedRegion": "ap-south-1"</code></td><td>Only allow actions in Mumbai region</td></tr><tr><td><code>StringLike</code></td><td><code>"s3:prefix": ["marketing/*"]</code></td><td>Only allow listing objects with marketing prefix</td></tr><tr><td><code>IpAddress</code></td><td><code>"aws:SourceIp": "203.0.113.0/24"</code></td><td>Only allow from specific IP range</td></tr><tr><td><code>Bool</code></td><td><code>"aws:MultiFactorAuthPresent": "true"</code></td><td>Only allow if MFA is active on the session</td></tr><tr><td><code>DateGreaterThan</code></td><td><code>"aws:CurrentTime": "2025-01-01T00:00:00Z"</code></td><td>Only allow after a specific date</td></tr><tr><td><code>StringEquals</code></td><td><code>"aws:PrincipalTag/Department": "Finance"</code></td><td>Only allow if user has tag Department=Finance</td></tr></tbody></table>
+<p>→ Conditions make policies surgical — instead of broad allow/deny, you add precision</p>
+<hr>
+<h3>STEP 5 — CREATE POLICIES FOR SHOPNOW</h3>
+<hr>
+<p><strong>Policy 1: Admin Full Access (for <code>admins</code> group)</strong></p>
+<p>→ IAM Console → Policies → Search for <code>AdministratorAccess</code><br>
+→ This is an AWS MANAGED policy (pre-built by AWS)<br>
+→ It contains:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Effect: Allow
+</span>Action: *
+Resource: *</code></pre></div>
+<p>→ Attach to <code>admins</code> group → <code>rahul-cto</code> inherits it<br>
+→ This gives unlimited access to every service and every resource</p>
+<p><strong>Types of Policies:</strong></p>
+<table><thead><tr><th>Type</th><th>Created By</th><th>Managed By</th><th>Use Case</th></tr></thead><tbody><tr><td>AWS Managed Policies</td><td>AWS</td><td>AWS (auto-updated)</td><td>Common patterns — <code>ReadOnlyAccess</code>, <code>AdministratorAccess</code>, <code>AmazonS3FullAccess</code></td></tr><tr><td>Customer Managed Policies</td><td>You</td><td>You</td><td>Custom permissions specific to your organization</td></tr><tr><td>Inline Policies</td><td>You</td><td>You (attached to single user/group/role)</td><td>Rare — strict 1:1 relationship with a specific entity</td></tr></tbody></table>
+<p>→ Preference order: AWS Managed → Customer Managed → Inline (last resort)</p>
+<hr>
+<p><strong>Policy 2: Developer Access — Broad S3 but No Bucket Deletion (for <code>developers</code> group)</strong></p>
+<p>→ IAM Console → Policies → "Create policy" → JSON editor</p>
+<p>→ This is a CUSTOMER MANAGED POLICY</p>
+<p><strong>Logic:</strong><br>
+→ Statement 1: Allow all S3 actions on the ShopNow bucket<br>
+→ Statement 2: Explicitly DENY bucket deletion</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Policy Name: ShopNow-Developer-S3-Policy
+</span>
+Statement 1:
+  Sid: AllowS3BucketAccess
+  Effect: Allow
+  Action: s3:*
+  Resource: 
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/*
+
+Statement 2:
+  Sid: DenyBucketDeletion
+  Effect: Deny
+  Action: s3:DeleteBucket
+  Resource: arn:aws:s3:::shopnow-productimages-prod-aps1</code></pre></div>
+<p>→ Why does this work?<br>
+→ Statement 1 allows ALL S3 actions (including DeleteBucket)<br>
+→ Statement 2 explicitly denies DeleteBucket<br>
+→ Explicit Deny ALWAYS overrides Allow → <code>priya-dev</code> can do everything EXCEPT delete the bucket</p>
+<p>→ Attach this policy to <code>developers</code> group</p>
+<hr>
+<p><strong>Policy 3: Finance Team — Only <code>invoices/</code> Prefix (for <code>finance-team</code> group)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Policy Name: ShopNow-Finance-S3-Policy
+</span>
+Statement 1:
+  Sid: AllowListBucketInvoicesOnly
+  Effect: Allow
+  Action: s3:ListBucket
+  Resource: arn:aws:s3:::shopnow-productimages-prod-aps1
+  Condition:
+    StringLike:
+      s3:prefix:
+        - "invoices/*"
+        - ""
+
+Statement 2:
+  Sid: AllowGetPutInvoicesObjects
+  Effect: Allow
+  Action:
+    - s3:GetObject
+    - s3:PutObject
+  Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/invoices/*</code></pre></div>
+<p>→ Statement 1: Can list bucket contents BUT only sees objects under <code>invoices/</code><br>
+→ The <code>""</code> prefix allows the root listing (needed for console navigation)<br>
+→ Statement 2: Can download and upload objects ONLY under <code>invoices/</code><br>
+→ They CANNOT see <code>products/</code> or <code>marketing/</code> prefixes<br>
+→ They CANNOT delete objects (no <code>s3:DeleteObject</code> in actions)</p>
+<p>→ Attach to <code>finance-team</code> group</p>
+<hr>
+<p><strong>Policy 4: Marketing Team — Only <code>marketing/</code> Prefix (for <code>marketing-team</code> group)</strong></p>
+<p>→ Same structure as Policy 3 but replace <code>invoices/</code> with <code>marketing/</code><br>
+→ This demonstrates policy reusability patterns</p>
+<hr>
+<p><strong>Policy 5: Read-Only Access (for <code>read-only-users</code> group)</strong></p>
+<p>→ IAM Console → Policies → Search for <code>ReadOnlyAccess</code><br>
+→ This is an AWS MANAGED policy<br>
+→ It allows <code>Get*</code>, <code>List*</code>, <code>Describe*</code> on virtually every AWS service<br>
+→ It does NOT allow <code>Put*</code>, <code>Create*</code>, <code>Delete*</code>, <code>Update*</code></p>
+<p>→ Attach to <code>read-only-users</code> group → <code>arjun-intern</code> inherits it<br>
+→ The intern can VIEW everything but CHANGE nothing</p>
+<hr>
+<h3>STEP 6 — ATTACH POLICIES TO GROUPS &amp; ADD USERS TO GROUPS</h3>
+<p>→ IAM Console → User groups → Select <code>developers</code> → Permissions tab → "Attach policies"<br>
+→ Search for <code>ShopNow-Developer-S3-Policy</code> → Attach</p>
+<p>→ IAM Console → User groups → Select <code>developers</code> → Users tab → "Add users"<br>
+→ Select <code>priya-dev</code> → Add</p>
+<p><strong>Final Mapping:</strong></p>
+<table><thead><tr><th>Group</th><th>Attached Policy</th><th>Members</th></tr></thead><tbody><tr><td><code>admins</code></td><td>AdministratorAccess (AWS Managed)</td><td>rahul-cto</td></tr><tr><td><code>developers</code></td><td>ShopNow-Developer-S3-Policy (Customer Managed)</td><td>priya-dev</td></tr><tr><td><code>finance-team</code></td><td>ShopNow-Finance-S3-Policy (Customer Managed)</td><td>amit-finance</td></tr><tr><td><code>marketing-team</code></td><td>ShopNow-Marketing-S3-Policy (Customer Managed)</td><td>neha-marketing</td></tr><tr><td><code>read-only-users</code></td><td>ReadOnlyAccess (AWS Managed)</td><td>arjun-intern</td></tr></tbody></table>
+<hr>
+<h3>STEP 7 — UNDERSTAND POLICY EVALUATION LOGIC (HOW AWS DECIDES ALLOW OR DENY)</h3>
+<p>→ This is the MOST important concept in IAM<br>
+→ When any IAM entity makes an API call, AWS evaluates permissions in this EXACT order:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>START
+</span>  │
+  ▼
+Is there an EXPLICIT DENY in any applicable policy?
+  │
+  ├── YES → DENIED (game over — nothing overrides explicit deny)
+  │
+  └── NO ──▶ Is there an EXPLICIT ALLOW in any applicable policy?
+                │
+                ├── YES → ALLOWED
+                │
+                └── NO → DENIED (implicit deny — default state)</code></pre></div>
+<p><strong>Three States of Permission:</strong></p>
+<table><thead><tr><th>State</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Explicit Allow</td><td>A policy statement says <code>Effect: Allow</code> for this action+resource</td><td>Developer policy allows <code>s3:PutObject</code></td></tr><tr><td>Explicit Deny</td><td>A policy statement says <code>Effect: Deny</code> for this action+resource</td><td>Developer policy denies <code>s3:DeleteBucket</code></td></tr><tr><td>Implicit Deny</td><td>No policy says anything about this action+resource</td><td>No policy mentions <code>ec2:TerminateInstances</code> → denied by default</td></tr></tbody></table>
+<p><strong>The Golden Rule:</strong><br>
+→ By default — EVERYTHING is denied (implicit deny)<br>
+→ An explicit Allow overrides implicit deny<br>
+→ An explicit Deny overrides EVERYTHING (even explicit Allow)<br>
+→ Deny &gt; Allow &gt; Implicit Deny</p>
+<p><strong>Real Scenario with ShopNow:</strong></p>
+<p>→ <code>priya-dev</code> tries to delete the bucket<br>
+→ AWS checks: Policy Statement 1 says <code>Allow s3:*</code> → this includes <code>s3:DeleteBucket</code><br>
+→ AWS checks: Policy Statement 2 says <code>Deny s3:DeleteBucket</code><br>
+→ Explicit Deny found → DENIED<br>
+→ Priya cannot delete the bucket even though <code>s3:*</code> includes it</p>
+<p>→ <code>arjun-intern</code> tries to delete an object<br>
+→ AWS checks: <code>ReadOnlyAccess</code> policy — no <code>s3:DeleteObject</code> action mentioned<br>
+→ No explicit Allow → Implicit Deny → DENIED<br>
+→ No explicit Deny needed — absence of Allow is enough</p>
+<hr>
+<h3>STEP 8 — UNDERSTANDING PERMISSION BOUNDARIES</h3>
+<p>→ Permission Boundary is a CEILING on what an IAM user or role CAN EVER have<br>
+→ Even if someone attaches <code>AdministratorAccess</code> to the user — the boundary limits them</p>
+<p><strong>How it works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Effective Permissions = Identity Policy ∩ Permission Boundary
+</span>                        (Intersection — only what BOTH allow)</code></pre></div>
+<p><strong>Scenario:</strong><br>
+→ The CTO wants to let <code>priya-dev</code> create IAM users for her team<br>
+→ But he's worried she might create users with <code>AdministratorAccess</code><br>
+→ Solution: Set a Permission Boundary on <code>priya-dev</code></p>
+<p><strong>Configuration:</strong><br>
+→ IAM Console → Users → <code>priya-dev</code> → Permissions tab → "Set permissions boundary"<br>
+→ Choose a policy that defines the MAXIMUM permissions</p>
+<p><strong>Permission Boundary Policy Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Policy Name: ShopNow-Developer-Boundary
+</span>
+Statement 1:
+  Sid: AllowOnlyS3AndEC2
+  Effect: Allow
+  Action:
+    - s3:*
+    - ec2:*
+    - iam:CreateUser
+    - iam:AttachUserPolicy
+  Resource: *
+
+Statement 2:
+  Sid: DenyChangingOwnBoundary
+  Effect: Deny
+  Action:
+    - iam:DeleteUserPermissionsBoundary
+    - iam:PutUserPermissionsBoundary
+  Resource: arn:aws:iam::123456789012:user/priya-dev</code></pre></div>
+<p>→ Now — even if someone attaches <code>AdministratorAccess</code> to <code>priya-dev</code><br>
+→ She can ONLY use S3, EC2, and limited IAM actions<br>
+→ She CANNOT use RDS, Redshift, Lambda, or any other service<br>
+→ She CANNOT remove her own boundary (Statement 2)</p>
+<p><strong>Visual:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────┐
+</span>│     Permission Boundary (Ceiling)   │
+│     S3 + EC2 + Limited IAM          │
+│                                     │
+│   ┌───────────────────────┐         │
+│   │  Identity Policy      │         │
+│   │  AdministratorAccess  │         │
+│   │  (Allow: *)           │         │
+│   └───────────────────────┘         │
+│                                     │
+│   Effective = ONLY S3 + EC2 + IAM   │
+│   (Intersection of both)            │
+└─────────────────────────────────────┘</code></pre></div>
+<hr>
+<h3>STEP 9 — ACCESS KEYS (PROGRAMMATIC ACCESS)</h3>
+<p>→ For <code>priya-dev</code> who uses AWS CLI</p>
+<p>→ IAM Console → Users → <code>priya-dev</code> → Security credentials → "Create access key"</p>
+<p><strong>Access Key Components:</strong></p>
+<table><thead><tr><th>Component</th><th>Example</th><th>Visibility</th></tr></thead><tbody><tr><td>Access Key ID</td><td><code>AKIAIOSFODNN7EXAMPLE</code></td><td>Visible anytime in console</td></tr><tr><td>Secret Access Key</td><td><code>wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY</code></td><td>Shown ONLY ONCE at creation — never again</td></tr></tbody></table>
+<p>→ Access Key ID = username equivalent (identifies who)<br>
+→ Secret Access Key = password equivalent (authenticates)</p>
+<p><strong>Access Key Best Practices:</strong></p>
+<table><thead><tr><th>Practice</th><th>Reason</th></tr></thead><tbody><tr><td>Download the CSV immediately</td><td>Secret is shown only once</td></tr><tr><td>Never embed in application code</td><td>Code goes to Git → credentials leaked → account compromised</td></tr><tr><td>Rotate keys every 90 days</td><td>Reduces exposure window if leaked</td></tr><tr><td>Use IAM Roles instead (Project 11)</td><td>Roles provide temporary credentials — no long-lived keys</td></tr><tr><td>Maximum 2 access keys per user</td><td>Allows rotation without downtime (create new → update apps → delete old)</td></tr></tbody></table>
+<hr>
+<h3>STEP 10 — PASSWORD POLICY</h3>
+<p>→ IAM Console → Account settings → "Edit password policy"</p>
+<p><strong>Configurable Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Recommended Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Minimum password length</td><td>14 characters</td><td>Prevents weak passwords</td></tr><tr><td>Require at least one uppercase letter</td><td>Yes</td><td>Complexity</td></tr><tr><td>Require at least one lowercase letter</td><td>Yes</td><td>Complexity</td></tr><tr><td>Require at least one number</td><td>Yes</td><td>Complexity</td></tr><tr><td>Require at least one non-alphanumeric character</td><td>Yes</td><td>Complexity</td></tr><tr><td>Allow users to change their own password</td><td>Yes</td><td>Self-service</td></tr><tr><td>Enable password expiration</td><td>Yes — 90 days</td><td>Forces rotation</td></tr><tr><td>Prevent password reuse</td><td>Remember last 12 passwords</td><td>Prevents cycling</td></tr><tr><td>Password expiration requires administrator reset</td><td>No</td><td>Allows self-service reset</td></tr></tbody></table>
+<hr>
+<h3>STEP 11 — ENABLE MFA FOR IAM USERS</h3>
+<p>→ IAM Console → Users → Select user → Security credentials → "Assign MFA device"</p>
+<p><strong>MFA Options:</strong></p>
+<table><thead><tr><th>Type</th><th>Device</th><th>Best For</th></tr></thead><tbody><tr><td>Virtual MFA</td><td>Google Authenticator, Authy, Microsoft Authenticator</td><td>Most users — phone-based</td></tr><tr><td>Hardware TOTP token</td><td>Gemalto token</td><td>High-security environments</td></tr><tr><td>FIDO2 Security Key</td><td>YubiKey</td><td>Phishing-resistant — strongest option</td></tr></tbody></table>
+<p>→ Enable MFA for ALL users — especially <code>admins</code> group<br>
+→ Can enforce MFA via policy condition: <code>"aws:MultiFactorAuthPresent": "true"</code></p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always secure root account with MFA and never use it for daily operations<br>
+→ Always create individual IAM users — one person = one user<br>
+→ Always use Groups to manage permissions — never attach policies directly to users<br>
+→ Always follow least privilege — give MINIMUM permissions needed for the job<br>
+→ Always use Customer Managed Policies for organization-specific permissions<br>
+→ Always use Permission Boundaries when delegating IAM administration<br>
+→ Always enable MFA for all human users — especially administrators<br>
+→ Always set a strong password policy at the account level<br>
+→ Always use tags on IAM users for organizational tracking<br>
+→ Always use descriptive Sids in policy statements for debugging<br>
+→ Always test policies using IAM Policy Simulator before applying<br>
+→ Always create an account alias for human-friendly sign-in URL</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never share root account credentials with anyone<br>
+→ Never create access keys for root account<br>
+→ Never attach policies directly to individual users — use groups<br>
+→ Never use <code>*</code> in Action AND Resource simultaneously unless it's a true admin policy<br>
+→ Never hardcode Access Key ID and Secret Access Key in application code<br>
+→ Never create one "god user" that everyone shares<br>
+→ Never forget the difference between bucket ARN and object ARN (Project 1 reference)<br>
+→ Never use inline policies for standard permissions — use managed policies<br>
+→ Never give <code>iam:*</code> permissions to non-admin users — they could escalate their own privileges<br>
+→ Never skip MFA for admin users — a compromised admin account = entire AWS account compromised<br>
+→ Never forget that implicit deny is the default — if nothing says Allow, it's denied<br>
+→ Never assume that removing an Allow = adding a Deny — they are different concepts</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>IAM Solution</th></tr></thead><tbody><tr><td>Human needs console access</td><td>IAM User with console password + MFA</td></tr><tr><td>Application on local machine needs API access</td><td>IAM User with Access Keys (temporary — prefer Roles)</td></tr><tr><td>Application on EC2 needs AWS access</td><td>IAM Role (NOT User — covered in Project 11)</td></tr><tr><td>50 developers need same permissions</td><td>IAM Group with policy attached</td></tr><tr><td>Contractor needs limited temporary access</td><td>IAM User with Permission Boundary + time-limited credentials</td></tr><tr><td>You want to restrict maximum possible permissions</td><td>Permission Boundary</td></tr><tr><td>You want to grant access to a specific S3 bucket</td><td>Customer Managed Policy with specific resource ARN</td></tr><tr><td>You want broad read-only access across services</td><td>AWS Managed Policy: ReadOnlyAccess</td></tr><tr><td>Cross-account access needed</td><td>IAM Role with Trust Policy (Project 40)</td></tr><tr><td>Auditing who did what</td><td>CloudTrail (Project 57) — logs every API call with IAM identity</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use IAM Users for applications running on AWS services → Use IAM Roles (Project 11)<br>
+→ Do NOT use IAM for managing thousands of external users (customers) → Use Amazon Cognito<br>
+→ Do NOT use IAM Policies alone for S3 access control → Combine with Bucket Policies (Project 10) for defense in depth<br>
+→ Do NOT use IAM Groups as identities in resource policies → Groups cannot be principals<br>
+→ Do NOT use inline policies when the same permission is needed by multiple entities → Use managed policies</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE IAM SERVICE ARCHITECTURE</h3>
+<p>→ IAM is a GLOBAL service — it is NOT region-specific<br>
+→ When you create an IAM user in <code>ap-south-1</code> console → it's available in ALL regions<br>
+→ IAM data is replicated across all AWS regions automatically<br>
+→ This is why IAM has no region selector in the console (always shows "Global")</p>
+<p>→ IAM is eventually consistent<br>
+→ If you create a user and immediately try to use it → might get a brief delay<br>
+→ Typically &lt; 1 second — but in rare cases, up to a few seconds<br>
+→ This is because the change needs to propagate across all global endpoints</p>
+<hr>
+<h3>2 → HOW AUTHENTICATION WORKS</h3>
+<p><strong>Console Login (Username + Password):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User enters credentials at sign-in URL
+</span>        │
+        ▼
+AWS IAM authentication service validates
+        │
+        ├── Password correct + MFA valid → Session token issued
+        │
+        └── Failed → "Invalid credentials" error
+        
+Session token = temporary credential that the browser uses for all subsequent API calls
+Console session default duration: 12 hours (configurable: 1-12 hours)</code></pre></div>
+<p><strong>API/CLI Authentication (Access Keys):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CLI command: aws s3 ls
+</span>        │
+        ▼
+AWS SDK reads Access Key ID + Secret Access Key from ~/.aws/credentials
+        │
+        ▼
+SDK creates a "Signature Version 4" (SigV4) signed request
+        │
+        ▼
+The signature includes:
+  - Access Key ID (identifies WHO)
+  - Timestamp (prevents replay attacks)
+  - Region + Service (scope)
+  - Hash of request body
+  - All signed with Secret Access Key using HMAC-SHA256
+        │
+        ▼
+AWS receives request → looks up Access Key ID → retrieves corresponding Secret Access Key
+        │
+        ▼
+AWS recreates the signature using the same algorithm
+        │
+        ├── Signatures match → Authenticated → Proceed to authorization
+        │
+        └── Signatures don't match → 403 Forbidden</code></pre></div>
+<p>→ The Secret Access Key NEVER travels over the network<br>
+→ Only the computed signature travels<br>
+→ This is why SigV4 is secure even without HTTPS (though HTTPS is always used)</p>
+<hr>
+<h3>3 → HOW AUTHORIZATION WORKS (POLICY EVALUATION ENGINE)</h3>
+<p>→ After authentication succeeds → AWS determines what the caller is allowed to do</p>
+<p><strong>Full Evaluation Flow (Single Account):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Request: priya-dev calls s3:DeleteBucket on shopnow-productimages-prod-aps1
+</span>        │
+        ▼
+Step 1: Gather ALL applicable policies
+        │
+        ├── Identity-based policies (attached to user/groups)
+        ├── Resource-based policies (S3 bucket policy — Project 10)
+        ├── Permission boundaries (if set)
+        ├── Session policies (if using temporary credentials)
+        └── Service Control Policies (if using AWS Organizations — Project 54)
+        │
+        ▼
+Step 2: Evaluate all policies
+        │
+        ▼
+Step 2a: Any EXPLICIT DENY across ALL policies?
+        │
+        ├── YES → FINAL DECISION: DENIED
+        │        (Developer policy has Deny s3:DeleteBucket → DENIED)
+        │
+        └── NO → Continue
+                │
+                ▼
+Step 2b: For identity-based policies + resource-based policies:
+         Is there an EXPLICIT ALLOW?
+                │
+                ├── YES → Check boundaries
+                │         │
+                │         ▼
+                │   Does Permission Boundary also ALLOW this action?
+                │         │
+                │         ├── YES → FINAL DECISION: ALLOWED
+                │         └── NO → FINAL DECISION: DENIED
+                │
+                └── NO → FINAL DECISION: DENIED (implicit deny)</code></pre></div>
+<p>→ This flow executes in MILLISECONDS for every single API call<br>
+→ AWS evaluates potentially dozens of policies per request<br>
+→ This is why well-structured policies matter — complex policies = slower evaluation</p>
+<hr>
+<h3>4 → HOW POLICY VARIABLES WORK</h3>
+<p>→ Policies can include dynamic variables that resolve at request time</p>
+<table><thead><tr><th>Variable</th><th>Resolves To</th><th>Example Use</th></tr></thead><tbody><tr><td><code>${aws:username}</code></td><td>IAM username of the caller</td><td>Give each user access to their own S3 "folder"</td></tr><tr><td><code>${aws:userid}</code></td><td>Unique ID of the caller</td><td></td></tr><tr><td><code>${aws:PrincipalTag/Department}</code></td><td>Tag value on the calling principal</td><td>ABAC — Attribute-Based Access Control</td></tr><tr><td><code>${aws:CurrentTime}</code></td><td>Current UTC timestamp</td><td>Time-based restrictions</td></tr><tr><td><code>${aws:SourceIp}</code></td><td>Caller's IP address</td><td>IP-based restrictions</td></tr><tr><td><code>${s3:prefix}</code></td><td>The prefix being listed</td><td>Restrict S3 listing to specific prefixes</td></tr></tbody></table>
+<p><strong>Example: Each user gets their own S3 folder:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Action: s3:*
+</span>Resource: arn:aws:s3:::shopnow-bucket/${aws:username}/*</code></pre></div>
+<p>→ When <code>priya-dev</code> calls → resolves to <code>arn:aws:s3:::shopnow-bucket/priya-dev/*</code><br>
+→ When <code>amit-finance</code> calls → resolves to <code>arn:aws:s3:::shopnow-bucket/amit-finance/*</code><br>
+→ One policy → works for all users dynamically</p>
+<hr>
+<h3>5 → IAM IDENTITY CENTER vs IAM USERS</h3>
+<p>→ IAM Users (what we created) are the CLASSIC approach<br>
+→ AWS now recommends IAM Identity Center (formerly AWS SSO) for human users<br>
+→ IAM Identity Center provides:</p>
+<ul>
+<li>Single sign-on across multiple AWS accounts</li>
+<li>Integration with corporate directories (Active Directory, Okta)</li>
+<li>Temporary credentials automatically (no long-lived passwords/keys)</li>
+</ul>
+<p>→ However — IAM Users are still fundamental to understand because:</p>
+<ul>
+<li>IAM Roles (Project 11) are built on the same policy model</li>
+<li>Service-to-service authentication uses the same concepts</li>
+<li>Cross-account access (Project 40) requires understanding trust policies</li>
+<li>Every AWS certification tests IAM User concepts extensively</li>
+</ul>
+<hr>
+<h3>6 → IAM LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>IAM Users per account</td><td>5,000</td></tr><tr><td>IAM Groups per account</td><td>300</td></tr><tr><td>IAM Roles per account</td><td>1,000</td></tr><tr><td>Managed policies per account</td><td>1,500</td></tr><tr><td>Policies attached to a user/group/role</td><td>10</td></tr><tr><td>Maximum policy document size (managed)</td><td>6,144 characters</td></tr><tr><td>Maximum policy document size (inline)</td><td>2,048 characters</td></tr><tr><td>Access keys per user</td><td>2</td></tr><tr><td>MFA devices per user</td><td>8</td></tr><tr><td>Groups per user</td><td>10</td></tr></tbody></table>
+<p>→ The 6,144 character limit is important — complex policies must be split across multiple policies<br>
+→ The 10 attached policies limit means you need to design policies efficiently</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Using root account for daily work</td><td>No audit trail per person, maximum blast radius if compromised</td><td>Create IAM users immediately, lock root away</td></tr><tr><td>2</td><td>Attaching policies directly to users</td><td>Unmanageable at scale — 50 users = 50 individual policy attachments to track</td><td>Always use groups</td></tr><tr><td>3</td><td>Using <code>Action: *</code> and <code>Resource: *</code> for non-admin users</td><td>User can do anything — delete databases, terminate instances, modify billing</td><td>Always specify exact actions and resources</td></tr><tr><td>4</td><td>Confusing bucket ARN with object ARN</td><td><code>s3:GetObject</code> on bucket ARN → Access Denied</td><td>Bucket ARN for bucket operations, bucket ARN/* for object operations</td></tr><tr><td>5</td><td>Forgetting implicit deny is the default</td><td>Creating a user with no policies → user can't do anything → confusion</td><td>Understand: no Allow = Denied</td></tr><tr><td>6</td><td>Not testing policies before applying</td><td>Production users locked out</td><td>Use IAM Policy Simulator first</td></tr><tr><td>7</td><td>Giving <code>iam:*</code> to developers</td><td>Developer creates admin user for themselves → privilege escalation</td><td>Restrict IAM actions + use Permission Boundaries</td></tr><tr><td>8</td><td>Creating access keys "just in case"</td><td>Unused keys become security liability — may leak in code repos</td><td>Create keys only when needed, audit regularly</td></tr><tr><td>9</td><td>Forgetting MFA on admin accounts</td><td>Phished password = full account compromise</td><td>Enforce MFA via policy condition</td></tr><tr><td>10</td><td>Policy character limit exceeded</td><td>"Policy too large" error during save</td><td>Split into multiple smaller policies (max 10 per entity)</td></tr><tr><td>11</td><td>Using old policy version "2008-10-17"</td><td>Policy variables don't work, unexpected behavior</td><td>Always use "2012-10-17"</td></tr><tr><td>12</td><td>Not using Sids in statements</td><td>Debugging "Access Denied" becomes nightmare with 20 statements</td><td>Always add descriptive Sids</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>User Scalability</strong></p>
+<ul>
+<li>5,000 IAM users per account hard limit</li>
+<li>For organizations with &gt; 5,000 people → use IAM Identity Center or Federation (SAML/OIDC)</li>
+<li>IAM Users are best for service accounts and small-to-medium teams</li>
+</ul>
+<p>→ <strong>Policy Scalability</strong></p>
+<ul>
+<li>Maximum 10 managed policies per entity (user/group/role)</li>
+<li>Maximum 6,144 characters per policy</li>
+<li>For complex permissions → combine multiple policies on a group</li>
+<li>For very granular access → use ABAC (Attribute-Based Access Control) with tags instead of writing one policy per user</li>
+</ul>
+<p>→ <strong>Group Scalability</strong></p>
+<ul>
+<li>300 groups per account</li>
+<li>A user in 10 groups × 10 policies per group = 100 policies evaluated per API call</li>
+<li>AWS handles this efficiently but keep policy count reasonable</li>
+</ul>
+<p>→ <strong>Multi-Account Scalability</strong></p>
+<ul>
+<li>Single AWS account IAM works for small organizations</li>
+<li>Medium/large organizations → multiple accounts (dev/staging/prod) → AWS Organizations (Project 54)</li>
+<li>Cross-account roles (Project 40) enable access without creating users in every account</li>
+</ul>
+<p>→ <strong>Audit Scalability</strong></p>
+<ul>
+<li>CloudTrail logs every IAM-authenticated API call</li>
+<li>At scale → millions of API calls per day → store CloudTrail logs in S3 (Project 1) → analyze with Athena (Project 18)</li>
+<li>IAM Access Analyzer automatically identifies resources shared externally</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify permissions are working correctly:</strong></p>
+<table><thead><tr><th>Verification Method</th><th>How</th></tr></thead><tbody><tr><td>IAM Policy Simulator</td><td>IAM Console → Policy Simulator → Select user → Select service/action → Run simulation → Shows Allow/Deny with reason</td></tr><tr><td>Console test</td><td>Log in as the IAM user → Try the action → See if it succeeds or shows "Access Denied"</td></tr><tr><td>CLI test</td><td>Configure CLI with user's access keys → Run command → Check response</td></tr><tr><td>Access Advisor</td><td>IAM Console → Users → Select user → "Access Advisor" tab → Shows which services the user has accessed and when</td></tr><tr><td>Last Activity</td><td>IAM Console → Users → Shows "Last activity" column → Identify unused users</td></tr><tr><td>Credential Report</td><td>IAM Console → "Credential report" → Download CSV → Shows all users, MFA status, key age, last login</td></tr></tbody></table>
+<p>→ <strong>How to debug "Access Denied":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Identify the EXACT API call being denied
+</span>        (Error message usually says which action was denied)
+
+Step 2: Check all policies attached to the user (direct + via groups)
+
+Step 3: Check resource-based policies (bucket policy for S3)
+
+Step 4: Check Permission Boundaries if set
+
+Step 5: Check Service Control Policies if using Organizations
+
+Step 6: Verify ARN format — bucket vs object ARN is #1 cause
+
+Step 7: Use Policy Simulator with the exact action + resource
+
+Step 8: Check for explicit Deny — remember Deny always wins</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ IAM is the security foundation of EVERYTHING in AWS<br>
+→ Without IAM — you have no access control, no audit trail, no accountability<br>
+→ The policy evaluation logic (Deny &gt; Allow &gt; Implicit Deny) governs every single API call<br>
+→ ARN format is the language of resource identification — you will write ARNs in every project going forward<br>
+→ Groups are the management layer — policies define permissions — users consume them through groups<br>
+→ Permission Boundaries set ceilings — even full admin policies cannot exceed boundaries<br>
+→ Connection to Project 1: The S3 bucket we created is now protected by IAM policies</p>
+<ul>
+<li><code>amit-finance</code> can ONLY see <code>invoices/</code> prefix</li>
+<li><code>arjun-intern</code> can view but NEVER delete</li>
+<li><code>priya-dev</code> can do everything EXCEPT delete the bucket<br>
+→ Every future project will reference IAM:</li>
+<li>Project 11: IAM Roles for EC2 (no access keys on servers)</li>
+<li>Project 17: IAM Role for Glue (service accessing S3)</li>
+<li>Project 22: IAM Role for Redshift (loading from S3)</li>
+<li>Project 39: Cross-account IAM (inter-account S3 access)</li>
+<li>Project 40: STS AssumeRole (cross-account role assumption)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has proper users and permissions<br>
+→ But the development team says: "We need a server to run our web application"<br>
+→ They need to launch an EC2 instance (virtual server)<br>
+→ Questions arise immediately:</p>
+<ul>
+<li>Which operating system? Which size? How much CPU/RAM?</li>
+<li>How do we connect to it securely?</li>
+<li>What happens when we stop it vs terminate it?</li>
+<li>How does the key pair SSH authentication work?</li>
+</ul>
+<p>→ <strong>This is exactly what Project 3 solves</strong><br>
+→ Project 3 introduces EC2 — the foundational compute service<br>
+→ It will use IAM knowledge from this project (who can launch/stop/terminate instances)<br>
+→ It will prepare you for Project 4 (Security Groups — network-level access control for EC2)<br>
+→ And eventually Project 11 where we attach IAM Roles TO EC2 instances</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 3: "The Developer Who Couldn't Access the Server — EC2 Instance Launch &amp; SSH Configuration"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-1.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 2/60</span></div><a class="nav-btn next" href="project-3.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

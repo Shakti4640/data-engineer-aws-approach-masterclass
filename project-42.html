@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 42: THE DATA MESH WHERE TEAMS SHARED CATALOGS — Cross-Account Glue Catal — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 42: THE DATA MESH WHERE TEAMS SHARED CATALOGS — Cross-Account Glue Catalog Sharing via Lake Formation</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's multi-account architecture is maturing across 5 accounts (Project 40)<br>
+→ Cross-account S3 access works (Project 39)<br>
+→ Cross-account messaging works (Project 41)<br>
+→ But the DATA CATALOG sharing problem remains unsolved</p>
+<p><strong>The Current Broken State:</strong></p>
+<p>→ HQ's Glue Data Catalog (Account <code>111111111111</code>) contains:</p>
+<table><thead><tr><th>Database</th><th>Tables</th><th>Description</th><th>Built In</th></tr></thead><tbody><tr><td><code>shopnow_raw</code></td><td>45 tables</td><td>Raw CSV/JSON ingested from sources</td><td>Project 17 (Crawlers)</td></tr><tr><td><code>shopnow_curated</code></td><td>85 tables</td><td>Cleaned Parquet data</td><td>Project 21, 25 (Glue ETL + CTAS)</td></tr><tr><td><code>shopnow_refined</code></td><td>70 tables</td><td>Business-ready aggregations</td><td>Project 25 (Athena CTAS)</td></tr><tr><td><strong>Total</strong></td><td><strong>200 tables</strong></td><td></td><td></td></tr></tbody></table>
+<p>→ Each table has:</p>
+<ul>
+<li>Schema definition (column names, data types)</li>
+<li>Partition keys and partition values</li>
+<li>S3 location pointing to the data</li>
+<li>Table properties (compression, format, serde)</li>
+<li>Statistics (row counts, data size)</li>
+</ul>
+<p><strong>What Each Account Needs:</strong></p>
+<table><thead><tr><th>Account</th><th>Needs Access To</th><th>Column Restrictions</th><th>Current Workaround</th></tr></thead><tbody><tr><td>Europe (<code>222222222222</code>)</td><td><code>shopnow_curated</code>: products, pricing, inventory (50 tables)</td><td>NO access to <code>customer_email</code>, <code>customer_phone</code> columns</td><td>50 manually-created local Glue tables</td></tr><tr><td>US (<code>333333333333</code>)</td><td><code>shopnow_curated</code>: products, pricing, us_orders (40 tables)</td><td>NO access to <code>customer_ssn</code> column</td><td>40 manually-created local Glue tables</td></tr><tr><td>Japan (<code>444444444444</code>)</td><td><code>shopnow_refined</code>: product_analytics, pricing_analytics (15 tables)</td><td>Full column access (aggregated data only)</td><td>15 manually-created local Glue tables</td></tr><tr><td>Shared Services (<code>555555555555</code>)</td><td>ALL databases, ALL tables</td><td>Full access (for monitoring and auditing)</td><td>No catalog access — uses direct S3 queries</td></tr></tbody></table>
+<p><strong>Why the Manual Workaround is Failing:</strong></p>
+<p><strong>Failure 1 — Schema Drift:</strong><br>
+→ HQ adds column <code>product_weight_kg</code> to <code>products</code> table<br>
+→ Europe's local copy still has the old schema<br>
+→ Europe's Athena queries don't see the new column<br>
+→ Europe's analysts file support ticket → HQ updates Europe's table manually → 3 days delay</p>
+<p><strong>Failure 2 — Partition Sync:</strong><br>
+→ HQ's <code>orders</code> table gets new daily partitions: <code>year=2025/month=01/day=16</code><br>
+→ Europe's local copy doesn't have this partition registered<br>
+→ Europe's queries return incomplete data (missing the latest day)<br>
+→ Nobody notices for a week → wrong business decisions</p>
+<p><strong>Failure 3 — No Column-Level Security:</strong><br>
+→ Europe's manually-created tables point to the SAME S3 data as HQ's tables<br>
+→ Even though Europe "shouldn't" see <code>customer_email</code> → their table definition includes ALL columns<br>
+→ A curious analyst can query <code>SELECT customer_email FROM products</code> → data leak<br>
+→ The S3 cross-account role (Project 39) grants <code>GetObject</code> → no column filtering at S3 level<br>
+→ Column-level restriction requires a CATALOG-LEVEL enforcement mechanism</p>
+<p><strong>Failure 4 — No Governance Visibility:</strong><br>
+→ HQ's data team has no way to see:</p>
+<ul>
+<li>WHICH external accounts have access to WHICH tables</li>
+<li>WHO in those accounts queried WHICH columns</li>
+<li>Whether external access is still needed or should be revoked<br>
+→ The manually-created local tables are invisible to HQ</li>
+</ul>
+<p><strong>Failure 5 — Duplication Waste:</strong><br>
+→ 105 manually-created tables across 3 accounts (50 + 40 + 15)<br>
+→ Each must be individually maintained<br>
+→ When HQ drops or renames a table → external copies become orphaned<br>
+→ No automated synchronization mechanism</p>
+<p><strong>The Data Engineering Lead asks:</strong></p>
+<blockquote>
+<p>"I need HQ to SHARE their Glue Catalog tables with other accounts,<br>
+where HQ controls WHICH databases, WHICH tables, and WHICH columns each account can see.<br>
+When HQ updates a table → external accounts see the update immediately.<br>
+I need a central governance dashboard showing all cross-account data access.<br>
+And I need column-level security so Europe CANNOT see PII columns even though they can read the underlying S3 files."</p>
+</blockquote>
+<p>→ This requires AWS Lake Formation — the governed data catalog sharing layer</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what Lake Formation IS and what problem it solves</p>
+<p><strong>Without Lake Formation (Current State):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Access Control Stack:
+</span>  S3 Bucket Policy → controls WHO can read WHICH S3 prefixes
+  IAM Policy → controls WHO can call WHICH S3 actions
+  KMS Key Policy → controls WHO can decrypt WHICH keys
+  Glue Catalog → ONLY controls WHO can modify catalog metadata
+  
+  RESULT: Access is at FILE/PREFIX level — NOT at TABLE/COLUMN level
+  If you can read the S3 file → you can read ALL columns in that file</code></pre></div>
+<p><strong>With Lake Formation (Target State):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Access Control Stack:
+</span>  Lake Formation Permissions → controls WHO can access WHICH database/table/column
+  Lake Formation enforces permissions AT QUERY TIME
+  Even if someone has S3 GetObject → Lake Formation blocks column access
+  
+  RESULT: Access is at TABLE and COLUMN level
+  You can read the S3 file but Lake Formation filters out restricted columns</code></pre></div>
+<p><strong>Lake Formation's Core Concept:</strong></p>
+<p>→ Lake Formation sits BETWEEN the Glue Data Catalog and the query engines (Athena, Redshift Spectrum, Glue ETL)<br>
+→ When a query runs → Lake Formation checks:</p>
+<ol>
+<li>Does this principal have permission to access this DATABASE?</li>
+<li>Does this principal have permission to access this TABLE?</li>
+<li>Does this principal have permission to access these specific COLUMNS?</li>
+<li>Are there any row-level filters applied?<br>
+→ If any check fails → the query is blocked or filtered</li>
+</ol>
+<p><strong>How Lake Formation Relates to IAM:</strong></p>
+<table><thead><tr><th>Layer</th><th>What It Controls</th><th>Granularity</th></tr></thead><tbody><tr><td>IAM</td><td>Who can call AWS API actions (<code>glue:GetTable</code>, <code>athena:StartQueryExecution</code>)</td><td>API-level</td></tr><tr><td>Lake Formation</td><td>Who can access which data (databases, tables, columns, rows)</td><td>Data-level</td></tr></tbody></table>
+<p>→ IAM and Lake Formation work TOGETHER:</p>
+<ul>
+<li>IAM allows the API call (e.g., "this role can call Athena")</li>
+<li>Lake Formation allows the data access (e.g., "this role can see columns A, B, C but not D")</li>
+<li>BOTH must allow for the query to succeed</li>
+</ul>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Enable Lake Formation and configure Data Lake Administrators</li>
+<li>Step 2 — Register S3 data locations with Lake Formation</li>
+<li>Step 3 — Grant Lake Formation permissions on databases and tables (intra-account)</li>
+<li>Step 4 — Share catalog resources cross-account using AWS RAM</li>
+<li>Step 5 — Accept shared resources and create Resource Links in consumer accounts</li>
+<li>Step 6 — Configure column-level security</li>
+<li>Step 7 — Configure cross-account query flow</li>
+<li>Step 8 — Set up governance dashboard and audit trail</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — ENABLE LAKE FORMATION AND CONFIGURE DATA LAKE ADMINISTRATORS</h3>
+<p>→ Sign into Account <code>111111111111</code> (HQ — the data producer)<br>
+→ Navigate to AWS Lake Formation → "Get started" (first-time setup)</p>
+<p><strong>Step 1a — Define Data Lake Administrators:</strong></p>
+<p>→ Lake Formation → "Administrative roles and tasks" → "Data lake administrators"<br>
+→ Click "Choose administrators"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>IAM users and roles</td><td><code>arn:aws:iam::111111111111:role/HQ-DataLakeAdminRole</code></td></tr><tr><td></td><td><code>arn:aws:iam::111111111111:user/data-engineering-lead</code></td></tr></tbody></table>
+<p><strong>What Data Lake Administrators Can Do:</strong></p>
+<table><thead><tr><th>Permission</th><th>Description</th></tr></thead><tbody><tr><td>Create databases</td><td>Create new Glue Catalog databases</td></tr><tr><td>Grant/revoke ALL Lake Formation permissions</td><td>Full control over who accesses what</td></tr><tr><td>Register S3 locations</td><td>Control which S3 paths are managed by Lake Formation</td></tr><tr><td>Share resources cross-account</td><td>Grant external accounts access to catalog resources</td></tr><tr><td>View all permissions</td><td>See complete permission matrix</td></tr></tbody></table>
+<p><strong>What Data Lake Administrators CANNOT Do:</strong><br>
+→ They cannot bypass IAM — they still need IAM permissions for API calls<br>
+→ They are DATA administrators, not IAM administrators<br>
+→ They manage DATA ACCESS, not infrastructure access</p>
+<hr>
+<p><strong>Step 1b — Change Default Catalog Permissions (CRITICAL):</strong></p>
+<p>→ Lake Formation → "Administrative roles and tasks" → "Data catalog settings"</p>
+<p><strong>Default Behavior (What you MUST change):</strong></p>
+<p>→ By default, Lake Formation has a compatibility mode enabled:<br>
+→ "Use only IAM access control for new databases" → ✅ CHECKED (default)<br>
+→ "Use only IAM access control for new tables in new databases" → ✅ CHECKED (default)</p>
+<p><strong>What this means:</strong><br>
+→ With these defaults ON → Lake Formation permissions are IGNORED<br>
+→ Access is controlled ONLY by IAM policies (same as before Lake Formation)<br>
+→ This exists for backward compatibility — so enabling Lake Formation doesn't break existing workloads</p>
+<p><strong>What you must change for governance:</strong><br>
+→ UNCHECK both settings:<br>
+→ "Use only IAM access control for new databases" → ❌ UNCHECKED<br>
+→ "Use only IAM access control for new tables in new databases" → ❌ UNCHECKED</p>
+<table><thead><tr><th>Setting</th><th>Default</th><th>Change To</th><th>Why</th></tr></thead><tbody><tr><td>Use only IAM access control for new databases</td><td>✅ Checked</td><td>❌ Unchecked</td><td>Enable Lake Formation permissions for databases</td></tr><tr><td>Use only IAM access control for new tables in new databases</td><td>✅ Checked</td><td>❌ Unchecked</td><td>Enable Lake Formation permissions for tables</td></tr></tbody></table>
+<p><strong>WARNING: Impact of Unchecking:</strong><br>
+→ Once unchecked → ALL new databases and tables are governed by Lake Formation<br>
+→ Existing databases and tables MAY lose access if Lake Formation permissions are not granted<br>
+→ Before unchecking → Grant Lake Formation permissions to all existing roles that need catalog access</p>
+<p><strong>Recommended Migration Path:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step A: Identify all IAM roles that currently access Glue Catalog
+</span>        (GlueETLRole, AthenaQueryRole, RedshiftSpectrumRole, etc.)
+
+Step B: Grant Lake Formation permissions to each role for each database/table they need
+
+Step C: THEN uncheck the default IAM-only settings
+
+Step D: Test all workloads — verify nothing broke
+
+Step E: If something breaks → the role is missing Lake Formation permission → grant it</code></pre></div>
+<hr>
+<p><strong>Step 1c — Grant Lake Formation Permissions to Existing Roles:</strong></p>
+<p>→ Lake Formation → "Data lake permissions" → "Grant"</p>
+<p><strong>For each existing role that accesses Glue Catalog:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Example</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td><td></td></tr><tr><td>IAM role</td><td>Select role</td><td><code>GlueETLRole</code></td></tr><tr><td>Database</td><td>Select database(s)</td><td><code>shopnow_raw</code>, <code>shopnow_curated</code>, <code>shopnow_refined</code></td></tr><tr><td>Database permissions</td><td><code>Describe</code></td><td>Can see database exists</td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td><td>Can query and see table metadata</td></tr><tr><td>Grantable permissions</td><td>None (for internal roles)</td><td>Internal roles should not re-grant</td></tr></tbody></table>
+<p><strong>Permissions Matrix for HQ Internal Roles:</strong></p>
+<table><thead><tr><th>Role</th><th>Databases</th><th>Table Permissions</th><th>Column Restrictions</th><th>Grantable</th></tr></thead><tbody><tr><td><code>GlueETLRole</code></td><td><code>shopnow_raw</code>, <code>shopnow_curated</code></td><td><code>Select</code>, <code>Insert</code>, <code>Delete</code>, <code>Describe</code>, <code>Alter</code></td><td>None (full column access)</td><td>No</td></tr><tr><td><code>AthenaQueryRole</code></td><td><code>shopnow_curated</code>, <code>shopnow_refined</code></td><td><code>Select</code>, <code>Describe</code></td><td>None (full column access)</td><td>No</td></tr><tr><td><code>GlueCrawlerRole</code></td><td><code>shopnow_raw</code>, <code>shopnow_curated</code>, <code>shopnow_refined</code></td><td><code>Create Table</code>, <code>Alter</code>, <code>Describe</code></td><td>None</td><td>No</td></tr><tr><td><code>RedshiftSpectrumRole</code></td><td><code>shopnow_curated</code>, <code>shopnow_refined</code></td><td><code>Select</code>, <code>Describe</code></td><td>None</td><td>No</td></tr><tr><td><code>HQ-DataLakeAdminRole</code></td><td>ALL</td><td>ALL</td><td>None</td><td>Yes (can grant to others)</td></tr></tbody></table>
+<p><strong>Lake Formation Permission Types:</strong></p>
+<table><thead><tr><th>Permission</th><th>What It Allows</th></tr></thead><tbody><tr><td><code>Select</code></td><td>Read data (query table)</td></tr><tr><td><code>Insert</code></td><td>Add data to table</td></tr><tr><td><code>Delete</code></td><td>Remove data from table</td></tr><tr><td><code>Describe</code></td><td>View metadata (schema, partitions, properties)</td></tr><tr><td><code>Alter</code></td><td>Modify table definition (add column, change properties)</td></tr><tr><td><code>Drop</code></td><td>Delete the table</td></tr><tr><td><code>Create Table</code></td><td>Create new tables in the database</td></tr><tr><td><code>Create Database</code></td><td>Create new databases</td></tr><tr><td><code>Data Location Access</code></td><td>Read/write to the underlying S3 location</td></tr><tr><td><code>Super</code></td><td>All permissions (database or table level)</td></tr></tbody></table>
+<hr>
+<h3>STEP 2 — REGISTER S3 DATA LOCATIONS WITH LAKE FORMATION</h3>
+<p>→ Lake Formation → "Data lake locations" → "Register location"</p>
+<p><strong>What Registration Does:</strong><br>
+→ Tells Lake Formation which S3 paths contain data lake data<br>
+→ Lake Formation uses a SERVICE-LINKED ROLE to access these S3 paths<br>
+→ This decouples data access from individual IAM roles<br>
+→ Instead of each role needing S3 permissions → Lake Formation manages S3 access centrally</p>
+<p><strong>Register Each Data Location:</strong></p>
+<table><thead><tr><th>S3 Location</th><th>IAM Role for Registration</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3://shopnow-datalake-raw/</code></td><td><code>AWSServiceRoleF[REDACTED:AWS_ACCESS_KEY]ess</code> (service-linked)</td><td>Raw data zone</td></tr><tr><td><code>s3://shopnow-datalake-curated/</code></td><td>Same service-linked role</td><td>Curated data zone</td></tr><tr><td><code>s3://shopnow-datalake-refined/</code></td><td>Same service-linked role</td><td>Refined data zone</td></tr></tbody></table>
+<p><strong>Registration Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>S3 path</td><td><code>s3://shopnow-datalake-curated/</code></td></tr><tr><td>IAM role</td><td>Use service-linked role (recommended)</td></tr></tbody></table>
+<p><strong>Understanding the Service-Linked Role:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT Lake Formation Registration:
+</span>  AthenaQueryRole needs: s3:GetObject on bucket + kms:Decrypt on key
+  GlueETLRole needs: s3:GetObject, s3:PutObject on bucket + kms:Decrypt, kms:GenerateDataKey
+  RedshiftSpectrumRole needs: s3:GetObject on bucket + kms:Decrypt
+  → Each role has direct S3 and KMS permissions
+  → Adding a new role = adding S3 + KMS permissions to that role
+
+WITH Lake Formation Registration:
+  Lake Formation service-linked role has: s3:GetObject, s3:PutObject + kms:Decrypt, kms:GenerateDataKey
+  AthenaQueryRole needs: ONLY Lake Formation Select permission on the table
+  GlueETLRole needs: ONLY Lake Formation Select + Insert permission
+  → Individual roles do NOT need direct S3 or KMS permissions
+  → Lake Formation mediates all data access through its service role
+  → Adding a new role = granting Lake Formation permission (no S3/KMS changes)</code></pre></div>
+<p><strong>CRITICAL: Hybrid Mode vs Pure Lake Formation Mode:</strong></p>
+<table><thead><tr><th>Mode</th><th>S3 Permissions</th><th>Lake Formation Permissions</th><th>When to Use</th></tr></thead><tbody><tr><td>Hybrid (Default)</td><td>Roles have BOTH S3 IAM permissions AND Lake Formation permissions</td><td>Lake Formation permissions checked</td><td>During migration — existing workloads still work via IAM</td></tr><tr><td>Pure Lake Formation</td><td>Roles do NOT have S3 IAM permissions — only Lake Formation</td><td>Lake Formation fully controls access</td><td>Target state — maximum governance</td></tr></tbody></table>
+<p>→ For ShopNow → Start with Hybrid mode during migration<br>
+→ Gradually remove S3 IAM permissions from roles<br>
+→ End state → Pure Lake Formation mode where ALL data access goes through Lake Formation</p>
+<p><strong>Service-Linked Role KMS Access:</strong><br>
+→ If S3 data is encrypted with KMS (Project 36) → the service-linked role needs <code>kms:Decrypt</code><br>
+→ Add the Lake Formation service-linked role to the KMS key policy:</p>
+<table><thead><tr><th>Principal</th><th>Actions</th><th>Key</th></tr></thead><tbody><tr><td><code>arn:aws:iam::111111111111:role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleF[REDACTED:AWS_ACCESS_KEY]ess</code></td><td><code>kms:Decrypt</code>, <code>kms:GenerateDataKey*</code>, <code>kms:DescribeKey</code></td><td><code>shopnow-s3-datalake-key</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 3 — SHARE CATALOG RESOURCES CROSS-ACCOUNT USING AWS RAM</h3>
+<p>→ This is the key mechanism for cross-account catalog sharing<br>
+→ AWS RAM (Resource Access Manager) enables sharing AWS resources across accounts</p>
+<p><strong>Understanding AWS RAM:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Detail</th></tr></thead><tbody><tr><td>What it shares</td><td>AWS resources (Lake Formation databases/tables, Subnets, Transit Gateways, etc.)</td></tr><tr><td>Who it shares with</td><td>AWS accounts, Organizational Units (OUs), entire Organizations</td></tr><tr><td>How it works</td><td>Resource owner creates a "share" → recipient accepts → recipient gets access</td></tr><tr><td>Cost</td><td>FREE — no charge for RAM itself</td></tr><tr><td>Relationship to Lake Formation</td><td>RAM handles the SHARING mechanism — Lake Formation handles the PERMISSIONS</td></tr></tbody></table>
+<p><strong>Step 3a — Enable Cross-Account Sharing in Lake Formation:</strong></p>
+<p>→ Lake Formation → Settings → "Cross-account version settings"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Cross-account version</td><td>Version 3 (recommended — supports tag-based access control)</td></tr><tr><td>Default permissions for newly shared resources</td><td>Named resource method</td></tr></tbody></table>
+<p><strong>Cross-Account Sharing Versions:</strong></p>
+<table><thead><tr><th>Version</th><th>Features</th><th>Mechanism</th></tr></thead><tbody><tr><td>Version 1-2 (Legacy)</td><td>Basic database/table sharing</td><td>Direct Lake Formation grants</td></tr><tr><td>Version 3 (Current)</td><td>Tag-based access control, column-level security, data filters</td><td>AWS RAM + Lake Formation</td></tr></tbody></table>
+<p>→ Version 3 is required for column-level security and tag-based access control<br>
+→ Always use Version 3 for new implementations</p>
+<p><strong>Step 3b — Grant Cross-Account Permissions via Lake Formation:</strong></p>
+<p>→ Lake Formation → "Data lake permissions" → "Grant"</p>
+<p><strong>Grant 1 — Europe Account Access to Curated Products/Pricing Tables:</strong></p>
+<p><strong>Page 1 — Principal:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>External accounts</td></tr><tr><td>AWS account ID</td><td><code>222222222222</code></td></tr></tbody></table>
+<p><strong>Page 2 — LF-Tags or catalog resources:</strong></p>
+<p>→ Two methods for granting access:</p>
+<p><strong>Method A — Named Resource (Grant specific databases/tables):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database</td><td><code>shopnow_curated</code></td></tr><tr><td>Tables</td><td>Select specific: <code>products</code>, <code>pricing</code>, <code>inventory</code> (and 47 more)</td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td></tr><tr><td>Grantable permissions</td><td><code>Select</code>, <code>Describe</code> (allows Europe to re-grant within their account)</td></tr></tbody></table>
+<p><strong>Method B — Tag-Based Access Control (TBAC) — Recommended for Scale:</strong></p>
+<p>→ Instead of granting per-table → assign TAGS to tables → grant based on tags</p>
+<p><strong>Step 3c — Set Up Tag-Based Access Control (TBAC):</strong></p>
+<p>→ Lake Formation → "LF-Tags" → "Add LF-tag"</p>
+<p><strong>Create Tags:</strong></p>
+<table><thead><tr><th>Tag Key</th><th>Allowed Values</th><th>Purpose</th></tr></thead><tbody><tr><td><code>classification</code></td><td><code>public</code>, <code>internal</code>, <code>confidential</code>, <code>restricted</code></td><td>Data sensitivity level</td></tr><tr><td><code>domain</code></td><td><code>products</code>, <code>pricing</code>, <code>orders</code>, <code>customers</code>, <code>inventory</code>, <code>analytics</code></td><td>Business domain</td></tr><tr><td><code>region_access</code></td><td><code>global</code>, <code>europe</code>, <code>us</code>, <code>japan</code>, <code>hq_only</code></td><td>Geographic access restriction</td></tr></tbody></table>
+<p><strong>Assign Tags to Databases/Tables:</strong></p>
+<p>→ Lake Formation → "LF-Tags" → "Assign to resource"</p>
+<table><thead><tr><th>Resource</th><th><code>classification</code></th><th><code>domain</code></th><th><code>region_access</code></th></tr></thead><tbody><tr><td><code>shopnow_curated.products</code></td><td><code>internal</code></td><td><code>products</code></td><td><code>global</code></td></tr><tr><td><code>shopnow_curated.pricing</code></td><td><code>internal</code></td><td><code>pricing</code></td><td><code>global</code></td></tr><tr><td><code>shopnow_curated.inventory</code></td><td><code>internal</code></td><td><code>inventory</code></td><td><code>global</code></td></tr><tr><td><code>shopnow_curated.customer_profiles</code></td><td><code>confidential</code></td><td><code>customers</code></td><td><code>hq_only</code></td></tr><tr><td><code>shopnow_curated.orders_india</code></td><td><code>confidential</code></td><td><code>orders</code></td><td><code>hq_only</code></td></tr><tr><td><code>shopnow_curated.orders_europe</code></td><td><code>confidential</code></td><td><code>orders</code></td><td><code>europe</code></td></tr><tr><td><code>shopnow_curated.orders_us</code></td><td><code>confidential</code></td><td><code>orders</code></td><td><code>us</code></td></tr><tr><td><code>shopnow_refined.product_analytics</code></td><td><code>internal</code></td><td><code>analytics</code></td><td><code>global</code></td></tr><tr><td><code>shopnow_refined.pricing_analytics</code></td><td><code>internal</code></td><td><code>analytics</code></td><td><code>global</code></td></tr></tbody></table>
+<p><strong>Grant Tag-Based Permissions to Europe:</strong></p>
+<p>→ Lake Formation → "Data lake permissions" → "Grant"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>External accounts</td></tr><tr><td>AWS account ID</td><td><code>222222222222</code></td></tr><tr><td>Resource type</td><td>LF-Tag</td></tr><tr><td>Tag key: <code>region_access</code></td><td>Values: <code>global</code>, <code>europe</code></td></tr><tr><td>Tag key: <code>classification</code></td><td>Values: <code>public</code>, <code>internal</code></td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td></tr><tr><td>Grantable permissions</td><td><code>Select</code>, <code>Describe</code></td></tr></tbody></table>
+<p><strong>What this grant means:</strong><br>
+→ Europe can access ANY table that has BOTH:</p>
+<ul>
+<li><code>region_access</code> = <code>global</code> OR <code>europe</code></li>
+<li><code>classification</code> = <code>public</code> OR <code>internal</code><br>
+→ Europe CANNOT access:</li>
+<li>Tables with <code>region_access</code> = <code>hq_only</code> or <code>us</code> or <code>japan</code></li>
+<li>Tables with <code>classification</code> = <code>confidential</code> or <code>restricted</code></li>
+</ul>
+<p><strong>Power of TBAC:</strong><br>
+→ When HQ creates a NEW table and tags it with <code>region_access=global</code> + <code>classification=internal</code><br>
+→ Europe AUTOMATICALLY gets access — no additional grant needed<br>
+→ When HQ changes a table's tag from <code>global</code> to <code>hq_only</code><br>
+→ Europe AUTOMATICALLY loses access — no revocation needed<br>
+→ Tags are the GOVERNANCE MECHANISM — they control access dynamically</p>
+<hr>
+<p><strong>Grant Tag-Based Permissions to Other Accounts:</strong></p>
+<p><strong>US Account (<code>333333333333</code>):</strong></p>
+<table><thead><tr><th>Tag Key</th><th>Allowed Values</th></tr></thead><tbody><tr><td><code>region_access</code></td><td><code>global</code>, <code>us</code></td></tr><tr><td><code>classification</code></td><td><code>public</code>, <code>internal</code></td></tr></tbody></table>
+<p><strong>Japan Account[REDACTED:BANK_ACCOUNT_NUMBER]444`):</strong></p>
+<table><thead><tr><th>Tag Key</th><th>Allowed Values</th></tr></thead><tbody><tr><td><code>region_access</code></td><td><code>global</code>, <code>japan</code></td></tr><tr><td><code>classification</code></td><td><code>public</code>, <code>internal</code></td></tr><tr><td><code>domain</code></td><td><code>analytics</code> (Japan only sees analytics tables)</td></tr></tbody></table>
+<p><strong>Shared Services Account (<code>555555555555</code>):</strong></p>
+<table><thead><tr><th>Tag Key</th><th>Allowed Values</th></tr></thead><tbody><tr><td><code>region_access</code></td><td><code>global</code>, <code>europe</code>, <code>us</code>, <code>japan</code>, <code>hq_only</code> (ALL values)</td></tr><tr><td><code>classification</code></td><td><code>public</code>, <code>internal</code>, <code>confidential</code>, <code>restricted</code> (ALL values)</td></tr></tbody></table>
+<p>→ Shared Services gets FULL access for auditing and monitoring purposes</p>
+<hr>
+<p><strong>Step 3d — AWS RAM Creates the Share Automatically:</strong></p>
+<p>→ When you grant cross-account permissions via Lake Formation (Version 3)<br>
+→ Lake Formation automatically creates an AWS RAM resource share<br>
+→ Navigate to AWS RAM → "Shared by me" → You'll see:</p>
+<table><thead><tr><th>Resource Share Name</th><th>Resources Shared</th><th>Shared With</th></tr></thead><tbody><tr><td><code>LakeFormation-111111111111-222222222222</code></td><td>Glue databases/tables matching tags</td><td>Account <code>222222222222</code></td></tr><tr><td><code>LakeFormation-111111111111-333333333333</code></td><td>Glue databases/tables matching tags</td><td>Account <code>333333333333</code></td></tr><tr><td><code>LakeFormation-111111111111-444444444444</code></td><td>Glue databases/tables matching tags</td><td>Account <code>444444444444</code></td></tr><tr><td><code>LakeFormation-111111111111-555555555555</code></td><td>Glue databases/tables matching tags</td><td>Account <code>555555555555</code></td></tr></tbody></table>
+<p>→ These RAM shares are auto-managed by Lake Formation — do NOT modify them manually</p>
+<hr>
+<h3>STEP 4 — ACCEPT SHARED RESOURCES IN CONSUMER ACCOUNTS</h3>
+<p>→ Sign into Account <code>222222222222</code> (Europe — the data consumer)</p>
+<p><strong>Step 4a — Accept the RAM Share:</strong></p>
+<p>→ Navigate to AWS RAM → "Shared with me" → "Resource shares"<br>
+→ You'll see a pending share from Account <code>111111111111</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Share name</td><td><code>LakeFormation-111111111111-222222222222</code></td></tr><tr><td>Status</td><td>Pending</td></tr><tr><td>Action</td><td>Accept</td></tr></tbody></table>
+<p>→ Click "Accept resource share"<br>
+→ Status changes to "Active"</p>
+<p><strong>If accounts are in the same AWS Organization with RAM sharing enabled:</strong><br>
+→ Shares are AUTOMATICALLY accepted — no manual acceptance needed<br>
+→ Navigate to AWS Organizations → Settings → "Enable sharing with AWS Organizations" → Enable<br>
+→ This eliminates the manual acceptance step for all organizational accounts</p>
+<p><strong>Step 4b — Create Resource Links in Consumer Account:</strong></p>
+<p>→ After accepting the share → the shared databases/tables appear in Lake Formation<br>
+→ But they are NOT directly visible in the consumer's Glue Data Catalog<br>
+→ You must create RESOURCE LINKS — these are pointers from the consumer's catalog to the producer's shared resources</p>
+<p><strong>What is a Resource Link?</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Producer Account (111) Glue Catalog:
+</span>  Database: shopnow_curated
+    Table: products (actual table with schema, location, partitions)
+
+Consumer Account (222) Glue Catalog:
+  Database: hq_shared_curated (local database)
+    Resource Link: products → points to 111's shopnow_curated.products</code></pre></div>
+<p>→ The resource link is a POINTER — not a copy<br>
+→ When HQ updates the <code>products</code> table schema → the resource link automatically reflects the change<br>
+→ No synchronization needed — the link is live</p>
+<p><strong>Create Resource Link Database:</strong></p>
+<p>→ Navigate to Lake Formation in Account <code>222222222222</code><br>
+→ "Databases" → "Create database"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database type</td><td>Resource link</td></tr><tr><td>Resource link name</td><td><code>hq_shared_curated</code></td></tr><tr><td>Shared database</td><td>Select <code>shopnow_curated</code> from Account <code>111111111111</code> (appears in dropdown after RAM acceptance)</td></tr></tbody></table>
+<p><strong>Create Resource Links for Tables:</strong></p>
+<p>→ Lake Formation → "Tables" → "Create table"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Table type</td><td>Resource link</td></tr><tr><td>Resource link name</td><td><code>products</code></td></tr><tr><td>Shared table</td><td>Select <code>products</code> from <code>shopnow_curated</code> in Account <code>111111111111</code></td></tr><tr><td>Target database</td><td><code>hq_shared_curated</code> (the resource link database created above)</td></tr></tbody></table>
+<p>→ Repeat for each shared table that Europe needs<br>
+→ OR → Create resource links for ALL shared tables at once (bulk operation)</p>
+<p><strong>Alternative — Database-Level Resource Link:</strong></p>
+<p>→ Instead of creating individual table resource links<br>
+→ Create ONE database-level resource link<br>
+→ ALL shared tables within that database automatically appear</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database type</td><td>Resource link</td></tr><tr><td>Resource link name</td><td><code>hq_shared_curated</code></td></tr><tr><td>Shared database</td><td><code>shopnow_curated</code> from Account <code>111111111111</code></td></tr></tbody></table>
+<p>→ Now <code>hq_shared_curated</code> in Europe's catalog shows ALL tables that Europe has permission to see<br>
+→ Tables Europe doesn't have permission for → invisible (filtered by Lake Formation)</p>
+<hr>
+<p><strong>Step 4c — Grant Local Permissions on Resource Links:</strong></p>
+<p>→ The resource link exists in Europe's catalog → but Europe's roles need PERMISSION to use it<br>
+→ Lake Formation in Account <code>222222222222</code> → "Data lake permissions" → "Grant"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>arn:aws:iam::222222222222:role/EuropeAthenaRole</code></td></tr><tr><td>Resource type</td><td>Database</td></tr><tr><td>Database</td><td><code>hq_shared_curated</code></td></tr><tr><td>Database permissions</td><td><code>Describe</code></td></tr></tbody></table>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>arn:aws:iam::222222222222:role/EuropeAthenaRole</code></td></tr><tr><td>Resource type</td><td>Table</td></tr><tr><td>Database</td><td><code>hq_shared_curated</code></td></tr><tr><td>Tables</td><td>All tables</td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td></tr></tbody></table>
+<p>→ This grants Europe's Athena role permission to query the resource-linked tables<br>
+→ The ACTUAL data access permissions are controlled by HQ's Lake Formation grants (Step 3)<br>
+→ This local grant controls who WITHIN Europe's account can use the resource links</p>
+<p><strong>Two-Layer Permission Model:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Layer 1: Producer Account (HQ) Lake Formation
+</span>  "Account 222222222222 can SELECT on tables with region_access=global/europe"
+  → Controls WHAT the external account can access
+
+Layer 2: Consumer Account (Europe) Lake Formation
+  "EuropeAthenaRole can SELECT on hq_shared_curated tables"
+  → Controls WHO within the external account can access
+
+BOTH layers must allow → Effective permission = Intersection</code></pre></div>
+<hr>
+<h3>STEP 5 — CONFIGURE COLUMN-LEVEL SECURITY</h3>
+<p>→ This solves the PII protection problem — Europe should NOT see <code>customer_email</code> and <code>customer_phone</code></p>
+<p><strong>Step 5a — Define Column-Level Permissions in Producer Account:</strong></p>
+<p>→ Sign into Account <code>111111111111</code> (HQ)<br>
+→ Lake Formation → "Data lake permissions" → "Grant"</p>
+<p><strong>Grant with Column Exclusion for Europe:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>External accounts</td></tr><tr><td>AWS account ID</td><td><code>222222222222</code></td></tr><tr><td>Database</td><td><code>shopnow_curated</code></td></tr><tr><td>Table</td><td><code>products</code></td></tr><tr><td>Column permissions type</td><td>"Exclude columns"</td></tr><tr><td>Excluded columns</td><td><code>customer_email</code>, <code>customer_phone</code>, <code>customer_address</code></td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td></tr></tbody></table>
+<p><strong>Two Column Permission Approaches:</strong></p>
+<table><thead><tr><th>Approach</th><th>Configuration</th><th>Use Case</th></tr></thead><tbody><tr><td>Include columns</td><td>Explicitly list columns the principal CAN access</td><td>When access is very restricted (few columns allowed)</td></tr><tr><td>Exclude columns</td><td>Explicitly list columns the principal CANNOT access</td><td>When access is broad with few exceptions (most columns allowed)</td></tr></tbody></table>
+<p><strong>For ShopNow:</strong><br>
+→ Europe can see 45 out of 48 columns in <code>products</code> table → Exclude 3 is simpler<br>
+→ Japan can see only 5 out of 48 columns → Include 5 is simpler</p>
+<p><strong>Grant with Column Inclusion for Japan:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>External accounts</td></tr><tr><td>AWS account ID</td><td><code>444444444444</code></td></tr><tr><td>Database</td><td><code>shopnow_refined</code></td></tr><tr><td>Table</td><td><code>product_analytics</code></td></tr><tr><td>Column permissions type</td><td>"Include columns"</td></tr><tr><td>Included columns</td><td><code>product_id</code>, <code>product_name</code>, <code>category</code>, <code>total_sales</code>, <code>avg_rating</code></td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td></tr></tbody></table>
+<p>→ Japan can ONLY see these 5 columns — all others are invisible</p>
+<p><strong>Step 5b — How Column-Level Security Works at Query Time:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Europe's analyst runs:
+</span>  SELECT * FROM hq_shared_curated.products LIMIT 10
+
+Athena receives the query
+    │
+    ▼
+Athena checks Lake Formation permissions for EuropeAthenaRole:
+    │
+    ├── Database permission: Describe on hq_shared_curated → ✅
+    ├── Table permission: Select on products → ✅
+    ├── Column permissions: ALL columns EXCEPT customer_email, customer_phone, customer_address
+    │
+    ▼
+Athena REWRITES the query internally:
+  SELECT product_id, product_name, category, price, weight, ... (45 columns) 
+  FROM hq_shared_curated.products LIMIT 10
+  
+  (customer_email, customer_phone, customer_address are REMOVED from SELECT *)
+    │
+    ▼
+Athena reads from S3 (via Lake Formation service role)
+    │
+    ▼
+Results returned to analyst — 45 columns visible, 3 columns invisible</code></pre></div>
+<p><strong>What if the analyst explicitly queries a restricted column?</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Europe's analyst runs:
+</span>  SELECT customer_email FROM hq_shared_curated.products LIMIT 10
+
+Athena checks Lake Formation permissions:
+    Column customer_email → EXCLUDED for this principal
+    
+    → Query FAILS with: "Insufficient Lake Formation permission(s): Required Select on customer_email"</code></pre></div>
+<p>→ Column-level security is ENFORCED — not just hidden in the UI<br>
+→ Even explicit column reference is blocked<br>
+→ This is fundamentally stronger than just hiding columns in a view</p>
+<hr>
+<h3>STEP 6 — CONFIGURE DATA FILTERS (Row-Level Security)</h3>
+<p>→ Lake Formation also supports ROW-LEVEL filtering (more advanced)</p>
+<p><strong>Scenario:</strong><br>
+→ The <code>orders</code> table contains orders from ALL regions<br>
+→ Europe should only see rows where <code>region = 'europe'</code><br>
+→ US should only see rows where <code>region = 'us'</code></p>
+<p><strong>Create Data Filter:</strong></p>
+<p>→ Lake Formation → "Data filters" → "Create data filter"</p>
+<p><strong>Filter 1 — Europe Orders Filter:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Filter name</td><td><code>europe-orders-only</code></td></tr><tr><td>Target database</td><td><code>shopnow_curated</code></td></tr><tr><td>Target table</td><td><code>orders</code></td></tr><tr><td>Column filter type</td><td>Exclude columns: <code>customer_email</code>, <code>customer_phone</code></td></tr><tr><td>Row filter expression</td><td><code>region = 'europe'</code></td></tr></tbody></table>
+<p><strong>Filter 2 — US Orders Filter:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Filter name</td><td><code>us-orders-only</code></td></tr><tr><td>Target database</td><td><code>shopnow_curated</code></td></tr><tr><td>Target table</td><td><code>orders</code></td></tr><tr><td>Column filter type</td><td>Exclude columns: <code>customer_ssn</code></td></tr><tr><td>Row filter expression</td><td><code>region = 'us'</code></td></tr></tbody></table>
+<p><strong>Grant Permissions with Data Filter:</strong></p>
+<p>→ Lake Formation → "Data lake permissions" → "Grant"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>External accounts</td></tr><tr><td>AWS account ID</td><td><code>222222222222</code></td></tr><tr><td>Database</td><td><code>shopnow_curated</code></td></tr><tr><td>Table</td><td><code>orders</code></td></tr><tr><td>Data filter</td><td><code>europe-orders-only</code></td></tr><tr><td>Table permissions</td><td><code>Select</code>, <code>Describe</code></td></tr></tbody></table>
+<p>→ Now Europe can query the <code>orders</code> table but:</p>
+<ul>
+<li>Only sees rows where <code>region = 'europe'</code></li>
+<li>Cannot see <code>customer_email</code> or <code>customer_phone</code> columns</li>
+<li>Both row AND column filters applied simultaneously</li>
+</ul>
+<hr>
+<h3>STEP 7 — CONFIGURE CROSS-ACCOUNT QUERY FLOW</h3>
+<p>→ Sign into Account <code>222222222222</code> (Europe)<br>
+→ Navigate to Athena → Query Editor</p>
+<p><strong>Europe's Athena Query Experience:</strong></p>
+<p>→ Data source: <code>AwsDataCatalog</code> (Europe's own Glue Catalog)<br>
+→ Database dropdown: Shows <code>hq_shared_curated</code> (the resource link database)<br>
+→ Tables: Shows only tables Europe has permission to see (based on HQ's Lake Formation grants)</p>
+<p><strong>Query Execution Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Europe's Analyst → Athena (Account 222)
+</span>    │
+    ├── Query: SELECT * FROM hq_shared_curated.products LIMIT 10
+    │
+    ▼
+Athena resolves resource link:
+    hq_shared_curated.products → shopnow_curated.products in Account 111
+    │
+    ▼
+Athena checks Lake Formation permissions:
+    │
+    ├── Check 1: HQ's Lake Formation (Account 111)
+    │     Does Account 222 have Select on shopnow_curated.products?
+    │     Tag-based grant: region_access=global, classification=internal → YES ✅
+    │     Column exclusion: customer_email, customer_phone, customer_address → Applied
+    │
+    ├── Check 2: Europe's Lake Formation (Account 222)
+    │     Does EuropeAthenaRole have Select on hq_shared_curated (resource link)?
+    │     → YES ✅
+    │
+    ▼
+Lake Formation service-linked role in Account 111:
+    Reads data from s3://shopnow-datalake-curated/products/
+    Decrypts with KMS key (shopnow-s3-datalake-key)
+    │
+    ▼
+Data returned to Athena in Account 222
+    Restricted columns filtered out
+    Results displayed to analyst</code></pre></div>
+<p><strong>CRITICAL: S3 Access Path for Cross-Account Lake Formation Queries:</strong></p>
+<p>→ The data lives in Account 111's S3 bucket<br>
+→ Europe's Athena role does NOT need direct S3 access to Account 111's bucket<br>
+→ Lake Formation's service-linked role in Account 111 reads the S3 data<br>
+→ Data is passed to Athena through Lake Formation's internal mechanisms</p>
+<p><strong>This means:</strong><br>
+→ The S3 bucket policy from Project 39 is NO LONGER needed for Athena queries<br>
+→ Lake Formation replaces direct S3 cross-account access for governed queries<br>
+→ Europe's Athena role needs ZERO S3 permissions on HQ's bucket<br>
+→ All access goes through Lake Formation → centralized governance</p>
+<p><strong>However — S3 cross-account access (Project 39) is STILL needed for:</strong></p>
+<ul>
+<li>Glue ETL jobs that read raw S3 files directly (not through catalog)</li>
+<li>Any tool that doesn't integrate with Lake Formation</li>
+<li>Redshift Spectrum (partial Lake Formation support)</li>
+</ul>
+<hr>
+<h3>STEP 8 — SET UP GOVERNANCE DASHBOARD AND AUDIT TRAIL</h3>
+<p><strong>Lake Formation Audit via CloudTrail:</strong></p>
+<p>→ Lake Formation actions are logged in CloudTrail:</p>
+<table><thead><tr><th>Event Name</th><th>What It Means</th></tr></thead><tbody><tr><td><code>GrantPermissions</code></td><td>New Lake Formation permission granted</td></tr><tr><td><code>RevokePermissions</code></td><td>Lake Formation permission revoked</td></tr><tr><td><code>GetDataAccess</code></td><td>Data access request evaluated by Lake Formation</td></tr><tr><td><code>CreateLFTag</code></td><td>New LF-Tag created</td></tr><tr><td><code>AddLFTagsToResource</code></td><td>Tags assigned to database/table</td></tr><tr><td><code>CreateDataFilter</code></td><td>Row/column filter created</td></tr><tr><td><code>PutDataLakeSettings</code></td><td>Lake Formation settings changed</td></tr></tbody></table>
+<p><strong>Key Audit Event — <code>GetDataAccess</code>:</strong></p>
+<p>→ Every time a query engine (Athena, Redshift Spectrum) requests data through Lake Formation<br>
+→ CloudTrail logs a <code>GetDataAccess</code> event containing:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Principal requesting access</td><td>The IAM role running the query</td></tr><tr><td>Resource accessed</td><td>Database, table, columns</td></tr><tr><td>Permission evaluated</td><td>What Lake Formation checked</td></tr><tr><td>Result</td><td>ALLOWED or DENIED</td></tr><tr><td>Account</td><td>Source account of the principal</td></tr></tbody></table>
+<p>→ This provides the COMPLETE audit trail the data engineering lead requested</p>
+<p><strong>Lake Formation Permission Dashboard:</strong></p>
+<p>→ Lake Formation → "Data lake permissions" → Shows ALL grants:</p>
+<table><thead><tr><th>Principal</th><th>Resource</th><th>Permissions</th><th>Grantable</th></tr></thead><tbody><tr><td>Account <code>222222222222</code></td><td><code>shopnow_curated.*</code> (tag-based)</td><td>Select, Describe</td><td>Yes</td></tr><tr><td>Account <code>333333333333</code></td><td><code>shopnow_curated.*</code> (tag-based)</td><td>Select, Describe</td><td>Yes</td></tr><tr><td>Accoun[REDACTED:BANK_ACCOUNT_NUMBER]444`</td><td><code>shopnow_refined.product_analytics</code></td><td>Select (5 columns)</td><td>No</td></tr><tr><td>Accoun[REDACTED:BANK_ACCOUNT_NUMBER]555`</td><td>ALL (tag-based)</td><td>Select, Describe</td><td>Yes</td></tr><tr><td><code>GlueETLRole</code></td><td><code>shopnow_raw.*</code>, <code>shopnow_curated.*</code></td><td>All table permissions</td><td>No</td></tr><tr><td><code>AthenaQueryRole</code></td><td><code>shopnow_curated.*</code>, <code>shopnow_refined.*</code></td><td>Select, Describe</td><td>No</td></tr></tbody></table>
+<p>→ ONE dashboard showing ALL data access permissions — internal AND external<br>
+→ The data engineering lead can answer: "Who has access to what?" in seconds</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always uncheck the default IAM-only settings AFTER granting Lake Formation permissions to existing roles<br>
+→ Always use Tag-Based Access Control (TBAC) for cross-account sharing at scale — tags automate future grants<br>
+→ Always register S3 data locations with Lake Formation for centralized access mediation<br>
+→ Always use column-level exclusion/inclusion for PII protection — stronger than views<br>
+→ Always use data filters for row-level security when regional data isolation is needed<br>
+→ Always create database-level resource links in consumer accounts — simplifies table visibility<br>
+→ Always grant both producer-side AND consumer-side Lake Formation permissions<br>
+→ Always enable AWS Organizations RAM sharing for automatic share acceptance<br>
+→ Always use Version 3 cross-account settings for full feature support<br>
+→ Always add the Lake Formation service-linked role to KMS key policies<br>
+→ Always test cross-account queries after setting up resource links<br>
+→ Always document the tag taxonomy — it becomes the governance framework</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never uncheck default IAM settings before granting Lake Formation permissions — breaks ALL existing workloads<br>
+→ Never grant <code>Super</code> permission to external accounts — grants full control including Drop<br>
+→ Never skip the resource link creation in consumer accounts — shared resources won't appear in Glue Catalog<br>
+→ Never modify AWS RAM shares created by Lake Formation manually — let Lake Formation manage them<br>
+→ Never grant grantable permissions to external accounts unless they need to re-delegate within their account<br>
+→ Never use named resource grants for 100+ tables — use tag-based access control instead<br>
+→ Never forget KMS key policy update for Lake Formation service-linked role — cross-account queries fail silently<br>
+→ Never assume column exclusion applies retroactively to cached results — only applies to new queries<br>
+→ Never create resource links with the same name as existing local tables — naming conflicts cause errors<br>
+→ Never skip consumer-side Lake Formation permission grants — resource links exist but roles can't use them<br>
+→ Never use Lake Formation for unstructured data (images, PDFs) — it's designed for tabular catalog data<br>
+→ Never rely solely on Lake Formation without CloudTrail — audit trail is essential for compliance</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Approach</th><th>Why</th></tr></thead><tbody><tr><td>Share specific tables with column restrictions</td><td>Lake Formation cross-account grant with column filters</td><td>Fine-grained access control at column level</td></tr><tr><td>Share based on data classification</td><td>Tag-Based Access Control (TBAC)</td><td>Automatic — new tables with matching tags auto-shared</td></tr><tr><td>Regional data isolation</td><td>Data filters (row-level security)</td><td>Only rows matching region filter are visible</td></tr><tr><td>Share entire database with full access</td><td>Database-level grant without column/row restrictions</td><td>Simplest for trusted accounts (e.g., Shared Services)</td></tr><tr><td>Consumer needs direct S3 file access (not catalog)</td><td>Cross-account S3 access (Project 39)</td><td>Lake Formation doesn't cover direct S3 reads</td></tr><tr><td>Consumer uses Glue ETL with JDBC sources</td><td>Not Lake Formation — use Glue connection + Secrets Manager (Project 24, 37)</td><td>Lake Formation governs catalog access, not JDBC</td></tr><tr><td>Quick ad-hoc query by external analyst</td><td>Lake Formation + Athena via resource links</td><td>Serverless, governed, audited</td></tr><tr><td>Bulk data transfer between accounts</td><td>S3 replication (Project 30) or DMS (Project 58)</td><td>Lake Formation is for access, not transfer</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Lake Formation when you only need S3 file-level access — use bucket policies (Project 39)<br>
+→ Do NOT use Lake Formation for non-Glue-Catalog data sources — it only governs Glue Catalog tables<br>
+→ Do NOT use Lake Formation for real-time streaming data access — use Kinesis (Project 52)<br>
+→ Do NOT use Lake Formation for database credential management — use Secrets Manager (Project 37)<br>
+→ Do NOT use Lake Formation when all consumers are in the same account with simple IAM needs — overhead not justified<br>
+→ Do NOT use Lake Formation for temporary one-time data sharing — use S3 presigned URLs or cross-account copy</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — LAKE FORMATION PERMISSION EVALUATION FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Query arrives at Athena: SELECT * FROM hq_shared_curated.products
+</span>        │
+        ▼
+Athena identifies the table as a resource link
+        │
+        ▼
+Athena resolves resource link → shopnow_curated.products in Account 111
+        │
+        ▼
+Lake Formation Permission Evaluation:
+        │
+        ├── Step 1: Is the caller an IAM principal with basic Glue/Athena permissions?
+        │     IAM Policy check: glue:GetTable, athena:StartQueryExecution → YES ✅
+        │
+        ├── Step 2: Consumer Account Lake Formation (Account 222)
+        │     Does EuropeAthenaRole have Select on hq_shared_curated resource link?
+        │     → Check local Lake Formation permissions → YES ✅
+        │
+        ├── Step 3: Producer Account Lake Formation (Account 111)
+        │     Does Account 222 have Select on shopnow_curated.products?
+        │     → Check cross-account grants (tag-based or named)
+        │     → Tag match: region_access=global ✅, classification=internal ✅
+        │     → Select permission granted ✅
+        │
+        ├── Step 4: Column-Level Check
+        │     Which columns is Account 222 allowed to see?
+        │     → Exclude: customer_email, customer_phone, customer_address
+        │     → Allowed: 45 out of 48 columns
+        │
+        ├── Step 5: Row-Level Check (if data filter exists)
+        │     Does a data filter apply to this principal+table combination?
+        │     → If yes: Add WHERE clause to query internally
+        │     → If no: All rows accessible
+        │
+        └── Step 6: Data Access
+              Lake Formation service-linked role in Account 111:
+                → s3:GetObject on s3://shopnow-datalake-curated/products/
+                → kms:Decrypt on shopnow-s3-datalake-key
+                → Returns data to Athena (filtered by column/row restrictions)</code></pre></div>
+<hr>
+<h3>MECHANIC 2 — TAG-BASED ACCESS CONTROL EVALUATION</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Grant: Account 222 can Select where:
+</span>  region_access IN [global, europe]
+  classification IN [public, internal]
+
+Table: shopnow_curated.customer_profiles
+  Tags: region_access=hq_only, classification=confidential
+
+Evaluation:
+  region_access: hq_only IN [global, europe]? → NO ❌
+  → ACCESS DENIED (first non-matching tag short-circuits)
+
+Table: shopnow_curated.products
+  Tags: region_access=global, classification=internal
+
+Evaluation:
+  region_access: global IN [global, europe]? → YES ✅
+  classification: internal IN [public, internal]? → YES ✅
+  → ALL tags match → ACCESS GRANTED ✅</code></pre></div>
+<p>→ ALL tag conditions must match (AND logic between tag keys)<br>
+→ Multiple values per tag key are OR logic (global OR europe)<br>
+→ First non-matching tag → immediate denial</p>
+<hr>
+<h3>MECHANIC 3 — RESOURCE LINK RESOLUTION</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer Account (222) Glue Catalog:
+</span>  Database: hq_shared_curated (resource link → shopnow_curated@111)
+    Table: products (resource link → products@shopnow_curated@111)
+
+When Athena queries hq_shared_curated.products:
+        │
+        ▼
+Glue Catalog resolves resource link chain:
+  hq_shared_curated → Database shopnow_curated in Account 111
+  products → Table products in shopnow_curated in Account 111
+        │
+        ▼
+Athena fetches table metadata from Account 111's Glue Catalog:
+  Schema: [product_id INT, product_name STRING, ...]
+  Location: s3://shopnow-datalake-curated/products/
+  Partition keys: [year, month]
+  Serde: Parquet
+        │
+        ▼
+All metadata is LIVE from producer's catalog
+  No local copy → always current
+  Schema changes in producer → immediately visible to consumer
+  New partitions in producer → immediately queryable by consumer</code></pre></div>
+<p>→ This solves the "schema drift" and "partition sync" problems from the hypothetical scenario</p>
+<hr>
+<h3>MECHANIC 4 — AWS RAM SHARING INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lake Formation grants cross-account permission
+</span>        │
+        ▼
+Lake Formation creates/updates AWS RAM resource share:
+  Share name: LakeFormation-111111111111-222222222222
+  Resources: Glue databases and tables matching the grant
+  Principal: Account 222222222222
+        │
+        ▼
+RAM share appears in Account 222's "Shared with me" console
+        │
+        ├── If accounts are in same Organization with RAM sharing enabled:
+        │     Share is AUTO-ACCEPTED → resources immediately available
+        │
+        └── If accounts are NOT in same Organization:
+              Share is PENDING → Account 222 must manually accept
+              → After acceptance → resources available
+        │
+        ▼
+After acceptance:
+  Account 222's Lake Formation can see shared databases/tables
+  Account 222 creates resource links pointing to shared resources
+  Resource links appear in Account 222's Glue Data Catalog</code></pre></div>
+<hr>
+<h3>MECHANIC 5 — COST MODEL</h3>
+<table><thead><tr><th>Component</th><th>Cost</th><th>Notes</th></tr></thead><tbody><tr><td>Lake Formation permissions</td><td>FREE</td><td>No charge for granting/revoking permissions</td></tr><tr><td>AWS RAM resource sharing</td><td>FREE</td><td>No charge for sharing resources</td></tr><tr><td>LF-Tags</td><td>FREE</td><td>No charge for creating/assigning tags</td></tr><tr><td>Data filters</td><td>FREE</td><td>No charge for row/column filters</td></tr><tr><td>Resource links</td><td>FREE</td><td>No charge for creating links</td></tr><tr><td>Athena queries (cross-account via LF)</td><td>Standard Athena pricing ($5/TB scanned)</td><td>Data scanned in producer's S3</td></tr><tr><td>S3 data access</td><td>Standard S3 request pricing</td><td>Charged to producer's account (Account 111)</td></tr><tr><td>CloudTrail logging</td><td>Standard CloudTrail pricing</td><td>GetDataAccess events logged</td></tr></tbody></table>
+<p>→ Lake Formation itself is FREE — cost comes from the query engines and storage<br>
+→ S3 data access charges go to the PRODUCER account (where data physically lives)<br>
+→ Query compute charges go to the CONSUMER account (where Athena runs)</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Default IAM settings still checked</td><td>Lake Formation permissions ignored — IAM controls access</td><td>Forgot to uncheck "Use only IAM access control"</td><td>Uncheck AFTER granting LF permissions to existing roles</td></tr><tr><td>2</td><td>Resource link not created in consumer account</td><td>Shared tables don't appear in consumer's Glue Catalog</td><td>RAM share accepted but no resource links created</td><td>Create database-level resource link in consumer account</td></tr><tr><td>3</td><td>Consumer role missing local Lake Formation permissions</td><td>Resource link exists but queries fail with "Insufficient LF permission"</td><td>Consumer account didn't grant local LF permissions on resource link</td><td>Grant Select/Describe to consumer roles on the resource link</td></tr><tr><td>4</td><td>KMS key policy missing service-linked role</td><td>Cross-account queries fail with KMS access denied</td><td>Lake Formation service-linked role can't decrypt S3 data</td><td>Add service-linked role to KMS key policy</td></tr><tr><td>5</td><td>Tag mismatch — table has unexpected tags</td><td>Account should have access but doesn't</td><td>Table tagged with <code>hq_only</code> instead of <code>global</code></td><td>Verify and correct tag assignments on the table</td></tr><tr><td>6</td><td>Column exclusion not applied</td><td>Consumer sees PII columns they shouldn't</td><td>Column-level grant was set on wrong table or wrong account</td><td>Verify column permissions in Lake Formation → Data lake permissions</td></tr><tr><td>7</td><td>RAM share pending — not accepted</td><td>Consumer account can't see shared resources</td><td>Manual acceptance required (accounts not in same Org)</td><td>Accept the RAM share in consumer account OR enable Org-level RAM sharing</td></tr><tr><td>8</td><td>Existing workloads break after enabling Lake Formation</td><td>Glue jobs, Athena queries fail with permission errors</td><td>Unchecked IAM defaults before granting LF permissions to existing roles</td><td>Grant LF permissions to all affected roles → then uncheck defaults</td></tr><tr><td>9</td><td>Data filter row expression incorrect</td><td>Wrong rows returned or no rows returned</td><td>SQL expression in data filter has syntax error or wrong column name</td><td>Test filter expression against actual table data</td></tr><tr><td>10</td><td>Grantable permissions given to wrong account</td><td>External account re-grants access to unauthorized parties</td><td>Grantable flag set unnecessarily on cross-account grant</td><td>Only enable grantable when consumer account needs to delegate within their account</td></tr><tr><td>11</td><td>Cross-region resource sharing fails</td><td>Resource links cannot be created</td><td>Lake Formation cross-account sharing is same-region only by default</td><td>Use Glue Catalog replication or ensure producer and consumer are in same region</td></tr><tr><td>12</td><td>Too many named resource grants</td><td>Permission management becomes unwieldy</td><td>200 tables × 4 accounts = 800 individual grants</td><td>Switch to Tag-Based Access Control (TBAC)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Table Count Scaling</strong></p>
+<ul>
+<li>Named resource grants: Manageable for &lt; 50 tables per account pair</li>
+<li>Tag-based grants: Scales to thousands of tables — one grant covers all matching tags</li>
+<li>When HQ adds new table with appropriate tags → auto-shared to all accounts with matching tag grants</li>
+</ul>
+<p>→ <strong>Account Count Scaling</strong></p>
+<ul>
+<li>5 accounts → Individual cross-account grants work</li>
+<li>20+ accounts → Use TBAC + AWS Organizations for automatic RAM acceptance</li>
+<li>100+ accounts → Use Organization-level grants with OU-based tag policies (Project 54)</li>
+</ul>
+<p>→ <strong>Column/Row Filter Scaling</strong></p>
+<ul>
+<li>Column filters: Per-table per-principal — manageable for dozens of tables</li>
+<li>Data filters: Per-table per-principal with row expressions — more complex</li>
+<li>For complex filtering needs → Consider creating curated views/tables in producer account</li>
+</ul>
+<p>→ <strong>Permission Evaluation Performance</strong></p>
+<ul>
+<li>Lake Formation permission checks add ~100-500ms to query startup</li>
+<li>Does NOT affect query execution time (once permissions are evaluated)</li>
+<li>Tag-based evaluation is efficient — O(number of tags) not O(number of tables)</li>
+<li>Column filtering is applied at read time — minimal overhead for Parquet columnar format</li>
+</ul>
+<p>→ <strong>Cross-Region Considerations</strong></p>
+<ul>
+<li>Lake Formation cross-account sharing works best within the same region</li>
+<li>For cross-region → Consider S3 replication (Project 30) + local Lake Formation in each region</li>
+<li>Glue Catalog is regional — resource links must be in the same region as the shared catalog</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the complete Lake Formation setup:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>Where</th><th>Expected Result</th></tr></thead><tbody><tr><td>Lake Formation enabled</td><td>Account 111 → Lake Formation → Settings</td><td>Admin roles configured, IAM defaults unchecked</td></tr><tr><td>S3 locations registered</td><td>Account 111 → Lake Formation → Data lake locations</td><td>All three data zones registered</td></tr><tr><td>Tags created</td><td>Account 111 → Lake Formation → LF-Tags</td><td>classification, domain, region_access tags exist</td></tr><tr><td>Tags assigned to tables</td><td>Account 111 → Lake Formation → Tables → select table → Tags</td><td>Correct tags on each table</td></tr><tr><td>Cross-account grants exist</td><td>Account 111 → Lake Formation → Data lake permissions</td><td>Grants for accounts 222, 333, 444, 555</td></tr><tr><td>RAM shares active</td><td>Account 111 → RAM → Shared by me</td><td>Active shares to each consumer account</td></tr><tr><td>RAM shares accepted</td><td>Each consumer account → RAM → Shared with me</td><td>Status: Active</td></tr><tr><td>Resource links created</td><td>Each consumer account → Glue Catalog → Databases</td><td>Resource link databases visible</td></tr><tr><td>Consumer roles have local LF permissions</td><td>Each consumer account → Lake Formation → Data lake permissions</td><td>Roles granted Select/Describe on resource links</td></tr><tr><td>Column exclusion applied</td><td>Account 111 → Lake Formation → Data lake permissions → specific grant</td><td>Excluded columns listed</td></tr><tr><td>KMS key allows service-linked role</td><td>Account 111 → KMS → Key policy</td><td>LF service-linked role listed</td></tr></tbody></table>
+<p>→ <strong>How to test cross-account governed queries:</strong></p>
+<table><thead><tr><th>Test</th><th>Action</th><th>Expected Result</th></tr></thead><tbody><tr><td>Query allowed table</td><td>Europe Athena: <code>SELECT * FROM hq_shared_curated.products LIMIT 5</code></td><td>Returns data with 45 columns (3 PII columns excluded)</td></tr><tr><td>Query excluded column explicitly</td><td>Europe Athena: <code>SELECT customer_email FROM hq_shared_curated.products</code></td><td>Error: "Insufficient Lake Formation permission"</td></tr><tr><td>Query denied table</td><td>Europe Athena: <code>SELECT * FROM hq_shared_curated.customer_profiles</code></td><td>Table not visible OR permission denied</td></tr><tr><td>Query with row filter</td><td>Europe Athena: <code>SELECT * FROM hq_shared_curated.orders</code></td><td>Only rows where <code>region = 'europe'</code> returned</td></tr><tr><td>Schema change propagation</td><td>HQ adds column to products → Europe queries products</td><td>New column visible immediately in Europe's query</td></tr><tr><td>New partition propagation</td><td>HQ adds partition to orders → Europe queries orders</td><td>New partition data included in Europe's results</td></tr></tbody></table>
+<p>→ <strong>How to present Lake Formation governance to auditor:</strong></p>
+<table><thead><tr><th>Auditor Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"Who has access to which data?"</td><td>Lake Formation → Data lake permissions → complete matrix</td></tr><tr><td>"Can external accounts see PII?"</td><td>Show column exclusion grants — PII columns explicitly excluded</td></tr><tr><td>"How is data classified?"</td><td>Show LF-Tags → classification, domain, region_access taxonomy</td></tr><tr><td>"What happens when new data is added?"</td><td>Demonstrate: Tag new table → external accounts auto-get access based on tag match</td></tr><tr><td>"Is there an audit trail?"</td><td>CloudTrail → GetDataAccess events showing every cross-account query</td></tr><tr><td>"Can you revoke access immediately?"</td><td>Demonstrate: Revoke grant → external account immediately denied</td></tr><tr><td>"How does row-level security work?"</td><td>Show data filters → row expression → demonstrate filtered query results</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Lake Formation is the GOVERNANCE LAYER for the data lake — it sits between the Glue Data Catalog and query engines to enforce fine-grained access control<br>
+→ Tag-Based Access Control (TBAC) is the scalable way to manage cross-account sharing — one tag grant covers unlimited tables with matching tags<br>
+→ Column-level security provides PII protection that S3 bucket policies CANNOT — even if someone has S3 GetObject, Lake Formation blocks restricted columns at query time<br>
+→ Data filters provide row-level security — regional data isolation without physical data separation<br>
+→ Resource links are POINTERS, not copies — schema changes and new partitions propagate automatically from producer to consumer<br>
+→ Two-layer permission model: Producer controls WHAT external accounts can access, Consumer controls WHO within their account can use it<br>
+→ AWS RAM handles the sharing mechanism, Lake Formation handles the permissions — they work together<br>
+→ The Lake Formation service-linked role needs KMS access to decrypt S3 data on behalf of cross-account queries<br>
+→ Lake Formation cross-account queries do NOT require direct S3 cross-account access — Lake Formation mediates all data access<br>
+→ Always uncheck IAM-only defaults AFTER granting Lake Formation permissions to existing roles — order matters</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 17 created the Glue Data Catalog with crawlers — now governed by Lake Formation<br>
+→ Project 18 established Athena querying via Glue Catalog — now enhanced with column/row security<br>
+→ Project 25 built the S3 → Glue → Athena pipeline — now cross-account accessible via resource links<br>
+→ Project 36 introduced KMS encryption — Lake Formation service-linked role needs KMS key policy entry<br>
+→ Project 39 established cross-account S3 access — Lake Formation provides a GOVERNED alternative for catalog-based queries<br>
+→ Project 40 established cross-account IAM role architecture — Lake Formation adds data-level permissions on top</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 43 (Redshift to MariaDB via Glue) will operate within the Lake Formation governed environment<br>
+→ Project 47 will DEEPEN Lake Formation with full data lake governance — building on the foundation established here<br>
+→ Project 51 will build the complete enterprise data lake using Lake Formation as the central governance mechanism across all zones (raw/curated/refined) and all accounts<br>
+→ Project 54 will introduce AWS Organizations — enabling Organization-level RAM sharing and SCP governance that complements Lake Formation<br>
+→ Project 60 will implement the full Data Mesh pattern — each account as a data domain, Lake Formation as the governance layer, resource links as the data product interface</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ Cross-account catalog sharing is operational<br>
+→ Europe, US, Japan, and Shared Services can all query HQ's data lake through governed resource links<br>
+→ Column-level and row-level security protect PII<br>
+→ But the data engineering team discovers a new data flow requirement:</p>
+<blockquote>
+<p>"Our Redshift data warehouse (Account 111) contains aggregated sales metrics that the operational team needs.<br>
+The operational team's application runs on MariaDB (also Account 111).<br>
+They need the Redshift aggregated data BACK in MariaDB for their dashboards.</p>
+<p>Currently this is a manual export → CSV → import process.<br>
+We need an automated Glue ETL job that reads from Redshift and writes to MariaDB.</p>
+<p>This is the REVERSE of Project 24 (MariaDB → S3 via Glue).<br>
+Now we need Redshift → MariaDB via Glue."</p>
+</blockquote>
+<p>→ Project 24 established Glue JDBC connection TO MariaDB (reading FROM MariaDB)<br>
+→ Project 22 established Redshift COPY from S3 (loading INTO Redshift)<br>
+→ But neither project covered the REVERSE flow: Reading FROM Redshift and Writing TO MariaDB through Glue</p>
+<p>→ <strong>This is the exact problem Project 43 solves</strong><br>
+→ Project 43 introduces bidirectional Glue ETL between Redshift and MariaDB<br>
+→ It combines Glue Redshift connections, Glue JDBC MariaDB connections, job bookmarking, and scheduling into a complete reverse-ETL pipeline</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 43: "The Warehouse Data That Needed to Flow Back to Operations — Redshift to MariaDB Data Sync via Glue"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-41.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 42/60</span></div><a class="nav-btn next" href="project-43.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

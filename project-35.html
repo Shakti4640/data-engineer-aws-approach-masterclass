@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 35: THE ANALYST WHO WANTED TO JOIN LAKE AND DATABASE DATA — Athena Feder — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 35: THE ANALYST WHO WANTED TO JOIN LAKE AND DATABASE DATA — Athena Federated Query to RDS MariaDB</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow has matured significantly since the early projects<br>
+→ Their data architecture now has TWO distinct data stores:</p>
+<p><strong>Store 1 — The Data Lake (S3 + Glue Catalog + Athena)</strong><br>
+→ Built across Projects 17, 18, 21, 25<br>
+→ Contains historical order data in Parquet format<br>
+→ Contains clickstream logs, product catalog snapshots, marketing campaign data<br>
+→ Queried via Athena using Glue Catalog tables<br>
+→ Holds 18 months of analytical data — billions of rows<br>
+→ Partitioned by <code>year/month/day</code> in S3</p>
+<p><strong>Store 2 — The Operational Database (RDS MariaDB)</strong><br>
+→ Built across Projects 9, 14, 29<br>
+→ Contains LIVE transactional data<br>
+→ Current customer profiles, real-time inventory, active order statuses, shipping addresses<br>
+→ Updated thousands of times per minute by the application layer<br>
+→ Holds only current-state data — not historical</p>
+<p>→ The lead analyst "Priya" gets a business request:</p>
+<blockquote>
+<p>"Show me all customers who placed orders in the last 18 months (historical data in S3)<br>
+whose current loyalty tier is 'Platinum' (live data in MariaDB)<br>
+along with their current shipping address (live data in MariaDB)<br>
+grouped by the marketing campaign that acquired them (historical data in S3)"</p>
+</blockquote>
+<p>→ This query REQUIRES joining data across BOTH stores simultaneously<br>
+→ Priya currently does this manually:</p>
+<ul>
+<li>Runs Athena query on S3 → exports CSV</li>
+<li>Connects to MariaDB via MySQL client → exports CSV</li>
+<li>Opens both CSVs in Excel → does VLOOKUP</li>
+<li>Takes 4 hours every time</li>
+<li>Error-prone — mismatched customer IDs, stale exports</li>
+</ul>
+<p>→ Priya asks: "Can I write ONE SQL query in Athena that joins my S3 data lake with my live MariaDB database?"</p>
+<p>→ The answer is YES — using <strong>Athena Federated Query</strong></p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the fundamental limitation being overcome</p>
+<p><strong>Without Federated Query (What Athena normally does — Project 18):</strong><br>
+→ Athena ONLY queries data registered in the Glue Data Catalog<br>
+→ Glue Data Catalog ONLY points to S3 locations<br>
+→ Therefore — Athena can only reach S3<br>
+→ Any data in RDS, DynamoDB, Redshift, or other stores is invisible to Athena</p>
+<p><strong>With Federated Query (What this project enables):</strong><br>
+→ Athena gains the ability to query EXTERNAL data sources beyond S3<br>
+→ It does this by delegating the query execution to a Lambda function<br>
+→ That Lambda function acts as a "connector" — it knows how to talk to the external source<br>
+→ The connector translates Athena's query into the external source's language<br>
+→ Results flow back through Lambda to Athena<br>
+→ From the analyst's perspective — it's just another table in a SQL query</p>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Understand the Federated Query architecture</li>
+<li>Step 2 — Deploy the MySQL connector Lambda (MariaDB is MySQL-compatible)</li>
+<li>Step 3 — Configure the Spill Bucket for large result sets</li>
+<li>Step 4 — Store MariaDB credentials securely (via Secrets Manager — Project 37)</li>
+<li>Step 5 — Register the connector as an Athena Data Source</li>
+<li>Step 6 — Write cross-source JOIN queries</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — PREREQUISITES VERIFICATION</h3>
+<p>→ Before starting, confirm these exist from previous projects:</p>
+<table><thead><tr><th>Prerequisite</th><th>From Project</th><th>What to Verify</th></tr></thead><tbody><tr><td>S3 Data Lake with Parquet data</td><td>Project 21, 25</td><td>Glue Catalog tables pointing to S3 Parquet data</td></tr><tr><td>Athena Workgroup configured</td><td>Project 18</td><td>Query result S3 location set</td></tr><tr><td>RDS MariaDB running in private subnet</td><td>Project 9, 14</td><td>Instance available, port 3306, security group configured</td></tr><tr><td>VPC with private subnets</td><td>Project 5</td><td>At least 2 private subnets in different AZs</td></tr><tr><td>Secrets Manager secret for MariaDB credentials</td><td>Project 37</td><td>Secret ARN containing username/password/host/port/dbname</td></tr></tbody></table>
+<p>→ If Secrets Manager (Project 37) was not yet configured for MariaDB:</p>
+<ul>
+<li>Navigate to AWS Secrets Manager → Store a new secret</li>
+<li>Secret type: "Credentials for Amazon RDS database"</li>
+<li>Username: <code>admin</code> (or your MariaDB admin user)</li>
+<li>Password: your password</li>
+<li>Select the RDS MariaDB instance</li>
+<li>Secret name: <code>shopnow/prod/mariadb/analytics</code></li>
+<li>Note the Secret ARN — you will need it</li>
+</ul>
+<hr>
+<h3>STEP 2 — CREATE THE SPILL BUCKET</h3>
+<p>→ Navigate to S3 → Create a new bucket</p>
+<p><strong>What is a Spill Bucket and why is it needed?</strong><br>
+→ Lambda functions have a response payload limit (6 MB for synchronous invocation)<br>
+→ When the federated connector queries MariaDB, the result set may be far larger than 6 MB<br>
+→ The connector "spills" (writes) overflow data to this S3 bucket temporarily<br>
+→ Athena reads the spilled data from S3 instead of from Lambda directly<br>
+→ Without a spill bucket → any query returning more than a few thousand rows FAILS</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Bucket Name</td><td><code>shopnow-athena-federation-spill-prod</code></td></tr><tr><td>Region</td><td>Same region as your Athena workgroup and RDS instance</td></tr><tr><td>Block Public Access</td><td>All ON (as per Project 1)</td></tr><tr><td>Default Encryption</td><td>SSE-S3 minimum (SSE-KMS recommended — see Project 36)</td></tr><tr><td>Versioning</td><td>Disabled (spill data is temporary)</td></tr></tbody></table>
+<p>→ Add a lifecycle rule (as per Project 12 concepts):</p>
+<ul>
+<li>Rule name: <code>auto-delete-spill-data</code></li>
+<li>Scope: Entire bucket</li>
+<li>Action: Expire current versions after 1 day</li>
+<li>This ensures spill data doesn't accumulate and incur storage costs</li>
+</ul>
+<hr>
+<h3>STEP 3 — DEPLOY THE ATHENA MYSQL CONNECTOR (via Serverless Application Repository)</h3>
+<p>→ This is the critical step — deploying the Lambda function that acts as the bridge</p>
+<p>→ Navigate to <strong>AWS Serverless Application Repository</strong> (SAR)<br>
+→ Search for: <code>AthenaJdbcConnector</code> or <code>AthenaMySQLConnector</code><br>
+→ AWS provides pre-built, AWS-authored connectors for common data sources</p>
+<p><strong>Available AWS-authored connectors include:</strong></p>
+<table><thead><tr><th>Connector</th><th>Target Data Source</th></tr></thead><tbody><tr><td>AthenaMySQLConnector</td><td>MySQL / MariaDB / Aurora MySQL</td></tr><tr><td>AthenaPostgreSQLConnector</td><td>PostgreSQL / Aurora PostgreSQL</td></tr><tr><td>AthenaRedshiftConnector</td><td>Redshift (alternative to federated query native)</td></tr><tr><td>AthenaDynamoDBConnector</td><td>DynamoDB</td></tr><tr><td>AthenaCloudWatchConnector</td><td>CloudWatch Logs</td></tr><tr><td>AthenaDocumentDBConnector</td><td>DocumentDB / MongoDB-compatible</td></tr><tr><td>AthenaElasticsearchConnector</td><td>OpenSearch / Elasticsearch</td></tr><tr><td>AthenaOracleConnector</td><td>Oracle Database</td></tr></tbody></table>
+<p>→ Since MariaDB is MySQL wire-protocol compatible → Use <code>AthenaMySQLConnector</code></p>
+<p>→ Click "Deploy" on the connector application</p>
+<p><strong>Deployment Settings:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Application Name</td><td><code>shopnow-athena-mysql-connector</code></td><td>Descriptive name for the Lambda function</td></tr><tr><td>SecretNameOrPrefix</td><td><code>shopnow/prod/mariadb/analytics</code></td><td>The Secrets Manager secret name from Step 1</td></tr><tr><td>SpillBucket</td><td><code>shopnow-athena-federation-spill-prod</code></td><td>The spill bucket from Step 2</td></tr><tr><td>SpillPrefix</td><td><code>athena-spill</code></td><td>Prefix inside the spill bucket for organization</td></tr><tr><td>LambdaFunctionName</td><td><code>shopnow-athena-mysql-connector</code></td><td>The actual Lambda function name that will be created</td></tr><tr><td>SecurityGroupIds</td><td><code>sg-0abc123def456</code></td><td>Security group that allows outbound to MariaDB SG on port 3306</td></tr><tr><td>SubnetIds</td><td><code>subnet-private-1a,subnet-private-1b</code></td><td>Private subnets where RDS lives (same VPC)</td></tr><tr><td>DefaultConnectionString</td><td><code>mysql://jdbc:mysql://&lt;RDS-endpoint&gt;:3306/&lt;database&gt;?user=${shopnow/prod/mariadb/analytics}</code></td><td>Connection string with secret reference</td></tr><tr><td>DisableSpillEncryption</td><td><code>false</code></td><td>Keep spill data encrypted</td></tr><tr><td>LambdaMemory</td><td><code>3008</code></td><td>Memory in MB — higher = faster query processing</td></tr><tr><td>LambdaTimeout</td><td><code>900</code></td><td>Maximum 15 minutes (900 seconds)</td></tr></tbody></table>
+<hr>
+<p><strong>CRITICAL: Understanding the Connection String Format</strong></p>
+<p>→ The <code>DefaultConnectionString</code> has a specific syntax:</p>
+<code>mysql://jdbc:mysql://&lt;RDS_ENDPOINT&gt;:3306/&lt;DATABASE_NAME&gt;?${SECRET_NAME}</code>
+<p>→ Breaking it down:</p>
+<table><thead><tr><th>Component</th><th>Purpose</th></tr></thead><tbody><tr><td><code>mysql://</code></td><td>Protocol identifier for the connector</td></tr><tr><td><code>jdbc:mysql://</code></td><td>JDBC driver protocol</td></tr><tr><td><code>&lt;RDS_ENDPOINT&gt;</code></td><td>The RDS MariaDB endpoint (e.g., <code>shopnow-db.abc123.ap-south-1.rds.amazonaws.com</code>)</td></tr><tr><td><code>:3306</code></td><td>MariaDB port</td></tr><tr><td><code>/&lt;DATABASE_NAME&gt;</code></td><td>Default database to connect to</td></tr><tr><td><code>?${SECRET_NAME}</code></td><td>Tells connector to fetch credentials from this Secrets Manager secret</td></tr></tbody></table>
+<p>→ The <code>${shopnow/prod/mariadb/analytics}</code> syntax is NOT a variable substitution in the traditional sense<br>
+→ The connector Lambda code recognizes this pattern and calls Secrets Manager API at runtime<br>
+→ Credentials are NEVER hardcoded — they are fetched dynamically on every invocation</p>
+<hr>
+<p><strong>CRITICAL: Understanding the Networking Requirements</strong></p>
+<p>→ The Lambda connector function MUST reach two things:</p>
+<table><thead><tr><th>Target</th><th>Why</th><th>How</th></tr></thead><tbody><tr><td>RDS MariaDB</td><td>To execute SQL queries</td><td>Lambda runs inside the SAME VPC as RDS → Security group allows 3306</td></tr><tr><td>Secrets Manager</td><td>To fetch credentials</td><td>Via VPC Endpoint for Secrets Manager (Interface Endpoint — Project 27 concepts) OR NAT Gateway</td></tr><tr><td>S3 (Spill Bucket)</td><td>To write overflow results</td><td>Via VPC Endpoint for S3 (Gateway Endpoint — Project 27) OR NAT Gateway</td></tr><tr><td>Athena Service</td><td>To return results</td><td>Athena invokes Lambda — response goes back through Lambda service</td></tr></tbody></table>
+<p>→ The Lambda function is deployed INTO your VPC (same concept as Project 26 Lambda VPC Config and Project 45)<br>
+→ Once inside VPC — Lambda loses internet access by default<br>
+→ Therefore — it CANNOT reach Secrets Manager or S3 without:</p>
+<ul>
+<li>Option A: NAT Gateway in the VPC (from Project 5)</li>
+<li>Option B: VPC Endpoints for Secrets Manager + S3 (from Project 27 — preferred, cheaper, faster)</li>
+</ul>
+<p><strong>Recommended VPC Endpoint Setup:</strong></p>
+<table><thead><tr><th>Endpoint Type</th><th>Service</th><th>Route Table Association</th></tr></thead><tbody><tr><td>Gateway Endpoint</td><td><code>com.amazonaws.ap-south-1.s3</code></td><td>Private subnet route tables</td></tr><tr><td>Interface Endpoint</td><td><code>com.amazonaws.ap-south-1.secretsmanager</code></td><td>Private subnets</td></tr></tbody></table>
+<p>→ If these endpoints already exist from Project 27 → No action needed<br>
+→ If not → Create them now following Project 27 patterns</p>
+<hr>
+<p><strong>Security Group Configuration for the Lambda Connector:</strong></p>
+<p>→ Create a NEW security group: <code>sg-athena-mysql-connector</code></p>
+<p><strong>Inbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Reason</th></tr></thead><tbody><tr><td>(none needed)</td><td>—</td><td>—</td><td>Lambda is invoked by AWS service, not by inbound traffic</td></tr></tbody></table>
+<p><strong>Outbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Destination</th><th>Reason</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-rds-mariadb</code> (RDS security group)</td><td>Connect to MariaDB</td></tr><tr><td>HTTPS</td><td>443</td><td><code>pl-xxxxx</code> (S3 prefix list) OR VPC Endpoint SG</td><td>Reach S3 spill bucket</td></tr><tr><td>HTTPS</td><td>443</td><td>Secrets Manager VPC Endpoint SG</td><td>Fetch credentials</td></tr></tbody></table>
+<p>→ ALSO — Update the RDS MariaDB security group (<code>sg-rds-mariadb</code>):</p>
+<p><strong>Add Inbound Rule:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Reason</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-athena-mysql-connector</code></td><td>Allow connector Lambda to reach MariaDB</td></tr></tbody></table>
+<p>→ This is the same security group cross-referencing pattern from Project 14 and Project 24</p>
+<hr>
+<h3>STEP 4 — VERIFY THE LAMBDA DEPLOYMENT</h3>
+<p>→ Navigate to AWS Lambda → Find <code>shopnow-athena-mysql-connector</code><br>
+→ Verify these settings:</p>
+<table><thead><tr><th>Setting</th><th>Expected</th></tr></thead><tbody><tr><td>Runtime</td><td>Java 11 (Athena connectors are Java-based)</td></tr><tr><td>Memory</td><td>3008 MB (or your configured value)</td></tr><tr><td>Timeout</td><td>15 minutes (900 seconds)</td></tr><tr><td>VPC</td><td>Your VPC with private subnets selected</td></tr><tr><td>Security Group</td><td><code>sg-athena-mysql-connector</code></td></tr><tr><td>Environment Variables</td><td>Contains <code>default</code> connection string, spill bucket, spill prefix</td></tr></tbody></table>
+<p>→ Check the IAM Execution Role attached to this Lambda:</p>
+<p><strong>The role MUST have these permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Why</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td>Secret ARN for MariaDB credentials</td><td>Fetch DB credentials</td></tr><tr><td><code>s3:PutObject</code></td><td>Spill bucket ARN</td><td>Write overflow data</td></tr><tr><td><code>s3:GetObject</code></td><td>Spill bucket ARN</td><td>Read spill data (for cleanup)</td></tr><tr><td><code>s3:ListBucket</code></td><td>Spill bucket ARN</td><td>List spill objects</td></tr><tr><td><code>kms:Decrypt</code></td><td>KMS key ARN (if secret or spill bucket uses KMS)</td><td>Decrypt encrypted data</td></tr><tr><td><code>ec2:CreateNetworkInterface</code></td><td><code>*</code></td><td>Lambda VPC ENI creation</td></tr><tr><td><code>ec2:DescribeNetworkInterfaces</code></td><td><code>*</code></td><td>Lambda VPC networking</td></tr><tr><td><code>ec2:DeleteNetworkInterface</code></td><td><code>*</code></td><td>Lambda VPC cleanup</td></tr><tr><td><code>logs:CreateLogGroup</code></td><td>Lambda log group ARN</td><td>CloudWatch logging</td></tr><tr><td><code>logs:CreateLogStream</code></td><td>Lambda log group ARN</td><td>CloudWatch logging</td></tr><tr><td><code>logs:PutLogEvents</code></td><td>Lambda log group ARN</td><td>CloudWatch logging</td></tr></tbody></table>
+<p>→ The SAR deployment usually creates this role automatically<br>
+→ VERIFY — don't assume — missing permissions cause cryptic "Access Denied" errors at query time</p>
+<hr>
+<h3>STEP 5 — REGISTER THE CONNECTOR AS AN ATHENA DATA SOURCE</h3>
+<p>→ Navigate to <strong>Amazon Athena</strong> → Left sidebar → "Data sources"<br>
+→ Click "Connect data source"</p>
+<p><strong>Configuration Page 1 — Choose data source:</strong></p>
+<table><thead><tr><th>Option</th><th>Selection</th></tr></thead><tbody><tr><td>Data source type</td><td>"S3 - AWS Glue Data Catalog" is already the default for normal Athena</td></tr><tr><td>For federated query</td><td>Select "Custom" or "MySQL" from the connector list</td></tr><tr><td>If MySQL appears as pre-built option</td><td>Select it directly</td></tr><tr><td>If only "Custom" appears</td><td>Select "Custom" and specify Lambda function</td></tr></tbody></table>
+<p><strong>Configuration Page 2 — Connection details:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Data source name</td><td><code>mariadb-operational</code></td><td>This is how this source appears in your SQL queries</td></tr><tr><td>Description</td><td><code>Live operational MariaDB database for federated queries</code></td><td>Documentation</td></tr><tr><td>Lambda function</td><td>Select <code>shopnow-athena-mysql-connector</code> from dropdown</td><td>The Lambda deployed in Step 3</td></tr></tbody></table>
+<p>→ Click "Connect data source"</p>
+<p>→ You now see <code>mariadb-operational</code> listed alongside <code>AwsDataCatalog</code> (Glue Catalog) in Athena</p>
+<p><strong>What just happened architecturally:</strong><br>
+→ Athena now has TWO data sources registered:</p>
+<table><thead><tr><th>Data Source Name</th><th>Type</th><th>What It Reaches</th></tr></thead><tbody><tr><td><code>AwsDataCatalog</code></td><td>Glue Data Catalog (default)</td><td>S3 data lake tables</td></tr><tr><td><code>mariadb-operational</code></td><td>Federated (Lambda connector)</td><td>RDS MariaDB tables</td></tr></tbody></table>
+<hr>
+<h3>STEP 6 — EXPLORE THE FEDERATED DATA SOURCE IN ATHENA</h3>
+<p>→ In Athena Query Editor → Data source dropdown → Select <code>mariadb-operational</code><br>
+→ You should see:</p>
+<p><strong>Database dropdown</strong> → Shows actual MariaDB databases (schemas)<br>
+→ Example: <code>shopnow_prod</code>, <code>shopnow_analytics</code></p>
+<p><strong>Tables list</strong> → Shows actual MariaDB tables<br>
+→ Example: <code>customers</code>, <code>inventory</code>, <code>orders_active</code>, <code>shipping_addresses</code></p>
+<p>→ The connector Lambda is dynamically querying MariaDB's <code>information_schema</code> to list these<br>
+→ No Glue Crawler needed — no Catalog table creation needed<br>
+→ The connector acts as a LIVE catalog for the external source</p>
+<p>→ Test with a simple query:</p>
+<p><strong>Query (conceptual):</strong><br>
+→ In Athena query editor<br>
+→ Data source: <code>mariadb-operational</code><br>
+→ Database: <code>shopnow_prod</code><br>
+→ Run: <code>SELECT * FROM customers LIMIT 10</code></p>
+<p>→ What happens behind the scenes:</p>
+<ol>
+<li>Athena receives the query</li>
+<li>Athena identifies the data source as <code>mariadb-operational</code> (federated)</li>
+<li>Athena invokes the Lambda connector function</li>
+<li>Lambda fetches MariaDB credentials from Secrets Manager</li>
+<li>Lambda opens JDBC connection to RDS MariaDB</li>
+<li>Lambda executes <code>SELECT * FROM customers LIMIT 10</code> against MariaDB</li>
+<li>Lambda returns results to Athena (if small) or spills to S3 (if large)</li>
+<li>Athena presents results to the analyst</li>
+</ol>
+<hr>
+<h3>STEP 7 — WRITE CROSS-SOURCE JOIN QUERIES (The actual goal)</h3>
+<p>→ Now Priya can write the query she originally needed</p>
+<p><strong>Conceptual Query Structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT
+</span>    lake_orders.customer_id,
+    lake_orders.campaign_name,
+    lake_orders.order_total,
+    lake_orders.order_date,
+    live_customers.loyalty_tier,
+    live_shipping.address_line1,
+    live_shipping.city,
+    live_shipping.country
+FROM
+    "AwsDataCatalog"."shopnow_datalake"."fact_orders" AS lake_orders
+JOIN
+    "mariadb-operational"."shopnow_prod"."customers" AS live_customers
+    ON lake_orders.customer_id = live_customers.customer_id
+JOIN
+    "mariadb-operational"."shopnow_prod"."shipping_addresses" AS live_shipping
+    ON live_customers.customer_id = live_shipping.customer_id
+    AND live_shipping.is_default = 1
+WHERE
+    live_customers.loyalty_tier = 'Platinum'
+    AND lake_orders.order_date &gt;= DATE '2024-01-01'
+GROUP BY
+    lake_orders.campaign_name,
+    lake_orders.customer_id,
+    lake_orders.order_total,
+    lake_orders.order_date,
+    live_customers.loyalty_tier,
+    live_shipping.address_line1,
+    live_shipping.city,
+    live_shipping.country</code></pre></div>
+<p><strong>Understanding the three-part table reference:</strong></p>
+<code>"&lt;DATA_SOURCE&gt;"."&lt;DATABASE&gt;"."&lt;TABLE&gt;"</code>
+<table><thead><tr><th>Component</th><th>For S3 Data Lake</th><th>For MariaDB</th></tr></thead><tbody><tr><td>Data Source</td><td><code>AwsDataCatalog</code></td><td><code>mariadb-operational</code></td></tr><tr><td>Database</td><td>Glue Catalog database name</td><td>MariaDB schema name</td></tr><tr><td>Table</td><td>Glue Catalog table name</td><td>MariaDB table name</td></tr></tbody></table>
+<p>→ This three-part naming is what makes cross-source JOINs possible<br>
+→ Athena knows which engine to send each table reference to<br>
+→ It fetches data from both sources and performs the JOIN in Athena's own engine</p>
+<hr>
+<h3>STEP 8 — UNDERSTANDING QUERY EXECUTION FLOW FOR CROSS-SOURCE JOINS</h3>
+<p>→ This is the most important architectural understanding:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Analyst submits query
+</span>        ↓
+Athena parses SQL → identifies TWO data sources
+        ↓
+    ┌───────────────────┬────────────────────────┐
+    ↓                                            ↓
+For S3 tables:                          For MariaDB tables:
+Athena reads Parquet                    Athena invokes Lambda connector
+directly from S3                        Lambda queries MariaDB via JDBC
+(normal Athena behavior                 Results spill to S3 if large
+from Project 18)                        Lambda returns result metadata
+    ↓                                            ↓
+    └───────────────────┬────────────────────────┘
+                        ↓
+            Athena performs the JOIN
+            in its own distributed engine
+            using data from BOTH sources
+                        ↓
+            Results written to Athena query
+            result location in S3
+            (as per Project 18 workgroup config)
+                        ↓
+            Analyst sees results</code></pre></div>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use Secrets Manager for database credentials — never hardcode in Lambda environment variables<br>
+→ Always create a dedicated spill bucket with lifecycle expiration (1 day)<br>
+→ Always deploy the connector Lambda in the SAME VPC and private subnets as RDS<br>
+→ Always configure VPC Endpoints for S3 and Secrets Manager to avoid NAT Gateway costs and latency<br>
+→ Always use the three-part naming convention in queries: <code>"data_source"."database"."table"</code><br>
+→ Always push down filters to the federated source — filter MariaDB tables in the WHERE clause<br>
+→ Always test the connector with a simple <code>SELECT LIMIT 10</code> before writing complex JOINs<br>
+→ Always monitor Lambda invocation duration and errors in CloudWatch (Project 19 concepts)<br>
+→ Always set appropriate Lambda memory (3008 MB recommended for large result sets)<br>
+→ Always set Lambda timeout to maximum (900 seconds) for complex queries<br>
+→ Always verify security group cross-referencing — connector SG → RDS SG on port 3306</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use federated query as a replacement for ETL — it is for ad-hoc analytical JOINs, not bulk data movement<br>
+→ Never run federated queries that do full table scans on large MariaDB tables — this hammers the operational database<br>
+→ Never skip the spill bucket — without it, any query returning &gt; 6 MB of federated data FAILS<br>
+→ Never deploy the Lambda connector in public subnets — it needs private subnets with VPC endpoints or NAT<br>
+→ Never forget to update the RDS security group to allow inbound from the connector Lambda security group<br>
+→ Never use the same security group for the connector Lambda and RDS — separate them for auditability<br>
+→ Never expect federated query performance to match native Athena-on-S3 performance — it is inherently slower<br>
+→ Never store the spill bucket in a different region than Athena — cross-region data transfer adds cost and latency<br>
+→ Never create multiple connector Lambdas for the same MariaDB — one connector can serve multiple databases<br>
+→ Never run concurrent heavy federated queries without monitoring MariaDB CPU — each query opens JDBC connections</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE ATHENA FEDERATED QUERY</h2>
+<table><thead><tr><th>Scenario</th><th>Use Federated Query?</th></tr></thead><tbody><tr><td>Ad-hoc analytical JOIN between S3 lake and live MariaDB</td><td>✅ Yes — exact use case</td></tr><tr><td>Exploring external data source schema without ETL</td><td>✅ Yes — instant catalog discovery</td></tr><tr><td>One-time data validation between lake and operational DB</td><td>✅ Yes — quick cross-check</td></tr><tr><td>Querying small reference tables from MariaDB alongside large S3 datasets</td><td>✅ Yes — efficient pattern</td></tr><tr><td>Dashboard that refreshes every 5 minutes with MariaDB data</td><td>❌ No — use Glue ETL to copy data to S3 (Project 24)</td></tr><tr><td>Bulk migration of MariaDB data to S3</td><td>❌ No — use Glue ETL (Project 24) or DMS (Project 58)</td></tr><tr><td>High-concurrency production API querying MariaDB through Athena</td><td>❌ No — use direct MariaDB connection or API Gateway + Lambda (Project 59)</td></tr><tr><td>Joining two S3-based Glue Catalog tables</td><td>❌ No — standard Athena is sufficient (Project 18)</td></tr><tr><td>Real-time streaming data joins</td><td>❌ No — use Kinesis (Project 52) or Flink</td></tr><tr><td>Nightly batch ETL from MariaDB to Redshift</td><td>❌ No — use Glue ETL (Project 24, 43)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ When query frequency exceeds a few times per day on the same data → ETL the data to S3 instead<br>
+→ When the federated source has millions of rows and no filter pushdown is possible → Full scan kills MariaDB performance<br>
+→ When latency requirements are under 2 seconds → Federated queries typically take 5-30+ seconds<br>
+→ When the operational database is already under high load → Federated queries add concurrent connections<br>
+→ When you need to materialize results for repeated use → Use CTAS (Project 25) to save results as S3 table<br>
+→ When the data source is in a different AWS region → Cross-region JDBC connections are slow and unreliable<br>
+→ When data needs transformation before joining → ETL first (Project 21, 24), then join natively in Athena</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — THE LAMBDA CONNECTOR ARCHITECTURE</h3>
+<p>→ Athena Federated Query is built on the <strong>Athena Query Federation SDK</strong><br>
+→ The SDK defines a contract between Athena and any external data source<br>
+→ This contract is implemented as a Lambda function with specific handler methods:</p>
+<table><thead><tr><th>Handler Method</th><th>What Athena Asks</th><th>What Lambda Responds</th></tr></thead><tbody><tr><td><code>GetDataSourceCapabilities</code></td><td>"What can you do?"</td><td>Supported operations, data types</td></tr><tr><td><code>ListSchemas</code></td><td>"What databases exist?"</td><td>List of MariaDB schemas</td></tr><tr><td><code>ListTables</code></td><td>"What tables exist in this schema?"</td><td>List of MariaDB tables</td></tr><tr><td><code>GetTable</code></td><td>"What columns does this table have?"</td><td>Column names, data types, partition info</td></tr><tr><td><code>GetSplits</code></td><td>"How should I parallelize reading this table?"</td><td>Split definitions (query partitions)</td></tr><tr><td><code>ReadRecords</code></td><td>"Give me data for this split"</td><td>Apache Arrow formatted record batches</td></tr></tbody></table>
+<p>→ Athena calls these Lambda handlers in sequence during query execution<br>
+→ The MySQL connector implements all these handlers using JDBC internally</p>
+<hr>
+<h3>MECHANIC 2 — PREDICATE PUSHDOWN</h3>
+<p>→ This is the MOST IMPORTANT performance concept in federated queries</p>
+<p><strong>Without pushdown:</strong><br>
+→ Athena asks Lambda: "Give me ALL rows from the <code>customers</code> table"<br>
+→ Lambda fetches 5 million rows from MariaDB<br>
+→ Athena filters them in its own engine<br>
+→ Result: Slow, expensive, hammers MariaDB</p>
+<p><strong>With pushdown:</strong><br>
+→ Athena asks Lambda: "Give me rows from <code>customers</code> WHERE <code>loyalty_tier = 'Platinum'</code>"<br>
+→ Lambda translates this to a MariaDB SQL query WITH the WHERE clause<br>
+→ MariaDB returns only 50,000 matching rows<br>
+→ Lambda sends 50,000 rows to Athena<br>
+→ Result: Fast, efficient, minimal MariaDB impact</p>
+<p><strong>What gets pushed down:</strong></p>
+<table><thead><tr><th>Filter Type</th><th>Pushed Down?</th></tr></thead><tbody><tr><td>Simple equality (<code>column = value</code>)</td><td>✅ Yes</td></tr><tr><td>Range filters (<code>column &gt; value</code>)</td><td>✅ Yes</td></tr><tr><td>IN lists (<code>column IN (a, b, c)</code>)</td><td>✅ Yes</td></tr><tr><td>LIMIT</td><td>✅ Yes</td></tr><tr><td>LIKE patterns</td><td>⚠️ Sometimes (connector-dependent)</td></tr><tr><td>Complex functions (<code>UPPER(column) = 'X'</code>)</td><td>❌ No — executed in Athena</td></tr><tr><td>JOINs between federated tables</td><td>❌ No — each table fetched separately, joined in Athena</td></tr><tr><td>Aggregations (SUM, COUNT)</td><td>❌ No — executed in Athena</td></tr></tbody></table>
+<p>→ To maximize performance → Always filter federated tables in the WHERE clause<br>
+→ This reduces data transfer from MariaDB → Lambda → Spill Bucket → Athena</p>
+<hr>
+<h3>MECHANIC 3 — SPLIT PARALLELISM</h3>
+<p>→ For large tables, the connector can "split" the read into parallel chunks</p>
+<p><strong>How splits work:</strong><br>
+→ Athena calls <code>GetSplits</code> → Connector decides how to partition the read<br>
+→ For MySQL connector — splits are typically based on:</p>
+<ul>
+<li>Row ranges (e.g., <code>id 1-100000</code>, <code>id 100001-200000</code>)</li>
+<li>Partition keys if MariaDB table is partitioned<br>
+→ Athena invokes Lambda MULTIPLE TIMES — once per split — in parallel<br>
+→ Each Lambda invocation reads its assigned split<br>
+→ Athena merges all split results</li>
+</ul>
+<p><strong>Parallelism configuration:</strong></p>
+<table><thead><tr><th>Factor</th><th>Impact</th></tr></thead><tbody><tr><td>Lambda concurrency limit</td><td>Limits how many splits run in parallel</td></tr><tr><td>RDS max_connections</td><td>Limits how many JDBC connections can be opened simultaneously</td></tr><tr><td>Athena DML query concurrency</td><td>Default 25 concurrent DML queries per account per region</td></tr></tbody></table>
+<hr>
+<h3>MECHANIC 4 — SPILL MECHANISM DEEP DIVE</h3>
+<p>→ Each Lambda invocation has a 6 MB response payload limit (Lambda service constraint)<br>
+→ The Athena Federation SDK handles this automatically:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda starts reading from MariaDB
+</span>        ↓
+Accumulates rows in memory as Apache Arrow blocks
+        ↓
+If accumulated data &lt; 6 MB → return directly to Athena
+        ↓
+If accumulated data &gt; 6 MB → encrypt and write to spill bucket
+        ↓
+Return to Athena: "Data is at s3://spill-bucket/athena-spill/&lt;query-id&gt;/&lt;split-id&gt;.spill"
+        ↓
+Athena reads spilled data from S3 directly</code></pre></div>
+<p>→ Spill data is encrypted using:</p>
+<ul>
+<li>AES-GCM encryption by default (within the connector)</li>
+<li>Additionally SSE-S3 or SSE-KMS if bucket encryption is configured</li>
+</ul>
+<p>→ Spill data is NOT automatically cleaned up by the connector<br>
+→ This is why the lifecycle policy from Step 2 is essential</p>
+<hr>
+<h3>MECHANIC 5 — TYPE MAPPING (MariaDB → Athena)</h3>
+<p>→ MariaDB data types must be mapped to Athena-compatible types:</p>
+<table><thead><tr><th>MariaDB Type</th><th>Athena Type</th><th>Notes</th></tr></thead><tbody><tr><td>INT, BIGINT</td><td>BIGINT</td><td>Precision preserved</td></tr><tr><td>DECIMAL(p,s)</td><td>DECIMAL(p,s)</td><td>Exact match</td></tr><tr><td>VARCHAR(n)</td><td>VARCHAR(n)</td><td>Exact match</td></tr><tr><td>TEXT, LONGTEXT</td><td>VARCHAR</td><td>Maximum length may be capped</td></tr><tr><td>DATE</td><td>DATE</td><td>Exact match</td></tr><tr><td>DATETIME, TIMESTAMP</td><td>TIMESTAMP</td><td>Timezone handling varies</td></tr><tr><td>BOOLEAN, TINYINT(1)</td><td>BOOLEAN</td><td>Mapped</td></tr><tr><td>FLOAT, DOUBLE</td><td>DOUBLE</td><td>Precision may vary</td></tr><tr><td>BLOB, LONGBLOB</td><td>VARBINARY</td><td>Binary data</td></tr><tr><td>ENUM</td><td>VARCHAR</td><td>Converted to string</td></tr><tr><td>JSON</td><td>VARCHAR</td><td>Stored as string — not queryable as JSON in Athena</td></tr></tbody></table>
+<p>→ Type mismatches cause silent data truncation or query failures<br>
+→ Always test with <code>SELECT *</code> on a small sample first</p>
+<hr>
+<h3>MECHANIC 6 — COST MODEL FOR FEDERATED QUERIES</h3>
+<table><thead><tr><th>Cost Component</th><th>How It's Charged</th></tr></thead><tbody><tr><td>Athena query cost</td><td>Per TB scanned in S3 (S3 portion only)</td></tr><tr><td>Lambda invocations</td><td>Per invocation + per GB-second of compute</td></tr><tr><td>Lambda duration</td><td>For the entire time Lambda is reading from MariaDB</td></tr><tr><td>Spill bucket storage</td><td>Per GB stored (minimal with lifecycle policy)</td></tr><tr><td>S3 requests for spill</td><td>PUT/GET requests</td></tr><tr><td>Data transfer</td><td>Lambda → S3 within same region = free</td></tr><tr><td>RDS impact</td><td>No direct AWS cost, but CPU/IO consumption on your RDS instance</td></tr></tbody></table>
+<p>→ Important: Athena does NOT charge per-TB-scanned for federated data<br>
+→ Athena only charges per-TB-scanned for S3-based data<br>
+→ Federated data costs come from Lambda execution<br>
+→ This means: Small federated result sets are very cheap, large ones get expensive via Lambda compute time</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Lambda timeout during query</td><td>Query fails after 15 minutes</td><td>Full table scan on large MariaDB table with no pushdown</td><td>Add WHERE filters, increase Lambda memory, reduce result set</td></tr><tr><td>2</td><td>"Access Denied" on Secrets Manager</td><td>Connector cannot start</td><td>Lambda execution role missing <code>secretsmanager:GetSecretValue</code></td><td>Add permission to Lambda role</td></tr><tr><td>3</td><td>"Network timeout connecting to host"</td><td>Lambda cannot reach RDS</td><td>Lambda not in same VPC, or security group rules missing</td><td>Verify VPC config, subnet placement, SG cross-reference</td></tr><tr><td>4</td><td>Spill bucket access denied</td><td>Query fails mid-execution when result set is large</td><td>Lambda role missing S3 permissions on spill bucket</td><td>Add <code>s3:PutObject</code>, <code>s3:GetObject</code>, <code>s3:ListBucket</code> on spill bucket ARN</td></tr><tr><td>5</td><td>Connector shows no databases or tables</td><td>Empty catalog in Athena dropdown</td><td>Secrets Manager secret has wrong credentials or wrong endpoint</td><td>Verify secret contains correct host, port, username, password</td></tr><tr><td>6</td><td>Query returns wrong data types</td><td>Numbers appear as strings, dates are malformed</td><td>Type mapping mismatch between MariaDB and Athena</td><td>Test with small sample, cast explicitly in SQL</td></tr><tr><td>7</td><td>MariaDB performance degrades when running federated queries</td><td>Application latency increases</td><td>Federated query opens many JDBC connections, does full scans</td><td>Use Read Replica for federated queries (Project 29), add filters</td></tr><tr><td>8</td><td>"Too many connections" error from MariaDB</td><td>Lambda invocations exhaust <code>max_connections</code></td><td>Multiple splits × multiple concurrent queries = many connections</td><td>Increase RDS <code>max_connections</code> parameter, limit Athena concurrency</td></tr><tr><td>9</td><td>Spill bucket fills up with GB of data</td><td>Storage costs increase unexpectedly</td><td>Lifecycle policy not configured, many large federated queries</td><td>Add 1-day expiration lifecycle rule</td></tr><tr><td>10</td><td>Cross-source JOIN is extremely slow</td><td>Query takes 20+ minutes</td><td>Large table on BOTH sides — Athena must fetch all data from both sources before joining</td><td>Pre-filter both sides, use CTAS to materialize frequently-used federated data</td></tr><tr><td>11</td><td>VPC endpoint missing for Secrets Manager</td><td>Lambda hangs indefinitely trying to fetch secret</td><td>No internet access and no VPC endpoint</td><td>Create Interface Endpoint for <code>secretsmanager</code> or add NAT Gateway</td></tr><tr><td>12</td><td>Deployed connector in wrong region</td><td>Athena cannot find the Lambda function</td><td>Lambda in us-east-1, Athena in ap-south-1</td><td>Redeploy connector in same region as Athena workgroup</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Query Concurrency Scaling</strong></p>
+<ul>
+<li>Athena allows 25 concurrent DML queries per account per region (soft limit — can request increase)</li>
+<li>Each federated query may invoke Lambda 1-N times (based on splits)</li>
+<li>Lambda concurrent execution default: 1,000 per account per region</li>
+<li>If 10 analysts run federated queries simultaneously → 10 × N splits = many concurrent Lambdas</li>
+<li>Monitor Lambda concurrent executions in CloudWatch</li>
+</ul>
+<p>→ <strong>RDS Connection Scaling</strong></p>
+<ul>
+<li>Each Lambda invocation opens 1 JDBC connection to MariaDB</li>
+<li>MariaDB <code>max_connections</code> default varies by instance class (typically 150-16,000)</li>
+<li>10 concurrent queries × 5 splits each = 50 simultaneous connections</li>
+<li>If application already uses 100 connections → total = 150 → may hit limit</li>
+<li>Solution: Use Read Replica (Project 29) as the federated query target</li>
+<li>Point the connector's connection string to the Read Replica endpoint</li>
+<li>This isolates analytical load from transactional load</li>
+</ul>
+<p>→ <strong>Data Volume Scaling</strong></p>
+<ul>
+<li>Small result sets (&lt; 6 MB) → Direct Lambda response → Fast</li>
+<li>Medium result sets (6 MB – 1 GB) → Spill to S3 → Moderate</li>
+<li>Large result sets (&gt; 1 GB) → Multiple spill files → Slow, expensive Lambda compute</li>
+<li>For large data volumes → Do NOT use federated query → Use Glue ETL (Project 24) to copy data to S3</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<ul>
+<li>Lambda cost scales linearly with query duration and memory</li>
+<li>A query that runs Lambda for 60 seconds at 3008 MB ≈ $0.05</li>
+<li>100 such queries per day ≈ $5/day ≈ $150/month</li>
+<li>If usage exceeds this → ETL the data to S3 and query natively (free Lambda cost)</li>
+</ul>
+<p>→ <strong>Multi-Database Scaling</strong></p>
+<ul>
+<li>One connector Lambda can serve multiple MariaDB databases on the same instance</li>
+<li>For multiple RDS instances → Deploy separate connector Lambdas (one per instance)</li>
+<li>Each gets its own data source name in Athena</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the setup is working:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>How</th><th>Expected Result</th></tr></thead><tbody><tr><td>Connector Lambda deployed</td><td>Lambda console → find function</td><td>Function exists with correct VPC, SG, memory</td></tr><tr><td>Lambda can reach MariaDB</td><td>Test invoke Lambda with empty event</td><td>No timeout (may return error format, but no network timeout)</td></tr><tr><td>Data source visible in Athena</td><td>Athena → Data sources dropdown</td><td><code>mariadb-operational</code> appears</td></tr><tr><td>Databases visible</td><td>Select data source → database dropdown</td><td>MariaDB schemas appear</td></tr><tr><td>Tables visible</td><td>Select database → table list</td><td>MariaDB tables appear</td></tr><tr><td>Simple query works</td><td><code>SELECT * FROM table LIMIT 5</code></td><td>5 rows returned</td></tr><tr><td>Cross-source JOIN works</td><td>JOIN S3 table with MariaDB table</td><td>Combined results returned</td></tr><tr><td>Spill bucket working</td><td>Run query returning &gt; 6 MB federated data</td><td>Query succeeds, spill objects appear in bucket</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing health:</strong></p>
+<table><thead><tr><th>Metric</th><th>Where</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>Lambda Invocation Errors</td><td>CloudWatch → Lambda metrics</td><td>Any errors &gt; 0</td></tr><tr><td>Lambda Duration</td><td>CloudWatch → Lambda metrics</td><td>&gt; 300 seconds (potential timeout risk)</td></tr><tr><td>Lambda Concurrent Executions</td><td>CloudWatch → Lambda metrics</td><td>&gt; 80% of account limit</td></tr><tr><td>RDS CPU Utilization</td><td>CloudWatch → RDS metrics</td><td>&gt; 80% when federated queries run</td></tr><tr><td>RDS Database Connections</td><td>CloudWatch → RDS metrics</td><td>&gt; 80% of max_connections</td></tr><tr><td>Spill Bucket Size</td><td>S3 → Metrics or CloudWatch S3 metrics</td><td>&gt; 10 GB (lifecycle may not be working)</td></tr><tr><td>Athena Query Execution Time</td><td>Athena → Query history</td><td>Federated queries &gt; 10 minutes</td></tr></tbody></table>
+<p>→ <strong>How to debug failures:</strong></p>
+<table><thead><tr><th>Failure Type</th><th>Debug Location</th><th>What to Look For</th></tr></thead><tbody><tr><td>Lambda execution error</td><td>CloudWatch Logs → <code>/aws/lambda/shopnow-athena-mysql-connector</code></td><td>Java stack traces, connection errors, credential errors</td></tr><tr><td>Athena query error</td><td>Athena → Query history → failed query → error message</td><td>"GENERIC_INTERNAL_ERROR", "HIVE_METASTORE_ERROR"</td></tr><tr><td>Network issues</td><td>VPC Flow Logs (if enabled)</td><td>Rejected traffic on port 3306 or 443</td></tr><tr><td>Permission issues</td><td>CloudTrail</td><td>AccessDenied events for SecretsManager, S3, Lambda</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Athena Federated Query breaks the "Athena can only query S3" limitation<br>
+→ It works through a Lambda connector that acts as a translator between Athena and external data sources<br>
+→ The connector handles schema discovery, predicate pushdown, split parallelism, and spill management<br>
+→ The three-part naming convention (<code>"data_source"."database"."table"</code>) enables cross-source JOINs in a single SQL<br>
+→ Performance depends critically on predicate pushdown — always filter federated tables<br>
+→ The connector Lambda must live in the same VPC as RDS with proper security group cross-referencing (Project 14, 24)<br>
+→ Credentials are managed via Secrets Manager (Project 37) — never hardcoded<br>
+→ VPC Endpoints (Project 27) are essential for Lambda-in-VPC to reach S3 and Secrets Manager<br>
+→ This is for AD-HOC analytics — not for production ETL or high-frequency dashboards<br>
+→ For repeated data needs → ETL the data to S3 first (Project 24), then query natively</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 18 gave Athena the ability to query S3 via Glue Catalog<br>
+→ Project 9 created the RDS MariaDB instance<br>
+→ Project 14 established EC2-to-RDS connectivity patterns (SG cross-reference)<br>
+→ Project 24 established Glue JDBC connectivity to MariaDB (same VPC networking concepts)<br>
+→ Project 26 introduced Lambda with SQS triggers and execution roles<br>
+→ Project 27 introduced VPC Endpoints for private service access<br>
+→ Project 37 introduced Secrets Manager for credential management<br>
+→ This project COMBINES all of these into a single federated query capability</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 48 will show the REVERSE pattern — Redshift querying MariaDB via federated query<br>
+→ Project 48 uses Redshift's native federated query (different from Athena's Lambda-based approach)<br>
+→ Project 48 also uses Secrets Manager (same as here) but with Redshift's external schema syntax<br>
+→ Understanding this Lambda-connector model prepares you for how Redshift handles it differently</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ Priya's cross-source JOIN queries are working beautifully<br>
+→ But the CISO walks in and says:</p>
+<blockquote>
+<p>"I just reviewed our infrastructure. The data in S3 is encrypted with SSE-S3 but we have no audit trail of who accessed which encryption keys. The RDS MariaDB instance is NOT encrypted at rest at all. And the Redshift cluster? Also unencrypted. Our compliance audit is in 3 weeks."</p>
+</blockquote>
+<p>→ The encryption scattered across Projects 1 (SSE-S3), 9 (RDS), and 16 (Redshift) was set to defaults or skipped<br>
+→ There is no centralized key management<br>
+→ There is no rotation policy<br>
+→ There is no audit trail of key usage</p>
+<p>→ <strong>This is the exact problem Project 36 solves</strong><br>
+→ Project 36 introduces KMS (Key Management Service) as the centralized encryption backbone<br>
+→ It covers SSE-S3 vs SSE-KMS decision, Customer Managed Keys, Key Policies, and encryption configuration for S3, RDS, and Redshift — all in one unified security model</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 36: "The Auditor Who Found Unencrypted Data Everywhere — KMS Encryption for S3, RDS &amp; Redshift"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-34.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 35/60</span></div><a class="nav-btn next" href="project-36.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

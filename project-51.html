@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 51: THE ENTERPRISE DATA LAKE — S3 + Glue + Athena + Lake Formation + Cro — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 51: THE ENTERPRISE DATA LAKE — S3 + Glue + Athena + Lake Formation + Cross-Account Access</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's CTO has declared 2025 the "Year of Data"<br>
+→ The company has outgrown its ad-hoc data infrastructure<br>
+→ Individual teams have built their own data pipelines independently over 18 months<br>
+→ The result is a fragmented data landscape:</p>
+<p><strong>Current State — Data Chaos:</strong></p>
+<table><thead><tr><th>Team</th><th>Account</th><th>Where Their Data Lives</th><th>Format</th><th>Catalog</th><th>Governance</th><th>Quality</th></tr></thead><tbody><tr><td>Fraud Detection</td><td>Account B</td><td>s3://fraud-team-data/</td><td>Parquet + CSV mixed</td><td>Glue Catalog (partial)</td><td>None — everyone has full access</td><td>No validation</td></tr><tr><td>Platform Engineering</td><td>Account A</td><td>s3://platform-exports/</td><td>JSON (nested)</td><td>No catalog</td><td>IAM bucket policy only</td><td>Manual checks</td></tr><tr><td>Analytics</td><td>Account C</td><td>s3://analytics-warehouse/</td><td>CSV (no partitioning)</td><td>Glue Catalog</td><td>IAM only</td><td>Athena queries catch issues</td></tr><tr><td>Customer Success</td><td>Account B</td><td>s3://customer-data-raw/</td><td>Excel + CSV mixed</td><td>No catalog</td><td>Public bucket (!!!)</td><td>None</td></tr><tr><td>Risk Modeling</td><td>Account B</td><td>s3://risk-models-output/</td><td>Parquet (partitioned)</td><td>Glue Catalog</td><td>Lake Formation (partial)</td><td>Glue Data Quality</td></tr><tr><td>Compliance</td><td>Account E</td><td>s3://compliance-reports/</td><td>PDF + CSV</td><td>No catalog</td><td>Encrypted (KMS)</td><td>Manual review</td></tr></tbody></table>
+<p><strong>The Problems This Creates:</strong></p>
+<table><thead><tr><th>Problem</th><th>Impact</th><th>Frequency</th></tr></thead><tbody><tr><td>Same customer data exists in 4 different S3 buckets</td><td>Storage waste + inconsistency — different teams have different versions</td><td>Permanent</td></tr><tr><td>No single catalog of what data exists</td><td>New analyst spends 2 weeks just finding relevant datasets</td><td>Every new hire</td></tr><tr><td>Customer PII (credit card, SSN) accessible to everyone in Account B</td><td>PCI-DSS violation — audit finding</td><td>Continuous risk</td></tr><tr><td>No data quality standards</td><td>Dashboard shows negative transaction counts — CEO loses trust</td><td>Weekly</td></tr><tr><td>Cross-account data access requires ad-hoc bucket policies</td><td>Each sharing request takes 2 days of engineering time</td><td>5x per week</td></tr><tr><td>No data lineage — nobody knows where data came from</td><td>Compliance audit fails — cannot prove data accuracy</td><td>Every audit</td></tr><tr><td>Excel files mixed with Parquet — Athena cannot query Excel</td><td>Manual conversion needed for every Excel file</td><td>Daily</td></tr><tr><td>No partitioning strategy — Athena scans entire datasets</td><td>$500/month in Athena scan costs for simple queries</td><td>Monthly</td></tr></tbody></table>
+<p><strong>The Chief Data Officer's Vision:</strong></p>
+<p>→ "Build ONE enterprise data lake that ALL teams use"<br>
+→ "Every dataset must be cataloged, governed, and quality-checked"<br>
+→ "Producers own their data — consumers request access through governance"<br>
+→ "No data duplication — one source of truth per entity"<br>
+→ "Cross-account access must be seamless and governed"<br>
+→ "New team onboarding should take hours, not weeks"<br>
+→ "Every query must respect column-level and row-level security"<br>
+→ "The architecture must scale to 100 datasets and 50 consumer teams without redesign"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand that an enterprise data lake is NOT a technology project<br>
+→ It is an ARCHITECTURE PATTERN that combines technologies already mastered in previous projects<br>
+→ No new AWS services are introduced — only the DESIGN of how they work together</p>
+<p><strong>The Enterprise Data Lake Architecture Pillars:</strong></p>
+<table><thead><tr><th>Pillar</th><th>What It Addresses</th><th>AWS Services</th><th>Previous Projects</th></tr></thead><tbody><tr><td>Storage</td><td>Where data lives physically</td><td>S3</td><td>Project 1, 10, 12</td></tr><tr><td>Cataloging</td><td>What data exists and its schema</td><td>Glue Data Catalog + Crawlers</td><td>Project 17, 25</td></tr><tr><td>Processing</td><td>How data is transformed</td><td>Glue ETL</td><td>Project 21, 24, 46</td></tr><tr><td>Querying</td><td>How data is consumed</td><td>Athena + Redshift Spectrum</td><td>Project 18, 25, 28</td></tr><tr><td>Governance</td><td>Who can access what</td><td>Lake Formation</td><td>Project 42, 47</td></tr><tr><td>Security</td><td>How data is protected</td><td>KMS + IAM + Lake Formation</td><td>Project 2, 36, 47</td></tr><tr><td>Networking</td><td>How accounts connect</td><td>Transit Gateway + VPC Endpoints</td><td>Project 27, 50</td></tr><tr><td>Orchestration</td><td>How pipelines run</td><td>Step Functions + EventBridge</td><td>Project 38, 49</td></tr><tr><td>Monitoring</td><td>How health is tracked</td><td>CloudWatch + CloudTrail</td><td>Project 8, 19</td></tr><tr><td>Cross-Account</td><td>How teams share data</td><td>RAM + Lake Formation + Bucket Policies</td><td>Project 39, 40, 42</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Design the account structure (who owns what)</li>
+<li>Step 2 — Design the data zone architecture (landing → raw → curated → refined)</li>
+<li>Step 3 — Design the S3 bucket and prefix strategy</li>
+<li>Step 4 — Design the Glue Catalog structure</li>
+<li>Step 5 — Design the data ingestion patterns</li>
+<li>Step 6 — Design the governance model (Lake Formation)</li>
+<li>Step 7 — Design the cross-account access model</li>
+<li>Step 8 — Design the data quality framework</li>
+<li>Step 9 — Design the consumer access patterns</li>
+<li>Step 10 — Design the monitoring and audit framework</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — DESIGN THE ACCOUNT STRUCTURE</h3>
+<p><strong>The Three-Account Data Lake Pattern:</strong></p>
+<p>→ Enterprise data lakes typically use a MINIMUM of three dedicated account roles:</p>
+<table><thead><tr><th>Account Role</th><th>PayScale Account</th><th>Purpose</th><th>Who Manages</th></tr></thead><tbody><tr><td><strong>Central Data Lake Account</strong></td><td>NEW — Account J (999999999999)</td><td>Hosts S3 storage, Glue Catalog, Lake Formation governance</td><td>Data Platform Team</td></tr><tr><td><strong>Producer Accounts</strong></td><td>Account A, B, C, E (existing)</td><td>Generate data, push to data lake</td><td>Individual business teams</td></tr><tr><td><strong>Consumer Accounts</strong></td><td>Account B, C, D, F, G (existing)</td><td>Query data from the data lake</td><td>Analysts, data scientists, auditors</td></tr></tbody></table>
+<p><strong>Why a DEDICATED Data Lake Account?</strong></p>
+<table><thead><tr><th>Approach</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Data lake in Account B (existing)</td><td>No new account needed</td><td>Mixes application workloads with data lake, blast radius, billing confusion</td></tr><tr><td>Data lake in DEDICATED account (Account J)</td><td>Clean isolation, clear ownership, separate billing, dedicated governance</td><td>Additional account to manage</td></tr></tbody></table>
+<p>→ PayScale creates Account J (999999999999) — the Central Data Lake Account<br>
+→ This account owns:</p>
+<ul>
+<li>ALL S3 data lake buckets</li>
+<li>The master Glue Data Catalog</li>
+<li>Lake Formation governance policies</li>
+<li>Centralized KMS keys for data encryption</li>
+</ul>
+<p><strong>Account Relationship Map:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌─────────────────────────┐
+</span>                    │   Account J (Data Lake)   │
+                    │   S3 + Glue Catalog +     │
+                    │   Lake Formation          │
+                    └────────┬──────────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+        PRODUCERS       GOVERNANCE     CONSUMERS
+              │              │              │
+    ┌─────────┴─────┐       │     ┌────────┴────────┐
+    │ Account A     │       │     │ Account C       │
+    │ (Platform)    │       │     │ (Analytics)     │
+    │               │       │     │                 │
+    │ Account B     │       │     │ Account D       │
+    │ (Risk/Fraud)  │       │     │ (Audit)         │
+    │               │       │     │                 │
+    │ Account E     │       │     │ Account F (Dev) │
+    │ (Compliance)  │       │     │                 │
+    └───────────────┘       │     │ Account G       │
+                            │     │ (Staging)       │
+                            │     └─────────────────┘
+                            │
+                    Lake Formation
+                    Controls ALL access</code></pre></div>
+<p>→ Some accounts are BOTH producers AND consumers (Account B produces fraud data, consumes platform data)<br>
+→ This is normal — the role is per-dataset, not per-account</p>
+<hr>
+<h3>STEP 2 — DESIGN THE DATA ZONE ARCHITECTURE</h3>
+<p><strong>The Four-Zone Model:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>LANDING ZONE → RAW ZONE → CURATED ZONE → REFINED ZONE
+</span>(Ingest)       (Preserve)   (Transform)    (Serve)</code></pre></div>
+<table><thead><tr><th>Zone</th><th>Purpose</th><th>Data State</th><th>Format</th><th>Who Writes</th><th>Who Reads</th><th>Retention</th></tr></thead><tbody><tr><td><strong>Landing</strong></td><td>Temporary staging for incoming data</td><td>As-received (CSV, JSON, Excel, API dumps)</td><td>Original format — untouched</td><td>Producers (automated pipelines)</td><td>Glue ETL only</td><td>7-30 days (auto-delete)</td></tr><tr><td><strong>Raw</strong></td><td>Permanent archive of source data</td><td>Converted to standard format but NOT transformed</td><td>Parquet (columnar, compressed)</td><td>Glue ETL (from Landing)</td><td>Data engineers, compliance</td><td>Indefinite (Glacier after 1 year)</td></tr><tr><td><strong>Curated</strong></td><td>Business-ready, cleaned, enriched data</td><td>Deduplicated, validated, joined, enriched</td><td>Parquet (partitioned, optimized)</td><td>Glue ETL (from Raw)</td><td>Analysts, data scientists, BI tools</td><td>Indefinite</td></tr><tr><td><strong>Refined</strong></td><td>Pre-aggregated datasets for specific use cases</td><td>Aggregated, summarized, pivoted</td><td>Parquet (highly optimized)</td><td>Glue ETL or Athena CTAS (from Curated)</td><td>Dashboards, APIs, executives</td><td>Refresh cycle (daily/hourly)</td></tr></tbody></table>
+<p><strong>Why Four Zones?</strong></p>
+<table><thead><tr><th>Question</th><th>Answer</th></tr></thead><tbody><tr><td>Why not just Landing + Curated?</td><td>Raw zone preserves original data — if curated transformation has a bug, you can reprocess from Raw without re-ingesting from source</td></tr><tr><td>Why not just one big bucket?</td><td>Different zones have different access patterns, retention policies, and governance requirements</td></tr><tr><td>Why Landing is temporary?</td><td>Landing data is in its original format (CSV, JSON) — not optimized for querying — it's a staging area only</td></tr><tr><td>Why Raw is Parquet but untransformed?</td><td>Parquet is efficient for storage and querying — converting format early saves downstream costs — but business logic is NOT applied yet</td></tr><tr><td>Why Curated is separate from Refined?</td><td>Curated is the "single source of truth" — Refined is derived for specific use cases — multiple Refined datasets can come from one Curated dataset</td></tr></tbody></table>
+<p><strong>Data Flow Through Zones:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Partner CSV Upload → Landing Zone
+</span>    |
+    ↓ Glue ETL Job 1: Format conversion (CSV → Parquet), schema validation
+    |
+Raw Zone (Parquet, partitioned by date, untransformed)
+    |
+    ↓ Glue ETL Job 2: Deduplication, cleaning, enrichment, joining
+    |
+Curated Zone (Parquet, partitioned by business keys, business-ready)
+    |
+    ├─→ Glue ETL Job 3a: Aggregate for fraud dashboard
+    |   Refined Zone: fraud_daily_summary
+    |
+    ├─→ Glue ETL Job 3b: Aggregate for executive report
+    |   Refined Zone: executive_metrics
+    |
+    └─→ Athena CTAS: Ad-hoc analysis dataset
+        Refined Zone: analyst_workspace</code></pre></div>
+<hr>
+<h3>STEP 3 — DESIGN THE S3 BUCKET AND PREFIX STRATEGY</h3>
+<p><strong>Bucket Strategy:</strong></p>
+<table><thead><tr><th>Option</th><th>Structure</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>One bucket per zone</td><td><code>s3://payscale-landing/</code>, <code>s3://payscale-raw/</code>, etc.</td><td>Simple, clear separation</td><td>Many buckets to manage</td></tr><tr><td>One bucket with zone prefixes</td><td><code>s3://payscale-datalake/landing/</code>, <code>s3://payscale-datalake/raw/</code>, etc.</td><td>Single bucket, unified policies</td><td>Harder to apply different lifecycle policies per zone</td></tr><tr><td>One bucket per zone per domain</td><td><code>s3://payscale-raw-fraud/</code>, <code>s3://payscale-raw-platform/</code>, etc.</td><td>Maximum isolation</td><td>Bucket explosion</td></tr></tbody></table>
+<p>→ PayScale chooses: <strong>One bucket per zone</strong> (balanced approach)</p>
+<p><strong>Bucket Configuration (Account J):</strong></p>
+<table><thead><tr><th>Bucket Name</th><th>Zone</th><th>Encryption</th><th>Versioning</th><th>Lifecycle</th><th>Block Public Access</th></tr></thead><tbody><tr><td><code>payscale-datalake-landing</code></td><td>Landing</td><td>SSE-KMS (from Project 36)</td><td>Disabled (temporary data)</td><td>Delete after 30 days</td><td>✅ All blocked</td></tr><tr><td><code>payscale-datalake-raw</code></td><td>Raw</td><td>SSE-KMS</td><td>Enabled (from Project 12)</td><td>Transition to Glacier after 365 days</td><td>✅ All blocked</td></tr><tr><td><code>payscale-datalake-curated</code></td><td>Curated</td><td>SSE-KMS</td><td>Enabled</td><td>Transition to IA after 180 days</td><td>✅ All blocked</td></tr><tr><td><code>payscale-datalake-refined</code></td><td>Refined</td><td>SSE-KMS</td><td>Disabled (regenerable)</td><td>Delete after 90 days (regenerable from curated)</td><td>✅ All blocked</td></tr></tbody></table>
+<p><strong>Prefix Strategy (Inside Each Bucket):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://payscale-datalake-raw/
+</span>    ├── domain=fraud/
+    │   ├── entity=transactions/
+    │   │   ├── year=2025/
+    │   │   │   ├── month=01/
+    │   │   │   │   ├── day=15/
+    │   │   │   │   │   ├── part-00001.snappy.parquet
+    │   │   │   │   │   └── part-00002.snappy.parquet
+    │   │   │   │   └── day=16/
+    │   │   │   └── month=02/
+    │   │   └── year=2024/
+    │   ├── entity=customers/
+    │   └── entity=merchants/
+    ├── domain=platform/
+    │   ├── entity=payments/
+    │   ├── entity=accounts/
+    │   └── entity=events/
+    ├── domain=compliance/
+    │   └── entity=audit_logs/
+    └── domain=analytics/
+        └── entity=web_events/</code></pre></div>
+<p><strong>Prefix Naming Convention:</strong></p>
+<table><thead><tr><th>Level</th><th>Key Format</th><th>Purpose</th><th>Example</th></tr></thead><tbody><tr><td>Domain</td><td><code>domain={name}/</code></td><td>Business domain separation</td><td><code>domain=fraud/</code></td></tr><tr><td>Entity</td><td><code>entity={name}/</code></td><td>Logical dataset within domain</td><td><code>entity=transactions/</code></td></tr><tr><td>Year</td><td><code>year=YYYY/</code></td><td>Time partitioning — Athena partition projection</td><td><code>year=2025/</code></td></tr><tr><td>Month</td><td><code>month=MM/</code></td><td>Time partitioning (zero-padded from Project 46)</td><td><code>month=01/</code></td></tr><tr><td>Day</td><td><code>day=DD/</code></td><td>Time partitioning</td><td><code>day=15/</code></td></tr></tbody></table>
+<p><strong>Why Hive-Style Partitioning (key=value)?</strong></p>
+<p>→ Athena and Redshift Spectrum recognize <code>key=value</code> prefix patterns as PARTITIONS automatically<br>
+→ Glue Crawlers detect and catalog these as partition columns<br>
+→ Partition projection (from Project 25) eliminates the need for <code>MSCK REPAIR TABLE</code><br>
+→ Athena queries with <code>WHERE year=2025 AND month=01</code> scan ONLY that partition — massive cost savings</p>
+<p><strong>Partition Projection Configuration (Athena — from Project 25):</strong></p>
+<table><thead><tr><th>Property</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>projection.enabled</code></td><td><code>true</code></td><td>Enable partition projection</td></tr><tr><td><code>projection.year.type</code></td><td><code>integer</code></td><td>Year is integer type</td></tr><tr><td><code>projection.year.range</code></td><td><code>2020,2030</code></td><td>Valid year range</td></tr><tr><td><code>projection.month.type</code></td><td><code>integer</code></td><td>Month is integer type</td></tr><tr><td><code>projection.month.range</code></td><td><code>1,12</code></td><td>Valid month range</td></tr><tr><td><code>projection.month.digits</code></td><td><code>2</code></td><td>Zero-padded (01, 02, ...)</td></tr><tr><td><code>projection.day.type</code></td><td><code>integer</code></td><td>Day is integer type</td></tr><tr><td><code>projection.day.range</code></td><td><code>1,31</code></td><td>Valid day range</td></tr><tr><td><code>projection.day.digits</code></td><td><code>2</code></td><td>Zero-padded</td></tr><tr><td><code>storage.location.template</code></td><td><code>s3://payscale-datalake-curated/domain=fraud/entity=transactions/year=${year}/month=${month}/day=${day}/</code></td><td>S3 path template</td></tr></tbody></table>
+<p>→ With partition projection → Athena NEVER calls <code>glue:GetPartitions</code><br>
+→ Athena constructs the S3 path directly from the query filter<br>
+→ This eliminates Glue API throttling for tables with millions of partitions</p>
+<hr>
+<h3>STEP 4 — DESIGN THE GLUE CATALOG STRUCTURE</h3>
+<p><strong>Catalog Hierarchy:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Data Catalog (Account J)
+</span>    |
+    ├── Database: raw_fraud
+    │   ├── Table: transactions    → s3://payscale-datalake-raw/domain=fraud/entity=transactions/
+    │   ├── Table: customers       → s3://payscale-datalake-raw/domain=fraud/entity=customers/
+    │   └── Table: merchants       → s3://payscale-datalake-raw/domain=fraud/entity=merchants/
+    |
+    ├── Database: raw_platform
+    │   ├── Table: payments         → s3://payscale-datalake-raw/domain=platform/entity=payments/
+    │   ├── Table: accounts         → s3://payscale-datalake-raw/domain=platform/entity=accounts/
+    │   └── Table: events           → s3://payscale-datalake-raw/domain=platform/entity=events/
+    |
+    ├── Database: curated_fraud
+    │   ├── Table: transactions_clean    → s3://payscale-datalake-curated/domain=fraud/entity=transactions/
+    │   ├── Table: customers_enriched    → s3://payscale-datalake-curated/domain=fraud/entity=customers/
+    │   └── Table: merchants_validated   → s3://payscale-datalake-curated/domain=fraud/entity=merchants/
+    |
+    ├── Database: curated_platform
+    │   ├── Table: payments_reconciled   → s3://...
+    │   └── Table: accounts_current      → s3://...
+    |
+    ├── Database: refined_fraud
+    │   ├── Table: daily_fraud_summary   → s3://payscale-datalake-refined/domain=fraud/entity=daily_summary/
+    │   └── Table: risk_score_trends     → s3://payscale-datalake-refined/domain=fraud/entity=risk_trends/
+    |
+    └── Database: refined_executive
+        └── Table: company_metrics       → s3://payscale-datalake-refined/domain=executive/entity=metrics/</code></pre></div>
+<p><strong>Database Naming Convention:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{zone}_{domain}
+</span>
+Examples:
+    raw_fraud        → Raw zone, fraud domain
+    curated_platform → Curated zone, platform domain
+    refined_executive → Refined zone, executive domain</code></pre></div>
+<p>→ This naming convention makes it immediately clear which zone and domain a database belongs to<br>
+→ Lake Formation permissions can be granted at the DATABASE level — covering all tables within</p>
+<p><strong>Glue Crawler Configuration (from Project 17):</strong></p>
+<table><thead><tr><th>Crawler</th><th>Source</th><th>Schedule</th><th>Target Database</th></tr></thead><tbody><tr><td><code>crawler-raw-fraud</code></td><td><code>s3://payscale-datalake-raw/domain=fraud/</code></td><td>Every 6 hours</td><td><code>raw_fraud</code></td></tr><tr><td><code>crawler-raw-platform</code></td><td><code>s3://payscale-datalake-raw/domain=platform/</code></td><td>Every 6 hours</td><td><code>raw_platform</code></td></tr><tr><td><code>crawler-curated-fraud</code></td><td><code>s3://payscale-datalake-curated/domain=fraud/</code></td><td>After ETL completion (triggered by workflow from Project 31, 49)</td><td><code>curated_fraud</code></td></tr><tr><td><code>crawler-curated-platform</code></td><td><code>s3://payscale-datalake-curated/domain=platform/</code></td><td>After ETL completion</td><td><code>curated_platform</code></td></tr><tr><td><code>crawler-refined-fraud</code></td><td><code>s3://payscale-datalake-refined/domain=fraud/</code></td><td>After aggregation jobs</td><td><code>refined_fraud</code></td></tr></tbody></table>
+<p>→ Crawlers are scheduled or triggered by Glue Workflows/Step Functions (from Project 31, 49)<br>
+→ Each crawler targets ONE domain within ONE zone — prevents cross-contamination</p>
+<hr>
+<h3>STEP 5 — DESIGN THE DATA INGESTION PATTERNS</h3>
+<p><strong>Three Ingestion Patterns Based on Source Type:</strong></p>
+<hr>
+<p><strong>Pattern A — Batch File Ingestion (Partners, External Sources)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>External Partner → Uploads CSV/JSON → S3 Landing Zone
+</span>    |
+    ↓ EventBridge detects upload (from Project 38, 49)
+    ↓ Step Functions orchestrates pipeline
+    |
+    ├── Step 1: Validate file (Lambda — from Project 49)
+    ├── Step 2: Glue ETL — Landing → Raw (format conversion, from Project 21)
+    ├── Step 3: Glue ETL — Raw → Curated (business logic, from Project 21)
+    ├── Step 4: Glue Crawler — Update catalog (from Project 17)
+    └── Step 5: SNS notification (from Project 6)</code></pre></div>
+<p><strong>How Producers Upload to Landing Zone (Cross-Account):</strong></p>
+<p>→ Producer accounts need write access to Account J's Landing bucket<br>
+→ Two approaches:</p>
+<table><thead><tr><th>Approach</th><th>How</th><th>When to Use</th></tr></thead><tbody><tr><td>Cross-account bucket policy (from Project 39)</td><td>Account J's bucket policy allows PutObject from producer account</td><td>Simple, few producers</td></tr><tr><td>Cross-account IAM role assumption (from Project 40)</td><td>Producer assumes a role in Account J that has S3 write access</td><td>More controlled, auditable</td></tr></tbody></table>
+<p><strong>Bucket Policy Approach (Landing Bucket):</strong></p>
+<p>→ Account J's <code>payscale-datalake-landing</code> bucket policy:</p>
+<table><thead><tr><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Account A (111111111111)</td><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-datalake-landing/domain=platform/*</code></td><td>Only to their domain prefix</td></tr><tr><td>Account B (222222222222)</td><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-datalake-landing/domain=fraud/*</code></td><td>Only to their domain prefix</td></tr><tr><td>Account E (555555555555)</td><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-datalake-landing/domain=compliance/*</code></td><td>Only to their domain prefix</td></tr></tbody></table>
+<p>→ Each producer can ONLY write to their own domain prefix — cannot overwrite other team's data<br>
+→ No producer has READ access to the landing zone — only Glue ETL reads from landing</p>
+<hr>
+<p><strong>Pattern B — Database Extraction (MariaDB, Internal Systems)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MariaDB (Account A/B) → Glue ETL with JDBC + Bookmarks (from Project 24, 46)
+</span>    |
+    ↓ Glue Job runs in Account J (or Account B with cross-account S3 write)
+    |
+    ├── Extracts incremental data from MariaDB
+    ├── Writes Parquet to Raw Zone
+    ├── Runs transformation to Curated Zone
+    └── Updates Glue Catalog</code></pre></div>
+<p><strong>Glue JDBC Connection for Cross-Account Database Access:</strong></p>
+<p>→ Glue job in Account J needs to reach MariaDB in Account B<br>
+→ Options:</p>
+<table><thead><tr><th>Option</th><th>How</th><th>Complexity</th></tr></thead><tbody><tr><td>Glue job runs in Account B, writes to Account J S3</td><td>Glue in Account B + cross-account S3 bucket policy</td><td>Medium</td></tr><tr><td>Glue job runs in Account J, connects to Account B MariaDB via VPC</td><td>Glue job in Account J VPC + Transit Gateway (Project 50) + cross-account JDBC</td><td>High</td></tr><tr><td>Glue job runs in Account J, connects via Glue Marketplace connector</td><td>Managed connector with cross-account credentials</td><td>Medium</td></tr></tbody></table>
+<p>→ PayScale chooses: <strong>Glue job runs in producer account, writes to central S3</strong><br>
+→ This keeps database access within the producer's account (least privilege)<br>
+→ Only the S3 output crosses the account boundary</p>
+<hr>
+<p><strong>Pattern C — Streaming Ingestion (Real-Time Events)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application Events → Kinesis Data Stream (from Project 52)
+</span>    |
+    ↓ Kinesis Firehose → S3 Landing Zone (buffered every 5 minutes)
+    |
+    ↓ EventBridge detects new files → Triggers processing pipeline</code></pre></div>
+<p>→ This pattern is covered in detail in Project 52<br>
+→ The output lands in the same Landing Zone → Same downstream processing</p>
+<hr>
+<h3>STEP 6 — DESIGN THE GOVERNANCE MODEL (LAKE FORMATION)</h3>
+<p><strong>This is the MOST CRITICAL section — governance makes or breaks an enterprise data lake</strong></p>
+<p><strong>Governance Design Principles:</strong></p>
+<table><thead><tr><th>Principle</th><th>Implementation</th></tr></thead><tbody><tr><td>Least privilege</td><td>Users get ONLY the access they need — no more</td></tr><tr><td>Producer ownership</td><td>Each team governs their own domain's data</td></tr><tr><td>Central administration</td><td>Data Platform Team has override capability</td></tr><tr><td>Column-level security</td><td>PII columns restricted by default</td></tr><tr><td>Row-level security</td><td>Regional teams see only their region</td></tr><tr><td>Cross-account governed sharing</td><td>External accounts access via Lake Formation grants</td></tr><tr><td>Audit everything</td><td>CloudTrail + Lake Formation logs all access</td></tr></tbody></table>
+<p><strong>Lake Formation Setup (Account J):</strong></p>
+<p><strong>Step 6a — Data Lake Administrators:</strong></p>
+<table><thead><tr><th>Administrator</th><th>Role</th><th>Purpose</th></tr></thead><tbody><tr><td><code>DataPlatformAdminRole</code></td><td>Data Lake Admin</td><td>Full governance control — can grant/revoke any permission</td></tr><tr><td><code>FraudDomainOwnerRole</code></td><td>Database Creator (fraud databases only)</td><td>Manages fraud domain governance — cannot touch platform domain</td></tr><tr><td><code>PlatformDomainOwnerRole</code></td><td>Database Creator (platform databases only)</td><td>Manages platform domain governance</td></tr></tbody></table>
+<p>→ Domain owners have DELEGATED governance — they manage their own domain without Data Platform Team involvement<br>
+→ This scales governance — the central team doesn't become a bottleneck</p>
+<p><strong>Step 6b — Register S3 Locations (from Project 47, Step 3):</strong></p>
+<table><thead><tr><th>S3 Path</th><th>Registered IAM Role</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3://payscale-datalake-landing/</code></td><td>[REDACTED:AWS_ACCESS_KEY]essRole`</td><td>Landing zone access</td></tr><tr><td><code>s3://payscale-datalake-raw/</code></td><td>[REDACTED:AWS_ACCESS_KEY]essRole`</td><td>Raw zone access</td></tr><tr><td><code>s3://payscale-datalake-curated/</code></td><td>[REDACTED:AWS_ACCESS_KEY]essRole`</td><td>Curated zone access</td></tr><tr><td><code>s3://payscale-datalake-refined/</code></td><td>[REDACTED:AWS_ACCESS_KEY]essRole`</td><td>Refined zone access</td></tr></tbody></table>
+<p><strong>Step 6c — Revoke IAMAllowedPrincipals (from Project 47, Step 4):</strong></p>
+<p>→ CRITICAL: Follow the safe migration order from Project 47<br>
+→ Grant explicit permissions FIRST → Then revoke IAMAllowedPrincipals<br>
+→ Do this for EVERY database in the catalog</p>
+<p><strong>Step 6d — Tag-Based Access Control (TBAC) Design (from Project 47, Step 9):</strong></p>
+<p><strong>LF-Tags:</strong></p>
+<table><thead><tr><th>Tag Key</th><th>Permitted Values</th><th>Purpose</th></tr></thead><tbody><tr><td><code>zone</code></td><td><code>landing</code>, <code>raw</code>, <code>curated</code>, <code>refined</code></td><td>Data maturity level</td></tr><tr><td><code>domain</code></td><td><code>fraud</code>, <code>platform</code>, <code>compliance</code>, <code>executive</code></td><td>Business domain</td></tr><tr><td><code>sensitivity</code></td><td><code>public</code>, <code>internal</code>, <code>confidential</code>, <code>restricted</code></td><td>Data classification</td></tr><tr><td><code>pii</code></td><td><code>true</code>, <code>false</code></td><td>Contains personally identifiable information</td></tr></tbody></table>
+<p><strong>Tag Assignments:</strong></p>
+<table><thead><tr><th>Resource</th><th>zone</th><th>domain</th><th>sensitivity</th><th>pii</th></tr></thead><tbody><tr><td>raw_fraud.transactions</td><td>raw</td><td>fraud</td><td>confidential</td><td>true</td></tr><tr><td>raw_fraud.customers</td><td>raw</td><td>fraud</td><td>restricted</td><td>true</td></tr><tr><td>raw_fraud.merchants</td><td>raw</td><td>fraud</td><td>internal</td><td>false</td></tr><tr><td>curated_fraud.transactions_clean</td><td>curated</td><td>fraud</td><td>confidential</td><td>true</td></tr><tr><td>curated_fraud.customers_enriched</td><td>curated</td><td>fraud</td><td>restricted</td><td>true</td></tr><tr><td>refined_fraud.daily_fraud_summary</td><td>refined</td><td>fraud</td><td>internal</td><td>false</td></tr><tr><td>refined_executive.company_metrics</td><td>refined</td><td>executive</td><td>public</td><td>false</td></tr></tbody></table>
+<p><strong>Column-Level Tags:</strong></p>
+<table><thead><tr><th>Table</th><th>Column</th><th>sensitivity</th><th>pii</th></tr></thead><tbody><tr><td><em>.transactions</em></td><td>credit_card_number</td><td>restricted</td><td>true</td></tr><tr><td><em>.customers</em></td><td>ssn_last4</td><td>restricted</td><td>true</td></tr><tr><td><em>.customers</em></td><td>email</td><td>confidential</td><td>true</td></tr><tr><td><em>.customers</em></td><td>phone</td><td>confidential</td><td>true</td></tr><tr><td><em>.customers</em></td><td>full_name</td><td>confidential</td><td>true</td></tr></tbody></table>
+<p><strong>Step 6e — TBAC Permission Grants:</strong></p>
+<p><strong>Grant 1: Senior Fraud Analysts — Full curated fraud access</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>SeniorFraudAnalystRole</code> (Account B)</td></tr><tr><td>LF-Tags</td><td>zone: <code>curated</code>, <code>refined</code> AND domain: <code>fraud</code> AND sensitivity: <code>public</code>, <code>internal</code>, <code>confidential</code>, <code>restricted</code></td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr></tbody></table>
+<p><strong>Grant 2: Junior Fraud Analysts — Curated fraud without PII</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>JuniorFraudAnalystRole</code> (Account B)</td></tr><tr><td>LF-Tags</td><td>zone: <code>curated</code>, <code>refined</code> AND domain: <code>fraud</code> AND sensitivity: <code>public</code>, <code>internal</code>, <code>confidential</code></td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr></tbody></table>
+<p>→ Junior analysts CANNOT see columns tagged <code>sensitivity=restricted</code> (credit_card_number, ssn_last4)<br>
+→ They CAN see columns tagged <code>confidential</code> or lower</p>
+<p><strong>Grant 3: Business Analysts — Refined only, all domains</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>BusinessAnalystRole</code> (Account C)</td></tr><tr><td>LF-Tags</td><td>zone: <code>refined</code> AND sensitivity: <code>public</code>, <code>internal</code></td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr></tbody></table>
+<p>→ Business analysts can ONLY see refined (pre-aggregated) data<br>
+→ They CANNOT see raw or curated data<br>
+→ They CANNOT see confidential or restricted data</p>
+<p><strong>Grant 4: Data Scientists — Curated data without restricted PII</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>DataScientistRole</code> (Account B)</td></tr><tr><td>LF-Tags</td><td>zone: <code>curated</code>, <code>refined</code> AND domain: <code>fraud</code>, <code>platform</code> AND sensitivity: <code>public</code>, <code>internal</code>, <code>confidential</code></td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr></tbody></table>
+<p><strong>Grant 5: External Auditor — Refined executive only (cross-account)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td>Account D (444444444444) — External account</td></tr><tr><td>LF-Tags</td><td>zone: <code>refined</code> AND domain: <code>executive</code> AND sensitivity: <code>public</code></td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr></tbody></table>
+<p>→ Auditor sees ONLY <code>refined_executive.company_metrics</code><br>
+→ Cross-account grant → RAM acceptance → Resource link (from Project 47, Step 10)</p>
+<p><strong>Grant 6: Glue ETL Service Role — Read/Write access for processing</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td><code>GlueETLServiceRole</code> (Account J)</td></tr><tr><td>LF-Tags</td><td>zone: <code>landing</code>, <code>raw</code>, <code>curated</code>, <code>refined</code> AND domain: ALL AND sensitivity: ALL</td></tr><tr><td>Permissions</td><td>Select, Describe, Insert, Alter</td></tr></tbody></table>
+<p>→ The ETL role needs FULL access to process data across all zones<br>
+→ This is the ONLY role with write access to curated and refined zones</p>
+<p><strong>Complete Permission Matrix:</strong></p>
+<table><thead><tr><th>Role</th><th>Landing</th><th>Raw</th><th>Curated</th><th>Refined</th><th>PII Columns</th><th>Cross-Account</th></tr></thead><tbody><tr><td>Data Platform Admin</td><td>✅ Full</td><td>✅ Full</td><td>✅ Full</td><td>✅ Full</td><td>✅ Full</td><td>N/A (Account J)</td></tr><tr><td>Fraud Domain Owner</td><td>❌</td><td>✅ Fraud only</td><td>✅ Fraud only</td><td>✅ Fraud only</td><td>✅ Full (their domain)</td><td>N/A (Account J)</td></tr><tr><td>Glue ETL Role</td><td>✅ Read</td><td>✅ Read/Write</td><td>✅ Read/Write</td><td>✅ Read/Write</td><td>✅ Full</td><td>N/A (Account J)</td></tr><tr><td>Senior Fraud Analyst</td><td>❌</td><td>❌</td><td>✅ Fraud</td><td>✅ Fraud</td><td>✅ Full</td><td>Account B</td></tr><tr><td>Junior Fraud Analyst</td><td>❌</td><td>❌</td><td>✅ Fraud</td><td>✅ Fraud</td><td>❌ Restricted hidden</td><td>Account B</td></tr><tr><td>Data Scientist</td><td>❌</td><td>❌</td><td>✅ Fraud+Platform</td><td>✅ Fraud+Platform</td><td>❌ Restricted hidden</td><td>Account B</td></tr><tr><td>Business Analyst</td><td>❌</td><td>❌</td><td>❌</td><td>✅ All refined</td><td>❌ Confidential+ hidden</td><td>Account C</td></tr><tr><td>External Auditor</td><td>❌</td><td>❌</td><td>❌</td><td>✅ Executive only</td><td>❌ All PII hidden</td><td>Account D</td></tr><tr><td>Dev Team</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>Account F — NO ACCESS</td></tr></tbody></table>
+<p>→ Dev Team (Account F) has ZERO access to the production data lake<br>
+→ They use a SEPARATE dev data lake with synthetic data (same architecture, different buckets)</p>
+<hr>
+<h3>STEP 7 — DESIGN THE CROSS-ACCOUNT ACCESS MODEL</h3>
+<p><strong>Three Layers of Cross-Account Access:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Layer 1: Network Connectivity
+</span>    → Transit Gateway (from Project 50) connects all accounts
+    → VPC Endpoints for S3 (from Project 27) in each account
+    → NOT needed for Athena → Athena uses AWS-managed endpoints
+
+Layer 2: Glue Catalog Sharing
+    → Lake Formation cross-account grants (from Project 42, 47)
+    → RAM shares the Glue Catalog resources
+    → Consumer accounts create Resource Links
+
+Layer 3: S3 Data Access
+    → Lake Formation credential vending (from Project 47)
+    → Consumer accounts do NOT need direct S3 access
+    → Lake Formation's registered IAM role accesses S3 on behalf of consumers</code></pre></div>
+<p><strong>Consumer Account Setup (Example — Account C Analytics):</strong></p>
+<p><strong>Step 7a — Accept RAM Share:</strong><br>
+→ Account C accepts the RAM invitation from Account J (like Project 47, Step 10b)</p>
+<p><strong>Step 7b — Create Resource Links:</strong></p>
+<table><thead><tr><th>Resource Link Name</th><th>Target Database (Account J)</th><th>Account C Database</th></tr></thead><tbody><tr><td><code>curated_fraud_link</code></td><td><code>curated_fraud</code></td><td><code>shared_from_datalake</code></td></tr><tr><td><code>refined_fraud_link</code></td><td><code>refined_fraud</code></td><td><code>shared_from_datalake</code></td></tr><tr><td><code>refined_executive_link</code></td><td><code>refined_executive</code></td><td><code>shared_from_datalake</code></td></tr></tbody></table>
+<p><strong>Step 7c — Grant Lake Formation Permissions on Resource Links:</strong><br>
+→ Account C's Lake Formation Admin grants permissions to Account C users on the resource links<br>
+→ This is the LOCAL governance layer — Account C controls WHO in their account can access what</p>
+<table><thead><tr><th>Principal (Account C)</th><th>Resource Link</th><th>Permissions</th></tr></thead><tbody><tr><td><code>BusinessAnalystRole</code></td><td><code>refined_fraud_link</code>, <code>refined_executive_link</code></td><td>Select, Describe</td></tr><tr><td><code>AnalyticsEngineerRole</code></td><td>All links</td><td>Select, Describe</td></tr></tbody></table>
+<p><strong>Step 7d — Consumer Queries Data:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account C Analyst uses Athena:
+</span>    SELECT * FROM shared_from_datalake.refined_fraud_link LIMIT 10;
+
+Flow:
+    Athena (Account C) → Resource Link → Lake Formation (Account C) validates local permission
+    → Lake Formation (Account J) validates cross-account permission
+    → Lake Formation credential vending → S3 (Account J) → Data returned</code></pre></div>
+<p>→ The analyst never needs S3 bucket ARN, access keys, or bucket policies<br>
+→ Everything flows through Lake Formation governance</p>
+<hr>
+<h3>STEP 8 — DESIGN THE DATA QUALITY FRAMEWORK</h3>
+<p><strong>Data Quality Checks at Each Zone Transition:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Landing → Raw: Schema validation, format conversion quality
+</span>Raw → Curated: Business rule validation, deduplication quality
+Curated → Refined: Aggregation accuracy, completeness checks</code></pre></div>
+<p><strong>Quality Check Categories:</strong></p>
+<table><thead><tr><th>Category</th><th>Check</th><th>Example</th><th>Zone Transition</th></tr></thead><tbody><tr><td>Completeness</td><td>No NULL values in required columns</td><td><code>transaction_id IS NOT NULL</code></td><td>Landing → Raw</td></tr><tr><td>Uniqueness</td><td>No duplicate records</td><td><code>COUNT(DISTINCT transaction_id) = COUNT(*)</code></td><td>Raw → Curated</td></tr><tr><td>Validity</td><td>Values within expected ranges</td><td><code>amount &gt; 0 AND amount &lt; 10000000</code></td><td>Landing → Raw</td></tr><tr><td>Consistency</td><td>Cross-field consistency</td><td><code>IF status='completed' THEN completed_at IS NOT NULL</code></td><td>Raw → Curated</td></tr><tr><td>Timeliness</td><td>Data is from expected time range</td><td><code>MAX(created_at) &gt;= CURRENT_DATE - INTERVAL 2 DAY</code></td><td>Landing → Raw</td></tr><tr><td>Accuracy</td><td>Aggregations match source</td><td><code>SUM(curated.amount) = SUM(raw.amount) for same date</code></td><td>Curated → Refined</td></tr></tbody></table>
+<p><strong>Implementation — Glue Data Quality (Native Feature):</strong></p>
+<p>→ AWS Glue Data Quality runs rules WITHIN the Glue ETL job<br>
+→ No separate service needed — it's built into Glue</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>DQDL Rules</td><td>Defined per ETL job</td><td>Data Quality Definition Language rules</td></tr><tr><td>Action on failure</td><td>FAIL the job OR write to quarantine</td><td>Stop pipeline or isolate bad data</td></tr><tr><td>Metrics</td><td>Published to CloudWatch</td><td>Monitoring and alerting</td></tr></tbody></table>
+<p><strong>Quarantine Pattern:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue ETL processes records
+</span>    |
+    ├── Record passes ALL quality rules → Write to Curated Zone ✅
+    |
+    └── Record FAILS any quality rule → Write to Quarantine Zone ❌
+        s3://payscale-datalake-curated/domain=fraud/entity=transactions_quarantine/</code></pre></div>
+<p>→ Quarantine data is reviewed by data engineers<br>
+→ After fixing → Records are reprocessed into curated zone<br>
+→ Quality metrics are published to CloudWatch (from Project 8) for dashboarding</p>
+<p><strong>Quality Scorecard (Published Daily):</strong></p>
+<table><thead><tr><th>Dataset</th><th>Date</th><th>Total Records</th><th>Passed</th><th>Failed</th><th>Quarantined</th><th>Score</th></tr></thead><tbody><tr><td>fraud.transactions</td><td>2025-01-15</td><td>15,000</td><td>14,850</td><td>150</td><td>150</td><td>99.0%</td></tr><tr><td>platform.payments</td><td>2025-01-15</td><td>25,000</td><td>24,990</td><td>10</td><td>10</td><td>99.96%</td></tr><tr><td>fraud.customers</td><td>2025-01-15</td><td>500</td><td>500</td><td>0</td><td>0</td><td>100%</td></tr></tbody></table>
+<p>→ Quality scores below threshold → SNS alert (from Project 6)<br>
+→ Quality trends tracked over time → Identifies degrading data sources</p>
+<hr>
+<h3>STEP 9 — DESIGN THE CONSUMER ACCESS PATTERNS</h3>
+<p><strong>Pattern 1: Self-Service Analytics via Athena (Primary)</strong></p>
+<code>Analyst (Account C) → Athena → Resource Link → Lake Formation → S3 (Account J)</code>
+<table><thead><tr><th>Configuration</th><th>Value</th></tr></thead><tbody><tr><td>Athena Workgroup</td><td>One per team: <code>wg-fraud-analysts</code>, <code>wg-business-analysts</code></td></tr><tr><td>Query Result Location</td><td><code>s3://payscale-athena-results-{account-id}/</code> (per account)</td></tr><tr><td>Workgroup Data Usage Limit</td><td>10 TB per day (prevents runaway queries)</td></tr><tr><td>Workgroup Query Timeout</td><td>30 minutes</td></tr></tbody></table>
+<p><strong>Workgroup Benefits (from Project 18):</strong><br>
+→ Separate cost tracking per team<br>
+→ Query result isolation (each team's results in their own bucket)<br>
+→ Data usage limits prevent accidental full-table scans<br>
+→ Enforced encryption on query results</p>
+<hr>
+<p><strong>Pattern 2: Redshift Spectrum for Complex Analytics (Secondary)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift (Account B) → Spectrum External Schema → Glue Catalog (Account J)
+</span>    → Lake Formation governs access → S3 (Account J)</code></pre></div>
+<p>→ Redshift Spectrum (from Project 28) can query Account J's Glue Catalog<br>
+→ Lake Formation governs the access — Redshift users see only permitted tables/columns<br>
+→ Combined with Redshift local tables and federated queries (from Project 48) → Three-source queries</p>
+<hr>
+<p><strong>Pattern 3: Redshift COPY for Warehouse Loading (Bulk)</strong></p>
+<code>S3 Curated Zone (Account J) → Redshift COPY (Account B)</code>
+<p>→ For datasets that need to be materialized in Redshift for performance<br>
+→ Redshift COPY uses cross-account IAM role (from Project 22, 39)<br>
+→ Lake Formation NOT involved — this is direct S3 access via IAM role</p>
+<hr>
+<p><strong>Pattern 4: QuickSight for Dashboards (Visualization — Project 59)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickSight (Account J or dedicated) → Athena → Glue Catalog → S3
+</span>    → SPICE dataset refreshed daily
+    → Row-Level Security in QuickSight mirrors Lake Formation row filters</code></pre></div>
+<p>→ QuickSight connects to Athena as the data source<br>
+→ SPICE (in-memory cache) provides fast dashboard rendering<br>
+→ Row-level security ensures dashboard viewers see only their permitted data</p>
+<hr>
+<h3>STEP 10 — DESIGN THE MONITORING AND AUDIT FRAMEWORK</h3>
+<p><strong>Monitoring Layers:</strong></p>
+<table><thead><tr><th>Layer</th><th>What to Monitor</th><th>Tool</th><th>Alert</th></tr></thead><tbody><tr><td>Pipeline Health</td><td>ETL job success/failure, duration, data quality scores</td><td>CloudWatch + Step Functions</td><td>SNS on failure</td></tr><tr><td>Storage Health</td><td>Bucket size growth, object counts, lifecycle transitions</td><td>S3 Storage Lens (from Project 56)</td><td>Monthly report</td></tr><tr><td>Query Health</td><td>Athena query duration, data scanned, failed queries</td><td>Athena Workgroup metrics</td><td>Alert on &gt; 1 TB scan</td></tr><tr><td>Governance Health</td><td>Permission grants/revokes, cross-account access patterns</td><td>CloudTrail + Lake Formation</td><td>Alert on unexpected grants</td></tr><tr><td>Cost Health</td><td>S3 storage cost, Athena scan cost, Glue DPU cost</td><td>Cost Explorer + Budgets</td><td>Alert on budget threshold</td></tr><tr><td>Security Health</td><td>Unauthorized access attempts, public bucket detection</td><td>GuardDuty + Config Rules (from Project 57)</td><td>Immediate alert</td></tr></tbody></table>
+<p><strong>CloudTrail Configuration (from Project 57):</strong></p>
+<p>→ CloudTrail must be enabled in Account J with S3 Data Events<br>
+→ Every S3 GetObject, PutObject, DeleteObject is logged<br>
+→ Every Glue API call is logged<br>
+→ Every Lake Formation grant/revoke is logged<br>
+→ Logs stored in a SEPARATE audit bucket with immutable retention</p>
+<p><strong>Data Lineage Tracking:</strong></p>
+<table><thead><tr><th>Question</th><th>Answer Source</th></tr></thead><tbody><tr><td>Where did this data come from?</td><td>Glue ETL job logs → Source S3 path + source database</td></tr><tr><td>When was this data last updated?</td><td>Glue job run timestamp + S3 object LastModified</td></tr><tr><td>Who transformed this data?</td><td>Glue job name + IAM role that executed it</td></tr><tr><td>What transformations were applied?</td><td>Glue job script version + job parameters</td></tr><tr><td>Who accessed this data?</td><td>CloudTrail S3 Data Events + Athena query logs</td></tr><tr><td>What quality checks did this data pass?</td><td>Glue Data Quality metrics + quality scorecard</td></tr></tbody></table>
+<p>→ Complete lineage from source (MariaDB/partner file) to consumption (Athena query) is traceable</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create a DEDICATED data lake account — never mix with application workloads<br>
+→ Always implement the four-zone architecture (Landing → Raw → Curated → Refined) — each zone has a clear purpose<br>
+→ Always use Hive-style partitioning (<code>key=value/</code>) for Athena and Spectrum compatibility<br>
+→ Always use Parquet format with Snappy compression for all zones except Landing<br>
+→ Always register ALL S3 data locations with Lake Formation before granting permissions<br>
+→ Always use Tag-Based Access Control for scalable governance — named grants don't scale beyond 20 tables<br>
+→ Always implement data quality checks at each zone transition — not just at ingestion<br>
+→ Always use partition projection in Athena for time-partitioned tables — eliminates Glue API bottleneck<br>
+→ Always create separate Athena workgroups per team — enables cost tracking and data limits<br>
+→ Always implement a quarantine pattern for failed quality records — never silently drop data<br>
+→ Always use cross-account Lake Formation grants (not bucket policies) for consumer access — governance is centralized<br>
+→ Always enable CloudTrail with S3 Data Events for the data lake account — audit trail is mandatory for compliance<br>
+→ Always design for domain ownership — each team governs their own data, central team provides the platform<br>
+→ Always use Resource Links for cross-account catalog access — direct table references don't work in consumer Athena<br>
+→ Always version your Glue ETL scripts in source control — data lineage requires knowing what transformation was applied</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never store the data lake in an application account — blast radius and billing confusion<br>
+→ Never skip the Raw zone — without it, you lose the ability to reprocess from source<br>
+→ Never allow producers to write directly to Curated zone — all data must go through ETL quality gates<br>
+→ Never grant IAMAllowedPrincipals on data lake databases — defeats the purpose of Lake Formation<br>
+→ Never use CSV as the storage format in Raw/Curated zones — Parquet is 10x more efficient for analytics<br>
+→ Never create one giant database for everything — use zone_domain naming convention<br>
+→ Never let consumers query the Landing zone — it contains unvalidated, potentially corrupt data<br>
+→ Never skip partition projection for large time-series tables — Glue GetPartitions API becomes the bottleneck<br>
+→ Never allow cross-account access via bucket policies alone — Lake Formation provides column/row-level control<br>
+→ Never forget to grant Glue ETL service role Lake Formation permissions — crawlers and jobs fail silently<br>
+→ Never mix production and development data in the same data lake — use separate buckets/accounts for dev<br>
+→ Never ignore data quality — one bad dataset destroys trust in the entire data lake<br>
+→ Never grant "Grantable" permissions to domain owners for other domains — each domain governs only itself<br>
+→ Never store Athena query results in the data lake buckets — use separate result buckets per account</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE THIS ARCHITECTURE</h2>
+<table><thead><tr><th>Scenario</th><th>Use Enterprise Data Lake?</th><th>Why</th></tr></thead><tbody><tr><td>Multiple teams need shared analytical data</td><td>✅ Yes</td><td>Central catalog + governed access</td></tr><tr><td>Data comes from 5+ different sources</td><td>✅ Yes</td><td>Unified ingestion patterns</td></tr><tr><td>Compliance requires audit trail and access control</td><td>✅ Yes</td><td>Lake Formation + CloudTrail</td></tr><tr><td>Cross-account data sharing is needed</td><td>✅ Yes</td><td>RAM + Lake Formation cross-account grants</td></tr><tr><td>Organization has &gt; 3 AWS accounts</td><td>✅ Yes</td><td>Centralized data lake account pattern</td></tr><tr><td>Single team, single data source, single consumer</td><td>❌ No</td><td>Overkill — simple S3 + Athena is sufficient</td></tr><tr><td>Real-time streaming only (no batch analytics)</td><td>❌ No</td><td>Data lake is batch-oriented — use Kinesis for real-time</td></tr><tr><td>Data volume &lt; 10 GB total</td><td>❌ No</td><td>Overhead exceeds benefit</td></tr><tr><td>Organization has no data governance requirements</td><td>❌ Probably not</td><td>Lake Formation overhead not justified</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE THIS ARCHITECTURE</h2>
+<p>→ When you have a single team with one data source → Simple S3 + Glue + Athena (from Project 25) is sufficient<br>
+→ When all data fits in a single Redshift cluster → Warehouse-only approach is simpler<br>
+→ When real-time sub-second analytics is the primary use case → Use Kinesis + DynamoDB, not a batch data lake<br>
+→ When the organization lacks data engineering skills → The architecture requires operational maturity<br>
+→ When there's no executive sponsorship for data governance → Lake Formation without governance culture is empty infrastructure<br>
+→ When total data volume is &lt; 10 GB → The overhead of zones, catalogs, and governance exceeds the benefit</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE COMPLETE DATA FLOW (END-TO-END)</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PRODUCER (Account A)                     DATA LAKE (Account J)                    CONSUMER (Account C)
+</span>    |                                         |                                        |
+    | Partner uploads CSV                     |                                        |
+    | to Landing bucket                       |                                        |
+    | (cross-account PutObject)               |                                        |
+    |                                         |                                        |
+    | ──────────────────────────────────────→  |                                        |
+    |                                         |                                        |
+    |                              EventBridge detects upload                          |
+    |                                         |                                        |
+    |                              Step Functions starts                               |
+    |                                         |                                        |
+    |                              Glue ETL: Landing → Raw                            |
+    |                              (CSV → Parquet, validate)                           |
+    |                                         |                                        |
+    |                              Glue ETL: Raw → Curated                            |
+    |                              (Deduplicate, clean, enrich)                        |
+    |                                         |                                        |
+    |                              Glue Crawler: Update Catalog                        |
+    |                                         |                                        |
+    |                              Lake Formation: Governs access                      |
+    |                                         |                                        |
+    |                                         |  ←─────────────────────────────────── |
+    |                                         |     Athena query via Resource Link     |
+    |                                         |                                        |
+    |                              Lake Formation validates:                           |
+    |                              - Account C has Select on table? ✅                |
+    |                              - Column-level filter applied                       |
+    |                              - Row-level filter applied                          |
+    |                                         |                                        |
+    |                              Credential vending: Lake Formation                  |
+    |                              accesses S3 on behalf of consumer                   |
+    |                                         |                                        |
+    |                                         |  ───────────────────────────────────→ |
+    |                                         |     Filtered results returned           |
+    |                                         |                                        |</code></pre></div>
+<hr>
+<h3>2 → HOW ZONE TRANSITIONS MAINTAIN DATA INTEGRITY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Landing Zone File: transactions-2025-01-15.csv
+</span>    Records: 15,000 (some may be invalid)
+    Format: CSV (human-readable, not optimized)
+    |
+    ↓ Glue ETL Job 1: Landing → Raw
+    |
+    Operations:
+    ├── Read CSV with schema inference
+    ├── Cast columns to correct types (string → decimal for amount)
+    ├── Add metadata columns: ingestion_timestamp, source_file, batch_id
+    ├── Convert to Parquet with Snappy compression
+    ├── Partition by year/month/day
+    └── Write to Raw Zone
+    
+    Quality Gates:
+    ├── Schema validation: All expected columns present? ✅
+    ├── Type validation: All values castable to expected types? ✅
+    └── Completeness: Required fields non-null? ✅ (failures → quarantine)
+    
+Raw Zone File: domain=fraud/entity=transactions/year=2025/month=01/day=15/part-00001.snappy.parquet
+    Records: 14,950 (50 quarantined for invalid types)
+    Format: Parquet (columnar, compressed, ~80% smaller than CSV)
+    Additional columns: ingestion_timestamp, source_file, batch_id
+    |
+    ↓ Glue ETL Job 2: Raw → Curated
+    |
+    Operations:
+    ├── Deduplicate by transaction_id (keep latest by ingestion_timestamp)
+    ├── Join with customers dimension (enrich with customer tier)
+    ├── Join with merchants dimension (enrich with merchant category)
+    ├── Apply business rules (classify transaction risk based on amount + merchant category)
+    ├── Standardize country codes (USA → US, United States → US)
+    └── Write to Curated Zone
+    
+    Quality Gates:
+    ├── Uniqueness: No duplicate transaction_ids? ✅
+    ├── Referential integrity: All customer_ids exist in customers table? ✅
+    ├── Business rules: All risk classifications valid? ✅
+    └── Completeness: No NULL values in enriched columns? ✅
+
+Curated Zone File: domain=fraud/entity=transactions/year=2025/month=01/day=15/part-00001.snappy.parquet
+    Records: 14,900 (50 duplicates removed)
+    Format: Parquet (partitioned, enriched, business-ready)
+    Additional columns: customer_tier, merchant_category, risk_classification, country_code_std</code></pre></div>
+<hr>
+<h3>3 → HOW TBAC RESOLVES ACROSS ZONES AND DOMAINS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User: JuniorFraudAnalystRole
+</span>TBAC Grant: zone IN (curated, refined) AND domain = fraud AND sensitivity IN (public, internal, confidential)
+
+Query: SELECT * FROM curated_fraud.transactions_clean WHERE year=2025 AND month=01
+
+Resolution:
+    Table: curated_fraud.transactions_clean
+    Table Tags: zone=curated ✅, domain=fraud ✅, sensitivity=confidential ✅
+    → TABLE ACCESS GRANTED ✅
+    
+    Column: transaction_id → Tag: sensitivity=internal → ✅ INCLUDED
+    Column: customer_id → Tag: sensitivity=internal → ✅ INCLUDED
+    Column: amount → Tag: sensitivity=internal → ✅ INCLUDED
+    Column: credit_card_number → Tag: sensitivity=restricted → ❌ EXCLUDED
+    Column: merchant → Tag: sensitivity=public → ✅ INCLUDED
+    Column: risk_score → Tag: sensitivity=confidential → ✅ INCLUDED
+    Column: customer_tier → Tag: sensitivity=internal → ✅ INCLUDED
+    
+    Result: Query returns all columns EXCEPT credit_card_number
+
+Same user queries: raw_fraud.transactions
+    Table Tags: zone=raw → ❌ NOT IN GRANT (grant only covers curated, refined)
+    → TABLE ACCESS DENIED ❌
+
+Same user queries: curated_platform.payments_reconciled
+    Table Tags: domain=platform → ❌ NOT IN GRANT (grant only covers fraud)
+    → TABLE ACCESS DENIED ❌</code></pre></div>
+<p>→ TBAC evaluates BOTH table tags AND column tags<br>
+→ The grant covers zone + domain + sensitivity combinations<br>
+→ Any mismatch at any level → Access denied</p>
+<hr>
+<h3>4 → HOW CROSS-ACCOUNT DATA FLOW WORKS WITHOUT DIRECT S3 ACCESS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer (Account C) has NO S3 permissions on Account J's buckets
+</span>Consumer (Account C) has NO IAM policy for s3:GetObject on Account J
+
+How does the query work?
+
+Step 1: Athena (Account C) receives query
+Step 2: Athena calls Glue Catalog via Resource Link
+Step 3: Lake Formation (Account C) validates local permission on resource link
+Step 4: Lake Formation (Account J) validates cross-account permission on target table
+Step 5: Lake Formation (Account J) generates TEMPORARY S3 credentials
+    → These credentials are scoped to ONLY the permitted columns and partitions
+    → Credentials expire after the query completes
+Step 6: Athena uses these temporary credentials to read Parquet files from S3
+Step 7: Athena applies column projection (skip excluded columns in Parquet reader)
+Step 8: Athena applies row filter (if data filter exists)
+Step 9: Results returned to Account C
+
+The consumer NEVER has direct S3 access
+Lake Formation's IAM role (registered in Step 6d) is the ONLY entity reading S3
+Credential vending creates a security boundary between consumers and storage</code></pre></div>
+<p>→ This is fundamentally different from cross-account bucket policies (Project 39)<br>
+→ With bucket policies → Consumer has direct S3 access → Cannot enforce column/row filtering<br>
+→ With Lake Formation → Consumer has NO direct S3 access → Column/row filtering enforced by Lake Formation</p>
+<hr>
+<h3>5 → STORAGE COST OPTIMIZATION ACROSS ZONES</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Zone: Landing
+</span>    Lifecycle: Delete after 30 days
+    Cost: Minimal (temporary data, auto-deleted)
+    
+Zone: Raw
+    Year 1: S3 Standard ($0.023/GB/month)
+    After Year 1: Transition to S3 Glacier Instant Retrieval ($0.004/GB/month)
+    Savings: 83% after year 1
+    
+Zone: Curated
+    First 6 months: S3 Standard ($0.023/GB/month)
+    After 6 months: Transition to S3 Standard-IA ($0.0125/GB/month)
+    Savings: 46% after 6 months
+    
+Zone: Refined
+    Lifecycle: Delete after 90 days (regenerable from curated)
+    Cost: Minimal (short retention, small datasets)</code></pre></div>
+<p><strong>Example Cost Calculation (1 TB total data):</strong></p>
+<table><thead><tr><th>Zone</th><th>Size</th><th>Storage Class</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Landing</td><td>50 GB (temporary)</td><td>Standard</td><td>$1.15</td></tr><tr><td>Raw</td><td>500 GB (1 year+)</td><td>Glacier Instant</td><td>$2.00</td></tr><tr><td>Curated</td><td>300 GB (6 months+)</td><td>Standard-IA</td><td>$3.75</td></tr><tr><td>Refined</td><td>50 GB (&lt; 90 days)</td><td>Standard</td><td>$1.15</td></tr><tr><td><strong>Total</strong></td><td><strong>900 GB effective</strong></td><td><strong>Mixed</strong></td><td><strong>$8.05/month</strong></td></tr></tbody></table>
+<p>→ Without lifecycle policies (all Standard): $20.70/month<br>
+→ With lifecycle policies: $8.05/month<br>
+→ Savings: 61%</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>No dedicated data lake account</td><td>Data lake buckets mixed with application data, billing impossible to separate</td><td>Data lake built in existing application account</td><td>Migrate to dedicated account — worth the effort</td></tr><tr><td>2</td><td>Skipped Raw zone</td><td>Curated data has bugs, no way to reprocess without re-ingesting from source</td><td>Went directly from Landing to Curated</td><td>Always preserve Raw — it's your insurance policy</td></tr><tr><td>3</td><td>IAMAllowedPrincipals not revoked</td><td>Lake Formation grants exist but everyone still has full access via IAM</td><td>Forgot the critical switch (from Project 47)</td><td>Revoke IAMAllowedPrincipals AFTER granting explicit permissions</td></tr><tr><td>4</td><td>CSV format in Curated zone</td><td>Athena scans 10x more data than needed — high costs, slow queries</td><td>No format conversion in ETL</td><td>Convert to Parquet in Landing → Raw ETL step</td></tr><tr><td>5</td><td>No partitioning strategy</td><td>Athena scans entire dataset for simple date-filtered queries</td><td>Files dumped in flat S3 structure</td><td>Implement year/month/day Hive-style partitioning</td></tr><tr><td>6</td><td>Glue Crawler creates wrong partitions</td><td>Athena queries return wrong results or errors</td><td>Inconsistent prefix naming (mixed date formats)</td><td>Standardize prefix naming convention — zero-pad all values</td></tr><tr><td>7</td><td>Cross-account consumer cannot query</td><td>"Table not found" or "Access Denied"</td><td>Missing Resource Link or RAM acceptance</td><td>Verify: RAM accepted → Resource Link created → LF permissions granted</td></tr><tr><td>8</td><td>New table added but nobody can access</td><td>Lake Formation denies all access to new table</td><td>IAMAllowedPrincipals revoked, no explicit grant for new table</td><td>Tag new table appropriately → TBAC grants auto-apply</td></tr><tr><td>9</td><td>Data quality issues propagate to curated</td><td>Dashboard shows impossible values (negative counts, future dates)</td><td>No quality gates between zones</td><td>Implement Glue Data Quality rules at each zone transition</td></tr><tr><td>10</td><td>Quarantine zone grows unbounded</td><td>S3 costs increase, quarantined data never reviewed</td><td>No process for reviewing and fixing quarantined records</td><td>Set up weekly quarantine review + lifecycle policy</td></tr><tr><td>11</td><td>Producer overwrites another producer's data</td><td>Fraud team accidentally writes to platform domain</td><td>Bucket policy too broad — allows PutObject to any prefix</td><td>Restrict producer write access to their specific domain prefix</td></tr><tr><td>12</td><td>Athena scan costs explode</td><td>$500/month Athena bill from one analyst</td><td>No workgroup data limits, no partition projection</td><td>Configure workgroup scan limits + implement partition projection</td></tr><tr><td>13</td><td>Lake Formation tag taxonomy too complex</td><td>50 tags with 200 values — impossible to manage</td><td>Over-engineering the classification</td><td>Start simple: 3-4 tags with clear values — expand as needed</td></tr><tr><td>14</td><td>Glue ETL role denied after LF activation</td><td>All ETL jobs fail with "Insufficient Lake Formation permissions"</td><td>ETL service role missing Lake Formation grants</td><td>Grant full zone access to ETL role BEFORE revoking IAMAllowedPrincipals</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Dataset Scalability</strong></p>
+<table><thead><tr><th>Metric</th><th>With TBAC</th><th>Without TBAC (Named Grants)</th></tr></thead><tbody><tr><td>10 datasets, 5 consumer roles</td><td>5 TBAC grants</td><td>50 named grants</td></tr><tr><td>50 datasets, 20 consumer roles</td><td>5-10 TBAC grants (same tags)</td><td>1,000 named grants</td></tr><tr><td>200 datasets, 50 consumer roles</td><td>5-10 TBAC grants (same tags)</td><td>10,000 named grants (impossible)</td></tr></tbody></table>
+<p>→ TBAC scales with the number of DISTINCT access patterns, not datasets × consumers<br>
+→ Adding a new dataset = Tag it appropriately → Existing TBAC grants auto-apply</p>
+<p>→ <strong>Storage Scalability</strong></p>
+<ul>
+<li>S3 has no storage limit (from Project 1)</li>
+<li>Lifecycle policies automatically manage cost as data ages</li>
+<li>Glacier tiers provide long-term archival at minimal cost</li>
+<li>Raw zone grows indefinitely but transitions to cheap storage after 1 year</li>
+</ul>
+<p>→ <strong>Query Scalability</strong></p>
+<ul>
+<li>Athena is serverless — scales automatically (from Project 18)</li>
+<li>Partition projection eliminates Glue API bottleneck for large partition counts</li>
+<li>Workgroup scan limits prevent individual users from consuming excessive resources</li>
+<li>Redshift Spectrum provides additional compute for complex analytical queries</li>
+</ul>
+<p>→ <strong>Producer Scalability</strong></p>
+<ul>
+<li>New producer = New bucket policy entry + New domain prefix + New crawlers</li>
+<li>Takes ~1 hour to onboard a new data producer</li>
+<li>Template infrastructure (CloudFormation/Terraform) can automate producer onboarding</li>
+</ul>
+<p>→ <strong>Consumer Scalability</strong></p>
+<ul>
+<li>New consumer account = RAM share + Resource Links + Local LF grants</li>
+<li>Takes ~2 hours to onboard a new consumer account</li>
+<li>If using TBAC → No changes needed in Account J — just grant tag-based access</li>
+</ul>
+<p>→ <strong>Cross-Account Scalability</strong></p>
+<ul>
+<li>Lake Formation supports sharing with AWS Organizations (all accounts at once)</li>
+<li>RAM supports sharing with OUs (organizational units)</li>
+<li>No practical limit on cross-account shares</li>
+</ul>
+<p>→ <strong>Cost Scalability (Monthly Estimates)</strong></p>
+<table><thead><tr><th>Data Volume</th><th>S3 Storage</th><th>Glue ETL</th><th>Athena Queries</th><th>Total</th></tr></thead><tbody><tr><td>100 GB</td><td>$5</td><td>$20</td><td>$5</td><td>$30/month</td></tr><tr><td>1 TB</td><td>$30</td><td>$100</td><td>$50</td><td>$180/month</td></tr><tr><td>10 TB</td><td>$200</td><td>$500</td><td>$200</td><td>$900/month</td></tr><tr><td>100 TB</td><td>$1,500</td><td>$2,000</td><td>$1,000</td><td>$4,500/month</td></tr></tbody></table>
+<p>→ Costs scale roughly linearly with data volume<br>
+→ Lifecycle policies and partition pruning are the primary cost optimization levers</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the data lake is correctly configured:</strong></p>
+<table>
+  <thead>
+    <tr>
+      <th>Check</th>
+      <th>Where to Look</th>
+      <th>Expected</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>All zones exist as S3 buckets</td>
+      <td>S3 Console (Account J)</td>
+      <td>4 buckets: landing, raw, curated, refined</td>
+    </tr>
+    <tr>
+      <td>Encryption enabled on all buckets</td>
+      <td>S3 → Properties → Encryption</td>
+      <td>SSE-KMS on all buckets</td>
+    </tr>
+    <tr>
+      <td>Block public access on all buckets</td>
+      <td>S3 → Permissions → Block Public Access</td>
+      <td>All 4 checkboxes ON for every bucket</td>
+    </tr>
+    <tr>
+      <td>Lifecycle policies configured</td>
+      <td>S3 → Management → Lifecycle rules</td>
+      <td>Landing: 30-day delete, Raw: Glacier after 365 days</td>
+    </tr>
+    <tr>
+      <td>Glue Catalog databases exist</td>
+      <td>Glue Console → Databases</td>
+      <td>raw_*, curated_*, refined_* databases present</td>
+    </tr>
+    <tr>
+      <td>Crawlers configured and running</td>
+      <td>Glue Console → Crawlers</td>
+      <td>Crawlers per domain per zone, recent successful runs</td>
+    </tr>
+    <tr>
+      <td>Lake Formation admins set</td>
+      <td>Lake Formation Console → Administrative roles</td>
+      <td>DataPlatformAdminRole listed</td>
+    </tr>
+    <tr>
+      <td>S3 locations registered</td>
+      <td>Lake Formation Console → Data lake locations</td>
+      <td>All 4 zone buckets registered</td>
+    </tr>
+    <tr>
+      <td>IAMAllowedPrincipals revoked</td>
+      <td>Lake Formation Console → Data permissions</td>
+      <td>No IAMAllowedPrincipals entries on any database</td>
+    </tr>
+    <tr>
+      <td>TBAC tags created</td>
+      <td>Lake Formation Console → LF-Tags</td>
+      <td>zone, domain, sensitivity, pii tags exist</td>
+    </tr>
+    <tr>
+      <td>TBAC grants configured</td>
+      <td>Lake Formation Console → Data permissions</td>
+      <td>Tag-based grants for each consumer role</td>
+    </tr>
+    <tr>
+      <td>Cross-account RAM shares active</td>
+      <td>RAM Console → Resource shares</td>
+      <td>Active shares to consumer accounts</td>
+    </tr>
+    <tr>
+      <td>Resource Links created in consumer accounts</td>
+      <td>Glue Console (consumer account) → Tables</td>
+      <td>Resource links pointing to Account J tables</td>
+    </tr>
+    <tr>
+      <td>Athena workgroups configured</td>
+      <td>Athena Console (consumer account) → Workgroups</td>
+      <td>Per-team workgroups with scan limits</td>
+    </tr>
+    <tr>
+      <td>Quality checks active</td>
+      <td>Glue Console → Job runs → Data quality tab</td>
+      <td>Quality rules defined and passing</td>
+    </tr>
+    <tr>
+      <td>CloudTrail logging S3 data events</td>
+      <td>CloudTrail Console (Account J)</td>
+      <td>Trail configured with S3 data events for all lake buckets</td>
+    </tr>
+  </tbody>
+</table>
+<p>→ <strong>How to verify governance is working correctly:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Test 1: Junior Analyst queries curated table
+</span>    → Expected: All columns EXCEPT credit_card_number returned
+    → Verify: SELECT * FROM curated_fraud.transactions_clean LIMIT 1
+    → Count columns — should be N-1
+
+Test 2: Junior Analyst queries raw table
+    → Expected: Access Denied
+    → Verify: SELECT * FROM raw_fraud.transactions LIMIT 1
+    → Error: "Insufficient permissions"
+
+Test 3: Business Analyst queries curated table
+    → Expected: Access Denied (only refined access)
+    → Verify: SELECT * FROM curated_fraud.transactions_clean LIMIT 1
+    → Error: "Insufficient permissions"
+
+Test 4: Business Analyst queries refined table
+    → Expected: Success with public + internal columns only
+    → Verify: SELECT * FROM refined_fraud.daily_fraud_summary LIMIT 1
+    → Returns data ✅
+
+Test 5: External Auditor queries non-permitted table
+    → Expected: Table not visible
+    → Verify: SHOW TABLES IN shared_from_datalake
+    → Only refined_executive tables visible
+
+Test 6: Dev account queries any production data lake table
+    → Expected: No access (no grants exist)
+    → Verify: Any query fails with permission error
+
+Test 7: New table added with correct tags
+    → Expected: Existing TBAC grants auto-apply
+    → Verify: Create new table, assign tags, query from permitted user
+    → Access granted without any new explicit grant ✅</code></pre></div>
+<p>→ <strong>How to monitor data lake health:</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alarm Condition</th><th>Action</th></tr></thead><tbody><tr><td>Pipeline success rate</td><td>Step Functions CloudWatch</td><td>&lt; 95% success rate over 24 hours</td><td>Investigate failing pipelines</td></tr><tr><td>Data freshness</td><td>Custom metric: MAX(ingestion_timestamp) per table</td><td>Data &gt; 24 hours stale</td><td>Check producer ingestion</td></tr><tr><td>Quality score per dataset</td><td>Glue Data Quality CloudWatch</td><td>Score &lt; 99%</td><td>Review quarantine, fix source</td></tr><tr><td>Athena scan volume per workgroup</td><td>Athena CloudWatch</td><td>&gt; 10 TB/day for any workgroup</td><td>Review query patterns, optimize partitioning</td></tr><tr><td>S3 storage growth rate</td><td>S3 Storage Lens</td><td>&gt; 20% month-over-month unexpected growth</td><td>Verify lifecycle policies active</td></tr><tr><td>Cross-account access failures</td><td>CloudTrail → Lake Formation events</td><td>Any AccessDenied for expected consumers</td><td>Check Lake Formation grants</td></tr><tr><td>Quarantine zone size</td><td>S3 metric: object count in quarantine prefix</td><td>&gt; 1000 objects accumulated</td><td>Trigger quarantine review process</td></tr><tr><td>Crawler failures</td><td>Glue CloudWatch</td><td>Any crawler failure</td><td>Check S3 path exists, IAM permissions</td></tr><tr><td>Lake Formation grant changes</td><td>CloudTrail → GrantPermissions/RevokePermissions</td><td>Unexpected grant to unknown principal</td><td>Security review</td></tr><tr><td>KMS key usage</td><td>KMS CloudWatch</td><td>Unusual decrypt volume</td><td>Potential unauthorized data access attempt</td></tr></tbody></table>
+<p>→ <strong>Data Lake Health Dashboard (CloudWatch Dashboard):</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Visualization</th></tr></thead><tbody><tr><td>Pipeline Status (24h)</td><td>Step Functions: ExecutionsSucceeded vs ExecutionsFailed</td><td>Stacked bar chart</td></tr><tr><td>Data Freshness</td><td>Custom: Hours since last ingestion per domain</td><td>Table with color coding (green &lt; 6h, yellow &lt; 24h, red &gt; 24h)</td></tr><tr><td>Quality Scores</td><td>Glue Data Quality: Score per dataset</td><td>Line chart trending over 30 days</td></tr><tr><td>Storage by Zone</td><td>S3: BucketSizeBytes per zone bucket</td><td>Pie chart</td></tr><tr><td>Athena Costs by Team</td><td>Athena: DataScannedInBytes per workgroup</td><td>Bar chart (daily)</td></tr><tr><td>Cross-Account Queries</td><td>CloudTrail: Count of cross-account Athena queries</td><td>Line chart (hourly)</td></tr><tr><td>Top 10 Expensive Queries</td><td>Athena: Queries sorted by DataScannedInBytes</td><td>Table</td></tr><tr><td>Quarantine Volume</td><td>S3: Object count in quarantine prefixes</td><td>Number widget with alarm</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ An enterprise data lake is NOT a technology project — it is an ARCHITECTURE PATTERN combining services already mastered<br>
+→ The four-zone model (Landing → Raw → Curated → Refined) provides clear data lifecycle management<br>
+→ Each zone has a distinct purpose, format, access pattern, and retention policy<br>
+→ A DEDICATED data lake account (separate from application accounts) provides clean isolation, billing, and governance<br>
+→ Tag-Based Access Control (TBAC) scales governance from 10 datasets to 10,000 datasets without linear grant explosion<br>
+→ Lake Formation credential vending means consumers NEVER have direct S3 access — the strongest security boundary<br>
+→ Cross-account data sharing follows a three-step pattern: Lake Formation grant → RAM acceptance → Resource Link<br>
+→ Data quality gates at each zone transition prevent corrupt data from reaching consumers<br>
+→ Partition projection eliminates the Glue API bottleneck for time-series tables<br>
+→ The architecture scales linearly — adding a new producer, consumer, or dataset follows templated patterns</p>
+<p>→ <strong>Connection to ALL previous projects — this project is the INTEGRATION point:</strong></p>
+<table><thead><tr><th>Previous Project</th><th>How It Connects to Enterprise Data Lake</th></tr></thead><tbody><tr><td>Project 1 (S3)</td><td>Storage foundation — four zone buckets</td></tr><tr><td>Project 2 (IAM)</td><td>Service roles for Glue, Athena, Lake Formation</td></tr><tr><td>Project 5 (VPC)</td><td>Network foundation for cross-account connectivity</td></tr><tr><td>Project 6 (SNS)</td><td>Pipeline notifications</td></tr><tr><td>Project 8 (CloudWatch)</td><td>Monitoring and alerting</td></tr><tr><td>Project 10 (S3 Policies)</td><td>Cross-account producer write access</td></tr><tr><td>Project 12 (Versioning + Lifecycle)</td><td>Zone-specific retention and archival</td></tr><tr><td>Project 17 (Glue Crawler)</td><td>Catalog management per zone per domain</td></tr><tr><td>Project 18 (Athena)</td><td>Primary consumer query engine</td></tr><tr><td>Project 21 (Glue ETL)</td><td>Zone transition processing</td></tr><tr><td>Project 22 (Redshift COPY)</td><td>Warehouse loading from curated zone</td></tr><tr><td>Project 25 (S3 → Glue → Athena Pipeline)</td><td>End-to-end analytics pipeline</td></tr><tr><td>Project 27 (VPC Endpoints)</td><td>S3 access without internet traversal</td></tr><tr><td>Project 28 (Redshift Spectrum)</td><td>Query data lake from warehouse</td></tr><tr><td>Project 36 (KMS)</td><td>Encryption at rest for all zone buckets</td></tr><tr><td>Project 37 (Secrets Manager)</td><td>Database credentials for JDBC ETL</td></tr><tr><td>Project 38 (EventBridge)</td><td>Pipeline triggering on file arrival</td></tr><tr><td>Project 39 (Cross-Account S3)</td><td>Producer write access to landing zone</td></tr><tr><td>Project 40 (Cross-Account IAM)</td><td>Role assumption for cross-account operations</td></tr><tr><td>Project 42 (Cross-Account Glue)</td><td>Catalog sharing via Lake Formation + RAM</td></tr><tr><td>Project 46 (Job Bookmarks)</td><td>Incremental ETL processing</td></tr><tr><td>Project 47 (Lake Formation)</td><td>Fine-grained governance — the governance backbone</td></tr><tr><td>Project 49 (Step Functions Pipeline)</td><td>Orchestration of zone transition pipelines</td></tr><tr><td>Project 50 (Transit Gateway)</td><td>Network connectivity for cross-account data access</td></tr></tbody></table>
+<p>→ This project VALIDATES that mastering individual services (Projects 1-50) enables building enterprise-grade architectures<br>
+→ No new service was introduced — only the DESIGN PATTERN of how they work together</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale's enterprise data lake is designed and operational<br>
+→ But the current architecture is entirely BATCH-oriented<br>
+→ Data arrives in files → Gets processed through zones → Available for querying hours later<br>
+→ The fraud detection team has a new requirement:</p>
+<p>→ "We need to detect fraud in REAL-TIME — not hours after it happens"<br>
+→ "When a transaction occurs, we need it in the data lake within SECONDS, not hours"<br>
+→ "The streaming data should flow through the same zone architecture"<br>
+→ "Batch and streaming data must coexist in the same data lake"</p>
+<p>→ Currently:</p>
+<ul>
+<li>Transaction happens → Written to MariaDB → Glue ETL runs nightly → Data lake updated 24 hours later</li>
+<li>Fraud detected 24 hours after it happened → Customer already lost money</li>
+</ul>
+<p>→ They need:</p>
+<ul>
+<li>Transaction happens → Event published to stream → Available in data lake within 60 seconds</li>
+<li>Fraud detected within seconds → Customer protected in real-time</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 52 solves</strong><br>
+→ Project 52: "The Real-Time Dashboard — Kinesis Data Streams → Firehose → S3 → Glue → Athena"<br>
+→ It introduces streaming ingestion into the enterprise data lake architecture<br>
+→ Kinesis Data Streams captures real-time events<br>
+→ Kinesis Firehose delivers them to S3 in near-real-time (buffered every 60-300 seconds)<br>
+→ The same Glue Catalog + Athena + Lake Formation governance applies to streaming data<br>
+→ Batch and streaming data coexist in the same zones, same tables, same governance model</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 52: "The Real-Time Dashboard — Kinesis Data Streams → Firehose → S3 → Glue → Athena"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-50.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 51/60</span></div><a class="nav-btn next" href="project-52.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

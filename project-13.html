@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 13: THE NOTIFICATION THAT NEEDED MULTIPLE CONSUMERS — SNS to SQS Fan-Out — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 13: THE NOTIFICATION THAT NEEDED MULTIPLE CONSUMERS — SNS to SQS Fan-Out Pattern</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-12) now has:</p>
+<ul>
+<li>S3 bucket with versioning and lifecycle policies (Projects 1, 10, 12)</li>
+<li>IAM Roles for EC2 (Project 11)</li>
+<li>SNS topics for notifications (Project 6)</li>
+<li>SQS queues for order processing (Project 7)</li>
+<li>Full VPC, monitoring, and RDS infrastructure (Projects 3-9)</li>
+</ul>
+<p>→ When a customer places an order → the web application must trigger FIVE downstream actions:</p>
+<table><thead><tr><th>#</th><th>Action</th><th>System</th><th>Priority</th></tr></thead><tbody><tr><td>1</td><td>Process payment</td><td>Payment service</td><td>Critical — must succeed</td></tr><tr><td>2</td><td>Update inventory</td><td>Inventory service</td><td>Critical — prevent overselling</td></tr><tr><td>3</td><td>Send confirmation email</td><td>Notification service</td><td>Important — customer expectation</td></tr><tr><td>4</td><td>Update analytics dashboard</td><td>Analytics service</td><td>Low — can be delayed</td></tr><tr><td>5</td><td>Generate shipping label</td><td>Logistics service</td><td>Important — warehouse needs it</td></tr></tbody></table>
+<p>→ Problem 1: SYNCHRONOUS ARCHITECTURE (Current — Broken)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Customer places order
+</span>    │
+    ▼
+Web App → Payment Service (200ms)
+              │
+              ▼
+         Inventory Service (150ms)
+              │
+              ▼
+         Notification Service (300ms)
+              │
+              ▼
+         Analytics Service (500ms) ← SLOW
+              │
+              ▼
+         Logistics Service (200ms)
+              │
+              ▼
+Customer sees: "Order Confirmed" (after 1,350ms total)</code></pre></div>
+<p>→ Total response time: 1,350ms (1.35 seconds) — too slow for customers<br>
+→ If Analytics Service is down → entire order flow FAILS → customer gets error<br>
+→ If Notification Service is slow → customer waits even though payment succeeded<br>
+→ ONE slow or failing service blocks EVERYTHING</p>
+<p>→ Problem 2: <code>priya-dev</code> tried using a single SQS queue (Project 7) to decouple</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Web App → SQS Queue → ???
+</span>
+Problem: SQS delivers each message to ONLY ONE consumer
+When Payment Service reads the message → it's invisible to Inventory Service
+Only ONE system processes each order → the others never see it</code></pre></div>
+<p>→ SQS is POINT-TO-POINT: One message → one consumer<br>
+→ They need PUBLISH-SUBSCRIBE + QUEUING: One message → multiple consumers, each with their own queue</p>
+<p>→ Problem 3: <code>priya-dev</code> tried using SNS (Project 6) directly</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Web App → SNS Topic → Payment Service (HTTP endpoint)
+</span>                     → Inventory Service (HTTP endpoint)
+                     → Notification Service (HTTP endpoint)
+                     → Analytics Service (HTTP endpoint)
+                     → Logistics Service (HTTP endpoint)</code></pre></div>
+<p>→ This WORKS for fan-out BUT:</p>
+<ul>
+<li>If Analytics Service is down → SNS retries 3 times → gives up → message LOST for analytics</li>
+<li>If Logistics Service is slow → SNS delivers but service can't process fast enough → dropped</li>
+<li>NO BUFFERING: Each consumer must process immediately or risk losing the message</li>
+<li>NO RETRY AT CONSUMER PACE: SNS pushes — consumer can't pull when ready</li>
+<li>During flash sale: 5,000 orders/minute → each service must handle 5,000/minute → no backpressure</li>
+</ul>
+<p>→ Problem 4: Different consumers need different processing rates:</p>
+<table><thead><tr><th>Consumer</th><th>Processing Speed</th><th>During Flash Sale (5,000 orders/min)</th></tr></thead><tbody><tr><td>Payment Service</td><td>1,000/min</td><td>Overwhelmed — orders dropped</td></tr><tr><td>Inventory Service</td><td>2,000/min</td><td>Overwhelmed — orders dropped</td></tr><tr><td>Notification Service</td><td>500/min</td><td>Severely overwhelmed</td></tr><tr><td>Analytics Service</td><td>100/min</td><td>Completely overwhelmed</td></tr><tr><td>Logistics Service</td><td>800/min</td><td>Overwhelmed</td></tr></tbody></table>
+<p>→ Without buffering → the SLOWEST consumer becomes the bottleneck<br>
+→ The CTO demands: "Each system must receive EVERY order, process at its OWN pace, and NEVER lose a message — even if a system is down for hours"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a FAN-OUT + BUFFERING problem<br>
+→ The solution: SNS → SQS Fan-Out Pattern</p>
+<p>→ Combines the BEST of both services:</p>
+<ul>
+<li>SNS provides: FAN-OUT (one message → many subscribers)</li>
+<li>SQS provides: BUFFERING (each consumer has its own queue, processes at own pace)</li>
+</ul>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                              ┌────────────────┐     ┌──────────────────┐
+</span>                         ┌───►│ SQS: Payment   │────►│ Payment Service  │
+                         │    │ Queue           │     │ (1,000/min)      │
+                         │    └────────────────┘     └──────────────────┘
+                         │
+                         │    ┌────────────────┐     ┌──────────────────┐
+                         ├───►│ SQS: Inventory  │────►│ Inventory Service│
+                         │    │ Queue           │     │ (2,000/min)      │
+                         │    └────────────────┘     └──────────────────┘
+                         │
+Web App → SNS Topic ─────┤    ┌────────────────┐     ┌──────────────────┐
+         (order-events)  ├───►│ SQS: Notify     │────►│ Notification Svc │
+                         │    │ Queue           │     │ (500/min)        │
+                         │    └────────────────┘     └──────────────────┘
+                         │
+                         │    ┌────────────────┐     ┌──────────────────┐
+                         ├───►│ SQS: Analytics  │────►│ Analytics Service│
+                         │    │ Queue           │     │ (100/min)        │
+                         │    └────────────────┘     └──────────────────┘
+                         │
+                         │    ┌────────────────┐     ┌──────────────────┐
+                         └───►│ SQS: Logistics  │────►│ Logistics Service│
+                              │ Queue           │     │ (800/min)        │
+                              └────────────────┘     └──────────────────┘</code></pre></div>
+<p><strong>Why This Architecture Solves EVERY Problem:</strong></p>
+<table><thead><tr><th>Problem</th><th>How Fan-Out Solves It</th></tr></thead><tbody><tr><td>Customer waits 1.35s</td><td>Web app publishes to SNS → returns immediately (~50ms)</td></tr><tr><td>One service down blocks all</td><td>Each queue is independent — downed service's queue buffers messages</td></tr><tr><td>Message lost if consumer fails</td><td>SQS retains messages for up to 14 days — consumer reads when ready</td></tr><tr><td>Different processing speeds</td><td>Each queue buffers independently — Analytics queue grows but nothing is lost</td></tr><tr><td>Flash sale spike</td><td>Queues absorb the burst — consumers process at steady rate</td></tr><tr><td>Need to add new consumer</td><td>Add new SQS queue → subscribe to SNS → zero change to publisher</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Create the SNS topic for order events</li>
+<li>Step 2 — Create SQS queues for each consumer</li>
+<li>Step 3 — Configure SQS access policies allowing SNS to send messages</li>
+<li>Step 4 — Subscribe SQS queues to the SNS topic</li>
+<li>Step 5 — Understand raw message delivery</li>
+<li>Step 6 — Configure subscription filter policies</li>
+<li>Step 7 — Test the complete fan-out flow</li>
+<li>Step 8 — Handle failure scenarios and dead letter queues</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE THE SNS TOPIC</h3>
+<p>→ SNS Console → "Create topic"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>Fan-out to SQS doesn't require FIFO ordering at the topic level</td></tr><tr><td>Name</td><td><code>shopnow-order-events</code></td><td>Central topic for all order-related events</td></tr><tr><td>Display name</td><td><code>OrderEvents</code></td><td>SMS display (if SMS subscribers are added later)</td></tr><tr><td>Encryption</td><td>Enable (aws/sns)</td><td>Encrypt messages at rest</td></tr></tbody></table>
+<p>→ Topic created → ARN: <code>arn:aws:sns:ap-south-1:123456789012:shopnow-order-events</code></p>
+<p><strong>Why Standard (Not FIFO) Topic:</strong></p>
+<p>→ FIFO topics limit throughput to 300 msg/sec<br>
+→ FIFO topics can ONLY fan out to FIFO SQS queues<br>
+→ Standard topics fan out to BOTH Standard and FIFO queues<br>
+→ For ShopNow: Order sequence matters at the QUEUE level (per-customer) — not at the topic level<br>
+→ Each consumer's SQS queue can be FIFO if that consumer needs ordering<br>
+→ The topic itself doesn't need to guarantee order — the queues handle it</p>
+<p><strong>FIFO Topic vs Standard Topic Fan-Out:</strong></p>
+<table><thead><tr><th>Feature</th><th>Standard Topic → Standard Queues</th><th>FIFO Topic → FIFO Queues</th></tr></thead><tbody><tr><td>Throughput</td><td>Virtually unlimited</td><td>300 msg/sec (topic-level)</td></tr><tr><td>Message ordering</td><td>Best-effort at topic, per-group in FIFO queues</td><td>Strict FIFO end-to-end</td></tr><tr><td>Deduplication</td><td>None at topic level</td><td>5-minute dedup at topic</td></tr><tr><td>Queue compatibility</td><td>Standard or FIFO queues</td><td>ONLY FIFO queues</td></tr><tr><td>Use case</td><td>High-throughput fan-out</td><td>Low-volume, strict ordering required</td></tr></tbody></table>
+<p>→ For most fan-out patterns → Standard topic is the right choice</p>
+<hr>
+<h3>STEP 2 — CREATE SQS QUEUES FOR EACH CONSUMER</h3>
+<p>→ Create 5 SQS queues — one per consumer service</p>
+<p><strong>Queue 1: Payment Processing</strong></p>
+<p>→ SQS Console → "Create queue"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Type</td><td>FIFO</td><td>Payment must be exactly-once — duplicate charges unacceptable</td></tr><tr><td>Name</td><td><code>shopnow-order-payment.fifo</code></td><td>FIFO names must end with <code>.fifo</code></td></tr><tr><td>Visibility timeout</td><td>120 seconds</td><td>Payment processing may take up to 60 seconds</td></tr><tr><td>Message retention</td><td>14 days</td><td>Maximum — payment messages are critical</td></tr><tr><td>Receive wait time</td><td>20 seconds</td><td>Long polling (Project 7)</td></tr><tr><td>Content-based deduplication</td><td>Enable</td><td>Prevent duplicate payment processing</td></tr><tr><td>Encryption</td><td>SSE-SQS</td><td>Encrypt at rest</td></tr></tbody></table>
+<p><strong>Queue 2: Inventory Update</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Type</td><td>FIFO</td><td>Inventory updates must be ordered per product</td></tr><tr><td>Name</td><td><code>shopnow-order-inventory.fifo</code></td><td></td></tr><tr><td>Visibility timeout</td><td>60 seconds</td><td>Inventory updates are fast</td></tr><tr><td>Message retention</td><td>7 days</td><td></td></tr><tr><td>Receive wait time</td><td>20 seconds</td><td></td></tr><tr><td>Content-based deduplication</td><td>Enable</td><td></td></tr></tbody></table>
+<p><strong>Queue 3: Email Notification</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>Email order doesn't matter — duplicate email is acceptable</td></tr><tr><td>Name</td><td><code>shopnow-order-notification</code></td><td></td></tr><tr><td>Visibility timeout</td><td>30 seconds</td><td>Sending email is fast</td></tr><tr><td>Message retention</td><td>4 days</td><td>Old notifications lose relevance</td></tr><tr><td>Receive wait time</td><td>20 seconds</td><td></td></tr></tbody></table>
+<p><strong>Queue 4: Analytics</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>Analytics is idempotent — duplicates are harmless</td></tr><tr><td>Name</td><td><code>shopnow-order-analytics</code></td><td></td></tr><tr><td>Visibility timeout</td><td>300 seconds</td><td>Analytics processing may be slow</td></tr><tr><td>Message retention</td><td>14 days</td><td>Analytics can process backlog slowly</td></tr><tr><td>Receive wait time</td><td>20 seconds</td><td></td></tr></tbody></table>
+<p><strong>Queue 5: Logistics / Shipping</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>Shipping label generation is idempotent</td></tr><tr><td>Name</td><td><code>shopnow-order-logistics</code></td><td></td></tr><tr><td>Visibility timeout</td><td>60 seconds</td><td></td></tr><tr><td>Message retention</td><td>7 days</td><td></td></tr><tr><td>Receive wait time</td><td>20 seconds</td><td></td></tr></tbody></table>
+<p><strong>Queue Type Decision Summary:</strong></p>
+<table><thead><tr><th>Queue</th><th>Type</th><th>Why</th></tr></thead><tbody><tr><td>Payment</td><td>FIFO</td><td>Exactly-once is CRITICAL — duplicate charges = lawsuits</td></tr><tr><td>Inventory</td><td>FIFO</td><td>Order matters — must decrement inventory in sequence per product</td></tr><tr><td>Notification</td><td>Standard</td><td>Duplicate email is acceptable, order doesn't matter</td></tr><tr><td>Analytics</td><td>Standard</td><td>Idempotent processing, high throughput needed</td></tr><tr><td>Logistics</td><td>Standard</td><td>Label generation is idempotent, order doesn't matter</td></tr></tbody></table>
+<p>→ FIFO queues where correctness is critical<br>
+→ Standard queues where throughput matters and duplicates are tolerable</p>
+<hr>
+<h3>STEP 3 — CONFIGURE SQS ACCESS POLICIES ALLOWING SNS</h3>
+<p>→ This is the CRITICAL step — without this, SNS cannot send messages to SQS<br>
+→ By default, only the queue owner can send messages (Project 7)<br>
+→ We must explicitly allow the SNS topic to send</p>
+<p>→ For EACH queue → SQS Console → Select queue → "Access policy" tab → "Edit"</p>
+<p><strong>Access Policy for <code>shopnow-order-payment.fifo</code>:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowSNSToSendMessage
+  Effect: Allow
+  Principal:
+    Service: sns.amazonaws.com
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-order-payment.fifo
+  Condition:
+    ArnEquals:
+      aws:SourceArn: arn:aws:sns:ap-south-1:123456789012:shopnow-order-events</code></pre></div>
+<p><strong>Every Field Explained:</strong></p>
+<p>→ <code>Principal: Service: sns.amazonaws.com</code> — The SNS service is the sender<br>
+→ <code>Action: sqs:SendMessage</code> — Allow sending messages to this queue<br>
+→ <code>Resource</code> — This specific queue's ARN (not wildcard)<br>
+→ <code>Condition: ArnEquals: aws:SourceArn</code> — ONLY from this specific SNS topic</p>
+<p>→ Without the condition → ANY SNS topic in ANY account could send to this queue<br>
+→ The condition ensures only <code>shopnow-order-events</code> can send</p>
+<p><strong>Apply the SAME policy pattern to ALL 5 queues:</strong><br>
+→ Change only the <code>Resource</code> ARN for each queue<br>
+→ The <code>SourceArn</code> condition stays the same (all receive from the same topic)</p>
+<p><strong>If Queue Uses SSE-KMS Encryption:</strong></p>
+<p>→ When the SQS queue is encrypted with KMS (not SSE-SQS):<br>
+→ SNS needs permission to use the KMS key to encrypt the message</p>
+<p>→ Additional KMS key policy required:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowSNSToUseKMSKey
+  Effect: Allow
+  Principal:
+    Service: sns.amazonaws.com
+  Action:
+    - kms:GenerateDataKey
+    - kms:Decrypt
+  Resource: "*"
+  Condition:
+    ArnEquals:
+      aws:SourceArn: arn:aws:sns:ap-south-1:123456789012:shopnow-order-events</code></pre></div>
+<p>→ This is added to the KMS key policy (not the SQS policy)<br>
+→ With SSE-SQS encryption → no KMS policy needed (simpler)<br>
+→ KMS deep dive in Project 36</p>
+<hr>
+<h3>STEP 4 — SUBSCRIBE SQS QUEUES TO THE SNS TOPIC</h3>
+<p>→ SNS Console → Select <code>shopnow-order-events</code> → "Create subscription"</p>
+<p><strong>Subscription 1: Payment Queue</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-order-payment.fifo</td></tr></tbody></table>
+<p>→ Click "Create subscription"<br>
+→ Status: "Confirmed" (auto-confirmed for same-account SQS subscriptions)</p>
+<p><strong>Subscription 2: Inventory Queue</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-order-inventory.fifo</td></tr></tbody></table>
+<p><strong>Subscription 3: Notification Queue</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-order-notification</td></tr></tbody></table>
+<p><strong>Subscription 4: Analytics Queue</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-order-analytics</td></tr></tbody></table>
+<p><strong>Subscription 5: Logistics Queue</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-order-logistics</td></tr></tbody></table>
+<p><strong>Also Add: Email Subscription for Ops Team</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Email</td></tr><tr><td>Endpoint</td><td><a href="mailto:ops-team@shopnow.com">ops-team@shopnow.com</a></td></tr></tbody></table>
+<p>→ Status: "Pending confirmation" → must click email link (Project 6)<br>
+→ This gives ops team visibility into all order events (useful for debugging)</p>
+<p><strong>Subscription Summary:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SNS Topic: shopnow-order-events
+</span>    │
+    ├── SQS: shopnow-order-payment.fifo     (CONFIRMED)
+    ├── SQS: shopnow-order-inventory.fifo    (CONFIRMED)
+    ├── SQS: shopnow-order-notification      (CONFIRMED)
+    ├── SQS: shopnow-order-analytics         (CONFIRMED)
+    ├── SQS: shopnow-order-logistics         (CONFIRMED)
+    └── Email: ops-team@shopnow.com          (PENDING → confirm)</code></pre></div>
+<p>→ 6 subscribers — one SNS publish → 6 simultaneous deliveries</p>
+<hr>
+<h3>STEP 5 — UNDERSTAND RAW MESSAGE DELIVERY</h3>
+<p>→ By default, SNS wraps the original message in a JSON envelope before sending to SQS<br>
+→ This envelope contains SNS metadata that the consumer must parse through</p>
+<p><strong>Default Behavior (Raw Message Delivery = OFF):</strong></p>
+<p>→ Publisher sends message body: <code>{"order_id": "ORD-001", "amount": 4497}</code><br>
+→ SQS receives this wrapped envelope:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Type": "Notification",
+  "MessageId": "sns-message-id-123",
+  "TopicArn": "arn:aws:sns:ap-south-1:123456789012:shopnow-order-events",
+  "Subject": "New Order",
+  "Message": "{\"order_id\": \"ORD-001\", \"amount\": 4497}",
+  "Timestamp": "2025-01-15T14:30:00.000Z",
+  "SignatureVersion": "1",
+  "Signature": "EXAMPLEpH+...",
+  "SigningCertURL": "https://sns.ap-south-1.amazonaws.com/...",
+  "UnsubscribeURL": "https://sns.ap-south-1.amazonaws.com/...",
+  "MessageAttributes": {
+    "order_type": {
+      "Type": "String",
+      "Value": "flash-sale"
+    }
+  }
+}</code></pre></div>
+<p>→ NOTICE: The actual message is INSIDE the <code>"Message"</code> field as an ESCAPED JSON string<br>
+→ The consumer must: Parse SQS message → Extract <code>"Message"</code> field → Parse AGAIN (double-parse)<br>
+→ This is ANNOYING for consumers that just want the order data</p>
+<p><strong>Raw Message Delivery (Enabled):</strong></p>
+<p>→ SNS Console → Select subscription → "Edit" → Enable "Raw message delivery"</p>
+<p>→ With raw message delivery ON → SQS receives the ORIGINAL message body directly:</p>
+<code>{"order_id": "ORD-001", "amount": 4497}</code>
+<p>→ Consumer only needs to parse ONCE — much simpler<br>
+→ BUT: SNS metadata (TopicArn, Timestamp, Signature) is NOT included<br>
+→ AND: Message attributes are delivered as SQS message attributes (not in the body)</p>
+<p><strong>When to Use Raw Message Delivery:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Raw Delivery</th><th>Default (Wrapped)</th></tr></thead><tbody><tr><td>Consumer only needs the message body</td><td>✅ ON</td><td>Requires double-parsing</td></tr><tr><td>Consumer needs SNS metadata (topic ARN, signature)</td><td>❌ OFF</td><td>Metadata included in envelope</td></tr><tr><td>Consumer needs to verify message authenticity</td><td>❌ OFF</td><td>Signature in envelope</td></tr><tr><td>Simple processing pipeline</td><td>✅ ON</td><td>Unnecessary complexity</td></tr><tr><td>Multiple protocol subscribers need consistent format</td><td>❌ OFF</td><td>Same format for all</td></tr></tbody></table>
+<p>→ For ShopNow → Enable Raw Message Delivery on ALL SQS subscriptions<br>
+→ Consumers just want the order data — they don't need SNS metadata</p>
+<p><strong>Enabling Raw Message Delivery:</strong></p>
+<p>→ SNS Console → Subscriptions → Select each SQS subscription → "Edit"<br>
+→ Raw message delivery: ✅ Enable<br>
+→ Save</p>
+<p>→ IMPORTANT: Raw message delivery is ONLY available for SQS and Firehose subscriptions<br>
+→ Email, SMS, HTTP, Lambda subscriptions ALWAYS receive the wrapped envelope</p>
+<hr>
+<h3>STEP 6 — SUBSCRIPTION FILTER POLICIES</h3>
+<p>→ Not every consumer needs EVERY message<br>
+→ Use filter policies (from Project 6) to route specific messages to specific queues</p>
+<p><strong>Scenario: ShopNow has three order types:</strong></p>
+<table><thead><tr><th>Order Type</th><th>Attribute Value</th><th>Who Needs It</th></tr></thead><tbody><tr><td>Regular order</td><td><code>regular</code></td><td>All consumers</td></tr><tr><td>Flash sale order</td><td><code>flash-sale</code></td><td>All consumers + special analytics</td></tr><tr><td>Return/refund</td><td><code>return</code></td><td>Payment + Inventory + Notification (NOT analytics or logistics)</td></tr></tbody></table>
+<p><strong>Filter Policy on Analytics Queue:</strong></p>
+<p>→ SNS Console → Select analytics subscription → "Edit" → Subscription filter policy</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "order_type": ["regular", "flash-sale"]
+}</code></pre></div>
+<p>→ Analytics queue receives regular and flash-sale orders<br>
+→ Return/refund orders are NOT delivered to analytics → reduces noise</p>
+<p><strong>Filter Policy on Logistics Queue:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "order_type": ["regular", "flash-sale"]
+}</code></pre></div>
+<p>→ Logistics doesn't need return/refund events — those are handled differently</p>
+<p><strong>Filter Policy on Payment Queue:</strong></p>
+<code>No filter policy (receives ALL messages)</code>
+<p>→ Payment must process everything — returns need refund processing</p>
+<p><strong>Filter Policy on Inventory Queue:</strong></p>
+<code>No filter policy (receives ALL messages)</code>
+<p>→ Inventory must update for all event types — returns increase stock</p>
+<p><strong>Filter Policy on Notification Queue:</strong></p>
+<code>No filter policy (receives ALL messages)</code>
+<p>→ Customer needs notification for every order event type</p>
+<p><strong>How Message Attributes Must Be Set by Publisher:</strong></p>
+<p>→ When publishing to the SNS topic → include message attributes:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message Body:
+</span>  {"order_id": "ORD-001", "customer_id": "CUST-5678", "items": [...], "amount": 4497}
+
+Message Attributes:
+  order_type: String = "flash-sale"
+  region: String = "south-india"
+  priority: Number = 1</code></pre></div>
+<p>→ SNS evaluates filter policies BEFORE delivery<br>
+→ If a subscription's filter doesn't match → message is NOT delivered to that queue<br>
+→ This is more efficient than delivering to all queues and having consumers discard irrelevant messages</p>
+<p><strong>Filter Policy Evaluation Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message published with attributes: order_type = "return"
+</span>        │
+        ▼
+SNS evaluates each subscription's filter policy:
+        │
+        ├── Payment queue: No filter → DELIVER ✓
+        ├── Inventory queue: No filter → DELIVER ✓
+        ├── Notification queue: No filter → DELIVER ✓
+        ├── Analytics queue: Filter = ["regular", "flash-sale"]
+        │   "return" NOT in list → DO NOT DELIVER ✗
+        └── Logistics queue: Filter = ["regular", "flash-sale"]
+            "return" NOT in list → DO NOT DELIVER ✗
+
+Result: 3 queues receive the message, 2 are filtered out</code></pre></div>
+<hr>
+<h3>STEP 7 — TEST THE COMPLETE FAN-OUT FLOW</h3>
+<p><strong>Publishing a Test Message:</strong></p>
+<p>→ SNS Console → Select <code>shopnow-order-events</code> → "Publish message"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Subject</td><td>New Order: ORD-TEST-001</td></tr><tr><td>Message body</td><td><code>{"order_id": "ORD-TEST-001", "customer_id": "CUST-TEST", "amount": 999, "items": [{"product_id": "PROD-001", "quantity": 1}]}</code></td></tr></tbody></table>
+<p><strong>Message Attributes:</strong></p>
+<table><thead><tr><th>Key</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td>order_type</td><td>String</td><td>regular</td></tr><tr><td>region</td><td>String</td><td>south-india</td></tr></tbody></table>
+<p>→ Click "Publish message"</p>
+<p><strong>Verification Steps:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CHECK 1: Message published successfully
+</span>         SNS returns MessageId → Confirmed ✓
+
+CHECK 2: All 5 SQS queues received the message
+         SQS Console → Each queue → "Messages available" = 1
+         
+         shopnow-order-payment.fifo: Messages available = 1 ✓
+         shopnow-order-inventory.fifo: Messages available = 1 ✓
+         shopnow-order-notification: Messages available = 1 ✓
+         shopnow-order-analytics: Messages available = 1 ✓
+         shopnow-order-logistics: Messages available = 1 ✓
+
+CHECK 3: Verify message content in each queue
+         SQS Console → Select queue → "Send and receive messages" → "Poll for messages"
+         → Message body matches what was published ✓
+         (With raw delivery: exact body. Without: wrapped in SNS envelope)
+
+CHECK 4: Verify filter policies work
+         Publish with order_type = "return"
+         → Payment, Inventory, Notification queues: Messages available = 1 ✓
+         → Analytics, Logistics queues: Messages available = 0 ✓ (filtered out)
+
+CHECK 5: Verify email subscriber received
+         Check ops-team@shopnow.com inbox → Email with order details ✓</code></pre></div>
+<p><strong>Full Traffic Flow Verification:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Web App (EC2 with IAM Role — Project 11)
+</span>    │
+    │ sns:Publish to shopnow-order-events
+    │ (Role: shopnow-web-server-role has sns:Publish permission)
+    │
+    ▼
+SNS Topic: shopnow-order-events
+    │
+    │ Evaluates 6 subscriptions
+    │ Applies filter policies
+    │
+    ├──► SQS: shopnow-order-payment.fifo
+    │    (SQS access policy allows SNS — Step 3)
+    │    Consumer: Payment Service EC2 (shopnow-order-processor-role has sqs:ReceiveMessage)
+    │
+    ├──► SQS: shopnow-order-inventory.fifo
+    │    Consumer: Inventory Service EC2
+    │
+    ├──► SQS: shopnow-order-notification
+    │    Consumer: Notification Service EC2
+    │
+    ├──► SQS: shopnow-order-analytics
+    │    Consumer: Analytics Service EC2
+    │
+    ├──► SQS: shopnow-order-logistics
+    │    Consumer: Logistics Service EC2
+    │
+    └──► Email: ops-team@shopnow.com
+         (For human visibility)</code></pre></div>
+<hr>
+<h3>STEP 8 — HANDLE FAILURE SCENARIOS AND DEAD LETTER QUEUES</h3>
+<p><strong>Scenario 1: SQS Queue Is Unavailable When SNS Tries to Deliver</strong></p>
+<p>→ SQS is a managed service — it's almost never unavailable<br>
+→ But if the SQS access policy is misconfigured → SNS gets "Access Denied"<br>
+→ SNS treats this as a delivery failure → retries based on retry policy</p>
+<p><strong>SNS Retry Policy for SQS Subscriptions:</strong></p>
+<table><thead><tr><th>Phase</th><th>Retries</th><th>Interval</th></tr></thead><tbody><tr><td>Immediate</td><td>3 retries</td><td>No delay (back-to-back)</td></tr><tr><td>Pre-backoff</td><td>2 retries</td><td>1 second apart</td></tr><tr><td>Backoff</td><td>10 retries</td><td>Exponential: 1s, 2s, 4s, ... up to 20s</td></tr><tr><td>Post-backoff</td><td>100,000+ retries</td><td>20 seconds apart</td></tr><tr><td>Total duration</td><td>~23 days</td><td>Before giving up</td></tr></tbody></table>
+<p>→ SNS retries SQS delivery aggressively — over 100,000 retries across 23 days<br>
+→ It's EXTREMELY unlikely for a properly configured SQS queue to lose a message from SNS</p>
+<hr>
+<p><strong>Scenario 2: Consumer Cannot Process a Message (Poison Message)</strong></p>
+<p>→ Payment service reads an order but can't process it (invalid data, external API failure)<br>
+→ Visibility timeout expires → message becomes visible → payment service reads it again → fails again<br>
+→ This loops forever → "poison message" consumes processing resources</p>
+<p>→ Solution: Dead Letter Queue (DLQ) on EACH SQS queue</p>
+<p><strong>Create DLQ for Payment Queue:</strong></p>
+<p>→ SQS Console → "Create queue"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Type</td><td>FIFO (must match source queue type)</td></tr><tr><td>Name</td><td><code>shopnow-order-payment-dlq.fifo</code></td></tr><tr><td>Message retention</td><td>14 days</td></tr><tr><td>Visibility timeout</td><td>60 seconds</td></tr></tbody></table>
+<p><strong>Configure Redrive Policy on Source Queue:</strong></p>
+<p>→ SQS Console → Select <code>shopnow-order-payment.fifo</code> → "Edit" → "Dead-letter queue"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Dead-letter queue</td><td>shopnow-order-payment-dlq.fifo</td><td>Where failed messages go</td></tr><tr><td>Maximum receives</td><td>3</td><td>After 3 failed processing attempts → move to DLQ</td></tr></tbody></table>
+<p><strong>How It Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Attempt 1: Consumer reads message → processing fails → doesn't delete
+</span>           Visibility timeout expires → message becomes visible again
+           ApproximateReceiveCount = 1
+
+Attempt 2: Consumer reads message → processing fails again
+           ApproximateReceiveCount = 2
+
+Attempt 3: Consumer reads message → processing fails again
+           ApproximateReceiveCount = 3 (= maxReceiveCount)
+
+SQS: "This message has been received 3 times without successful deletion"
+     → Move message to DLQ: shopnow-order-payment-dlq.fifo
+     → Message removed from source queue
+     → Message appears in DLQ
+
+Operations team:
+     → Monitor DLQ depth (CloudWatch alarm — Project 8)
+     → Investigate failed messages
+     → Fix the issue
+     → Redrive messages back to source queue (or process manually)</code></pre></div>
+<p><strong>DLQ for Each Consumer Queue:</strong></p>
+<table><thead><tr><th>Source Queue</th><th>DLQ</th><th>maxReceiveCount</th></tr></thead><tbody><tr><td>shopnow-order-payment.fifo</td><td>shopnow-order-payment-dlq.fifo</td><td>3</td></tr><tr><td>shopnow-order-inventory.fifo</td><td>shopnow-order-inventory-dlq.fifo</td><td>3</td></tr><tr><td>shopnow-order-notification</td><td>shopnow-order-notification-dlq</td><td>5</td></tr><tr><td>shopnow-order-analytics</td><td>shopnow-order-analytics-dlq</td><td>5</td></tr><tr><td>shopnow-order-logistics</td><td>shopnow-order-logistics-dlq</td><td>3</td></tr></tbody></table>
+<p>→ Payment/Inventory: Low maxReceiveCount (3) → fail fast, investigate quickly<br>
+→ Notification/Analytics: Higher maxReceiveCount (5) → more retries before giving up (transient failures may resolve)</p>
+<p><strong>DLQ Monitoring (Project 8 Reference):</strong></p>
+<p>→ CloudWatch Alarm for EACH DLQ:</p>
+<table><thead><tr><th>Metric</th><th>Queue</th><th>Threshold</th><th>Action</th></tr></thead><tbody><tr><td>ApproximateNumberOfMessagesVisible</td><td>shopnow-order-payment-dlq.fifo</td><td>&gt; 0</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>ApproximateNumberOfMessagesVisible</td><td>shopnow-order-inventory-dlq.fifo</td><td>&gt; 0</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>ApproximateNumberOfMessagesVisible</td><td>shopnow-order-notification-dlq</td><td>&gt; 10</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>ApproximateNumberOfMessagesVisible</td><td>shopnow-order-analytics-dlq</td><td>&gt; 50</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>ApproximateNumberOfMessagesVisible</td><td>shopnow-order-logistics-dlq</td><td>&gt; 0</td><td>SNS: shopnow-ops-alerts</td></tr></tbody></table>
+<p>→ Payment DLQ: ANY message in DLQ = CRITICAL → investigate immediately<br>
+→ Analytics DLQ: Tolerate up to 50 before alerting → analytics can batch-process later</p>
+<p><strong>Redrive to Source (DLQ Recovery):</strong></p>
+<p>→ After fixing the issue → move messages back to the source queue for reprocessing<br>
+→ SQS Console → Select DLQ → "Start DLQ redrive"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Redrive destination</td><td>Source queue (auto-detected)</td></tr><tr><td>Velocity</td><td>System optimized (SQS manages the rate)</td></tr></tbody></table>
+<p>→ Messages move from DLQ back to source queue → consumers process them again<br>
+→ This is the RECOVERY mechanism — no message is permanently lost</p>
+<hr>
+<p><strong>Scenario 3: SNS Cannot Deliver to SQS After All Retries (Extremely Rare)</strong></p>
+<p>→ Configure a DLQ on the SNS SUBSCRIPTION (not just the SQS queue)<br>
+→ This catches messages that SNS itself couldn't deliver to SQS</p>
+<p>→ SNS Console → Select SQS subscription → "Edit" → "Redrive policy (dead-letter queue)"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Dead-letter queue</td><td>arn:aws:sqs:ap-south-1:123456789012:shopnow-sns-delivery-dlq</td></tr></tbody></table>
+<p>→ The SNS DLQ is a SEPARATE queue from the SQS consumer DLQ<br>
+→ SNS DLQ catches: SNS → SQS delivery failures<br>
+→ SQS DLQ catches: Consumer processing failures<br>
+→ Two different failure points → two different DLQs</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FAILURE POINT 1: SNS → SQS delivery failure
+</span>  SNS cannot send to SQS (access denied, queue deleted, etc.)
+  → Message goes to SNS subscription DLQ
+  → Monitor and fix SQS access policy
+
+FAILURE POINT 2: SQS → Consumer processing failure
+  Consumer reads from SQS but can't process (application error)
+  → Message goes to SQS source queue's DLQ
+  → Monitor, fix consumer, redrive</code></pre></div>
+<hr>
+<h3>STEP 9 — ADDING A NEW CONSUMER (EXTENSIBILITY)</h3>
+<p>→ One month later → ShopNow adds a fraud detection system<br>
+→ It needs to receive ALL order events and check for fraudulent patterns<br>
+→ How much effort to add?</p>
+<p><strong>Steps to Add a New Consumer:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Create SQS queue: shopnow-order-fraud-detection
+</span>Step 2: Add SQS access policy allowing SNS to send
+Step 3: Create SNS subscription: SQS protocol → fraud-detection queue
+Step 4: (Optional) Add filter policy if only certain order types need checking
+Step 5: Deploy the fraud detection consumer application
+
+CHANGES TO EXISTING SYSTEMS: ZERO
+→ The publisher (web app) is unchanged
+→ Other consumers are unchanged
+→ No code changes, no redeployment
+→ The new consumer just subscribes and starts receiving</code></pre></div>
+<p>→ THIS is the power of fan-out architecture<br>
+→ Adding consumers is ADDITIVE — never modifies existing components<br>
+→ This is the Open/Closed Principle applied to distributed systems</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create a SEPARATE SQS queue per consumer — never share queues between different processing concerns<br>
+→ Always configure SQS access policies with <code>aws:SourceArn</code> condition — prevents unauthorized topics from sending<br>
+→ Always enable Raw Message Delivery for SQS subscriptions — simplifies consumer code<br>
+→ Always create DLQs for BOTH levels: SNS subscription DLQ + SQS consumer DLQ<br>
+→ Always monitor DLQ depth with CloudWatch alarms (Project 8)<br>
+→ Always use filter policies when consumers don't need every message — reduces processing waste<br>
+→ Always include message attributes when publishing — enables future filter policies without publisher changes<br>
+→ Always use Standard topics for fan-out unless you need end-to-end FIFO<br>
+→ Always test the complete flow: publish → verify all queues → verify filter policies<br>
+→ Always set maxReceiveCount based on criticality: low for critical queues, higher for tolerant ones<br>
+→ Always document which queues subscribe to which topics — this becomes complex at scale<br>
+→ Always consider queue type per consumer: FIFO for critical, Standard for tolerant</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use a single SQS queue for multiple independent consumers — SQS is point-to-point per message<br>
+→ Never skip SQS access policy configuration — SNS silently fails to deliver without permission<br>
+→ Never use FIFO topics when you need high-throughput fan-out — 300 msg/sec limit<br>
+→ Never forget DLQs — without them, poison messages loop forever consuming resources<br>
+→ Never set maxReceiveCount too high for critical queues — delays detection of processing failures<br>
+→ Never set maxReceiveCount to 1 — transient failures need at least 2-3 retries<br>
+→ Never forget that FIFO DLQs must match source FIFO queues — Standard DLQ with FIFO source doesn't work<br>
+→ Never publish without message attributes — you lose the ability to add filters later<br>
+→ Never assume SNS → SQS delivery is instant — there can be sub-second delays<br>
+→ Never create circular dependencies: Queue A → processes → publishes to Topic → delivers to Queue A<br>
+→ Never mix KMS-encrypted queues with unencrypted SNS without proper key policies<br>
+→ Never forget the ops email subscription for visibility — invaluable for debugging</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Pattern</th></tr></thead><tbody><tr><td>One event → multiple independent processors</td><td>SNS → SQS fan-out (this project)</td></tr><tr><td>One event → one processor with buffering</td><td>Direct SQS (Project 7)</td></tr><tr><td>One event → notification to humans</td><td>SNS with Email/SMS subscriptions (Project 6)</td></tr><tr><td>One event → immediate processing (no buffering)</td><td>SNS → Lambda (Project 26)</td></tr><tr><td>One event → multiple processors + humans</td><td>SNS → SQS (processing) + Email (notification)</td></tr><tr><td>One event → same processing with load balancing</td><td>Multiple consumers on ONE SQS queue (competing consumers)</td></tr><tr><td>Complex event routing based on content</td><td>EventBridge (Project 38) instead of SNS</td></tr><tr><td>Real-time streaming with ordering</td><td>Kinesis (Project 52) instead of SNS+SQS</td></tr></tbody></table>
+<p><strong>SNS → SQS vs SNS → Lambda:</strong></p>
+<table><thead><tr><th>Feature</th><th>SNS → SQS → Consumer</th><th>SNS → Lambda</th></tr></thead><tbody><tr><td>Buffering</td><td>✅ SQS buffers during spikes</td><td>❌ Lambda must handle immediately</td></tr><tr><td>Retry control</td><td>✅ Visibility timeout + DLQ</td><td>⚠️ Limited retry (2 built-in)</td></tr><tr><td>Processing rate control</td><td>✅ Consumer pulls at own pace</td><td>❌ Lambda invoked per message</td></tr><tr><td>Cost at high volume</td><td>💰 SQS + compute cost</td><td>💰 Lambda invocation cost (may be higher)</td></tr><tr><td>Operational complexity</td><td>⚠️ Must manage consumers</td><td>✅ Serverless — no servers to manage</td></tr><tr><td>Best for</td><td>High-volume, variable-rate processing</td><td>Low-volume, event-driven processing</td></tr></tbody></table>
+<p>→ For ShopNow's order processing → SNS → SQS (high volume, need buffering)<br>
+→ For triggered tasks like thumbnail generation → SNS → Lambda (simpler, low volume)</p>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use SNS → SQS fan-out when only ONE consumer exists → Use direct SQS<br>
+→ Do NOT use SNS → SQS when you need sub-millisecond latency → Use direct API calls<br>
+→ Do NOT use SNS → SQS for request-response patterns → Fan-out is fire-and-forget<br>
+→ Do NOT use SNS → SQS for streaming data → Use Kinesis (Project 52) for ordered, high-volume streams<br>
+→ Do NOT use SNS → SQS when all consumers need the exact same processing → Use one SQS queue with competing consumers<br>
+→ Do NOT use SNS → SQS for complex content-based routing → Use EventBridge (Project 38) which supports rich event pattern matching</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE COMPLETE FAN-OUT MESSAGE FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Web App publishes to SNS Topic
+</span>        │
+        ▼
+Step 1: SNS receives Publish API call
+        Authenticates via IAM (shopnow-web-server-role — Project 11)
+        Authorizes via role policy (sns:Publish allowed — Project 11)
+        │
+        ▼
+Step 2: SNS stores message redundantly across AZs
+        Returns MessageId to publisher immediately
+        (Publisher's work is DONE — takes ~10-50ms)
+        │
+        ▼
+Step 3: SNS retrieves all confirmed subscriptions (6 subscribers)
+        │
+        ▼
+Step 4: For EACH subscription (evaluated in parallel):
+        │
+        ├── Subscription 1: SQS shopnow-order-payment.fifo
+        │   Filter policy: None → DELIVER
+        │   │
+        │   ├── Check raw message delivery: ON → Send original body
+        │   ├── FIFO queue → SNS adds MessageGroupId and MessageDeduplicationId
+        │   │   (Derived from SNS MessageId and subscription settings)
+        │   ├── Call sqs:SendMessage to payment queue
+        │   ├── SQS access policy: SNS allowed? → YES
+        │   ├── SQS encryption: Encrypt with SSE-SQS
+        │   └── Message stored in payment queue ✓
+        │
+        ├── Subscription 2: SQS shopnow-order-inventory.fifo
+        │   Same flow as above → Message stored in inventory queue ✓
+        │
+        ├── Subscription 3: SQS shopnow-order-notification
+        │   Filter policy: None → DELIVER
+        │   Standard queue → no FIFO attributes needed
+        │   → Message stored in notification queue ✓
+        │
+        ├── Subscription 4: SQS shopnow-order-analytics
+        │   Filter policy: order_type IN ["regular", "flash-sale"]
+        │   Message attribute order_type = "regular" → MATCH → DELIVER
+        │   → Message stored in analytics queue ✓
+        │
+        ├── Subscription 5: SQS shopnow-order-logistics
+        │   Filter policy: order_type IN ["regular", "flash-sale"]
+        │   Message attribute order_type = "regular" → MATCH → DELIVER
+        │   → Message stored in logistics queue ✓
+        │
+        └── Subscription 6: Email ops-team@shopnow.com
+            Filter policy: None → DELIVER
+            → Email sent via AWS SMTP ✓
+        │
+        ▼
+Step 5: ALL deliveries complete (typically within 50-200ms of publish)
+        Each SQS queue now has the message
+        Each consumer pulls from their own queue at their own pace</code></pre></div>
+<hr>
+<h3>2 → HOW SNS DELIVERS TO FIFO SQS QUEUES</h3>
+<p>→ When an SNS Standard topic delivers to a FIFO SQS queue → SNS must provide:</p>
+<ul>
+<li>MessageGroupId (required for FIFO queues)</li>
+<li>MessageDeduplicationId (required if content-based dedup is off)</li>
+</ul>
+<p><strong>How SNS Generates These for FIFO Queue Subscriptions:</strong></p>
+<table><thead><tr><th>Attribute</th><th>How SNS Sets It</th><th>Override Possible?</th></tr></thead><tbody><tr><td>MessageGroupId</td><td>From the <code>MessageGroupId</code> message attribute set by publisher</td><td>YES — publisher must set it</td></tr><tr><td>MessageDeduplicationId</td><td>From the SNS MessageId (auto-generated, unique)</td><td>YES — if content-based dedup is enabled on queue</td></tr></tbody></table>
+<p>→ CRITICAL: If publishing to a Standard topic that fans out to FIFO queues:</p>
+<ul>
+<li>Publisher MUST include a <code>MessageGroupId</code> message attribute</li>
+<li>Without it → SNS cannot send to the FIFO queue → delivery fails silently</li>
+</ul>
+<p><strong>Publisher Must Include:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message Attributes (when publishing to SNS topic):
+</span>  order_type: String = "regular"
+  region: String = "south-india"
+  MessageGroupId: String = "CUST-5678"    ← REQUIRED for FIFO queue subscribers</code></pre></div>
+<p>→ The <code>MessageGroupId</code> attribute is used by SNS when delivering to FIFO queues<br>
+→ For non-FIFO queue subscribers → this attribute is ignored<br>
+→ This allows a Standard topic to fan out to a MIX of Standard and FIFO queues</p>
+<hr>
+<h3>3 → HOW CONCURRENT DELIVERY WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SNS delivers to 5 SQS queues CONCURRENTLY (not sequentially):
+</span>
+Timeline:
+0ms:    SNS starts delivery to all 5 queues simultaneously
+5ms:    Payment queue confirms receipt ✓
+8ms:    Notification queue confirms receipt ✓
+12ms:   Logistics queue confirms receipt ✓
+15ms:   Inventory queue confirms receipt ✓
+45ms:   Analytics queue confirms receipt ✓ (slightly slower)
+
+Total fan-out time: ~50ms (determined by SLOWEST delivery)</code></pre></div>
+<p>→ SNS does NOT wait for one delivery to complete before starting the next<br>
+→ All deliveries happen in parallel → total time = max(individual delivery times)<br>
+→ This is why fan-out is fast even with many subscribers</p>
+<hr>
+<h3>4 → HOW MESSAGE ORDERING WORKS END-TO-END</h3>
+<p><strong>Standard Topic → Standard Queue (No ordering guarantee):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Publisher sends: Order A, Order B, Order C (in sequence)
+</span>SNS topic receives: A, B, C
+SNS delivers to Standard queue: Might arrive as B, A, C or A, C, B
+Consumer reads: No guaranteed order
+
+→ Consumer must handle out-of-order messages
+→ Or consumer must use message timestamps to reconstruct order</code></pre></div>
+<p><strong>Standard Topic → FIFO Queue (Ordering within message group):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Publisher sends: Order A (group: CUST-1), Order B (group: CUST-1), Order C (group: CUST-2)
+</span>SNS delivers to FIFO queue:
+  Group CUST-1: A then B (in order)
+  Group CUST-2: C (independent)
+Consumer reads from CUST-1: A first, then B (guaranteed)
+Consumer reads from CUST-2: C (independent of CUST-1)</code></pre></div>
+<p>→ FIFO queue preserves order within each message group<br>
+→ But the ORDER in which groups are processed is not guaranteed<br>
+→ CUST-2's Order C might be processed before CUST-1's Order A</p>
+<p><strong>FIFO Topic → FIFO Queue (Strictest ordering):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Publisher sends: Order A (group: CUST-1), Order B (group: CUST-1)
+</span>FIFO topic guarantees: A delivered before B
+FIFO queue guarantees: A processed before B
+
+Full end-to-end ordering within the group
+BUT limited to 300 msg/sec at the topic level</code></pre></div>
+<p>→ For ShopNow: Standard topic → FIFO queues for critical consumers → good balance</p>
+<hr>
+<h3>5 → COST ANALYSIS OF FAN-OUT PATTERN</h3>
+<p><strong>Per-Message Cost Breakdown:</strong></p>
+<table><thead><tr><th>Component</th><th>Cost Per Message</th><th>ShopNow Volume (5,000 orders/day)</th></tr></thead><tbody><tr><td>SNS Publish (1 message)</td><td>~$0.0000005</td><td>$0.075/month</td></tr><tr><td>SNS → SQS delivery (5 queues)</td><td>$0.0000003 per delivery × 5</td><td>$0.225/month</td></tr><tr><td>SQS SendMessage (5 queues)</td><td>$0.0000004 per message × 5</td><td>$0.300/month</td></tr><tr><td>SQS ReceiveMessage (5 consumers)</td><td>$0.0000004 per receive × 5</td><td>$0.300/month</td></tr><tr><td>SQS DeleteMessage (5 consumers)</td><td>$0.0000004 per delete × 5</td><td>$0.300/month</td></tr><tr><td><strong>Total messaging cost</strong></td><td></td><td><strong>~$1.20/month</strong></td></tr></tbody></table>
+<p>→ The entire fan-out messaging infrastructure costs ~₹100/month for 5,000 orders/day<br>
+→ This is NEGLIGIBLE compared to the value it provides (reliability, decoupling, scalability)</p>
+<p><strong>Cost Comparison: Fan-Out vs Direct Integration:</strong></p>
+<table><thead><tr><th>Architecture</th><th>Monthly Cost</th><th>Reliability</th><th>Scalability</th></tr></thead><tbody><tr><td>Direct synchronous calls</td><td>$0 (no messaging)</td><td>LOW (one failure breaks all)</td><td>LOW (slowest service is bottleneck)</td></tr><tr><td>SNS → SQS fan-out</td><td>~₹100</td><td>HIGH (queues buffer failures)</td><td>HIGH (each consumer independent)</td></tr><tr><td>Direct SQS per consumer (no SNS)</td><td>~₹80</td><td>MEDIUM (publisher must send to each queue)</td><td>MEDIUM (publisher knows all queues)</td></tr></tbody></table>
+<p>→ The ~₹20 difference between direct SQS and SNS+SQS is worth the decoupling<br>
+→ With SNS → publisher sends ONCE → SNS handles distribution → publisher doesn't know about consumers</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Missing SQS access policy for SNS</td><td>Messages silently not delivered to queue — queue stays empty</td><td>Always add <code>sqs:SendMessage</code> policy with <code>aws:SourceArn</code> condition</td></tr><tr><td>2</td><td>Missing MessageGroupId for FIFO queue subscribers</td><td>SNS delivery to FIFO queue fails silently</td><td>Always include <code>MessageGroupId</code> as message attribute when publishing</td></tr><tr><td>3</td><td>FIFO DLQ type doesn't match source queue type</td><td>CreateQueue for DLQ fails or redrive policy rejected</td><td>FIFO source → FIFO DLQ, Standard source → Standard DLQ</td></tr><tr><td>4</td><td>Raw message delivery OFF → consumers parse twice</td><td>Consumers get SNS envelope instead of original message → double parsing</td><td>Enable raw message delivery for all SQS subscriptions</td></tr><tr><td>5</td><td>No DLQ configured → poison messages loop forever</td><td>Consumer repeatedly fails on same message → wastes resources</td><td>Always configure DLQ with appropriate maxReceiveCount</td></tr><tr><td>6</td><td>KMS-encrypted queue without SNS key access</td><td>SNS gets "Access Denied" from KMS → delivery fails</td><td>Add SNS service principal to KMS key policy</td></tr><tr><td>7</td><td>Filter policy too restrictive → messages never delivered</td><td>Queue appears empty → consumers idle → business logic broken</td><td>Test filter policies with various message attribute combinations</td></tr><tr><td>8</td><td>Publishing without message attributes → filters can't work</td><td>All subscribers get all messages → no routing capability</td><td>Always include relevant attributes even if not filtering today</td></tr><tr><td>9</td><td>Using FIFO topic → only FIFO queues can subscribe</td><td>Standard queue subscription rejected → delivery breaks</td><td>Use Standard topic for mixed queue type fan-out</td></tr><tr><td>10</td><td>Not monitoring individual queue depths</td><td>One consumer falls behind silently → backlog grows unnoticed</td><td>CloudWatch alarm per queue on ApproximateNumberOfMessagesVisible (Project 8)</td></tr><tr><td>11</td><td>Single SNS topic for all event types</td><td>Unrelated events delivered to all consumers → waste</td><td>Use separate topics for distinct event domains or use filter policies</td></tr><tr><td>12</td><td>Not testing with return/refund events</td><td>Filter policies work for regular orders but break for edge cases</td><td>Test ALL message attribute combinations against all filter policies</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Throughput Scalability</strong></p>
+<ul>
+<li>Standard SNS topic: Virtually unlimited publishing rate</li>
+<li>Standard SQS queues: Virtually unlimited receive/send rate</li>
+<li>FIFO SQS queues: 300 msg/sec per message group (3,000 with batching)</li>
+<li>Fan-out itself adds minimal latency (50-200ms for all deliveries)</li>
+<li>No pre-provisioning needed — scales automatically</li>
+</ul>
+<p>→ <strong>Consumer Scalability</strong></p>
+<ul>
+<li>Each consumer can have MULTIPLE instances reading from the same queue</li>
+<li>Competing consumers pattern: 5 EC2 instances reading from payment queue → 5x throughput</li>
+<li>Auto Scaling (Project 33) can scale consumers based on queue depth</li>
+<li>Each consumer scales independently — slow analytics doesn't affect fast payment processing</li>
+</ul>
+<p>→ <strong>Subscriber Scalability</strong></p>
+<ul>
+<li>Up to 12.5 million subscriptions per SNS topic</li>
+<li>Practical limit: Hundreds of SQS queues per topic is manageable</li>
+<li>Each additional subscriber = ONE new SQS queue + ONE subscription → zero change to publisher</li>
+</ul>
+<p>→ <strong>Multi-Region Fan-Out</strong></p>
+<ul>
+<li>SNS can deliver to SQS queues in DIFFERENT regions</li>
+<li>Example: Topic in ap-south-1 → Queue in us-east-1 (cross-region delivery)</li>
+<li>Cross-region delivery adds latency but enables global processing</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Messaging costs are NEGLIGIBLE compared to compute costs</li>
+<li>At 1 million messages/day → messaging cost is ~$10/month</li>
+<li>Real cost is in CONSUMER COMPUTE (EC2/Lambda) — not in SNS/SQS</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify the fan-out is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Topic has all subscriptions</td><td>SNS Console → Topic → Subscriptions → Count matches expected</td></tr><tr><td>All subscriptions confirmed</td><td>Each subscription status = "Confirmed"</td></tr><tr><td>SQS access policies correct</td><td>Each queue → Access policy → SNS allowed with SourceArn condition</td></tr><tr><td>Messages flowing</td><td>Publish test message → check each queue → Messages available &gt; 0</td></tr><tr><td>Filter policies working</td><td>Publish with specific attributes → verify filtered queues don't receive</td></tr><tr><td>DLQs configured</td><td>Each source queue → Dead-letter queue configured with maxReceiveCount</td></tr><tr><td>DLQs empty (healthy)</td><td>Each DLQ → Messages available = 0</td></tr><tr><td>No delivery failures</td><td>CloudWatch → SNS metric: NumberOfNotificationsFailed = 0</td></tr></tbody></table>
+<p>→ <strong>How to debug "queue not receiving messages from SNS":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Is the subscription confirmed?
+</span>        SNS Console → Subscriptions → Status column
+        If "Pending" or "Deleted" → recreate subscription
+
+STEP 2: Is the SQS access policy correct?
+        SQS Console → Queue → Access policy
+        Does it allow sqs:SendMessage from sns.amazonaws.com?
+        Does the SourceArn condition match the exact topic ARN?
+
+STEP 3: Is the filter policy filtering out the message?
+        Check subscription filter policy
+        Compare with message attributes used during publish
+        Publish without attributes → does message arrive? (confirms filter is the issue)
+
+STEP 4: Is the queue encrypted with KMS?
+        If yes → does the KMS key policy allow sns.amazonaws.com?
+        Try with SSE-SQS encryption → if it works, KMS policy is the issue
+
+STEP 5: Is the topic encrypted with KMS?
+        If yes → SQS subscription needs access to the topic's KMS key
+        Check key policy
+
+STEP 6: Check SNS delivery status logs
+        CloudWatch Logs → sns/ → Look for delivery failures
+        Shows: MessageId, delivery status, error message
+
+STEP 7: For FIFO queues → check MessageGroupId
+        Is the publisher including MessageGroupId as message attribute?
+        Without it → SNS can't deliver to FIFO queues
+
+STEP 8: Check CloudTrail for SNS:Publish events
+        Was the publish call successful?
+        What attributes were included?</code></pre></div>
+<p>→ <strong>Monitoring Dashboard Additions (Project 8):</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>SNS Published Messages</td><td>NumberOfMessagesPublished</td><td>Confirm publisher is sending</td></tr><tr><td>SNS Delivery Failures</td><td>NumberOfNotificationsFailed</td><td>Catch delivery problems</td></tr><tr><td>Per-Queue Depth (5 widgets)</td><td>ApproximateNumberOfMessagesVisible per queue</td><td>Monitor each consumer's backlog</td></tr><tr><td>Per-Queue Age (5 widgets)</td><td>ApproximateAgeOfOldestMessage per queue</td><td>Detect slow consumers</td></tr><tr><td>DLQ Depth (5 widgets)</td><td>ApproximateNumberOfMessagesVisible per DLQ</td><td>Detect processing failures</td></tr><tr><td>SNS → SQS Delivery Rate</td><td>NumberOfNotificationsDelivered</td><td>Confirm fan-out is working</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ SNS → SQS Fan-Out is the MOST POWERFUL messaging pattern in AWS — one publish, many independent consumers<br>
+→ SNS provides FAN-OUT (one-to-many distribution) — SQS provides BUFFERING (each consumer's own pace)<br>
+→ Together they solve: decoupling, reliability, independent scaling, and graceful failure handling<br>
+→ SQS access policy is the CRITICAL configuration — without it, SNS silently fails to deliver<br>
+→ Raw message delivery simplifies consumers by removing the SNS envelope wrapper<br>
+→ Filter policies enable selective delivery — not every consumer needs every message<br>
+→ DLQs are needed at TWO levels: SNS subscription DLQ (delivery failures) + SQS consumer DLQ (processing failures)<br>
+→ Adding new consumers is ADDITIVE — zero changes to publisher or existing consumers<br>
+→ Standard topic → mix of Standard and FIFO queues gives the best balance of throughput and correctness<br>
+→ For FIFO queue subscribers → publisher MUST include MessageGroupId as a message attribute</p>
+<p>→ Connection to Project 6: SNS topics (created in Project 6) are the publishing endpoint</p>
+<ul>
+<li>Topic access policies allow AWS services to publish</li>
+<li>Subscription confirmation (email) still applies</li>
+<li>Filter policies (introduced in Project 6) enable selective routing</li>
+</ul>
+<p>→ Connection to Project 7: SQS queues (created in Project 7) are the consumer endpoints</p>
+<ul>
+<li>Visibility timeout, retention, polling all apply (Project 7 concepts)</li>
+<li>Dead Letter Queues (Project 7 concept) handle poison messages</li>
+<li>FIFO vs Standard queue decision (Project 7) applies per consumer</li>
+</ul>
+<p>→ Connection to Project 11: IAM Role on web server EC2 has <code>sns:Publish</code> permission<br>
+→ Connection to Project 8: CloudWatch monitors queue depths and DLQ counts</p>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 15: S3 Event → SNS → SQS (file upload triggers multiple processors)</li>
+<li>Project 20: Dead Letter Queue deep dive (building on DLQ concepts introduced here)</li>
+<li>Project 26: SNS → SQS → Lambda (serverless consumer pattern)</li>
+<li>Project 34: S3 → Lambda → Redshift pipeline (event-driven data loading)</li>
+<li>Project 41: Cross-account SNS → SQS (inter-account fan-out)</li>
+<li>Project 49: Complex multi-service pipeline with fan-out at each stage</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has a robust fan-out architecture for order processing<br>
+→ But the development team says: "The web application needs to talk to the RDS MariaDB database"<br>
+→ They have:</p>
+<ul>
+<li>EC2 instances in public subnets (web servers — Project 3)</li>
+<li>RDS MariaDB in private subnets (database — Project 9)</li>
+<li>Security Groups configured (Project 4)</li>
+<li>VPC with proper routing (Project 5)</li>
+</ul>
+<p>→ But when they configure the application connection string:</p>
+<ul>
+<li>Which endpoint to use? (RDS endpoint vs IP)</li>
+<li>How to handle connection pooling?</li>
+<li>What if the connection drops?</li>
+<li>How to secure the connection (SSL/TLS)?</li>
+<li>How to test connectivity from EC2 to RDS?</li>
+</ul>
+<p>→ The team also needs to connect a SECOND application (order processor) to the SAME database<br>
+→ And a batch reporting job that runs at night</p>
+<p>→ <strong>This is exactly what Project 14 solves</strong><br>
+→ Project 14 covers EC2 to RDS MariaDB Private Connectivity<br>
+→ It explains connection string configuration, SSL/TLS, connection pooling, and multi-application access patterns<br>
+→ It builds on VPC (Project 5), Security Groups (Project 4), and RDS (Project 9)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 14: "The Web App That Couldn't Talk to Its Database — EC2 to RDS MariaDB Private Connectivity"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-12.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 13/60</span></div><a class="nav-btn next" href="project-14.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

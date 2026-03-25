@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 36: THE AUDITOR WHO FOUND UNENCRYPTED DATA EVERYWHERE — KMS Encryption f — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 36: THE AUDITOR WHO FOUND UNENCRYPTED DATA EVERYWHERE — KMS Encryption for S3, RDS &amp; Redshift</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow is preparing for their first enterprise compliance audit (SOC 2 Type II)<br>
+→ The auditor "David" runs a security assessment across their AWS environment<br>
+→ His findings are alarming:</p>
+<p><strong>Finding 1 — S3 Data Lake</strong><br>
+→ 12 S3 buckets exist across the organization<br>
+→ 8 buckets use SSE-S3 encryption (configured in Project 1)<br>
+→ 4 buckets have NO default encryption at all<br>
+→ Nobody can answer: "Who accessed the encryption keys? When? For which objects?"<br>
+→ SSE-S3 provides encryption but ZERO audit trail — AWS manages the keys invisibly</p>
+<p><strong>Finding 2 — RDS MariaDB</strong><br>
+→ The production MariaDB instance (Project 9) was launched WITHOUT encryption at rest<br>
+→ At the time, the team thought "it's in a private subnet, so it's secure"<br>
+→ The auditor explains: "Network isolation is NOT encryption. If someone copies the underlying EBS volume, data is readable in plain text"<br>
+→ Snapshots of this database are also unencrypted — anyone with snapshot access reads raw data</p>
+<p><strong>Finding 3 — Redshift Cluster</strong><br>
+→ The Redshift cluster (Project 16) was launched without encryption<br>
+→ Contains 18 months of customer purchase history, PII (names, emails, phone numbers)<br>
+→ The auditor marks this as a CRITICAL finding</p>
+<p><strong>Finding 4 — No Key Management Strategy</strong><br>
+→ No centralized encryption key management exists<br>
+→ No key rotation policy<br>
+→ No key access audit trail<br>
+→ No separation between "who can use a key" and "who can manage a key"<br>
+→ No ability to revoke encryption access independently from data access</p>
+<p><strong>The Auditor's Mandate:</strong></p>
+<blockquote>
+<p>"Encrypt everything at rest using keys YOU control with full audit trail.<br>
+Implement key rotation. Separate key administration from key usage.<br>
+Prove you can answer: WHO used WHICH key, WHEN, for WHAT purpose."</p>
+</blockquote>
+<p>→ This requires AWS KMS (Key Management Service) as the centralized encryption backbone</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand WHY SSE-S3 (from Project 1) is insufficient for compliance</p>
+<p><strong>SSE-S3 (What we configured in Project 1):</strong><br>
+→ AWS generates the encryption key<br>
+→ AWS manages the encryption key<br>
+→ AWS rotates the encryption key<br>
+→ You have ZERO visibility into key usage<br>
+→ You CANNOT audit who decrypted what<br>
+→ You CANNOT restrict decryption separately from S3 access<br>
+→ You CANNOT disable or revoke the key<br>
+→ For basic protection — sufficient<br>
+→ For compliance, governance, auditing — insufficient</p>
+<p><strong>SSE-KMS (What this project introduces):</strong><br>
+→ YOU create the encryption key (or AWS creates one you control)<br>
+→ YOU define who can use the key (key policy)<br>
+→ YOU define who can manage the key (key administrators)<br>
+→ Every key usage is logged in CloudTrail automatically<br>
+→ You CAN rotate the key automatically<br>
+→ You CAN disable or schedule deletion of the key<br>
+→ You CAN grant/revoke access independently from the data service</p>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Understand KMS key hierarchy and types</li>
+<li>Step 2 — Create a Customer Managed Key (CMK) for S3</li>
+<li>Step 3 — Create a Customer Managed Key for RDS</li>
+<li>Step 4 — Create a Customer Managed Key for Redshift</li>
+<li>Step 5 — Apply KMS encryption to S3 buckets</li>
+<li>Step 6 — Handle the RDS encryption problem (cannot encrypt existing unencrypted instance)</li>
+<li>Step 7 — Handle the Redshift encryption migration</li>
+<li>Step 8 — Configure key rotation</li>
+<li>Step 9 — Verify audit trail in CloudTrail</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND KMS KEY HIERARCHY AND TYPES</h3>
+<p>→ Before creating anything — understand what KMS actually manages</p>
+<p><strong>The Encryption Hierarchy:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌──────────────────────┐
+</span>                    │   KMS Master Key     │
+                    │   (CMK / KMS Key)    │
+                    │   Never leaves KMS   │
+                    └──────────┬───────────┘
+                               │
+                    Generates / Encrypts
+                               │
+                    ┌──────────▼───────────┐
+                    │   Data Encryption    │
+                    │   Key (DEK)          │
+                    │   Used to encrypt    │
+                    │   your actual data   │
+                    └──────────┬───────────┘
+                               │
+                    Encrypts
+                               │
+                    ┌──────────▼───────────┐
+                    │   Your Data          │
+                    │   (S3 object, RDS    │
+                    │   volume, Redshift   │
+                    │   block)             │
+                    └──────────────────────┘</code></pre></div>
+<p><strong>This is called "Envelope Encryption":</strong><br>
+→ The KMS Master Key encrypts the Data Encryption Key (DEK)<br>
+→ The DEK encrypts the actual data<br>
+→ The encrypted DEK is stored alongside the encrypted data<br>
+→ The KMS Master Key NEVER leaves KMS — it never touches your data directly<br>
+→ To decrypt: KMS decrypts the DEK → DEK decrypts the data</p>
+<p><strong>Why envelope encryption?</strong><br>
+→ KMS has API rate limits (typically 5,500–30,000 requests/second depending on key type and region)<br>
+→ If KMS encrypted every byte directly — it would be a bottleneck<br>
+→ Instead — KMS only encrypts/decrypts the small DEK<br>
+→ The DEK handles the bulk encryption locally (in S3, RDS, Redshift infrastructure)<br>
+→ This combines KMS security with high throughput</p>
+<hr>
+<p><strong>Three Types of KMS Keys:</strong></p>
+<table><thead><tr><th>Key Type</th><th>Who Creates</th><th>Who Manages</th><th>Who Pays</th><th>Audit Trail</th><th>Key Policy Control</th><th>Rotation Control</th></tr></thead><tbody><tr><td><strong>AWS Owned Keys</strong></td><td>AWS</td><td>AWS</td><td>Free</td><td>❌ No</td><td>❌ No</td><td>AWS decides</td></tr><tr><td><strong>AWS Managed Keys</strong></td><td>AWS (auto-created per service)</td><td>AWS</td><td>Free (but usage charges may apply)</td><td>✅ Yes (CloudTrail)</td><td>❌ No (cannot modify policy)</td><td>Auto every year (mandatory)</td></tr><tr><td><strong>Customer Managed Keys</strong></td><td>You</td><td>You</td><td>$1/month per key + $0.03 per 10,000 API calls</td><td>✅ Yes (CloudTrail)</td><td>✅ Full control</td><td>You configure (optional auto-rotate)</td></tr></tbody></table>
+<p><strong>What the auditor requires → Customer Managed Keys (CMKs)</strong><br>
+→ Full control over key policy<br>
+→ Full audit trail<br>
+→ Ability to disable/revoke<br>
+→ Configurable rotation<br>
+→ Separation of duties (key admin ≠ key user)</p>
+<hr>
+<p><strong>AWS Managed Key Naming Convention:</strong><br>
+→ When a service like S3 or RDS first uses KMS, AWS auto-creates an AWS Managed Key<br>
+→ These appear as <code>aws/s3</code>, <code>aws/rds</code>, <code>aws/redshift</code> in the KMS console<br>
+→ You CANNOT modify their key policy<br>
+→ You CANNOT disable them<br>
+→ You CANNOT delete them<br>
+→ They exist per service per region per account<br>
+→ The auditor considers these INSUFFICIENT because you cannot control access granularity</p>
+<hr>
+<h3>STEP 2 — CREATE A CUSTOMER MANAGED KEY FOR S3</h3>
+<p>→ Navigate to AWS KMS Console → "Customer managed keys" → "Create key"</p>
+<p><strong>Configuration Page 1 — Key Type:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Key type</td><td>Symmetric</td><td>Single key for both encrypt and decrypt — required for S3/RDS/Redshift</td></tr><tr><td>Key usage</td><td>Encrypt and decrypt</td><td>Standard usage for data encryption</td></tr><tr><td>Advanced options — Key material origin</td><td>KMS</td><td>KMS generates the key material (safest option)</td></tr><tr><td>Advanced options — Regionality</td><td>Single-Region key</td><td>Key exists in one region only</td></tr></tbody></table>
+<p><strong>Understanding Symmetric vs Asymmetric:</strong></p>
+<table><thead><tr><th>Type</th><th>Use Case</th><th>AWS Service Encryption Support</th></tr></thead><tbody><tr><td>Symmetric</td><td>Data encryption at rest (S3, RDS, EBS, Redshift)</td><td>✅ Required by all AWS services for encryption at rest</td></tr><tr><td>Asymmetric (RSA/ECC)</td><td>Digital signatures, encryption where parties don't share secrets</td><td>❌ NOT supported for S3/RDS/Redshift encryption</td></tr></tbody></table>
+<p>→ For this entire project → Always use Symmetric keys<br>
+→ AWS services that integrate with KMS for encryption at rest ONLY support symmetric keys</p>
+<hr>
+<p><strong>Configuration Page 2 — Labels:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Alias</td><td><code>shopnow-s3-datalake-key</code></td></tr><tr><td>Description</td><td><code>Customer managed key for S3 data lake bucket encryption — SOC2 compliance</code></td></tr><tr><td>Tags — Key: <code>Environment</code></td><td>Value: <code>Production</code></td></tr><tr><td>Tags — Key: <code>Service</code></td><td>Value: <code>S3</code></td></tr><tr><td>Tags — Key: <code>Compliance</code></td><td>Value: <code>SOC2</code></td></tr><tr><td>Tags — Key: <code>ManagedBy</code></td><td>Value: <code>SecurityTeam</code></td></tr></tbody></table>
+<p>→ Alias is a friendly name — the actual key has a UUID like <code>arn:aws:kms:ap-south-1:123456789012:key/abc123-def456-ghi789</code><br>
+→ Alias creates an additional ARN: <code>arn:aws:kms:ap-south-1:123456789012:alias/shopnow-s3-datalake-key</code><br>
+→ Both ARNs can be used to reference the key — alias is human-readable</p>
+<hr>
+<p><strong>Configuration Page 3 — Key Administrators:</strong></p>
+<p>→ Key administrators can MANAGE the key but CANNOT USE it for encryption/decryption</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Key administrators</td><td>IAM Role: <code>SecurityTeamAdminRole</code></td></tr><tr><td></td><td>IAM User: <code>security-admin-david</code> (the auditor's account)</td></tr><tr><td>Allow key administrators to delete this key</td><td>✅ Checked (but with safeguards)</td></tr></tbody></table>
+<p><strong>What key administrators CAN do:</strong><br>
+→ Enable/disable the key<br>
+→ Modify the key policy<br>
+→ Schedule key deletion<br>
+→ Create/update/delete key aliases<br>
+→ View key metadata and tags</p>
+<p><strong>What key administrators CANNOT do (with proper separation):</strong><br>
+→ Encrypt data with this key<br>
+→ Decrypt data with this key<br>
+→ Generate data keys<br>
+→ This is the "separation of duties" the auditor demands</p>
+<hr>
+<p><strong>Configuration Page 4 — Key Users:</strong></p>
+<p>→ Key users can USE the key for encryption/decryption but CANNOT manage it</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>IAM Role: <code>GlueETLRole</code></td><td>✅ Selected</td><td>Glue jobs need to write encrypted Parquet to S3 (Project 21, 24)</td></tr><tr><td>IAM Role: <code>AthenaQueryRole</code></td><td>✅ Selected</td><td>Athena needs to read encrypted objects from S3 (Project 18, 25)</td></tr><tr><td>IAM Role: <code>EC2AppRole</code></td><td>✅ Selected</td><td>EC2 application uploads files to S3 (Project 11)</td></tr><tr><td>IAM Role: <code>LambdaProcessorRole</code></td><td>✅ Selected</td><td>Lambda functions reading/writing S3 (Project 26, 34)</td></tr><tr><td>IAM Role: <code>RedshiftCopyRole</code></td><td>✅ Selected</td><td>Redshift COPY/UNLOAD needs to read/write encrypted S3 (Project 22, 23)</td></tr></tbody></table>
+<p><strong>What key users CAN do:</strong><br>
+→ <code>kms:Encrypt</code> — encrypt data with this key<br>
+→ <code>kms:Decrypt</code> — decrypt data encrypted with this key<br>
+→ <code>kms:GenerateDataKey</code> — request a data encryption key (for envelope encryption)<br>
+→ <code>kms:Generate[REDACTED:AWS_ACCESS_KEY]ext</code> — for deferred decryption patterns<br>
+→ <code>kms:DescribeKey</code> — view key metadata<br>
+→ <code>kms:ReEncryptFrom</code> / <code>kms:ReEncryptTo</code> — re-encrypt data under a different key</p>
+<p><strong>What key users CANNOT do:</strong><br>
+→ Disable or delete the key<br>
+→ Modify the key policy<br>
+→ Manage aliases</p>
+<p>→ Click "Finish" → Key is created</p>
+<hr>
+<p><strong>Understanding the Key Policy (What was auto-generated):</strong></p>
+<p>→ Navigate to the created key → "Key policy" tab<br>
+→ The key policy is a JSON document — similar to IAM policies but ATTACHED TO THE KEY, not to a user/role</p>
+<p><strong>Key Policy Structure (Conceptual — Settings view):</strong></p>
+<table><thead><tr><th>Statement</th><th>Principal</th><th>Actions</th><th>Purpose</th></tr></thead><tbody><tr><td>Enable IAM User Permissions</td><td><code>arn:aws:iam::123456789012:root</code></td><td><code>kms:*</code></td><td>Allows the account root to manage this key — SAFETY NET</td></tr><tr><td>Key Administrators</td><td><code>SecurityTeamAdminRole</code>, <code>security-admin-david</code></td><td><code>kms:Create*</code>, <code>kms:Describe*</code>, <code>kms:Enable*</code>, <code>kms:List*</code>, <code>kms:Put*</code>, <code>kms:Update*</code>, <code>kms:Revoke*</code>, <code>kms:Disable*</code>, <code>kms:Get*</code>, <code>kms:Delete*</code>, <code>kms:TagResource</code>, <code>kms:UntagResource</code>, <code>kms:ScheduleKeyDeletion</code>, <code>kms:CancelKeyDeletion</code></td><td>Manage the key lifecycle</td></tr><tr><td>Key Users</td><td><code>GlueETLRole</code>, <code>AthenaQueryRole</code>, <code>EC2AppRole</code>, etc.</td><td><code>kms:Encrypt</code>, <code>kms:Decrypt</code>, <code>kms:ReEncrypt*</code>, <code>kms:GenerateDataKey*</code>, <code>kms:DescribeKey</code></td><td>Use the key for data encryption/decryption</td></tr><tr><td>Grant Permissions</td><td>Same Key Users</td><td><code>kms:CreateGrant</code>, <code>kms:ListGrants</code>, <code>kms:RevokeGrant</code></td><td>Allow AWS services to use the key on behalf of the user (explained below)</td></tr></tbody></table>
+<p><strong>CRITICAL: The Root Account Statement</strong><br>
+→ The first statement grants <code>kms:*</code> to <code>arn:aws:iam::123456789012:root</code><br>
+→ This does NOT mean the root user can bypass everything<br>
+→ It means: IAM policies in this account CAN grant KMS permissions for this key<br>
+→ Without this statement → Even IAM Admin cannot grant anyone access to this key<br>
+→ This is the SAFETY NET — if you lock yourself out of the key policy, IAM can still recover access<br>
+→ NEVER remove this statement — you risk permanent key lockout</p>
+<p><strong>CRITICAL: KMS Grants</strong><br>
+→ The "Grant Permissions" statement allows key users to create KMS Grants<br>
+→ Grants are temporary, scoped permissions that AWS services create automatically<br>
+→ Example: When S3 needs to encrypt an object, it creates a grant to use the key for that specific operation<br>
+→ Grants are how AWS services interact with KMS without you manually invoking KMS APIs<br>
+→ Without grant permissions → S3, RDS, Redshift CANNOT use the key even if listed as key users</p>
+<hr>
+<h3>STEP 3 — CREATE A CUSTOMER MANAGED KEY FOR RDS</h3>
+<p>→ Navigate to KMS → Create key → Same process as Step 2</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Key type</td><td>Symmetric</td></tr><tr><td>Key usage</td><td>Encrypt and decrypt</td></tr><tr><td>Alias</td><td><code>shopnow-rds-mariadb-key</code></td></tr><tr><td>Description</td><td><code>Customer managed key for RDS MariaDB encryption at rest</code></td></tr><tr><td>Tag — Service</td><td><code>RDS</code></td></tr><tr><td>Key Administrators</td><td><code>SecurityTeamAdminRole</code></td></tr><tr><td>Key Users</td><td><code>RDSServiceRole</code> (the role RDS uses internally)</td></tr></tbody></table>
+<p><strong>Special Consideration for RDS Key Users:</strong><br>
+→ RDS encrypts/decrypts data ON YOUR BEHALF<br>
+→ The RDS service itself needs to call KMS<br>
+→ You must grant usage to the RDS service principal<br>
+→ When you select the key during RDS instance creation, RDS automatically creates a Grant<br>
+→ This grant allows the RDS service to use the key for the lifecycle of the instance<br>
+→ The grant is tied to the specific RDS instance — if instance is deleted, grant is revoked</p>
+<p><strong>Additional Key Users to Consider:</strong></p>
+<table><thead><tr><th>Role</th><th>Why</th></tr></thead><tbody><tr><td><code>GlueETLRole</code></td><td>If Glue connects to this encrypted RDS via JDBC (Project 24), Glue needs <code>kms:Decrypt</code> to read</td></tr><tr><td><code>LambdaConnectorRole</code></td><td>If Athena federated query connector (Project 35) connects to encrypted RDS</td></tr><tr><td><code>DMSReplicationRole</code></td><td>If DMS migrates data from/to this encrypted RDS (Project 58)</td></tr></tbody></table>
+<p>→ These can be added later as needed — key policy is editable</p>
+<hr>
+<h3>STEP 4 — CREATE A CUSTOMER MANAGED KEY FOR REDSHIFT</h3>
+<p>→ Navigate to KMS → Create key → Same process</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Key type</td><td>Symmetric</td></tr><tr><td>Key usage</td><td>Encrypt and decrypt</td></tr><tr><td>Alias</td><td><code>shopnow-redshift-warehouse-key</code></td></tr><tr><td>Description</td><td><code>Customer managed key for Redshift cluster encryption at rest</code></td></tr><tr><td>Tag — Service</td><td><code>Redshift</code></td></tr><tr><td>Key Administrators</td><td><code>SecurityTeamAdminRole</code></td></tr><tr><td>Key Users</td><td>Redshift service role, <code>GlueETLRole</code>, <code>RedshiftCopyRole</code></td></tr></tbody></table>
+<p>→ Key created</p>
+<p><strong>Summary of Keys Created:</strong></p>
+<table><thead><tr><th>Key Alias</th><th>Purpose</th><th>Used By</th></tr></thead><tbody><tr><td><code>shopnow-s3-datalake-key</code></td><td>S3 bucket encryption</td><td>S3, Glue, Athena, Lambda, Redshift COPY/UNLOAD, EC2 app</td></tr><tr><td><code>shopnow-rds-mariadb-key</code></td><td>RDS MariaDB encryption</td><td>RDS service, Glue JDBC, Lambda connector, DMS</td></tr><tr><td><code>shopnow-redshift-warehouse-key</code></td><td>Redshift cluster encryption</td><td>Redshift service, Glue, Spectrum</td></tr></tbody></table>
+<p>→ Three separate keys for three services — this provides:</p>
+<ul>
+<li>Granular access control (S3 key users ≠ RDS key users)</li>
+<li>Independent rotation schedules</li>
+<li>Independent audit trails</li>
+<li>Ability to revoke access to one service without affecting others</li>
+</ul>
+<hr>
+<h3>STEP 5 — APPLY KMS ENCRYPTION TO S3 BUCKETS</h3>
+<p>→ Navigate to S3 → Select <code>shopnow-datalake-prod</code> bucket<br>
+→ Properties tab → Default encryption → Edit</p>
+<table><thead><tr><th>Setting</th><th>Previous Value (Project 1)</th><th>New Value</th></tr></thead><tbody><tr><td>Server-side encryption</td><td>SSE-S3</td><td>SSE-KMS</td></tr><tr><td>AWS KMS key</td><td>N/A</td><td>Choose from your AWS KMS keys → <code>shopnow-s3-datalake-key</code></td></tr><tr><td>Bucket Key</td><td>Disabled or default</td><td>✅ Enable</td></tr></tbody></table>
+<p>→ Save changes</p>
+<p><strong>What "Bucket Key" Does (Important cost optimization):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT Bucket Key:
+</span>    Every object upload → S3 calls KMS GenerateDataKey → unique DEK per object
+    1 million objects = 1 million KMS API calls
+    Cost: 1,000,000 × $0.03/10,000 = $3.00
+
+WITH Bucket Key:
+    S3 generates a bucket-level key FROM KMS → uses that to derive per-object keys locally
+    1 million objects ≈ a few KMS API calls (for the bucket key)
+    Cost: Negligible
+    Savings: Up to 99% reduction in KMS API costs</code></pre></div>
+<p>→ Bucket Key is a MUST for high-volume buckets<br>
+→ Trade-off: CloudTrail logs show the bucket-level key ARN, not individual object-level KMS calls<br>
+→ For most compliance needs — this is acceptable<br>
+→ If you need per-object KMS audit → Disable Bucket Key (very rare requirement)</p>
+<p><strong>What Happens to Existing Objects?</strong><br>
+→ Changing default encryption does NOT re-encrypt existing objects<br>
+→ Existing objects remain encrypted with SSE-S3<br>
+→ Only NEW objects uploaded after the change use SSE-KMS<br>
+→ To re-encrypt existing objects → Use S3 Batch Operations or copy objects in place</p>
+<p><strong>Re-encrypting Existing Objects:</strong><br>
+→ Navigate to S3 → Management tab → "Create Batch Operations job"<br>
+→ Or use the simpler approach:</p>
+<ul>
+<li>S3 → Select objects → Actions → "Copy" → Copy to same bucket/same key</li>
+<li>Under encryption → Select SSE-KMS with your key</li>
+<li>This creates a new version (if versioning enabled from Project 12) encrypted with KMS</li>
+</ul>
+<p>→ Repeat for all buckets that need KMS encryption</p>
+<hr>
+<h3>STEP 6 — HANDLE THE RDS ENCRYPTION PROBLEM</h3>
+<p>→ This is the most painful finding — and a critical lesson</p>
+<p><strong>THE HARD TRUTH:</strong><br>
+→ You CANNOT enable encryption on an existing unencrypted RDS instance<br>
+→ There is NO "toggle encryption ON" button<br>
+→ This is an AWS architectural limitation — encryption is set at volume creation time<br>
+→ The underlying EBS volumes were created without encryption — they cannot be retroactively encrypted</p>
+<p><strong>THE SOLUTION — Migrate to an Encrypted Instance:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Unencrypted RDS Instance
+</span>        ↓
+Create Snapshot (unencrypted)
+        ↓
+Copy Snapshot → Enable Encryption → Select KMS Key
+        ↓
+Encrypted Snapshot Created
+        ↓
+Restore Snapshot to NEW RDS Instance (encrypted)
+        ↓
+New Encrypted RDS Instance Running
+        ↓
+Update application connection strings
+        ↓
+Verify everything works
+        ↓
+Delete old unencrypted instance</code></pre></div>
+<p><strong>Step-by-Step:</strong></p>
+<p><strong>6a — Create Snapshot of Current Unencrypted Instance</strong><br>
+→ Navigate to RDS → Select <code>shopnow-mariadb-prod</code><br>
+→ Actions → "Take snapshot"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Snapshot name</td><td><code>shopnow-mariadb-pre-encryption-snapshot</code></td></tr></tbody></table>
+<p>→ Wait for snapshot status: "Available" (may take minutes depending on database size)</p>
+<p><strong>6b — Copy Snapshot with Encryption</strong><br>
+→ Navigate to RDS → Snapshots → Select the snapshot<br>
+→ Actions → "Copy snapshot"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>New DB snapshot identifier</td><td><code>shopnow-mariadb-encrypted-snapshot</code></td></tr><tr><td>Destination Region</td><td>Same region (or different for DR — Project 55)</td></tr><tr><td>Enable Encryption</td><td>✅ Yes</td></tr><tr><td>AWS KMS Key</td><td>Select <code>shopnow-rds-mariadb-key</code></td></tr></tbody></table>
+<p>→ Wait for copy to complete — this creates an ENCRYPTED copy of the snapshot</p>
+<p><strong>6c — Restore Encrypted Snapshot to New Instance</strong><br>
+→ Select <code>shopnow-mariadb-encrypted-snapshot</code><br>
+→ Actions → "Restore snapshot"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>DB instance identifier</td><td><code>shopnow-mariadb-prod-encrypted</code></td></tr><tr><td>DB instance class</td><td>Same as original (e.g., <code>db.r5.large</code>) — Project 9 settings</td></tr><tr><td>Storage type</td><td>Same as original</td></tr><tr><td>VPC</td><td>Same VPC (Project 5)</td></tr><tr><td>Subnet group</td><td>Same subnet group (Project 9)</td></tr><tr><td>Security groups</td><td>Same security groups (Project 4, 14)</td></tr><tr><td>Parameter group</td><td>Same parameter group as original</td></tr><tr><td>Option group</td><td>Same option group</td></tr></tbody></table>
+<p>→ The new instance is ENCRYPTED with your Customer Managed Key<br>
+→ Wait for instance to become "Available"</p>
+<p><strong>6d — Update Application Connections</strong><br>
+→ The new instance has a NEW endpoint: <code>shopnow-mariadb-prod-encrypted.abc123.ap-south-1.rds.amazonaws.com</code><br>
+→ Update all connection strings:</p>
+<table><thead><tr><th>Component</th><th>What to Update</th><th>Reference Project</th></tr></thead><tbody><tr><td>EC2 application</td><td>Database connection string</td><td>Project 14</td></tr><tr><td>Glue JDBC Connection</td><td>Connection URL</td><td>Project 24</td></tr><tr><td>Athena federated connector</td><td>Secrets Manager secret (host field)</td><td>Project 35</td></tr><tr><td>Secrets Manager secret</td><td>Update the host value</td><td>Project 37</td></tr></tbody></table>
+<p>→ If using Secrets Manager (Project 37) → Update the secret with new endpoint → All consumers automatically get new endpoint on next credential fetch</p>
+<p><strong>6e — Verify and Cleanup</strong><br>
+→ Test all applications against new encrypted instance<br>
+→ Verify Read Replica recreation if needed (Project 29 — replicas cannot be copied, must be recreated from encrypted instance)<br>
+→ Once verified → Delete old unencrypted instance<br>
+→ Delete old unencrypted snapshot (keep encrypted snapshot as backup)</p>
+<p><strong>DOWNTIME CONSIDERATION:</strong><br>
+→ During the cutover (changing endpoint), there IS a brief downtime<br>
+→ To minimize: Use Route 53 CNAME or application-level configuration management<br>
+→ For zero-downtime: Use DMS (Project 58 concepts) for continuous replication from old to new, then cutover</p>
+<hr>
+<h3>STEP 7 — HANDLE THE REDSHIFT ENCRYPTION MIGRATION</h3>
+<p>→ Redshift has a BETTER story than RDS — encryption CAN be enabled on existing clusters</p>
+<p><strong>Two Options:</strong></p>
+<p><strong>Option A — Modify Existing Cluster (Preferred for Redshift)</strong><br>
+→ Navigate to Redshift Console → Select cluster → Actions → "Modify"</p>
+<table><thead><tr><th>Setting</th><th>Previous Value</th><th>New Value</th></tr></thead><tbody><tr><td>Encryption</td><td>Disabled</td><td>Enable</td></tr><tr><td>KMS Key</td><td>N/A</td><td><code>shopnow-redshift-warehouse-key</code></td></tr></tbody></table>
+<p>→ Click "Modify cluster"</p>
+<p><strong>What Happens Internally:</strong><br>
+→ Redshift performs an online encryption migration<br>
+→ The cluster remains available during the migration<br>
+→ Behind the scenes:</p>
+<ul>
+<li>Redshift creates a new encrypted cluster</li>
+<li>Migrates all data from old to new</li>
+<li>Swaps the endpoint to the new cluster</li>
+<li>Deletes the old unencrypted cluster<br>
+→ The endpoint DOES NOT change — applications are unaffected<br>
+→ Duration depends on data volume — can take hours for large clusters<br>
+→ Cluster status shows "resizing" during migration</li>
+</ul>
+<p><strong>Option B — Snapshot and Restore (If Option A fails or for cross-region)</strong><br>
+→ Similar to RDS approach:</p>
+<ul>
+<li>Create snapshot → Copy with encryption → Restore</li>
+<li>But this creates a NEW endpoint (unlike Option A)</li>
+</ul>
+<p>→ Option A is preferred because it preserves the endpoint</p>
+<hr>
+<h3>STEP 8 — CONFIGURE KEY ROTATION</h3>
+<p>→ Navigate to KMS → Select each key → "Key rotation" tab</p>
+<p><strong>For Customer Managed Keys:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Automatic key rotation</td><td>✅ Enable</td></tr><tr><td>Rotation period</td><td>Every 365 days (only option for automatic rotation)</td></tr></tbody></table>
+<p><strong>What Rotation Actually Does:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Year 1: KMS Key has backing key version 1 (BK-1)
+</span>         All new data encrypted with BK-1
+         
+Year 2: Rotation creates backing key version 2 (BK-2)
+         New data encrypted with BK-2
+         Old data still encrypted with BK-1
+         The KMS Key ARN/Alias does NOT change
+         KMS automatically knows which backing key to use for decryption
+         
+Year 3: BK-3 created → new data uses BK-3
+         BK-1 and BK-2 data still decryptable
+         Old backing keys are NEVER deleted (as long as key exists)</code></pre></div>
+<p>→ This is TRANSPARENT rotation — no re-encryption needed<br>
+→ The key ID/ARN remains the same<br>
+→ Applications need ZERO changes<br>
+→ Old data remains accessible — KMS tracks which backing key encrypted which data<br>
+→ Cost: No additional charge for rotated backing keys</p>
+<p><strong>Why the Auditor Cares:</strong><br>
+→ If a backing key is ever compromised, new data uses a new backing key<br>
+→ Rotation limits the blast radius of key compromise<br>
+→ Compliance frameworks (SOC2, PCI-DSS, HIPAA) require key rotation policies</p>
+<hr>
+<h3>STEP 9 — VERIFY AUDIT TRAIL IN CLOUDTRAIL</h3>
+<p>→ Navigate to CloudTrail → Event history</p>
+<p><strong>Every KMS API call is logged:</strong></p>
+<table><thead><tr><th>Event Name</th><th>What It Means</th><th>When It Happens</th></tr></thead><tbody><tr><td><code>GenerateDataKey</code></td><td>A service requested a new data encryption key</td><td>S3 object upload, RDS write operation</td></tr><tr><td><code>Decrypt</code></td><td>A service decrypted a data encryption key</td><td>S3 object download, RDS read operation</td></tr><tr><td><code>Encrypt</code></td><td>Direct encryption call</td><td>Less common for service integrations</td></tr><tr><td><code>CreateGrant</code></td><td>A service created temporary access grant</td><td>RDS instance startup, Redshift startup</td></tr><tr><td><code>RetireGrant</code></td><td>A grant was retired</td><td>Service no longer needs the key</td></tr><tr><td><code>DescribeKey</code></td><td>Key metadata was queried</td><td>Service validating key exists</td></tr><tr><td><code>EnableKeyRotation</code></td><td>Rotation was enabled</td><td>Admin action</td></tr><tr><td><code>DisableKey</code></td><td>Key was disabled</td><td>Emergency revocation</td></tr><tr><td><code>ScheduleKeyDeletion</code></td><td>Key deletion was scheduled</td><td>Decommissioning</td></tr></tbody></table>
+<p><strong>Filtering CloudTrail for KMS Events:</strong></p>
+<table><thead><tr><th>Filter</th><th>Value</th></tr></thead><tbody><tr><td>Event source</td><td><code>kms.amazonaws.com</code></td></tr><tr><td>Resource type</td><td><code>AWS::KMS::Key</code></td></tr><tr><td>Resource name</td><td>Key ARN or alias</td></tr><tr><td>Time range</td><td>Last 7 days</td></tr></tbody></table>
+<p>→ Each event shows:</p>
+<ul>
+<li>WHO made the call (IAM principal ARN)</li>
+<li>WHEN (timestamp)</li>
+<li>WHICH key (key ARN)</li>
+<li>FROM WHERE (source IP, user agent)</li>
+<li>SUCCESS or FAILURE</li>
+</ul>
+<p>→ This is the audit trail the compliance auditor requires<br>
+→ SSE-S3 does NOT generate these events — only SSE-KMS does<br>
+→ This is the primary reason for migrating from SSE-S3 to SSE-KMS</p>
+<hr>
+<h3>STEP 10 — CONFIGURE CLOUDTRAIL FOR COMPLETE KMS LOGGING</h3>
+<p>→ If not already configured — ensure CloudTrail has a trail capturing KMS events</p>
+<p>→ Navigate to CloudTrail → Trails → Create trail or Edit existing trail</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trail name</td><td><code>shopnow-security-audit-trail</code></td></tr><tr><td>Storage location</td><td>Dedicated S3 bucket: <code>shopnow-cloudtrail-logs-prod</code></td></tr><tr><td>Log file SSE-KMS encryption</td><td>✅ Enable — use a SEPARATE KMS key for CloudTrail itself</td></tr><tr><td>CloudTrail KMS Key</td><td>Create new: <code>shopnow-cloudtrail-key</code></td></tr><tr><td>Management events</td><td>Read + Write</td></tr><tr><td>Data events — S3</td><td>All current and future S3 buckets (Read + Write)</td></tr><tr><td>Data events — KMS</td><td>Not a separate toggle — KMS management events are captured by default</td></tr></tbody></table>
+<p><strong>CRITICAL: Encrypt CloudTrail logs with KMS</strong><br>
+→ CloudTrail logs contain sensitive information (who accessed what)<br>
+→ These logs should themselves be encrypted with a Customer Managed Key<br>
+→ Use a SEPARATE key from the data keys — so that data key administrators cannot tamper with audit logs<br>
+→ Key administrators for the CloudTrail key should ONLY be the security team</p>
+<p><strong>Key Separation Architecture:</strong></p>
+<table><thead><tr><th>KMS Key</th><th>Used For</th><th>Key Administrators</th><th>Key Users</th></tr></thead><tbody><tr><td><code>shopnow-s3-datalake-key</code></td><td>S3 data lake objects</td><td>Security Team</td><td>Glue, Athena, Lambda, EC2, Redshift</td></tr><tr><td><code>shopnow-rds-mariadb-key</code></td><td>RDS MariaDB volumes</td><td>Security Team</td><td>RDS service, Glue JDBC, Lambda connector</td></tr><tr><td><code>shopnow-redshift-warehouse-key</code></td><td>Redshift cluster</td><td>Security Team</td><td>Redshift service, Glue</td></tr><tr><td><code>shopnow-cloudtrail-key</code></td><td>CloudTrail audit logs</td><td>Security Team ONLY</td><td>CloudTrail service ONLY</td></tr></tbody></table>
+<p>→ This separation ensures:</p>
+<ul>
+<li>A compromised Glue role cannot read audit logs</li>
+<li>A compromised EC2 role cannot decrypt database volumes</li>
+<li>Only the security team can manage all keys</li>
+<li>Each service has minimum necessary encryption access</li>
+</ul>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use Customer Managed Keys (CMK) for compliance-sensitive workloads<br>
+→ Always separate key administrators from key users — enforce least privilege<br>
+→ Always enable automatic key rotation on every Customer Managed Key<br>
+→ Always enable S3 Bucket Key when using SSE-KMS — reduces cost by up to 99%<br>
+→ Always keep the root account statement in key policies — prevents lockout<br>
+→ Always use separate KMS keys per service category (S3, RDS, Redshift, CloudTrail)<br>
+→ Always verify that service IAM roles have both IAM permissions AND key policy permissions<br>
+→ Always tag KMS keys with service, environment, compliance framework<br>
+→ Always test encryption by uploading a test object and verifying you can read it back<br>
+→ Always update Secrets Manager secrets when migrating to encrypted RDS instances (new endpoint)<br>
+→ Always check that Glue, Athena, Lambda roles have <code>kms:Decrypt</code> and <code>kms:GenerateDataKey</code> on the S3 KMS key<br>
+→ Always verify CloudTrail is capturing KMS events — this IS the audit trail</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never remove the root account statement from key policy — you risk permanent key lockout<br>
+→ Never use the same KMS key for data encryption AND audit log encryption — defeats audit integrity<br>
+→ Never grant <code>kms:*</code> to application roles — only grant specific actions (<code>Encrypt</code>, <code>Decrypt</code>, <code>GenerateDataKey</code>)<br>
+→ Never assume changing S3 default encryption re-encrypts existing objects — it only affects NEW objects<br>
+→ Never attempt to enable encryption on existing unencrypted RDS — it is architecturally impossible<br>
+→ Never forget to re-create Read Replicas after encrypting the primary RDS (replicas must be recreated)<br>
+→ Never delete a KMS key that still has encrypted data — all data becomes PERMANENTLY unreadable<br>
+→ Never schedule key deletion with the minimum 7-day waiting period without thorough impact analysis<br>
+→ Never hardcode KMS key ARNs in application code — use aliases or parameter store references<br>
+→ Never create one key per object or per table — this creates key management explosion<br>
+→ Never disable a key "temporarily" without communicating to all teams — it instantly breaks all services using it<br>
+→ Never skip Bucket Key for high-volume S3 buckets — KMS API costs can become significant</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Encryption Option</th><th>When to Use</th></tr></thead><tbody><tr><td>SSE-S3</td><td>Non-compliance workloads, internal tools, dev/test environments where audit trail is unnecessary</td></tr><tr><td>SSE-KMS with AWS Managed Key (<code>aws/s3</code>)</td><td>Need CloudTrail audit trail but don't need custom key policy or cross-account access</td></tr><tr><td>SSE-KMS with Customer Managed Key</td><td>Compliance workloads (SOC2, HIPAA, PCI-DSS), cross-account access control, key rotation requirement, separation of duties</td></tr><tr><td>DSSE-KMS (Dual-layer)</td><td>Ultra-sensitive workloads requiring two layers of encryption — very rare, specific compliance requirements</td></tr><tr><td>Client-side encryption</td><td>When you don't trust AWS to handle encryption at all — you encrypt before uploading — AWS never sees plaintext</td></tr></tbody></table>
+<table><thead><tr><th>RDS Encryption Decision</th><th>Guidance</th></tr></thead><tbody><tr><td>New production instance</td><td>ALWAYS enable encryption at creation time with CMK</td></tr><tr><td>Existing unencrypted instance</td><td>Snapshot → Copy with encryption → Restore → Migrate</td></tr><tr><td>Dev/test instance</td><td>AWS Managed Key (<code>aws/rds</code>) is sufficient</td></tr><tr><td>Cross-account snapshot sharing</td><td>MUST use Customer Managed Key (AWS Managed Keys cannot be shared cross-account)</td></tr></tbody></table>
+<table><thead><tr><th>Redshift Encryption Decision</th><th>Guidance</th></tr></thead><tbody><tr><td>New cluster</td><td>Enable encryption at creation with CMK</td></tr><tr><td>Existing unencrypted cluster</td><td>Modify cluster to enable encryption (online migration)</td></tr><tr><td>Redshift Serverless (Project 53)</td><td>Encryption is mandatory and always enabled</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Customer Managed Keys for throwaway dev/test environments — $1/month per key adds up with 50 test keys<br>
+→ Do NOT use KMS for client-side encryption of data that never touches AWS — use local HSM or vault<br>
+→ Do NOT use separate KMS keys per individual table or object — use per-service or per-classification-level<br>
+→ Do NOT use KMS for encrypting data in transit — that's TLS/SSL (handled by service configurations)<br>
+→ Do NOT use asymmetric KMS keys for AWS service encryption at rest — they are not supported</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — ENVELOPE ENCRYPTION FLOW (S3 Example)</h3>
+<p><strong>Encryption (Object Upload):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application uploads object to S3 bucket with SSE-KMS
+</span>        ↓
+S3 calls KMS: GenerateDataKey(KeyId = shopnow-s3-datalake-key)
+        ↓
+KMS returns TWO things:
+  1. Plaintext Data Encryption Key (DEK)
+  2. Encrypted DEK (encrypted using the CMK)
+        ↓
+S3 uses the plaintext DEK to encrypt the object data using AES-256-GCM
+        ↓
+S3 stores:
+  - Encrypted object data
+  - Encrypted DEK (as object metadata)
+        ↓
+S3 DISCARDS the plaintext DEK from memory
+        ↓
+KMS logs the GenerateDataKey call in CloudTrail</code></pre></div>
+<p><strong>Decryption (Object Download):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application requests object from S3
+</span>        ↓
+S3 reads the encrypted DEK from object metadata
+        ↓
+S3 calls KMS: Decrypt(CiphertextBlob = encrypted DEK)
+        ↓
+KMS checks:
+  1. Is the caller authorized in the key policy? → Yes/No
+  2. Is the caller authorized in IAM policy? → Yes/No
+  3. Is the key enabled? → Yes/No
+        ↓
+If all checks pass:
+  KMS returns the plaintext DEK
+        ↓
+S3 uses the plaintext DEK to decrypt the object data
+        ↓
+S3 returns decrypted data to the application
+        ↓
+S3 DISCARDS the plaintext DEK from memory
+        ↓
+KMS logs the Decrypt call in CloudTrail</code></pre></div>
+<p><strong>Key insight:</strong> The CMK NEVER leaves KMS. The CMK never touches the data. The CMK only encrypts/decrypts the DEK.</p>
+<hr>
+<h3>MECHANIC 2 — DOUBLE AUTHORIZATION MODEL</h3>
+<p>→ To use a KMS key, the caller must be authorized in BOTH:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────┐     ┌──────────────────────┐
+</span>│    KMS Key Policy     │     │    IAM Policy         │
+│  (attached to key)    │ AND │  (attached to role)   │
+│                       │     │                       │
+│  Must ALLOW the       │     │  Must ALLOW the       │
+│  caller to perform    │     │  caller to perform    │
+│  the KMS action       │     │  the KMS action       │
+└──────────────────────┘     └──────────────────────┘
+              │                          │
+              └──────────┬───────────────┘
+                         ↓
+                  BOTH must allow
+                  Either denying = DENIED</code></pre></div>
+<p><strong>Example Scenario:</strong></p>
+<table><thead><tr><th>IAM Policy</th><th>Key Policy</th><th>Result</th></tr></thead><tbody><tr><td>Allows <code>kms:Decrypt</code> on key ARN</td><td>Lists role as Key User</td><td>✅ Access Granted</td></tr><tr><td>Allows <code>kms:Decrypt</code> on key ARN</td><td>Does NOT list role</td><td>❌ Access Denied</td></tr><tr><td>Does NOT allow <code>kms:Decrypt</code></td><td>Lists role as Key User</td><td>❌ Access Denied</td></tr><tr><td>Allows <code>kms:Decrypt</code> on <code>*</code></td><td>Lists role as Key User</td><td>✅ Access Granted (but IAM <code>*</code> is bad practice)</td></tr></tbody></table>
+<p>→ This dual-check is WHY KMS provides stronger access control than SSE-S3<br>
+→ With SSE-S3 → If you have S3 GetObject permission, you automatically get decryption<br>
+→ With SSE-KMS → You need S3 GetObject permission AND KMS Decrypt permission → Two independent gates</p>
+<hr>
+<h3>MECHANIC 3 — KMS GRANT MECHANISM (How AWS Services Use Keys)</h3>
+<p>→ When RDS or Redshift starts up with a KMS-encrypted configuration:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>RDS Service starts encrypted instance
+</span>        ↓
+RDS calls KMS: CreateGrant(
+    KeyId = shopnow-rds-mariadb-key
+    GranteePrincipal = RDS internal service principal
+    Operations = [Decrypt, Encrypt, GenerateDataKey, ReEncrypt, CreateGrant, RetireGrant]
+    RetiringPrincipal = RDS internal service principal
+)
+        ↓
+KMS creates a Grant — a temporary, scoped permission
+        ↓
+RDS uses this Grant for all encryption/decryption operations
+during the instance lifecycle
+        ↓
+When instance is deleted:
+    RDS calls RetireGrant → Grant is removed</code></pre></div>
+<p>→ Grants are separate from the Key Policy<br>
+→ Grants allow services to operate without modifying the key policy<br>
+→ You can view active grants: KMS Console → Key → "Grants" tab<br>
+→ Each grant shows: Grantee, Operations allowed, Creation date</p>
+<hr>
+<h3>MECHANIC 4 — KEY STATES AND LIFECYCLE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌─────────┐
+</span>        Create Key  │ Enabled │ ← Normal operating state
+                    └────┬────┘
+                         │
+              DisableKey │
+                         ↓
+                    ┌──────────┐
+                    │ Disabled │ ← Key exists but cannot be used
+                    └────┬─────┘   All Encrypt/Decrypt calls FAIL
+                         │         Re-enable with EnableKey
+                         │
+     ScheduleKeyDeletion │ (7-30 day waiting period)
+                         ↓
+                    ┌────────────────────┐
+                    │ Pending Deletion   │ ← Waiting period
+                    └────────┬───────────┘   Can cancel with CancelKeyDeletion
+                             │               All Encrypt/Decrypt calls FAIL
+                             │
+              After waiting  │ period expires
+                             ↓
+                    ┌─────────┐
+                    │ Deleted │ ← PERMANENT and IRREVERSIBLE
+                    └─────────┘   All data encrypted with this key
+                                  is PERMANENTLY UNREADABLE</code></pre></div>
+<p><strong>CRITICAL WARNING:</strong><br>
+→ Key deletion is the MOST DANGEROUS operation in KMS<br>
+→ If you delete a key that encrypted S3 objects → Those objects become permanently unreadable<br>
+→ If you delete a key that encrypted RDS volumes → That database becomes permanently inaccessible<br>
+→ The minimum waiting period is 7 days — use the maximum 30 days for production keys<br>
+→ During the waiting period — monitor CloudTrail for any Decrypt calls using this key<br>
+→ If ANY calls appear → Cancel deletion — someone still needs this key</p>
+<hr>
+<h3>MECHANIC 5 — RDS ENCRYPTION INTERNALS</h3>
+<p><strong>How RDS Uses KMS:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>RDS Instance with KMS Encryption
+</span>        ↓
+Underlying EBS Volumes are encrypted with:
+  - A volume-specific DEK
+  - The DEK is encrypted by your KMS CMK
+        ↓
+Every I/O operation:
+  - EBS decrypts data transparently
+  - The DEK is cached in memory on the host
+  - KMS is NOT called for every read/write (that would be too slow)
+  - KMS is only called at volume mount time (instance start)
+        ↓
+RDS Snapshots:
+  - Snapshots inherit the encryption key of the source instance
+  - Encrypted instance → encrypted snapshot (automatically)
+  - You CAN copy a snapshot with a DIFFERENT KMS key (for cross-account sharing)
+        ↓
+Read Replicas:
+  - Must use the SAME KMS key as primary (same region)
+  - Cross-region replica CAN use a different KMS key (key is region-specific)</code></pre></div>
+<hr>
+<h3>MECHANIC 6 — REDSHIFT ENCRYPTION INTERNALS</h3>
+<p><strong>How Redshift Uses KMS:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift Cluster with KMS Encryption
+</span>        ↓
+Four-tier encryption hierarchy:
+  1. KMS CMK (your Customer Managed Key)
+  2. Cluster Encryption Key (CEK) — encrypted by CMK
+  3. Database Encryption Key (DEK) — encrypted by CEK
+  4. Data Blocks — encrypted by DEK using AES-256
+        ↓
+Key rotation in Redshift:
+  - When you rotate the KMS key → Redshift re-encrypts the CEK
+  - The DEK and data blocks are NOT re-encrypted (too expensive)
+  - This is transparent and does not require downtime
+        ↓
+Snapshots:
+  - Encrypted snapshots use the same KMS key
+  - Cross-region snapshot copy requires a "snapshot copy grant"
+    in the destination region with a KMS key in that region</code></pre></div>
+<hr>
+<h3>MECHANIC 7 — CROSS-SERVICE KMS PERMISSION FLOW</h3>
+<p>→ When Athena reads SSE-KMS encrypted Parquet files from S3 (combining Projects 18 and 36):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Analyst runs Athena query
+</span>        ↓
+Athena assumes the Workgroup execution role (e.g., AthenaQueryRole)
+        ↓
+AthenaQueryRole needs:
+  1. s3:GetObject on the S3 bucket (IAM policy) — from Project 18
+  2. kms:Decrypt on the S3 KMS key (IAM policy + Key Policy) — from THIS project
+        ↓
+For each Parquet file:
+  Athena calls S3 GetObject
+  S3 calls KMS Decrypt (using AthenaQueryRole's permissions)
+  KMS checks both key policy AND IAM policy
+  If authorized → DEK decrypted → Parquet file decrypted → data returned to Athena</code></pre></div>
+<p>→ If the <code>AthenaQueryRole</code> is listed as a key user in the key policy BUT the IAM policy attached to the role does NOT include <code>kms:Decrypt</code> → Access Denied<br>
+→ BOTH must align — this is the most common source of "everything was working with SSE-S3 but broke when I switched to SSE-KMS"</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Switched S3 to SSE-KMS but Glue jobs fail</td><td><code>AccessDeniedException</code> on KMS</td><td>Glue role not listed as key user AND/OR missing <code>kms:Decrypt</code>/<code>kms:GenerateDataKey</code> in IAM policy</td><td>Add Glue role to key policy as user + add KMS permissions to IAM policy</td></tr><tr><td>2</td><td>Athena queries fail after S3 encryption change</td><td><code>Access Denied</code> for encrypted objects</td><td>Athena execution role missing KMS permissions</td><td>Same fix as above for Athena role</td></tr><tr><td>3</td><td>Redshift COPY from encrypted S3 fails</td><td><code>KMS access denied</code> during COPY</td><td>Redshift IAM role (from Project 22) missing KMS Decrypt permission</td><td>Add <code>kms:Decrypt</code> to Redshift role + add to S3 key policy</td></tr><tr><td>4</td><td>Deleted KMS key thinking it was unused</td><td>Data permanently unreadable</td><td>Key was still encrypting active S3 objects or RDS volumes</td><td>ALWAYS use 30-day deletion window + monitor CloudTrail during window</td></tr><tr><td>5</td><td>Created KMS key in wrong region</td><td>Services cannot find the key</td><td>KMS keys are REGIONAL — a key in us-east-1 cannot encrypt data in ap-south-1</td><td>Create key in same region as the data/service</td></tr><tr><td>6</td><td>Removed root account statement from key policy</td><td>Permanent lockout — nobody can manage the key</td><td>Without root statement, IAM cannot grant access</td><td>Contact AWS Support — they MAY be able to help (not guaranteed)</td></tr><tr><td>7</td><td>Lambda in VPC cannot call KMS</td><td>Lambda timeout when processing encrypted S3 objects</td><td>No VPC Endpoint for KMS and no NAT Gateway</td><td>Create Interface Endpoint for <code>kms</code> (similar to Project 27, 35)</td></tr><tr><td>8</td><td>RDS Read Replica fails after primary encryption</td><td>Cannot create replica</td><td>Replica must use same KMS key (same region) — key policy may not allow RDS to create grants</td><td>Verify key policy allows grant creation</td></tr><tr><td>9</td><td>Cross-region S3 replication fails after enabling KMS</td><td>Replication shows "Failed" status</td><td>Destination bucket KMS key is in different region — source key cannot encrypt in destination</td><td>Specify destination KMS key in replication rule configuration</td></tr><tr><td>10</td><td>KMS API throttling under heavy load</td><td><code>ThrottlingException</code> from KMS</td><td>Too many GenerateDataKey/Decrypt calls exceeding key-level quota</td><td>Enable S3 Bucket Key, request quota increase, use caching</td></tr><tr><td>11</td><td>Existing S3 objects still SSE-S3 after changing default</td><td>Compliance audit finds mixed encryption</td><td>Default encryption only applies to NEW objects</td><td>Re-encrypt existing objects via S3 Batch Operations or copy-in-place</td></tr><tr><td>12</td><td>Snapshot shared cross-account but recipient cannot access</td><td><code>Access Denied</code> when restoring shared snapshot</td><td>KMS key policy does not include the recipient account</td><td>Add recipient account to key policy or use a dedicated cross-account key (Project 39 concepts)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>KMS API Request Quotas</strong></p>
+<table><thead><tr><th>Request Type</th><th>Default Quota (per second per key)</th><th>Notes</th></tr></thead><tbody><tr><td>Cryptographic operations (Encrypt, Decrypt, GenerateDataKey)</td><td>5,500 – 30,000 (varies by region and key type)</td><td>Shared across all users of the key</td></tr><tr><td>Symmetric key operations</td><td>Higher quota</td><td>Most common for AWS service encryption</td></tr><tr><td>Asymmetric key operations</td><td>Lower quota</td><td>Not used for service encryption</td></tr></tbody></table>
+<p>→ With S3 Bucket Key enabled → Quota is rarely an issue<br>
+→ Without Bucket Key + millions of objects per hour → Can hit throttling<br>
+→ Solution: Enable Bucket Key, request quota increase via AWS Support</p>
+<p>→ <strong>Key Count Scaling</strong></p>
+<ul>
+<li>No hard limit on number of Customer Managed Keys per account</li>
+<li>Soft limit: Typically 100,000 keys per account per region</li>
+<li>Cost: $1/month per key (including disabled keys awaiting deletion)</li>
+<li>Best practice: Use per-service or per-classification keys, NOT per-resource keys</li>
+<li>Example: 1 key for all S3 buckets, not 1 key per bucket</li>
+</ul>
+<p>→ <strong>Cross-Account Key Scaling (Preview for Project 39)</strong></p>
+<ul>
+<li>Customer Managed Keys CAN be shared cross-account via key policy</li>
+<li>Add the external account's root ARN to the key policy</li>
+<li>External account then grants access to specific roles via IAM</li>
+<li>AWS Managed Keys CANNOT be shared cross-account</li>
+<li>This is why compliance workloads MUST use Customer Managed Keys</li>
+</ul>
+<p>→ <strong>Multi-Region Key Scaling</strong></p>
+<ul>
+<li>KMS supports Multi-Region Keys (MRK) — replicas of a key in multiple regions</li>
+<li>Useful when data is replicated cross-region (S3 CRR from Project 30, cross-region RDS from Project 55)</li>
+<li>Multi-Region Keys have the same key material in all regions</li>
+<li>Data encrypted in Region A can be decrypted in Region B without cross-region KMS calls</li>
+</ul>
+<p>→ <strong>Encryption Performance Impact</strong></p>
+<table><thead><tr><th>Service</th><th>Performance Impact of KMS Encryption</th></tr></thead><tbody><tr><td>S3</td><td>Negligible — encryption/decryption handled at infrastructure level</td></tr><tr><td>RDS</td><td>Negligible — EBS encryption is transparent, DEK cached in memory</td></tr><tr><td>Redshift</td><td>Negligible for most workloads — slight overhead during key rotation</td></tr><tr><td>Athena</td><td>Negligible — S3 handles decryption before data reaches Athena</td></tr><tr><td>Glue</td><td>Negligible — same as S3/RDS</td></tr><tr><td>Lambda</td><td>May add 10-50ms per KMS API call if not using Bucket Key</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify encryption is properly applied:</strong></p>
+<table><thead><tr><th>Service</th><th>Verification Method</th><th>Expected Result</th></tr></thead><tbody><tr><td>S3 Bucket</td><td>Properties → Default encryption</td><td>Shows SSE-KMS with your key alias</td></tr><tr><td>S3 Object</td><td>Click object → Properties → Server-side encryption</td><td>Shows <code>aws:kms</code> with key ARN</td></tr><tr><td>RDS Instance</td><td>Configuration tab → Encryption</td><td>Shows "Encrypted" with KMS key ARN</td></tr><tr><td>RDS Snapshot</td><td>Snapshot details → Encryption</td><td>Shows "Encrypted" with KMS key ARN</td></tr><tr><td>Redshift Cluster</td><td>Properties → Database configurations → Encryption</td><td>Shows KMS with key ARN</td></tr><tr><td>CloudTrail</td><td>Event history → filter <code>kms.amazonaws.com</code></td><td>GenerateDataKey and Decrypt events visible</td></tr></tbody></table>
+<p>→ <strong>How to verify key policy is correct:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th><th>Expected</th></tr></thead><tbody><tr><td>Root statement exists</td><td>Key policy JSON → first statement</td><td><code>Principal: arn:aws:iam::ACCOUNT:root</code> with <code>kms:*</code></td></tr><tr><td>Key administrators defined</td><td>Key policy → admin statement</td><td>Only security team roles listed</td></tr><tr><td>Key users defined</td><td>Key policy → usage statement</td><td>Only required service roles listed</td></tr><tr><td>Grant permissions present</td><td>Key policy → grant statement</td><td><code>kms:CreateGrant</code>, <code>kms:ListGrants</code>, <code>kms:RevokeGrant</code> for service roles</td></tr></tbody></table>
+<p>→ <strong>How to audit key usage:</strong></p>
+<table><thead><tr><th>Audit Question</th><th>Where to Find Answer</th></tr></thead><tbody><tr><td>Who decrypted data in the last 7 days?</td><td>CloudTrail → Filter: <code>eventName = Decrypt</code>, <code>resources.ARN = key ARN</code></td></tr><tr><td>How many times was the key used today?</td><td>CloudWatch Metrics → KMS → <code>KeyUsage</code> metric (if enabled)</td></tr><tr><td>Are there failed access attempts?</td><td>CloudTrail → Filter: <code>errorCode = AccessDeniedException</code>, <code>eventSource = kms.amazonaws.com</code></td></tr><tr><td>When was the key last rotated?</td><td>KMS Console → Key → "Key rotation" tab → Last rotation date</td></tr><tr><td>Who modified the key policy?</td><td>CloudTrail → Filter: <code>eventName = PutKeyPolicy</code></td></tr><tr><td>Is key pending deletion?</td><td>KMS Console → Key → Status column → "Pending deletion"</td></tr></tbody></table>
+<p>→ <strong>How to present to the auditor:</strong></p>
+<table><thead><tr><th>Auditor Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"Is data encrypted at rest?"</td><td>Show KMS encryption on S3, RDS, Redshift configurations</td></tr><tr><td>"Who controls the encryption keys?"</td><td>Show key policy — security team as administrators, application roles as users</td></tr><tr><td>"Can you prove separation of duties?"</td><td>Show that key admins cannot encrypt/decrypt, key users cannot manage keys</td></tr><tr><td>"Is there an audit trail?"</td><td>Show CloudTrail events for KMS — every Decrypt/Encrypt logged with caller, timestamp, key</td></tr><tr><td>"Do you rotate keys?"</td><td>Show automatic rotation enabled on all keys — 365-day rotation</td></tr><tr><td>"Can you revoke access?"</td><td>Demonstrate disabling a key → all encryption/decryption immediately fails → re-enable</td></tr><tr><td>"What happens if a key is compromised?"</td><td>Disable the key → create new key → re-encrypt data → schedule old key deletion</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ KMS is the CENTRALIZED encryption backbone of AWS — it controls keys for S3, RDS, Redshift, EBS, and 50+ other services<br>
+→ The three key types (AWS Owned, AWS Managed, Customer Managed) represent increasing control and responsibility<br>
+→ Customer Managed Keys are REQUIRED for compliance — they provide key policy control, audit trail, and rotation<br>
+→ Envelope encryption is the fundamental mechanism — the CMK encrypts the DEK, the DEK encrypts the data<br>
+→ The CMK NEVER leaves KMS — this is the security guarantee<br>
+→ Authorization requires BOTH IAM policy AND key policy to allow — dual-gate security<br>
+→ You CANNOT encrypt an existing unencrypted RDS instance — you must snapshot → copy with encryption → restore<br>
+→ You CAN encrypt an existing unencrypted Redshift cluster — online migration preserves the endpoint<br>
+→ Changing S3 default encryption does NOT re-encrypt existing objects — only new objects<br>
+→ Key deletion is PERMANENT and IRREVERSIBLE — use maximum 30-day waiting period<br>
+→ Always enable Bucket Key for S3 SSE-KMS — up to 99% reduction in KMS API costs<br>
+→ Always keep separate keys for data vs audit logs — prevents tampering with evidence</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 1 introduced SSE-S3 — basic encryption without audit trail<br>
+→ Project 9 created the RDS MariaDB instance — now encrypted<br>
+→ Project 16 created the Redshift cluster — now encrypted<br>
+→ Project 22 Redshift COPY from S3 — now requires KMS Decrypt permission on S3 key<br>
+→ Project 23 Redshift UNLOAD to S3 — now requires KMS GenerateDataKey permission on S3 key<br>
+→ Project 24 Glue JDBC to MariaDB — now requires KMS permissions for encrypted RDS<br>
+→ Project 35 Athena federated query — connector Lambda now needs KMS Decrypt for encrypted RDS</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 37 (next) introduces Secrets Manager for credential management<br>
+→ Secrets Manager itself encrypts secrets using KMS keys<br>
+→ The KMS understanding from THIS project is prerequisite for understanding HOW Secrets Manager protects credentials<br>
+→ Project 37 will reference this project's key policy concepts when configuring secret encryption keys<br>
+→ Project 57 will build the complete security architecture combining KMS + CloudTrail + VPC Endpoints + Config Rules</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The auditor David is satisfied with the encryption configuration<br>
+→ But during his review, he found something else:</p>
+<blockquote>
+<p>"Your Glue ETL job has the MariaDB password in an environment variable — in plain text.<br>
+Your Lambda connector for Athena federated query has the database endpoint hardcoded.<br>
+Your EC2 application has database credentials in a config file on disk.<br>
+If ANY of these compute resources are compromised, the attacker gets database credentials immediately."</p>
+</blockquote>
+<p>→ Encryption at rest (this project) protects data ON DISK<br>
+→ But credentials in environment variables, config files, and code are a SEPARATE problem<br>
+→ Credentials need to be:</p>
+<ul>
+<li>Stored centrally and securely</li>
+<li>Fetched dynamically at runtime</li>
+<li>Rotated automatically without application changes</li>
+<li>Audited for who accessed which credential and when</li>
+</ul>
+<p>→ <strong>This is the exact problem Project 37 solves</strong><br>
+→ Project 37 introduces AWS Secrets Manager — centralized credential storage with automatic rotation<br>
+→ It will use KMS keys (from THIS project) to encrypt the secrets<br>
+→ It will integrate with RDS MariaDB (Project 9), Glue JDBC (Project 24), and Athena connector (Project 35)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 37: "The Credentials Hardcoded in Config Files — Secrets Manager for Database Credentials"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-35.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 36/60</span></div><a class="nav-btn next" href="project-37.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

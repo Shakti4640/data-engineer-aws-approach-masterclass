@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 29: THE DATABASE THAT COULDN'T AFFORD DOWNTIME — Multi-AZ RDS MariaDB wi — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 29: THE DATABASE THAT COULDN'T AFFORD DOWNTIME — Multi-AZ RDS MariaDB with Read Replica</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's RDS MariaDB instance (Project 9) is the operational backbone:</p>
+<ul>
+<li>E-commerce application reads/writes orders, customers, products, payments</li>
+<li>50,000 orders/day flow through this single database instance</li>
+<li>Peak: 500 transactions/second during flash sales</li>
+<li>Current configuration: Single-AZ deployment in <code>ap-south-1a</code></li>
+</ul>
+<p>→ <strong>Incident Report — The Tuesday Outage:</strong></p>
+<table><thead><tr><th>Timeline</th><th>Event</th><th>Impact</th></tr></thead><tbody><tr><td>14:47</td><td>Hardware failure in AZ <code>ap-south-1a</code></td><td>RDS instance unreachable</td></tr><tr><td>14:48</td><td>Application health checks fail</td><td>Load balancer returns 503 errors</td></tr><tr><td>14:49</td><td>Customer-facing website shows "Service Unavailable"</td><td>Customers cannot browse or purchase</td></tr><tr><td>14:52</td><td>On-call engineer alerted via CloudWatch Alarm (Project 8)</td><td>Investigation begins</td></tr><tr><td>14:55</td><td>Engineer confirms RDS instance is in "rebooting" state</td><td>No manual action possible — waiting for AWS</td></tr><tr><td>15:10</td><td>RDS instance recovers — comes back online</td><td>Database accessible but connections need re-establishment</td></tr><tr><td>15:15</td><td>Application reconnects — service fully restored</td><td>28 minutes of total downtime</td></tr><tr><td>15:20</td><td>Post-incident: 1,200 failed transactions, $45,000 estimated revenue loss</td><td>Customer support backlog: 300 calls</td></tr></tbody></table>
+<p>→ <strong>Problem 1: Single Point of Failure</strong></p>
+<ul>
+<li>One AZ failure = complete database outage</li>
+<li>Application has ZERO redundancy for the database tier</li>
+<li>EC2 instances span multiple AZs (Project 5) — but database is in only one</li>
+<li>The weakest link determines system availability</li>
+</ul>
+<p>→ <strong>Problem 2: No Automatic Failover</strong></p>
+<ul>
+<li>When the AZ recovered, the instance came back on its own</li>
+<li>But what if the AZ didn't recover for 4 hours? Or the EBS volume was corrupted?</li>
+<li>The engineer would need to manually restore from snapshot — 30-60 minutes</li>
+<li>During restoration — choosing a new AZ, restoring data, updating DNS, reconnecting application</li>
+<li>Manual process = human error risk + longer downtime</li>
+</ul>
+<p>→ <strong>Problem 3: Read Scaling Crisis</strong></p>
+<ul>
+<li>Despite the ban (Project 24), analysts are querying MariaDB directly again</li>
+<li>Reason: Glue extraction runs once daily at 02:00 UTC — analysts need data from 10:00 AM</li>
+<li>15 analysts running complex analytical queries during business hours</li>
+<li>These queries scan millions of rows — consuming 40% of CPU</li>
+<li>Production application response time degraded from 50ms to 300ms</li>
+<li>DBA monitoring shows:</li>
+</ul>
+<table><thead><tr><th>Metric</th><th>Normal</th><th>During Analyst Queries</th><th>Impact</th></tr></thead><tbody><tr><td>CPU Utilization</td><td>35%</td><td>75%</td><td>Application slowdown</td></tr><tr><td>Read IOPS</td><td>2,000</td><td>8,000</td><td>Disk contention</td></tr><tr><td>Active Connections</td><td>50</td><td>120</td><td>Connection pool pressure</td></tr><tr><td>Average Query Latency</td><td>5ms</td><td>45ms</td><td>User-visible degradation</td></tr></tbody></table>
+<p>→ <strong>Problem 4: Glue Extraction Impact (Revisited from Project 24)</strong></p>
+<ul>
+<li>Project 24 recommended using a Read Replica for Glue extraction</li>
+<li>But no Read Replica exists yet</li>
+<li>The nightly Glue extraction job (02:00 UTC) runs against the primary</li>
+<li>During extraction: 5 parallel JDBC connections scanning large tables</li>
+<li>CPU spikes to 60% for 35 minutes — overlapping with early morning orders from global customers</li>
+</ul>
+<p>→ <strong>Problem 5: Business Continuity Requirements</strong></p>
+<ul>
+<li>After the Tuesday outage, the board demands:
+<ul>
+<li><strong>RTO (Recovery Time Objective)</strong>: &lt; 2 minutes (time to recover)</li>
+<li><strong>RPO (Recovery Point Objective)</strong>: 0 data loss (no transactions lost)</li>
+<li><strong>Read scaling</strong>: Analysts must have a separate database endpoint</li>
+<li><strong>Extraction safety</strong>: Glue must not touch the primary database</li>
+</ul>
+</li>
+</ul>
+<p>→ The CTO says: "I need the database to survive AZ failures automatically, with zero data loss, zero manual intervention, and analyst queries must NEVER touch the production database again"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the two distinct problems and their solutions</p>
+<table><thead><tr><th>Problem</th><th>Solution</th><th>RDS Feature</th></tr></thead><tbody><tr><td>AZ failure resilience + automatic failover</td><td>Synchronous standby in another AZ</td><td><strong>Multi-AZ Deployment</strong></td></tr><tr><td>Read scaling + analyst offloading + safe extraction</td><td>Read-only copy with separate endpoint</td><td><strong>Read Replica</strong></td></tr></tbody></table>
+<p>→ These are DIFFERENT features that solve DIFFERENT problems<br>
+→ They can be used independently or together<br>
+→ ShopNow needs BOTH</p>
+<p><strong>Multi-AZ vs Read Replica — Fundamental Differences:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Multi-AZ</th><th>Read Replica</th></tr></thead><tbody><tr><td>Purpose</td><td>High availability / failover</td><td>Read scaling / offloading</td></tr><tr><td>Replication</td><td>Synchronous (zero data loss)</td><td>Asynchronous (slight lag)</td></tr><tr><td>Readable?</td><td>Standby is NOT readable</td><td>Replica IS readable</td></tr><tr><td>Endpoint</td><td>Same endpoint (DNS failover)</td><td>Separate endpoint</td></tr><tr><td>AZ placement</td><td>MUST be different AZ</td><td>Can be same AZ, different AZ, or different region</td></tr><tr><td>Failover</td><td>Automatic (60-120 seconds)</td><td>Manual promotion (minutes)</td></tr><tr><td>Number</td><td>Exactly 1 standby</td><td>Up to 15 replicas</td></tr><tr><td>Cost</td><td>~2x instance cost (standby instance)</td><td>Per-replica instance cost</td></tr><tr><td>Data loss on failover</td><td>Zero (synchronous)</td><td>Potential lag data loss (asynchronous)</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand Multi-AZ architecture and failover mechanics</li>
+<li>Step 2 — Enable Multi-AZ on existing RDS instance</li>
+<li>Step 3 — Verify Multi-AZ configuration and failover behavior</li>
+<li>Step 4 — Understand Read Replica architecture</li>
+<li>Step 5 — Create Read Replica(s)</li>
+<li>Step 6 — Configure application and analyst access patterns</li>
+<li>Step 7 — Redirect Glue extraction to Read Replica (connects to Project 24)</li>
+<li>Step 8 — Monitor replication and failover readiness</li>
+<li>Step 9 — Test failover scenarios</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND MULTI-AZ ARCHITECTURE</h3>
+<p><strong>How Multi-AZ Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                        ┌──────────────────────┐
+</span>                        │   RDS DNS ENDPOINT    │
+                        │   shopnow-prod-db.    │
+                        │   xxxxx.ap-south-1.   │
+                        │   rds.amazonaws.com   │
+                        └──────────┬───────────┘
+                                   │
+                          DNS resolves to
+                          PRIMARY instance IP
+                                   │
+              ┌────────────────────┼────────────────────┐
+              │                    │                     │
+    ┌─────────▼──────────┐        │        ┌────────────▼─────────┐
+    │   AZ: ap-south-1a   │        │        │   AZ: ap-south-1b    │
+    │                      │        │        │                      │
+    │  ┌────────────────┐ │   Synchronous   │  ┌────────────────┐ │
+    │  │  PRIMARY        │ │   Replication   │  │  STANDBY       │ │
+    │  │  (Active)       │─┼───────────────▶│  │  (Passive)     │ │
+    │  │                 │ │   Every write   │  │                │ │
+    │  │  Reads ✅       │ │   is replicated │  │  NOT readable  │ │
+    │  │  Writes ✅      │ │   before ACK    │  │  NOT writable  │ │
+    │  │                 │ │                 │  │                │ │
+    │  │  EBS Volume     │ │                 │  │  EBS Volume    │ │
+    │  │  (data)         │ │                 │  │  (exact copy)  │ │
+    │  └────────────────┘ │                 │  └────────────────┘ │
+    │                      │                 │                      │
+    └──────────────────────┘                 └──────────────────────┘</code></pre></div>
+<p><strong>Synchronous Replication — What It Means:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application sends: INSERT INTO orders VALUES (...)
+</span>       ↓
+PRIMARY receives the write
+       ↓
+PRIMARY writes to local EBS storage
+       ↓
+PRIMARY sends the write to STANDBY (synchronous)
+       ↓
+STANDBY writes to its local EBS storage
+       ↓
+STANDBY acknowledges to PRIMARY: "Write confirmed"
+       ↓
+PRIMARY acknowledges to APPLICATION: "INSERT successful"
+       ↓
+ONLY NOW does the application know the write succeeded</code></pre></div>
+<p>→ Key insight: The application does NOT get acknowledgment until BOTH copies are written<br>
+→ This guarantees: If PRIMARY fails after acknowledging → STANDBY has the data<br>
+→ RPO = 0 (zero data loss) — because no write is acknowledged unless both copies exist</p>
+<p><strong>Trade-off: Synchronous replication adds latency</strong><br>
+→ Each write must wait for standby acknowledgment<br>
+→ Typical additional latency: 2-5ms (cross-AZ network)<br>
+→ For ShopNow: 50ms average query time → 55ms with Multi-AZ → acceptable</p>
+<p><strong>Failover Process:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PRIMARY in AZ-a fails (hardware, network, or storage failure)
+</span>       ↓
+RDS detects failure (health checks every few seconds)
+       ↓
+RDS initiates automatic failover (NO human intervention)
+       ↓
+STEP 1: STANDBY in AZ-b is promoted to PRIMARY (30-60 seconds)
+  ├── Standby stops accepting replication
+  ├── Standby completes any pending writes
+  └── Standby transitions to PRIMARY role (read + write)
+       ↓
+STEP 2: DNS record updated (30-60 seconds)
+  ├── shopnow-prod-db.xxxxx.rds.amazonaws.com
+  ├── Previously resolved to: AZ-a IP (old primary)
+  └── Now resolves to: AZ-b IP (new primary = former standby)
+       ↓
+STEP 3: Application reconnects
+  ├── Application's next database call uses the DNS name
+  ├── DNS resolves to new primary IP
+  ├── Connection established to new primary
+  └── Application resumes normal operation
+       ↓
+STEP 4: RDS provisions new standby (background — minutes to hours)
+  ├── New standby created in AZ-a (or another AZ)
+  ├── Data synchronized from new primary
+  └── Multi-AZ protection restored
+       ↓
+Total failover time: 60-120 seconds
+Data loss: ZERO (synchronous replication)
+Manual intervention: NONE</code></pre></div>
+<p><strong>What triggers automatic failover:</strong></p>
+<table><thead><tr><th>Trigger</th><th>Example</th><th>Automatic?</th></tr></thead><tbody><tr><td>AZ outage</td><td>Entire AZ infrastructure failure</td><td>✅ Yes</td></tr><tr><td>Instance failure</td><td>Underlying EC2 host failure</td><td>✅ Yes</td></tr><tr><td>Storage failure</td><td>EBS volume failure</td><td>✅ Yes</td></tr><tr><td>Network failure</td><td>Loss of network connectivity to primary</td><td>✅ Yes</td></tr><tr><td>Manual reboot with failover</td><td>DBA initiates reboot with failover option</td><td>✅ Yes (intentional)</td></tr><tr><td>OS patching</td><td>Maintenance window applies patches</td><td>✅ Yes (planned)</td></tr><tr><td>Instance class modification</td><td>Changing from db.r5.large to db.r5.xlarge</td><td>✅ Yes (applied to standby first, then failover)</td></tr></tbody></table>
+<hr>
+<h3>STEP 2 — ENABLE MULTI-AZ ON EXISTING RDS INSTANCE</h3>
+<p>→ Navigate to RDS Console → Select <code>shopnow-prod-db</code> → Modify</p>
+<p><strong>Multi-AZ Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Current Value</th><th>New Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Multi-AZ deployment</td><td>No</td><td><strong>Yes</strong></td><td>Enable standby in another AZ</td></tr></tbody></table>
+<p><strong>Additional Settings to Review:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>DB Instance Class</td><td><code>db.r5.large</code></td><td>Unchanged — standby uses same class</td></tr><tr><td>Storage Type</td><td><code>gp3</code></td><td>Unchanged — standby uses same storage</td></tr><tr><td>Allocated Storage</td><td>500 GB</td><td>Unchanged — standby gets same storage</td></tr><tr><td>Backup Retention</td><td>7 days → <strong>14 days</strong></td><td>Increase for better recovery options</td></tr><tr><td>Backup Window</td><td><code>03:00-04:00 UTC</code></td><td>Keep — automated backups still needed</td></tr><tr><td>Maintenance Window</td><td><code>sun:05:00-sun:06:00 UTC</code></td><td>Keep — patches applied during this window</td></tr></tbody></table>
+<p><strong>Apply Immediately vs Next Maintenance Window:</strong></p>
+<table><thead><tr><th>Option</th><th>Behavior</th><th>Downtime</th><th>Recommendation</th></tr></thead><tbody><tr><td>Apply immediately</td><td>Conversion starts now</td><td>Brief outage during conversion (~10-30 minutes)</td><td>Use during low-traffic period</td></tr><tr><td>Next maintenance window</td><td>Conversion happens during scheduled window</td><td>Same brief outage but scheduled</td><td>Safer for production</td></tr></tbody></table>
+<p>→ For ShopNow: Apply during next maintenance window (Sunday 05:00 UTC)<br>
+→ The conversion process:</p>
+<ol>
+<li>RDS takes a snapshot of the primary</li>
+<li>RDS restores the snapshot to a new instance in a different AZ</li>
+<li>RDS establishes synchronous replication</li>
+<li>Brief outage while replication is activated</li>
+<li>Multi-AZ is active</li>
+</ol>
+<p><strong>What changes after enabling Multi-AZ:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Before</th><th>After</th></tr></thead><tbody><tr><td>Endpoint DNS</td><td>Same</td><td>Same (no change!)</td></tr><tr><td>Connection string</td><td>Same</td><td>Same (no change!)</td></tr><tr><td>Application code</td><td>Same</td><td>Same (no change!)</td></tr><tr><td>AZ resilience</td><td>None — single AZ failure = outage</td><td>Survives AZ failure with 60-120 sec failover</td></tr><tr><td>Write latency</td><td>Baseline</td><td>+2-5ms (synchronous replication overhead)</td></tr><tr><td>Cost</td><td>1x instance</td><td>~2x instance (standby instance charged)</td></tr><tr><td>Maintenance behavior</td><td>Downtime during patching</td><td>Patch standby → failover → patch old primary → minimal downtime</td></tr></tbody></table>
+<p>→ <strong>ZERO application changes required</strong> — the DNS endpoint stays the same<br>
+→ Application connects to the same endpoint — RDS handles failover transparently via DNS</p>
+<hr>
+<h3>STEP 3 — VERIFY MULTI-AZ CONFIGURATION</h3>
+<p><strong>Verification 1: RDS Console</strong></p>
+<p>→ Navigate to RDS → Select instance → Configuration tab</p>
+<table><thead><tr><th>Property</th><th>Expected Value</th></tr></thead><tbody><tr><td>Multi-AZ</td><td>Yes</td></tr><tr><td>Secondary AZ</td><td><code>ap-south-1b</code> (different from primary <code>ap-south-1a</code>)</td></tr><tr><td>Status</td><td>Available</td></tr></tbody></table>
+<p><strong>Verification 2: CloudWatch Events for Failover</strong></p>
+<p>→ RDS publishes events for failover activities<br>
+→ Navigate to RDS → Event subscriptions → Create Event Subscription</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Subscription name</td><td><code>shopnow-rds-failover-alerts</code></td><td>Descriptive name</td></tr><tr><td>Source type</td><td>DB instance</td><td>Monitor instance events</td></tr><tr><td>Source</td><td><code>shopnow-prod-db</code></td><td>Specific instance</td></tr><tr><td>Event categories</td><td><code>failover</code>, <code>failure</code>, <code>recovery</code>, <code>maintenance</code></td><td>Relevant event types</td></tr><tr><td>Target</td><td>SNS Topic <code>shopnow-ops-critical</code> (Project 6)</td><td>Alert channel</td></tr></tbody></table>
+<p>→ Now any failover event triggers an SNS notification → email/SMS to on-call team</p>
+<p><strong>Verification 3: Test Failover (Non-Production First)</strong></p>
+<p>→ Navigate to RDS → Select instance → Actions → Reboot</p>
+<table><thead><tr><th>Option</th><th>Behavior</th></tr></thead><tbody><tr><td>Reboot</td><td>Restarts the instance in the same AZ — no failover</td></tr><tr><td><strong>Reboot with failover</strong></td><td>Forces failover to standby AZ — tests the entire failover process</td></tr></tbody></table>
+<p>→ <strong>ALWAYS test failover in staging/dev FIRST</strong><br>
+→ Then test in production during a maintenance window<br>
+→ Measure:</p>
+<ul>
+<li>Time from reboot initiation to instance available: Target &lt; 120 seconds</li>
+<li>Application reconnection time: Target &lt; 30 seconds after instance available</li>
+<li>Data integrity: Verify no data loss after failover</li>
+</ul>
+<p><strong>Expected failover timeline:</strong></p>
+<table><thead><tr><th>Time</th><th>Event</th></tr></thead><tbody><tr><td>T+0s</td><td>Reboot with failover initiated</td></tr><tr><td>T+5s</td><td>Primary begins shutdown</td></tr><tr><td>T+10s</td><td>Standby promotion begins</td></tr><tr><td>T+30-60s</td><td>Standby promoted to primary</td></tr><tr><td>T+45-75s</td><td>DNS updated to point to new primary</td></tr><tr><td>T+60-120s</td><td>Instance status: Available</td></tr><tr><td>T+70-130s</td><td>Application reconnects via DNS</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — UNDERSTAND READ REPLICA ARCHITECTURE</h3>
+<p><strong>How Read Replicas Work:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────────────────────────────────────┐
+</span>│                                                                         │
+│  ┌──────────────────┐     Synchronous      ┌──────────────────────┐   │
+│  │  PRIMARY          │     Replication      │  STANDBY (Multi-AZ)  │   │
+│  │  (AZ-a)           │────────────────────▶│  (AZ-b)              │   │
+│  │                    │                      │  NOT readable        │   │
+│  │  Reads ✅ Writes ✅│                      │                      │   │
+│  └────────┬───────────┘                      └──────────────────────┘   │
+│           │                                                              │
+│           │ Asynchronous Replication                                     │
+│           │ (typically &lt; 1 second lag)                                    │
+│           │                                                              │
+│           ├──────────────────────┬──────────────────────┐               │
+│           ▼                      ▼                      ▼               │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐     │
+│  │  READ REPLICA 1   │  │  READ REPLICA 2   │  │  READ REPLICA 3  │     │
+│  │  (AZ-a or AZ-b)   │  │  (AZ-b)           │  │  (AZ-a)          │     │
+│  │                    │  │                    │  │                   │     │
+│  │  Reads ✅          │  │  Reads ✅          │  │  Reads ✅         │     │
+│  │  Writes ❌         │  │  Writes ❌         │  │  Writes ❌        │     │
+│  │                    │  │                    │  │                   │     │
+│  │  SEPARATE          │  │  SEPARATE          │  │  SEPARATE         │     │
+│  │  ENDPOINT          │  │  ENDPOINT          │  │  ENDPOINT         │     │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘     │
+│                                                                         │
+│  Endpoint: shopnow-    Endpoint: shopnow-    Endpoint: shopnow-       │
+│  prod-db-replica1.     prod-db-replica2.     prod-db-replica3.        │
+│  xxxxx.rds...          xxxxx.rds...          xxxxx.rds...             │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>Asynchronous Replication — What It Means:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application sends: INSERT INTO orders VALUES (...)
+</span>       ↓
+PRIMARY writes to local storage
+       ↓
+PRIMARY acknowledges to APPLICATION: "INSERT successful"
+  (Application does NOT wait for replica)
+       ↓
+PRIMARY sends the write to READ REPLICAS (asynchronously)
+       ↓
+Replicas receive the write (typically &lt; 1 second later)
+       ↓
+Replicas apply the write to their local storage</code></pre></div>
+<p>→ Key difference from Multi-AZ:</p>
+<ul>
+<li>Multi-AZ: Application waits for standby acknowledgment (synchronous)</li>
+<li>Read Replica: Application does NOT wait — replica catches up later (asynchronous)</li>
+</ul>
+<p>→ Consequence: <strong>Replica lag</strong></p>
+<ul>
+<li>There is a brief period where the replica is "behind" the primary</li>
+<li>Typical lag: &lt; 1 second under normal load</li>
+<li>Under heavy write load: 1-5 seconds</li>
+<li>Under extreme load: 10-60 seconds (concerning)</li>
+</ul>
+<p>→ For analyst queries: 1-second lag is completely irrelevant<br>
+→ For Glue extraction: 1-second lag is irrelevant<br>
+→ For application reads requiring absolute consistency: Use primary, not replica</p>
+<hr>
+<h3>STEP 5 — CREATE READ REPLICAS</h3>
+<p>→ Navigate to RDS Console → Select <code>shopnow-prod-db</code> → Actions → Create Read Replica</p>
+<p><strong>Read Replica 1: Analyst Queries</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>DB Instance Identifier</td><td><code>shopnow-prod-db-analytics</code></td><td>Descriptive name for analyst replica</td></tr><tr><td>Instance Class</td><td><code>db.r5.large</code></td><td>Same as primary (analysts run heavy queries)</td></tr><tr><td>Multi-AZ (for replica)</td><td>No</td><td>Analyst replica doesn't need HA — primary has Multi-AZ</td></tr><tr><td>Availability Zone</td><td><code>ap-south-1b</code></td><td>Different AZ for resilience</td></tr><tr><td>Storage Type</td><td><code>gp3</code></td><td>Inherited from primary</td></tr><tr><td>Public Access</td><td>No</td><td>Private subnet only (Project 5)</td></tr><tr><td>VPC Security Group</td><td><code>sg-0rds-analytics</code></td><td>Separate SG for analyst access</td></tr><tr><td>DB Parameter Group</td><td><code>shopnow-analytics-params</code></td><td>Can differ from primary — optimize for read queries</td></tr><tr><td>Monitoring</td><td>Enhanced Monitoring enabled</td><td>60-second granularity</td></tr><tr><td>Performance Insights</td><td>Enabled</td><td>Query-level performance tracking</td></tr></tbody></table>
+<p><strong>Read Replica 2: Glue ETL Extraction</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>DB Instance Identifier</td><td><code>shopnow-prod-db-etl</code></td><td>Dedicated to Glue extraction</td></tr><tr><td>Instance Class</td><td><code>db.r5.xlarge</code></td><td>Larger than primary — handles parallel extraction</td></tr><tr><td>Multi-AZ (for replica)</td><td>No</td><td>ETL replica doesn't need HA</td></tr><tr><td>Availability Zone</td><td><code>ap-south-1a</code></td><td>Same AZ as Glue ENIs for lower latency</td></tr><tr><td>VPC Security Group</td><td><code>sg-0rds-etl</code></td><td>Separate SG — only Glue can access</td></tr><tr><td>DB Parameter Group</td><td><code>shopnow-etl-params</code></td><td>Optimized for full table scans</td></tr></tbody></table>
+<p><strong>Why Two Separate Replicas?</strong></p>
+<table><thead><tr><th>Concern</th><th>Single Shared Replica</th><th>Two Dedicated Replicas</th></tr></thead><tbody><tr><td>Resource contention</td><td>Analyst queries compete with Glue extraction</td><td>Each workload has dedicated resources</td></tr><tr><td>Sizing</td><td>Must be large enough for BOTH workloads</td><td>Each sized for its specific workload</td></tr><tr><td>Scheduling</td><td>Glue extraction may slow analyst queries</td><td>Independent — no interference</td></tr><tr><td>Security</td><td>Same SG for analysts and Glue</td><td>Different SGs — principle of least privilege</td></tr><tr><td>Cost</td><td>1x replica cost</td><td>2x replica cost</td></tr><tr><td>Resilience</td><td>One failure affects both</td><td>One failure affects only one workload</td></tr></tbody></table>
+<p>→ For ShopNow: Two replicas is the right choice<br>
+→ The cost difference ($200/month for one extra db.r5.large) is justified by workload isolation</p>
+<p><strong>Security Group Configuration:</strong></p>
+<p><strong>SG: <code>sg-0rds-analytics</code> (Analyst Replica)</strong></p>
+<table><thead><tr><th>Direction</th><th>Type</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>Inbound</td><td>MySQL/Aurora</td><td>3306</td><td><code>sg-0analyst-tools</code></td><td>Analyst SQL tools (DBeaver, DataGrip)</td></tr><tr><td>Inbound</td><td>MySQL/Aurora</td><td>3306</td><td>VPN CIDR (10.10.0.0/16)</td><td>Analyst VPN access</td></tr></tbody></table>
+<p>→ Note: NO application server access — analysts only</p>
+<p><strong>SG: <code>sg-0rds-etl</code> (ETL Replica)</strong></p>
+<table><thead><tr><th>Direction</th><th>Type</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>Inbound</td><td>MySQL/Aurora</td><td>3306</td><td><code>sg-0glue789</code> (Glue SG from Project 24)</td><td>Glue ETL extraction</td></tr></tbody></table>
+<p>→ Note: ONLY Glue can access — no analysts, no application</p>
+<p><strong>Updated RDS Security Group Summary:</strong></p>
+<table><thead><tr><th>Security Group</th><th>Attached To</th><th>Allows Access From</th><th>Purpose</th></tr></thead><tbody><tr><td><code>sg-0rds456</code></td><td>Primary instance</td><td>EC2 app servers, Glue (legacy)</td><td>Production read/write</td></tr><tr><td><code>sg-0rds-analytics</code></td><td>Analytics replica</td><td>Analyst tools, VPN</td><td>Read-only analyst queries</td></tr><tr><td><code>sg-0rds-etl</code></td><td>ETL replica</td><td>Glue ENIs only</td><td>Read-only Glue extraction</td></tr></tbody></table>
+<hr>
+<h3>STEP 6 — CONFIGURE ACCESS PATTERNS</h3>
+<p><strong>Pattern 1: Application → Primary (Read + Write)</strong></p>
+<table><thead><tr><th>Component</th><th>Configuration</th></tr></thead><tbody><tr><td>Endpoint</td><td><code>shopnow-prod-db.xxxxx.ap-south-1.rds.amazonaws.com</code> (primary)</td></tr><tr><td>Port</td><td>3306</td></tr><tr><td>Operations</td><td>SELECT, INSERT, UPDATE, DELETE</td></tr><tr><td>Security Group</td><td><code>sg-0rds456</code> → allows from EC2 app SG</td></tr><tr><td>Connection Pool</td><td>50 connections max</td></tr></tbody></table>
+<p>→ Application ALWAYS connects to the primary endpoint for writes<br>
+→ Application MAY read from primary for consistency-critical reads</p>
+<p><strong>Pattern 2: Application → Replica (Read-Only, Eventual Consistency)</strong></p>
+<p>→ Some application reads can tolerate 1-second lag:</p>
+<ul>
+<li>Product catalog browsing (price changed 1 second ago → acceptable)</li>
+<li>Customer profile display (address updated 1 second ago → acceptable)</li>
+<li>Order history listing (new order appears 1 second late → acceptable)</li>
+</ul>
+<p>→ Application reads NOT suitable for replica:</p>
+<ul>
+<li>"Did my payment just succeed?" (must be consistent — use primary)</li>
+<li>"Is this item still in stock?" (inventory must be real-time — use primary)</li>
+<li>"Show me the order I just placed" (read-after-write — use primary)</li>
+</ul>
+<table><thead><tr><th>Component</th><th>Configuration</th></tr></thead><tbody><tr><td>Endpoint</td><td><code>shopnow-prod-db-analytics.xxxxx.ap-south-1.rds.amazonaws.com</code></td></tr><tr><td>Port</td><td>3306</td></tr><tr><td>Operations</td><td>SELECT only</td></tr><tr><td>Connection Pool</td><td>20 connections max</td></tr><tr><td>Use for</td><td>Product browsing, order history, customer profiles</td></tr></tbody></table>
+<p>→ Splitting reads between primary and replica: <strong>read/write splitting</strong><br>
+→ Application configuration: Two connection pools — primary (write + critical reads) and replica (non-critical reads)<br>
+→ This offloads 30-50% of read traffic from the primary</p>
+<p><strong>Pattern 3: Analysts → Analytics Replica (Read-Only)</strong></p>
+<table><thead><tr><th>Component</th><th>Configuration</th></tr></thead><tbody><tr><td>Endpoint</td><td><code>shopnow-prod-db-analytics.xxxxx.ap-south-1.rds.amazonaws.com</code></td></tr><tr><td>Port</td><td>3306</td></tr><tr><td>User</td><td><code>analyst_readonly</code> (dedicated read-only database user)</td></tr><tr><td>Operations</td><td>SELECT only</td></tr><tr><td>Max Connections</td><td>20 (limit concurrent analyst queries)</td></tr><tr><td>Query Timeout</td><td>300 seconds (kill queries running &gt; 5 minutes)</td></tr></tbody></table>
+<p>→ Analyst database user configuration:</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Username</td><td><code>analyst_readonly</code></td><td>Dedicated analyst user</td></tr><tr><td>Permissions</td><td>SELECT only on all tables</td><td>Read-only access</td></tr><tr><td>Max connections per user</td><td>20</td><td>Prevent connection exhaustion</td></tr><tr><td>Max query execution time</td><td>300 seconds</td><td>Kill runaway queries</td></tr><tr><td>Host restriction</td><td>VPN CIDR only</td><td>Only from corporate VPN</td></tr></tbody></table>
+<p>→ Now analysts query the REPLICA — primary is completely unaffected<br>
+→ If analysts run a 5-minute full table scan → only the replica's CPU spikes<br>
+→ Application performance: ZERO impact</p>
+<p><strong>Pattern 4: Glue ETL → ETL Replica (Read-Only)</strong></p>
+<p>→ Update the Glue Connection from Project 24:</p>
+<table><thead><tr><th>Setting</th><th>Old Value (Project 24)</th><th>New Value</th></tr></thead><tbody><tr><td>JDBC URL</td><td><code>jdbc:mysql://shopnow-prod-db.xxxxx.rds.amazonaws.com:3306/shopnow_db</code></td><td><code>jdbc:mysql://shopnow-prod-db-etl.xxxxx.rds.amazonaws.com:3306/shopnow_db</code></td></tr></tbody></table>
+<p>→ Navigate to Glue Console → Connections → <code>shopnow-mariadb-prod</code> → Edit<br>
+→ Change the JDBC URL to point to the ETL replica endpoint<br>
+→ OR: Create a new connection <code>shopnow-mariadb-etl-replica</code> for clarity</p>
+<p>→ Update all Glue ETL jobs (Project 24) to use the new connection:</p>
+<ul>
+<li><code>shopnow-mariadb-orders-to-s3</code> → use ETL replica</li>
+<li><code>shopnow-mariadb-customers-to-s3</code> → use ETL replica</li>
+<li><code>shopnow-mariadb-products-to-s3</code> → use ETL replica</li>
+<li><code>shopnow-mariadb-payments-to-s3</code> → use ETL replica</li>
+<li><code>shopnow-mariadb-order-items-to-s3</code> → use ETL replica</li>
+<li><code>shopnow-mariadb-inventory-to-s3</code> → use ETL replica</li>
+</ul>
+<p>→ After this change:</p>
+<ul>
+<li>Glue extracts from the ETL replica — primary CPU: ZERO impact</li>
+<li>Glue can use higher parallelism (more partitions) without worrying about production</li>
+<li>Extraction can run at ANY time — not just off-peak hours</li>
+<li>Could even run extraction more frequently (every 4 hours instead of daily)</li>
+</ul>
+<p><strong>Updated Security Group for Glue:</strong></p>
+<p>→ From Project 24: Glue SG had outbound to <code>sg-0rds456</code> (primary SG)<br>
+→ Now change to outbound to <code>sg-0rds-etl</code> (ETL replica SG)</p>
+<table><thead><tr><th>Old Rule</th><th>New Rule</th></tr></thead><tbody><tr><td>Outbound: TCP 3306 → <code>sg-0rds456</code></td><td>Outbound: TCP 3306 → <code>sg-0rds-etl</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 7 — CONFIGURE PARAMETER GROUPS FOR REPLICAS</h3>
+<p>→ Read Replicas can use DIFFERENT parameter groups than the primary<br>
+→ This allows optimizing replicas for their specific workload</p>
+<p><strong>Primary Parameter Group: <code>shopnow-primary-params</code></strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td><code>max_connections</code></td><td>200</td><td>Application needs many short-lived connections</td></tr><tr><td><code>innodb_buffer_pool_size</code></td><td>75% of RAM</td><td>Standard OLTP optimization</td></tr><tr><td><code>query_cache_size</code></td><td>0 (disabled)</td><td>MariaDB 10.6+ — query cache is deprecated</td></tr><tr><td><code>slow_query_log</code></td><td>1 (enabled)</td><td>Track slow queries</td></tr><tr><td><code>long_query_time</code></td><td>1 (second)</td><td>Log queries &gt; 1 second</td></tr><tr><td><code>innodb_flush_log_at_trx_commit</code></td><td>1</td><td>Full durability — every commit flushed</td></tr></tbody></table>
+<p><strong>Analytics Replica Parameter Group: <code>shopnow-analytics-params</code></strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td><code>max_connections</code></td><td>50</td><td>Fewer analysts than app connections</td></tr><tr><td><code>innodb_buffer_pool_size</code></td><td>80% of RAM</td><td>More memory for large scans</td></tr><tr><td><code>tmp_table_size</code></td><td>256M</td><td>Larger temp tables for complex GROUP BY</td></tr><tr><td><code>max_heap_table_size</code></td><td>256M</td><td>Match tmp_table_size</td></tr><tr><td><code>sort_buffer_size</code></td><td>4M</td><td>Larger sort buffers for ORDER BY</td></tr><tr><td><code>read_buffer_size</code></td><td>2M</td><td>Larger read buffers for full scans</td></tr><tr><td><code>slow_query_log</code></td><td>1</td><td>Track analyst query performance</td></tr><tr><td><code>long_query_time</code></td><td>10 (seconds)</td><td>Analyst queries are naturally longer</td></tr></tbody></table>
+<p>→ Analytics replica is tuned for ANALYTICAL workloads (large scans, sorts, aggregations)<br>
+→ Primary is tuned for OLTP workloads (many small, fast transactions)</p>
+<p><strong>ETL Replica Parameter Group: <code>shopnow-etl-params</code></strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td><code>max_connections</code></td><td>30</td><td>Glue uses 5-10 connections max</td></tr><tr><td><code>innodb_buffer_pool_size</code></td><td>80% of RAM</td><td>Large buffer for sequential scans</td></tr><tr><td><code>read_buffer_size</code></td><td>4M</td><td>Optimize for Glue's sequential reads</td></tr><tr><td><code>net_read_timeout</code></td><td>300</td><td>Longer timeout for large result sets</td></tr><tr><td><code>net_write_timeout</code></td><td>300</td><td>Longer timeout for large result sets</td></tr><tr><td><code>max_allowed_packet</code></td><td>64M</td><td>Large packets for bulk reads</td></tr></tbody></table>
+<p>→ ETL replica is tuned for BULK EXTRACTION (large sequential reads, few connections)</p>
+<hr>
+<h3>STEP 8 — MONITOR REPLICATION AND FAILOVER READINESS</h3>
+<p><strong>Monitoring 1: Replica Lag</strong></p>
+<p>→ The most critical metric for Read Replicas</p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Meaning</th></tr></thead><tbody><tr><td><code>ReplicaLag</code></td><td>CloudWatch → RDS</td><td>Seconds behind the primary</td></tr></tbody></table>
+<p>→ Navigate to CloudWatch → Alarms → Create Alarm</p>
+<p><strong>Alarm: Replica Lag Warning</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>AWS/RDS</code> → <code>ReplicaLag</code></td></tr><tr><td>DB Instance</td><td><code>shopnow-prod-db-analytics</code></td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Threshold</td><td>&gt; 30 seconds</td></tr><tr><td>Alarm Action</td><td>SNS <code>shopnow-ops-alerts</code></td></tr></tbody></table>
+<p><strong>Alarm: Replica Lag Critical</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Threshold</td><td>&gt; 300 seconds (5 minutes)</td></tr><tr><td>Alarm Action</td><td>SNS <code>shopnow-ops-critical</code></td></tr></tbody></table>
+<p>→ Create similar alarms for the ETL replica</p>
+<p><strong>What causes high replica lag:</strong></p>
+<table><thead><tr><th>Cause</th><th>Typical Lag</th><th>Resolution</th></tr></thead><tbody><tr><td>Normal operation</td><td>&lt; 1 second</td><td>No action needed</td></tr><tr><td>Heavy writes on primary</td><td>1-5 seconds</td><td>Temporary — lag recovers after write burst</td></tr><tr><td>Replica under-provisioned</td><td>5-30 seconds</td><td>Upgrade replica instance class</td></tr><tr><td>Long-running transaction on replica</td><td>10-60 seconds</td><td>Kill the long query on replica</td></tr><tr><td>Network issues between AZs</td><td>Variable</td><td>Check AWS status — usually transient</td></tr><tr><td>Replica storage full</td><td>Replication stops</td><td>Increase replica storage</td></tr></tbody></table>
+<p><strong>Monitoring 2: Multi-AZ Failover Events</strong></p>
+<p>→ RDS Event Subscription (configured in Step 3) sends notifications for:</p>
+<table><thead><tr><th>Event</th><th>Meaning</th><th>Action</th></tr></thead><tbody><tr><td><code>Failover started</code></td><td>Primary failure detected</td><td>Alert team — failover in progress</td></tr><tr><td><code>Failover completed</code></td><td>New primary active</td><td>Verify application connectivity</td></tr><tr><td><code>Multi-AZ standby created</code></td><td>New standby provisioned after failover</td><td>Verify Multi-AZ protection restored</td></tr><tr><td><code>Replication resumed</code></td><td>Read Replica reconnected after failover</td><td>Verify replica lag is decreasing</td></tr></tbody></table>
+<p><strong>Monitoring 3: CloudWatch Dashboard</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Instance</th><th>Purpose</th></tr></thead><tbody><tr><td>Primary CPU</td><td>CPUUtilization</td><td><code>shopnow-prod-db</code></td><td>Primary health</td></tr><tr><td>Analytics Replica CPU</td><td>CPUUtilization</td><td><code>shopnow-prod-db-analytics</code></td><td>Analyst load</td></tr><tr><td>ETL Replica CPU</td><td>CPUUtilization</td><td><code>shopnow-prod-db-etl</code></td><td>Extraction load</td></tr><tr><td>Analytics Replica Lag</td><td>ReplicaLag</td><td><code>shopnow-prod-db-analytics</code></td><td>Data freshness</td></tr><tr><td>ETL Replica Lag</td><td>ReplicaLag</td><td><code>shopnow-prod-db-etl</code></td><td>Extraction data freshness</td></tr><tr><td>Primary Connections</td><td>DatabaseConnections</td><td><code>shopnow-prod-db</code></td><td>Connection pool health</td></tr><tr><td>Primary Write IOPS</td><td>WriteIOPS</td><td><code>shopnow-prod-db</code></td><td>Write load</td></tr><tr><td>Primary Read IOPS</td><td>ReadIOPS</td><td><code>shopnow-prod-db</code></td><td>Read load (should decrease after replica offloading)</td></tr></tbody></table>
+<p><strong>Expected Metrics After Replica Offloading:</strong></p>
+<table><thead><tr><th>Metric</th><th>Before Replicas</th><th>After Replicas</th><th>Change</th></tr></thead><tbody><tr><td>Primary CPU</td><td>75% (peak)</td><td>40% (peak)</td><td>-47%</td></tr><tr><td>Primary Read IOPS</td><td>8,000</td><td>3,000</td><td>-62%</td></tr><tr><td>Primary Active Connections</td><td>120</td><td>55</td><td>-54%</td></tr><tr><td>Primary Query Latency</td><td>45ms (avg)</td><td>8ms (avg)</td><td>-82%</td></tr></tbody></table>
+<p>→ Dramatic improvement in primary performance — analysts and Glue no longer compete with the application</p>
+<hr>
+<h3>STEP 9 — TEST FAILOVER SCENARIOS</h3>
+<p><strong>Test 1: Planned Multi-AZ Failover</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Note current primary AZ (ap-south-1a)</td><td>RDS Console → instance details</td></tr><tr><td>2</td><td>Initiate reboot with failover</td><td>RDS → Actions → Reboot → With Failover</td></tr><tr><td>3</td><td>Start timer</td><td>Measure total downtime</td></tr><tr><td>4</td><td>Monitor application</td><td>Brief connection errors expected</td></tr><tr><td>5</td><td>Instance available</td><td>New primary in ap-south-1b</td></tr><tr><td>6</td><td>Stop timer</td><td>Total time should be &lt; 120 seconds</td></tr><tr><td>7</td><td>Verify application connectivity</td><td>Application resumes normal operation</td></tr><tr><td>8</td><td>Verify data integrity</td><td>Recent transactions still present</td></tr><tr><td>9</td><td>Verify replicas reconnected</td><td>ReplicaLag decreasing toward 0</td></tr><tr><td>10</td><td>Check SNS notification received</td><td>Failover event notification in email/SMS</td></tr></tbody></table>
+<p><strong>Test 2: Replica Promotion (Disaster Recovery)</strong></p>
+<p>→ What if BOTH primary and standby fail? (extremely rare — region-level event)<br>
+→ A Read Replica can be PROMOTED to a standalone primary</p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Select replica</td><td>RDS Console → <code>shopnow-prod-db-analytics</code></td></tr><tr><td>2</td><td>Actions → Promote</td><td>Begins promotion process</td></tr><tr><td>3</td><td>Wait for promotion</td><td>Status changes: Available</td></tr><tr><td>4</td><td>Note: Promotion is IRREVERSIBLE</td><td>Replica becomes standalone — no longer replicates</td></tr><tr><td>5</td><td>Update application connection string</td><td>Point to promoted replica's endpoint</td></tr><tr><td>6</td><td>Verify read/write capability</td><td>INSERT/UPDATE now works on promoted replica</td></tr></tbody></table>
+<p>→ Promotion takes 5-15 minutes<br>
+→ Data loss = replica lag at time of promotion (typically &lt; 1 second)<br>
+→ After promotion: former replica is a standalone DB — must set up new replicas</p>
+<p><strong>Promotion is a LAST RESORT — not a regular failover mechanism:</strong></p>
+<ul>
+<li>Multi-AZ failover: Automatic, &lt; 2 minutes, zero data loss</li>
+<li>Replica promotion: Manual, 5-15 minutes, potential data loss = replica lag</li>
+<li>Use Multi-AZ for HA; use replica promotion only for disaster recovery</li>
+</ul>
+<hr>
+<h3>STEP 10 — READ REPLICA ACROSS REGIONS (Preview for Project 55)</h3>
+<p>→ Read Replicas can be created in a DIFFERENT AWS region</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Source instance</td><td><code>shopnow-prod-db</code> (ap-south-1)</td><td>Mumbai primary</td></tr><tr><td>Replica region</td><td><code>us-east-1</code></td><td>Virginia — for US-based analysts or DR</td></tr></tbody></table>
+<p>→ Cross-region replica:</p>
+<ul>
+<li>Higher replication lag (50-200ms network latency)</li>
+<li>Cross-region data transfer charges</li>
+<li>Provides geographic redundancy</li>
+<li>Can be promoted to standalone for region-level disaster recovery</li>
+</ul>
+<p>→ Deep dive in Project 55 (Cross-Region DR)</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable Multi-AZ for production databases — the cost of downtime far exceeds the cost of a standby<br>
+→ Always create at least one Read Replica for analyst query offloading — protect primary performance<br>
+→ Always create a dedicated Read Replica for ETL extraction — isolate extraction from all other workloads<br>
+→ Always use separate security groups for each replica — enforce least-privilege access<br>
+→ Always use separate parameter groups for each replica — optimize for workload type (OLTP vs analytical vs ETL)<br>
+→ Always monitor ReplicaLag — alarm at 30 seconds (warning) and 300 seconds (critical)<br>
+→ Always set up RDS Event Subscriptions for failover events — immediate notification<br>
+→ Always test failover before you need it — scheduled failover tests quarterly<br>
+→ Always update Glue JDBC connections to point to ETL replica (Project 24 update)<br>
+→ Always create dedicated database users for each access pattern (app, analyst, glue)<br>
+→ Always verify application handles connection drops gracefully — failover causes brief disconnection<br>
+→ Always increase backup retention when enabling Multi-AZ — 14+ days recommended</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never run production databases without Multi-AZ — single AZ is a ticking time bomb<br>
+→ Never let analysts query the primary database — always redirect to Read Replica<br>
+→ Never let Glue ETL extract from the primary — always use a dedicated replica<br>
+→ Never assume Read Replica is a backup — it's a live copy, not a point-in-time recovery mechanism<br>
+→ Never ignore ReplicaLag alarms — sustained high lag means replica is falling behind (may indicate under-provisioning)<br>
+→ Never use the same security group for primary and replicas — different access patterns need different rules<br>
+→ Never use the same parameter group for OLTP primary and analytical replica — different workloads need different tuning<br>
+→ Never promote a Read Replica unless it's a true disaster scenario — promotion is irreversible<br>
+→ Never skip failover testing — an untested failover is not a failover plan<br>
+→ Never forget to update Glue connections after creating ETL replica — Glue still points to primary otherwise<br>
+→ Never create Read Replicas without monitoring — an unmonitored lagging replica serves stale data silently<br>
+→ Never set max_connections on replica higher than it can handle — more connections ≠ better performance</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE MULTI-AZ VS READ REPLICA</h2>
+<table><thead><tr><th>Scenario</th><th>Multi-AZ</th><th>Read Replica</th><th>Both</th></tr></thead><tbody><tr><td>Production database needs HA</td><td>✅ Yes</td><td>Not sufficient alone</td><td>✅ Ideal</td></tr><tr><td>Analyst query offloading</td><td>Not relevant</td><td>✅ Yes</td><td>✅ Combined</td></tr><tr><td>ETL extraction isolation</td><td>Not relevant</td><td>✅ Yes</td><td>✅ Combined</td></tr><tr><td>Cross-region disaster recovery</td><td>Not sufficient</td><td>✅ Cross-region replica</td><td>✅ Combined</td></tr><tr><td>Application read scaling</td><td>Not relevant</td><td>✅ Yes</td><td>✅ Combined</td></tr><tr><td>Development/testing copy</td><td>Not relevant</td><td>✅ Yes (or snapshot restore)</td><td>—</td></tr><tr><td>Compliance: zero data loss</td><td>✅ Yes (synchronous)</td><td>❌ No (asynchronous)</td><td>Multi-AZ for RPO=0</td></tr><tr><td>Sub-minute automatic failover</td><td>✅ Yes</td><td>❌ No (manual promotion)</td><td>Multi-AZ for RTO&lt;2min</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ When database is non-critical (dev/test) → Multi-AZ doubles cost unnecessarily<br>
+→ When read load is minimal (&lt; 10 queries/day from analysts) → Read Replica cost not justified<br>
+→ When using Aurora instead of RDS → Aurora has built-in multi-AZ and up to 15 read replicas natively<br>
+→ When budget is extremely constrained and downtime is acceptable → Single-AZ with automated backups provides recovery (not HA)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → MULTI-AZ SYNCHRONOUS REPLICATION ENGINE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>APPLICATION WRITE:
+</span>  INSERT INTO orders (order_id, total) VALUES (12345, 99.99)
+       ↓
+PRIMARY INSTANCE (AZ-a):
+  ├── Write to InnoDB buffer pool (memory)
+  ├── Write to InnoDB redo log (WAL — Write-Ahead Log)
+  ├── Flush redo log to EBS (primary's disk)
+  │
+  ├── SIMULTANEOUSLY: Send redo log entry to STANDBY
+  │     ├── Network transfer: AZ-a → AZ-b (2-5ms latency)
+  │     ├── Standby receives redo log entry
+  │     ├── Standby writes to its redo log on its EBS
+  │     └── Standby acknowledges: "Received and persisted"
+  │
+  ├── PRIMARY receives standby acknowledgment
+  └── PRIMARY acknowledges to APPLICATION: "COMMIT successful"
+       ↓
+STANDBY INSTANCE (AZ-b):
+  ├── Applies redo log entry to its InnoDB buffer pool
+  ├── Eventually flushes to data files (background)
+  └── Standby is now consistent with primary
+       ↓
+GUARANTEE: If primary fails after acknowledging COMMIT:
+  ├── Standby has the redo log entry
+  ├── Standby can apply it during promotion
+  └── ZERO data loss</code></pre></div>
+<p>→ The replication is at the STORAGE level (redo log), not the SQL level<br>
+→ This is more efficient than SQL-based replication — no need to re-execute queries</p>
+<hr>
+<h3>2 → FAILOVER DNS MECHANISM</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>NORMAL STATE:
+</span>  DNS: shopnow-prod-db.xxxxx.rds.amazonaws.com
+    → CNAME → primary-instance.ap-south-1a.rds.amazonaws.com
+      → A record → 10.0.1.50 (primary's private IP in AZ-a)
+  
+  TTL (Time-To-Live): 5 seconds
+  (DNS record cached for only 5 seconds)
+
+FAILOVER INITIATED:
+  T+0s: Primary failure detected
+  T+30s: Standby promoted to primary
+  T+45s: DNS CNAME updated:
+    shopnow-prod-db.xxxxx.rds.amazonaws.com
+      → CNAME → promoted-instance.ap-south-1b.rds.amazonaws.com
+        → A record → 10.0.2.75 (new primary's private IP in AZ-b)
+  
+  T+50s: DNS TTL expires (was 5 seconds)
+  T+50s: Application's next DNS lookup resolves to new IP
+  T+51s: Application connects to new primary
+  T+51s: Service restored
+
+WHY TTL = 5 SECONDS MATTERS:
+  ├── If TTL = 300 seconds (5 minutes): Application would cache old IP for 5 minutes after failover
+  ├── If TTL = 5 seconds: Application gets new IP within 5 seconds of DNS update
+  └── RDS sets TTL intentionally low for fast failover</code></pre></div>
+<p>→ <strong>Critical application requirement</strong>: Application must NOT cache DNS longer than TTL<br>
+→ Most modern connection pools and SDKs respect DNS TTL<br>
+→ If application caches DNS indefinitely → failover doesn't work → must restart application</p>
+<p><strong>Application connection handling during failover:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application connection pool has 50 active connections to old primary
+</span>       ↓
+Primary fails → all 50 connections are broken
+       ↓
+Connection pool detects broken connections (socket errors)
+       ↓
+Connection pool attempts to create new connections
+       ↓
+DNS resolution returns NEW primary IP
+       ↓
+New connections established to new primary
+       ↓
+Application resumes operation
+       ↓
+TOTAL APPLICATION DISRUPTION: 60-120 seconds</code></pre></div>
+<p>→ Well-designed connection pools handle this automatically<br>
+→ Application may see brief errors during the 60-120 second window<br>
+→ Retry logic in the application handles these transient failures</p>
+<hr>
+<h3>3 → READ REPLICA ASYNCHRONOUS REPLICATION ENGINE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PRIMARY WRITE:
+</span>  INSERT INTO orders (order_id, total) VALUES (12345, 99.99)
+       ↓
+PRIMARY:
+  ├── Writes to InnoDB + redo log
+  ├── Acknowledges to APPLICATION immediately
+  │     (Does NOT wait for replicas)
+  └── Writes to BINARY LOG (binlog)
+       ↓
+BINARY LOG REPLICATION:
+  ├── Replica's I/O thread connects to primary's binlog
+  ├── Reads new binlog events
+  ├── Writes events to replica's RELAY LOG
+  └── This is the NETWORK transfer step (&lt; 1 second typically)
+       ↓
+REPLICA SQL THREAD:
+  ├── Reads relay log events
+  ├── Applies SQL statements to replica's database
+  └── Replica data is now updated
+       ↓
+REPLICA LAG = Time between:
+  ├── Primary commits the write
+  └── Replica applies the write
+  ├── Components: Network transfer time + SQL apply time
+  └── Typical: &lt; 1 second</code></pre></div>
+<p><strong>Why replicas can lag:</strong></p>
+<table><thead><tr><th>Cause</th><th>Mechanism</th><th>Typical Lag</th></tr></thead><tbody><tr><td>Network latency (same region)</td><td>Cross-AZ transfer time</td><td>1-5ms</td></tr><tr><td>Network latency (cross-region)</td><td>Internet/backbone transfer</td><td>50-200ms</td></tr><tr><td>Replica CPU overloaded</td><td>SQL thread can't apply fast enough</td><td>Seconds to minutes</td></tr><tr><td>Long-running query on replica</td><td>Blocks SQL thread application</td><td>Duration of query</td></tr><tr><td>Primary write burst</td><td>Binlog events accumulate faster than replica applies</td><td>Seconds</td></tr><tr><td>Large transaction on primary</td><td>Single large binlog event</td><td>Seconds to minutes</td></tr></tbody></table>
+<hr>
+<h3>4 → READ REPLICA PROMOTION MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PROMOTION INITIATED (manual action):
+</span>       ↓
+STEP 1: Replica stops replication
+  ├── I/O thread stops reading from primary's binlog
+  ├── SQL thread finishes applying remaining relay log events
+  └── Replica is now at a consistent point
+       ↓
+STEP 2: Replica reconfigured
+  ├── Read-only mode disabled → writes now allowed
+  ├── Binary logging enabled (was disabled on replica)
+  ├── Replica becomes a standalone RDS instance
+  └── New endpoint retains the replica's original endpoint name
+       ↓
+STEP 3: Instance restarts (brief)
+  ├── Configuration changes require restart
+  └── Takes 1-3 minutes
+       ↓
+STEP 4: Instance available
+  ├── Status: Available
+  ├── Role: Standalone (no longer a replica)
+  ├── Read/Write: Both enabled
+  └── No connection to former primary
+       ↓
+POST-PROMOTION:
+  ├── Former replica is now an independent database
+  ├── No automatic replication from old primary
+  ├── Must create NEW replicas from this promoted instance
+  ├── Must update application connection strings if using as new primary
+  └── Old primary (if still running) continues independently</code></pre></div>
+<p>→ Promotion is ONE-WAY — cannot be reversed<br>
+→ After promotion, the instance is fully independent<br>
+→ Must rebuild the replica infrastructure from scratch</p>
+<hr>
+<h3>5 → COST BREAKDOWN</h3>
+<table><thead><tr><th>Component</th><th>Instance</th><th>Monthly Cost (ap-south-1)</th><th>Purpose</th></tr></thead><tbody><tr><td>Primary</td><td>db.r5.large</td><td>~$200</td><td>Application read/write</td></tr><tr><td>Multi-AZ Standby</td><td>db.r5.large (hidden)</td><td>~$200</td><td>HA failover (included in Multi-AZ pricing)</td></tr><tr><td>Analytics Replica</td><td>db.r5.large</td><td>~$200</td><td>Analyst queries</td></tr><tr><td>ETL Replica</td><td>db.r5.xlarge</td><td>~$400</td><td>Glue extraction</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~$1,000/month</strong></td><td></td></tr></tbody></table>
+<p>→ Before (single instance): ~$200/month<br>
+→ After (Multi-AZ + 2 replicas): ~$1,000/month<br>
+→ Cost increase: $800/month</p>
+<p>→ <strong>Justification:</strong></p>
+<table><thead><tr><th>Benefit</th><th>Value</th></tr></thead><tbody><tr><td>Avoided downtime (1 incident/quarter × $45K)</td><td>$180K/year avoided</td></tr><tr><td>Primary performance improvement (40% → 8ms latency)</td><td>Customer experience → revenue</td></tr><tr><td>Analyst self-service (no more waiting for Glue daily extract)</td><td>Productivity × 15 analysts</td></tr><tr><td>Safer Glue extraction (no production impact)</td><td>Operational stability</td></tr><tr><td><strong>$800/month investment → $180K+/year risk mitigation</strong></td><td><strong>225x ROI</strong></td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>Application doesn't reconnect after failover</td><td>Application down for minutes after failover completes</td><td>Application caches DNS or doesn't handle connection drops</td><td>Use connection pool with automatic reconnection; respect DNS TTL</td></tr><tr><td>2</td><td>Replica lag continuously increasing</td><td>ReplicaLag metric grows over hours/days</td><td>Replica under-provisioned — can't keep up with primary writes</td><td>Upgrade replica instance class</td></tr><tr><td>3</td><td>Analysts see stale data on replica</td><td>Report numbers don't match primary</td><td>Normal replica lag — asynchronous replication</td><td>Educate analysts about eventual consistency; monitor lag</td></tr><tr><td>4</td><td>Glue extraction data inconsistent</td><td>Extracted data has partial transactions</td><td>Extraction reads during active transaction on replica</td><td>Use consistent snapshot isolation or extract during low-write periods</td></tr><tr><td>5</td><td>Multi-AZ failover takes &gt; 2 minutes</td><td>Failover exceeds expected time</td><td>Large uncommitted transactions on primary must be rolled back on standby</td><td>Keep transactions short; avoid long-running transactions</td></tr><tr><td>6</td><td>Read Replica falls behind during Glue extraction</td><td>Lag spikes during extraction window</td><td>Glue's heavy read load slows replica's SQL apply thread</td><td>Use dedicated ETL replica; increase replica instance size</td></tr><tr><td>7</td><td>Promoted replica has no Multi-AZ</td><td>Promoted replica is single-AZ</td><td>Promotion creates standalone instance — Multi-AZ not inherited</td><td>Enable Multi-AZ on promoted replica immediately after promotion</td></tr><tr><td>8</td><td>Application writes to replica</td><td>"Read-only" error</td><td>Application misconfigured — connecting to replica endpoint for writes</td><td>Verify connection strings — write connections must use primary endpoint</td></tr><tr><td>9</td><td>Replica storage full</td><td>Replication breaks — replica stops syncing</td><td>Replica storage not auto-scaled; primary grew but replica didn't</td><td>Enable storage auto-scaling on replicas</td></tr><tr><td>10</td><td>Failover during maintenance</td><td>Unexpected failover during maintenance window</td><td>Multi-AZ applies patches via failover (by design)</td><td>Expected behavior — inform team about maintenance windows</td></tr><tr><td>11</td><td>Multiple replicas competing for binlog</td><td>Primary binlog thread overloaded</td><td>Too many replicas reading from primary's binlog simultaneously</td><td>Limit replicas to 5 or fewer; use cascading replication for more</td></tr><tr><td>12</td><td>Cross-AZ data transfer costs</td><td>Unexpected charges</td><td>Replica in different AZ incurs cross-AZ data transfer for replication</td><td>Expected — minor cost; same-AZ replica has lower latency but less resilience</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Read Scaling</strong></p>
+<table><thead><tr><th>Replicas</th><th>Total Read Capacity</th><th>Use Case</th></tr></thead><tbody><tr><td>0 (primary only)</td><td>1x</td><td>Small application, no analytics</td></tr><tr><td>1</td><td>2x</td><td>Analytics offloading</td></tr><tr><td>2</td><td>3x</td><td>Analytics + ETL separation</td></tr><tr><td>3-5</td><td>4-6x</td><td>High read traffic, multiple consumer types</td></tr><tr><td>5-15 (MariaDB max)</td><td>6-16x</td><td>Heavy read workloads, many consumer applications</td></tr></tbody></table>
+<p>→ Each replica is independent — adding replicas doesn't impact primary performance (minimal binlog overhead)<br>
+→ Replicas can be different instance classes — right-size for each workload</p>
+<p>→ <strong>Write Scaling Limitation</strong></p>
+<table><thead><tr><th>Aspect</th><th>Capability</th></tr></thead><tbody><tr><td>Write scaling with Multi-AZ</td><td>❌ No — standby is not writable</td></tr><tr><td>Write scaling with Read Replicas</td><td>❌ No — replicas are read-only</td></tr><tr><td>Write scaling options</td><td>Vertical scaling (larger instance) OR application sharding OR Aurora</td></tr></tbody></table>
+<p>→ Multi-AZ and Read Replicas solve READ scaling and AVAILABILITY<br>
+→ They do NOT solve WRITE scaling — that requires architectural changes</p>
+<p>→ <strong>Replica Instance Sizing</strong></p>
+<table><thead><tr><th>Workload</th><th>Instance Class Relative to Primary</th><th>Rationale</th></tr></thead><tbody><tr><td>Light analyst queries</td><td>Same or smaller</td><td>Moderate read load</td></tr><tr><td>Heavy analytical queries</td><td>Same or larger</td><td>Complex scans need more CPU/memory</td></tr><tr><td>Glue extraction (parallel)</td><td>Larger</td><td>5-10 concurrent connections doing full table scans</td></tr><tr><td>Application read offloading</td><td>Same</td><td>Must handle same read patterns as primary</td></tr></tbody></table>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Configuration</th><th>Monthly Cost</th><th>Availability</th><th>Read Capacity</th></tr></thead><tbody><tr><td>Single-AZ, no replicas</td><td>$200</td><td>Low (single AZ)</td><td>1x</td></tr><tr><td>Multi-AZ, no replicas</td><td>$400</td><td>High (automatic failover)</td><td>1x</td></tr><tr><td>Multi-AZ + 1 replica</td><td>$600</td><td>High + read offloading</td><td>2x</td></tr><tr><td>Multi-AZ + 2 replicas</td><td>$1,000</td><td>High + dedicated workloads</td><td>3x</td></tr><tr><td>Multi-AZ + 5 replicas</td><td>$1,600</td><td>High + heavy read scaling</td><td>6x</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify Multi-AZ is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Multi-AZ enabled?</td><td>RDS Console → Instance → Configuration</td><td>Multi-AZ: Yes</td></tr><tr><td>Standby AZ?</td><td>RDS Console → Instance → Configuration</td><td>Secondary AZ listed</td></tr><tr><td>Failover tested?</td><td>Reboot with failover → measure time</td><td>&lt; 120 seconds</td></tr><tr><td>Event subscription active?</td><td>RDS → Event Subscriptions</td><td>Subscription for failover events</td></tr><tr><td>Application handles failover?</td><td>Trigger failover → verify app reconnects</td><td>Brief errors then recovery</td></tr></tbody></table>
+<p>→ <strong>How to verify Read Replicas are working:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Replicas created?</td><td>RDS Console → Instance → Replication section</td><td>Replicas listed</td></tr><tr><td>Replica status?</td><td>RDS Console → Replica instance → Status</td><td>Available</td></tr><tr><td>Replica lag?</td><td>CloudWatch → ReplicaLag metric</td><td>&lt; 1 second normally</td></tr><tr><td>Analysts using replica?</td><td>Check connection logs on replica</td><td>Analyst user connections visible</td></tr><tr><td>Glue using ETL replica?</td><td>Glue Connection → JDBC URL</td><td>Points to ETL replica endpoint</td></tr><tr><td>Primary CPU improved?</td><td>CloudWatch → Primary CPUUtilization</td><td>Decreased after offloading</td></tr><tr><td>Primary Read IOPS improved?</td><td>CloudWatch → Primary ReadIOPS</td><td>Decreased after offloading</td></tr></tbody></table>
+<p>→ <strong>Operational Health Summary Dashboard:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────┐
+</span>│                    RDS HEALTH DASHBOARD                          │
+│                                                                   │
+│  PRIMARY (shopnow-prod-db)        STANDBY (Multi-AZ)            │
+│  ├── Status: Available ✅          ├── AZ: ap-south-1b ✅        │
+│  ├── CPU: 35% ✅                   └── Sync: Active ✅           │
+│  ├── Connections: 55/200 ✅                                      │
+│  ├── Write IOPS: 1,500 ✅                                       │
+│  └── Read IOPS: 2,000 ✅                                        │
+│                                                                   │
+│  ANALYTICS REPLICA                ETL REPLICA                    │
+│  ├── Status: Available ✅          ├── Status: Available ✅       │
+│  ├── CPU: 45% ✅                   ├── CPU: 15% (idle) ✅        │
+│  ├── Replica Lag: 0.3s ✅          ├── Replica Lag: 0.5s ✅      │
+│  ├── Connections: 12/50 ✅         ├── Connections: 0/30 ✅      │
+│  └── Read IOPS: 5,000 ✅          └── Read IOPS: 0 (off-peak) ✅│
+│                                                                   │
+│  ALERTS: None active ✅                                          │
+└─────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Multi-AZ provides HIGH AVAILABILITY — automatic failover in &lt; 2 minutes with ZERO data loss<br>
+→ Read Replicas provide READ SCALING — offload analyst queries and ETL extraction from the primary<br>
+→ They solve DIFFERENT problems and should be used TOGETHER for production databases<br>
+→ Multi-AZ = synchronous replication (zero data loss, not readable)<br>
+→ Read Replica = asynchronous replication (slight lag, readable)<br>
+→ The primary database now serves ONLY the application — analysts and Glue use dedicated replicas<br>
+→ Primary performance improved dramatically: CPU 75% → 35%, latency 45ms → 8ms<br>
+→ Failover is TRANSPARENT to the application — same DNS endpoint, automatic DNS update</p>
+<p>→ This project transforms the database tier from a single point of failure to a resilient, scaled architecture:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE (Project 9):                    AFTER (This Project):
+</span>                                        
+┌──────────────┐                       ┌──────────────┐
+│   PRIMARY     │                       │   PRIMARY     │ ← Application only
+│   (Single AZ) │                       │   (Multi-AZ)  │
+│               │                       └───────┬───────┘
+│  App + Analyst│                               │ Synchronous
+│  + Glue       │                       ┌───────▼───────┐
+│  ALL on one   │                       │   STANDBY      │ ← Auto-failover
+│  instance     │                       │   (Hidden)     │
+└──────────────┘                       └───────┬───────┘
+                                               │ Asynchronous
+                                       ┌───────┴───────┐
+                                ┌──────▼──────┐ ┌──────▼──────┐
+                                │  ANALYTICS   │ │  ETL         │
+                                │  REPLICA     │ │  REPLICA     │
+                                │  (Analysts)  │ │  (Glue)      │
+                                └─────────────┘ └─────────────┘</code></pre></div>
+<p>→ This project connects to:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 9 (RDS MariaDB)</td><td>Multi-AZ and replicas extend the base RDS setup</td></tr><tr><td>Project 14 (EC2 → RDS)</td><td>Application still connects to primary; read offloading to replica</td></tr><tr><td>Project 24 (Glue JDBC)</td><td>Glue connection updated to use ETL replica endpoint</td></tr><tr><td>Project 4 (Security Groups)</td><td>Separate SGs for primary, analytics replica, ETL replica</td></tr><tr><td>Project 8 (CloudWatch)</td><td>ReplicaLag alarms, failover event monitoring</td></tr><tr><td>Project 37 (Secrets Manager)</td><td>Credential management for multiple endpoints</td></tr><tr><td>Project 48 (Redshift Federated)</td><td>Federated query can target Read Replica instead of primary</td></tr><tr><td>Project 55 (Cross-Region DR)</td><td>Cross-region Read Replica for disaster recovery</td></tr><tr><td>Project 58 (DMS)</td><td>DMS can read from replica for migration — protecting primary</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The database is now highly available with Multi-AZ and scaled with Read Replicas<br>
+→ But what about the DATA in S3? Is it protected against loss?</p>
+<p>→ Consider this scenario:</p>
+<ul>
+<li>ShopNow's entire data lake lives in <code>s3://shopnow-data-lake</code> in <code>ap-south-1</code> (Mumbai)</li>
+<li>What if there's a regional AWS outage affecting <code>ap-south-1</code>?</li>
+<li>What if someone accidentally deletes the bucket? (Project 12's versioning helps but doesn't protect against bucket deletion)</li>
+<li>What if a compliance audit requires data to exist in TWO geographic locations?</li>
+</ul>
+<p>→ S3 provides 11 9s durability WITHIN a region — but all copies are in the same region<br>
+→ For geographic redundancy → data must exist in a SECOND region</p>
+<p>→ <strong>This is exactly what Project 30 solves</strong><br>
+→ Project 30 introduces Cross-Region S3 Replication — automatically copying objects from one bucket to another in a different AWS region<br>
+→ You will learn how to configure replication rules, IAM roles for replication, and Replication Time Control for SLA-bound copying<br>
+→ Combined with Multi-AZ RDS (this project) and S3 versioning (Project 12), this creates a comprehensive data protection strategy<br>
+→ This is the foundation for the full disaster recovery architecture in Project 55</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 30: "The Compliance Team That Demanded Geo-Redundancy — Cross-Region S3 Replication"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-28.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 29/60</span></div><a class="nav-btn next" href="project-30.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

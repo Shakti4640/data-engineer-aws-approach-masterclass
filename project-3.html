@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 3: THE DEVELOPER WHO COULDN'T ACCESS THE SERVER — EC2 Instance Launch &a — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 3: THE DEVELOPER WHO COULDN'T ACCESS THE SERVER — EC2 Instance Launch &amp; SSH Configuration</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Project 1 and 2) now has their S3 bucket secured with IAM policies<br>
+→ The development team says: "We need a server to run our product catalog web application"<br>
+→ Previously — they ran the app on a physical server under the CTO's desk<br>
+→ That server overheated twice, crashed once, and nobody could access it from home<br>
+→ The CTO decides: "Let's move to AWS — spin up a virtual server"<br>
+→ <code>priya-dev</code> gets the task — she launches an EC2 instance from the console<br>
+→ Instance shows "Running" — but she CANNOT connect to it via SSH<br>
+→ She tries the public IP → "Connection timed out"<br>
+→ She tries the key pair → "Permission denied (publickey)"<br>
+→ She restarts the instance → the public IP CHANGES → bookmarks break<br>
+→ She stops the instance overnight to save money → starts it next morning → IP changed again<br>
+→ She terminates the instance by accident thinking "Terminate" means "Stop" → instance is GONE permanently<br>
+→ The CTO asks: "Why is something as simple as launching a server this complicated?"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ EC2 (Elastic Compute Cloud) is AWS's virtual server service<br>
+→ It gives you a virtual machine (VM) running on AWS physical hardware<br>
+→ You control the operating system, applications, networking, and storage</p>
+<p>→ The problems Priya faced map to specific EC2 concepts:</p>
+<table><thead><tr><th>Problem</th><th>Root Cause</th><th>EC2 Concept</th></tr></thead><tbody><tr><td>Cannot SSH → "Connection timed out"</td><td>No inbound rule allowing port 22</td><td>Security Group (Project 4 deep-dive)</td></tr><tr><td>Cannot SSH → "Permission denied"</td><td>Wrong key pair or wrong username</td><td>Key Pair + AMI default user</td></tr><tr><td>Public IP changes on stop/start</td><td>Default public IP is ephemeral</td><td>Elastic IP</td></tr><tr><td>Terminated instead of stopped</td><td>Misunderstanding instance lifecycle</td><td>Instance States</td></tr><tr><td>Didn't know which size to pick</td><td>No understanding of instance families</td><td>Instance Types</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand what an AMI is (the server template)</li>
+<li>Step 2 — Understand Instance Types (CPU/RAM/Network sizing)</li>
+<li>Step 3 — Understand Key Pairs (SSH authentication)</li>
+<li>Step 4 — Launch an instance with correct settings</li>
+<li>Step 5 — Understand Instance States (running/stopped/terminated)</li>
+<li>Step 6 — Understand public IP vs Elastic IP</li>
+<li>Step 7 — Connect via SSH successfully</li>
+<li>Step 8 — Understand Instance Metadata</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND AMI (AMAZON MACHINE IMAGE)</h3>
+<p>→ An AMI is a TEMPLATE that contains:</p>
+<ul>
+<li>Operating system (Linux, Windows, macOS)</li>
+<li>Pre-installed software (if any)</li>
+<li>Boot volume configuration</li>
+<li>Launch permissions (who can use this AMI)</li>
+<li>Block device mapping (which storage volumes to attach)</li>
+</ul>
+<p>→ Think of AMI as a "snapshot" of a fully configured server that you can launch copies from</p>
+<p><strong>AMI Sources:</strong></p>
+<table><thead><tr><th>Source</th><th>Description</th><th>Examples</th></tr></thead><tbody><tr><td>AWS Quick Start AMIs</td><td>Official, maintained by AWS</td><td>Amazon Linux 2023, Ubuntu 22.04, Windows Server 2022, Red Hat Enterprise Linux</td></tr><tr><td>AWS Marketplace AMIs</td><td>Third-party vendor images</td><td>Pre-configured WordPress, NGINX, databases — some free, some paid</td></tr><tr><td>Community AMIs</td><td>Shared by other AWS users</td><td>Wide variety — use with caution (security risk)</td></tr><tr><td>Custom AMIs</td><td>Created by YOU from your own instances</td><td>Your app pre-installed, your configs baked in</td></tr></tbody></table>
+<p><strong>For ShopNow:</strong><br>
+→ Choose: Amazon Linux 2023 (free tier eligible, AWS-optimized, lightweight)<br>
+→ AMI ID format: <code>ami-0abcdef1234567890</code> (unique per region)<br>
+→ IMPORTANT: AMIs are REGION-SPECIFIC</p>
+<ul>
+<li>An AMI in <code>ap-south-1</code> is NOT available in <code>us-east-1</code></li>
+<li>You must copy an AMI to use it in another region</li>
+</ul>
+<p><strong>Default SSH Usernames per AMI:</strong></p>
+<table><thead><tr><th>AMI</th><th>Default Username</th></tr></thead><tbody><tr><td>Amazon Linux 2 / 2023</td><td><code>ec2-user</code></td></tr><tr><td>Ubuntu</td><td><code>ubuntu</code></td></tr><tr><td>Red Hat Enterprise Linux</td><td><code>ec2-user</code></td></tr><tr><td>CentOS</td><td><code>centos</code></td></tr><tr><td>Debian</td><td><code>admin</code></td></tr><tr><td>SUSE Linux</td><td><code>ec2-user</code></td></tr><tr><td>Windows</td><td><code>Administrator</code> (RDP, not SSH)</td></tr></tbody></table>
+<p>→ THIS is why Priya got "Permission denied" — she was using <code>root</code> instead of <code>ec2-user</code><br>
+→ Each AMI has a SPECIFIC default user — using the wrong one = authentication failure</p>
+<hr>
+<h3>STEP 2 — UNDERSTAND INSTANCE TYPES</h3>
+<p>→ Instance Type determines the HARDWARE specifications of your virtual server<br>
+→ Format: <code>{family}{generation}.{size}</code><br>
+→ Example: <code>t3.micro</code> → Family: <code>t</code>, Generation: <code>3</code>, Size: <code>micro</code></p>
+<p><strong>Instance Families (What each letter means):</strong></p>
+<table><thead><tr><th>Family</th><th>Optimized For</th><th>Use Case</th><th>Example Types</th></tr></thead><tbody><tr><td><code>t</code></td><td>General purpose (burstable)</td><td>Web servers, dev environments, small apps</td><td>t3.micro, t3.small, t3.medium</td></tr><tr><td><code>m</code></td><td>General purpose (fixed)</td><td>Application servers, mid-size databases</td><td>m6i.large, m6i.xlarge</td></tr><tr><td><code>c</code></td><td>Compute optimized</td><td>CPU-intensive tasks, batch processing, gaming</td><td>c6i.large, c6i.2xlarge</td></tr><tr><td><code>r</code></td><td>Memory optimized</td><td>In-memory databases, caching, real-time analytics</td><td>r6i.large, r6i.4xlarge</td></tr><tr><td><code>i</code></td><td>Storage optimized</td><td>High sequential read/write, data warehousing</td><td>i3.large, i3.xlarge</td></tr><tr><td><code>g</code> / <code>p</code></td><td>GPU / Accelerated computing</td><td>Machine learning, video rendering, graphics</td><td>g5.xlarge, p4d.24xlarge</td></tr><tr><td><code>d</code></td><td>Dense storage</td><td>Hadoop, distributed file systems</td><td>d3.xlarge</td></tr></tbody></table>
+<p><strong>Instance Sizes:</strong></p>
+<table><thead><tr><th>Size</th><th>Relative Capacity</th></tr></thead><tbody><tr><td>nano</td><td>Smallest (0.5 GB RAM)</td></tr><tr><td>micro</td><td>Very small (1 GB RAM) — Free Tier eligible for <code>t2.micro</code> / <code>t3.micro</code></td></tr><tr><td>small</td><td>2 GB RAM</td></tr><tr><td>medium</td><td>4 GB RAM</td></tr><tr><td>large</td><td>8 GB RAM</td></tr><tr><td>xlarge</td><td>16 GB RAM</td></tr><tr><td>2xlarge</td><td>32 GB RAM</td></tr><tr><td>4xlarge → 24xlarge</td><td>Progressively larger</td></tr><tr><td>metal</td><td>Bare metal — full physical server</td></tr></tbody></table>
+<p>→ Each size DOUBLES the resources (vCPU + RAM) of the previous size</p>
+<p><strong>Burstable Instances (T-family) — Critical to understand:</strong></p>
+<p>→ <code>t3.micro</code> has a BASELINE CPU performance (e.g., 10% of a full vCPU)<br>
+→ When your app needs more → it "bursts" above baseline using CPU credits<br>
+→ CPU credits accumulate when instance is BELOW baseline<br>
+→ CPU credits are consumed when instance is ABOVE baseline<br>
+→ If credits run out → performance is capped at baseline → app becomes slow</p>
+<table><thead><tr><th>Concept</th><th>Meaning</th></tr></thead><tbody><tr><td>Baseline</td><td>Guaranteed minimum CPU performance</td></tr><tr><td>Burst</td><td>Temporary above-baseline performance using credits</td></tr><tr><td>CPU Credits</td><td>Currency for bursting — earned when idle, spent when busy</td></tr><tr><td>Unlimited Mode</td><td>Can burst beyond credit balance — charged per-vCPU-hour for excess usage</td></tr></tbody></table>
+<p>→ For ShopNow's dev server → <code>t3.micro</code> is perfect (low traffic, occasional bursts)<br>
+→ For production with consistent load → use <code>m</code> family (no bursting concept — fixed performance)</p>
+<p><strong>For ShopNow:</strong><br>
+→ Choose: <code>t3.micro</code> (1 vCPU, 1 GB RAM, free tier eligible)</p>
+<hr>
+<h3>STEP 3 — UNDERSTAND KEY PAIRS (SSH AUTHENTICATION)</h3>
+<p>→ AWS EC2 uses KEY-BASED authentication — NOT password-based<br>
+→ This is MORE secure than passwords because:</p>
+<ul>
+<li>Keys are 2048-bit or 4096-bit RSA/ED25519 — virtually uncrackable</li>
+<li>No password to guess, brute-force, or phish</li>
+<li>Private key never leaves your machine</li>
+</ul>
+<p><strong>How Key Pairs Work:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CREATION:
+</span>┌──────────────────────┐         ┌──────────────────────┐
+│     PUBLIC KEY        │         │     PRIVATE KEY       │
+│ (stored by AWS on    │         │ (downloaded by YOU    │
+│  the EC2 instance    │         │  ONCE at creation     │
+│  in ~/.ssh/          │         │  — stored on your     │
+│  authorized_keys)    │         │  local machine)       │
+└──────────────────────┘         └──────────────────────┘
+         │                                  │
+         │           SSH CONNECTION         │
+         │◄────────────────────────────────►│
+         │                                  │
+         │  1. Client sends connection      │
+         │     request with public key ID   │
+         │                                  │
+         │  2. Server creates challenge     │
+         │     encrypted with public key    │
+         │                                  │
+         │  3. Client decrypts challenge    │
+         │     with private key             │
+         │                                  │
+         │  4. Client sends proof back      │
+         │                                  │
+         │  5. Server verifies → ACCESS     │
+         │     GRANTED                      │
+         └──────────────────────────────────┘</code></pre></div>
+<p><strong>Creating a Key Pair:</strong></p>
+<p>→ EC2 Console → Key Pairs (left sidebar under Network &amp; Security) → "Create key pair"</p>
+<table><thead><tr><th>Setting</th><th>Options</th><th>Recommendation</th></tr></thead><tbody><tr><td>Name</td><td>Any descriptive name</td><td><code>shopnow-dev-key-aps1</code></td></tr><tr><td>Key pair type</td><td>RSA or ED25519</td><td>RSA (broader compatibility) or ED25519 (more modern, smaller key)</td></tr><tr><td>Private key file format</td><td><code>.pem</code> (Linux/Mac/newer Windows) or <code>.ppk</code> (PuTTY on Windows)</td><td><code>.pem</code> for most use cases</td></tr></tbody></table>
+<p>→ Click "Create key pair"<br>
+→ Browser automatically downloads the <code>.pem</code> file<br>
+→ THIS FILE IS DOWNLOADED ONLY ONCE — AWS DOES NOT STORE THE PRIVATE KEY<br>
+→ If you lose it → you CANNOT recover it → you must create a new key pair</p>
+<p><strong>After Download — Set Permissions (on your local machine):</strong></p>
+<p>→ The <code>.pem</code> file must have restricted permissions<br>
+→ SSH refuses to use a key file that is readable by others<br>
+→ On Linux/Mac: File permission must be <code>400</code> (read-only by owner)<br>
+→ On Windows: Right-click → Properties → Security → Remove all users except your own</p>
+<p>→ THIS is the other reason Priya got "Permission denied" — her key file had open permissions</p>
+<hr>
+<h3>STEP 4 — LAUNCH THE EC2 INSTANCE</h3>
+<p>→ EC2 Console → "Launch instance"</p>
+<p><strong>Setting 1: Name and Tags</strong></p>
+<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td>shopnow-product-catalog-dev</td></tr><tr><td>Environment</td><td>Development</td></tr><tr><td>Department</td><td>Engineering</td></tr><tr><td>Owner</td><td>priya-dev</td></tr></tbody></table>
+<p>→ Tags work identically to S3 tags (Project 1) and IAM tags (Project 2)<br>
+→ The "Name" tag is special — it appears as the instance name in the console</p>
+<hr>
+<p><strong>Setting 2: Application and OS Images (AMI)</strong></p>
+<p>→ Select: Amazon Linux 2023 AMI<br>
+→ Architecture: 64-bit (x86) — unless you specifically need ARM (Graviton)<br>
+→ Confirm: "Free tier eligible" badge is shown</p>
+<hr>
+<p><strong>Setting 3: Instance Type</strong></p>
+<p>→ Select: <code>t3.micro</code><br>
+→ Shows: 1 vCPU, 1 GB Memory</p>
+<hr>
+<p><strong>Setting 4: Key Pair</strong></p>
+<p>→ Select: <code>shopnow-dev-key-aps1</code> (created in Step 3)<br>
+→ Or "Create new key pair" if not created yet<br>
+→ CRITICAL: Without a key pair → you CANNOT SSH into the instance after launch<br>
+→ You CAN launch without a key pair → but then you need Session Manager (SSM) for access</p>
+<hr>
+<p><strong>Setting 5: Network Settings</strong></p>
+<p>→ This is where MOST launch mistakes happen</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>VPC</td><td>Default VPC (auto-created by AWS in every region)</td><td>For now — custom VPC in Project 5</td></tr><tr><td>Subnet</td><td>No preference (auto-assign to any AZ)</td><td>For now — specific subnet selection in Project 5</td></tr><tr><td>Auto-assign public IP</td><td>Enable</td><td>Needed for SSH from internet</td></tr><tr><td>Firewall (Security Groups)</td><td>Create security group</td><td>Controls who can connect</td></tr></tbody></table>
+<p><strong>Security Group Configuration (Introductory — Deep dive in Project 4):</strong></p>
+<p>→ A Security Group is a virtual firewall that controls inbound and outbound traffic<br>
+→ For SSH access — we need an INBOUND rule:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port Range</th><th>Source</th><th>Description</th></tr></thead><tbody><tr><td>SSH</td><td>TCP</td><td>22</td><td>My IP (auto-detects your current IP)</td><td>SSH access from my location</td></tr></tbody></table>
+<p>→ "My IP" sets the source to your current public IP (e.g., <code>203.0.113.45/32</code>)<br>
+→ The <code>/32</code> means ONLY this single IP address — nobody else can SSH in<br>
+→ NEVER set source to <code>0.0.0.0/0</code> for SSH — this allows the ENTIRE internet to attempt SSH connections</p>
+<p>→ Security Group Name: <code>shopnow-dev-ssh-sg</code></p>
+<p>→ THIS is why Priya's first attempt timed out — she had no Security Group rule allowing port 22</p>
+<hr>
+<p><strong>Setting 6: Configure Storage</strong></p>
+<p>→ Root volume (boot volume):</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Size</td><td>8 GiB (default)</td><td>Sufficient for OS + basic applications</td></tr><tr><td>Volume Type</td><td>gp3 (General Purpose SSD)</td><td>Best price-performance for most workloads</td></tr><tr><td>IOPS</td><td>3,000 (default for gp3)</td><td>Input/Output operations per second</td></tr><tr><td>Throughput</td><td>125 MB/s (default for gp3)</td><td>Sequential read/write speed</td></tr><tr><td>Delete on termination</td><td>Yes (default)</td><td>Volume is deleted when instance is terminated</td></tr><tr><td>Encrypted</td><td>No (default) — change to Yes</td><td>Encrypt boot volume with KMS (explored in Project 36)</td></tr></tbody></table>
+<p><strong>EBS Volume Types (for reference):</strong></p>
+<table><thead><tr><th>Volume Type</th><th>Code</th><th>Use Case</th><th>Max IOPS</th><th>Max Throughput</th></tr></thead><tbody><tr><td>General Purpose SSD</td><td>gp3</td><td>Boot volumes, dev/test, most workloads</td><td>16,000</td><td>1,000 MB/s</td></tr><tr><td>General Purpose SSD (older)</td><td>gp2</td><td>Legacy — gp3 is better in every way</td><td>16,000</td><td>250 MB/s</td></tr><tr><td>Provisioned IOPS SSD</td><td>io2 Block Express</td><td>Databases needing consistent high IOPS</td><td>256,000</td><td>4,000 MB/s</td></tr><tr><td>Throughput Optimized HDD</td><td>st1</td><td>Big data, log processing, sequential reads</td><td>500</td><td>500 MB/s</td></tr><tr><td>Cold HDD</td><td>sc1</td><td>Infrequently accessed, lowest cost</td><td>250</td><td>250 MB/s</td></tr></tbody></table>
+<p>→ For ShopNow dev server → gp3, 8 GiB is perfect</p>
+<hr>
+<p><strong>Setting 7: Advanced Details (Important ones)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>IAM instance profile</td><td>None (for now)</td><td>Will be configured in Project 11</td></tr><tr><td>Shutdown behavior</td><td>Stop (NOT Terminate)</td><td>When OS issues shutdown command → instance stops (not destroyed)</td></tr><tr><td>Termination protection</td><td>Enable</td><td>Prevents accidental termination — must disable protection first</td></tr><tr><td>Detailed monitoring</td><td>Disable (for now)</td><td>CloudWatch metrics every 1 minute instead of 5 — costs extra</td></tr><tr><td>Tenancy</td><td>Shared (default)</td><td>Your instance runs on shared physical hardware — cheapest</td></tr><tr><td>User data</td><td>Empty (for now)</td><td>Bootstrap script that runs on first launch — advanced use</td></tr><tr><td>Metadata version</td><td>V2 only (IMDSv2)</td><td>More secure instance metadata access — explained in Step 8</td></tr></tbody></table>
+<p>→ TERMINATION PROTECTION is what would have saved Priya's accidental termination<br>
+→ With it enabled → clicking "Terminate" shows an error → must disable protection first</p>
+<p>→ Click "Launch instance" → Instance launches → State: "Pending" → then "Running"</p>
+<hr>
+<h3>STEP 5 — UNDERSTAND INSTANCE STATES</h3>
+<p>→ EC2 instances go through a lifecycle of states</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌──────────────────────────────────────────────┐
+</span>                    │                                              │
+                    ▼                                              │
+    ┌─────────┐  Launch  ┌─────────┐        ┌──────────┐         │
+    │ AMI     │────────►│ Pending │───────►│ Running  │         │
+    │(Template)│         └─────────┘        └────┬─────┘         │
+    └─────────┘                                  │               │
+                                    ┌────────────┼────────────┐  │
+                                    │            │            │  │
+                                    ▼            ▼            ▼  │
+                              ┌──────────┐ ┌──────────┐ ┌────────┴──┐
+                              │ Stopping │ │Shutting  │ │ Rebooting │
+                              │          │ │  Down    │ │           │
+                              └────┬─────┘ └────┬─────┘ └───────────┘
+                                   │            │
+                                   ▼            ▼
+                              ┌──────────┐ ┌──────────────┐
+                              │ Stopped  │ │ Terminated   │
+                              │          │ │ (GONE)       │
+                              └────┬─────┘ └──────────────┘
+                                   │
+                                   │  Start
+                                   │
+                                   ▼
+                              ┌──────────┐
+                              │ Pending  │──────► Running
+                              └──────────┘</code></pre></div>
+<p><strong>Critical Differences:</strong></p>
+<table><thead><tr><th>Action</th><th>What Happens</th><th>Data Preserved?</th><th>Public IP Preserved?</th><th>Billing</th></tr></thead><tbody><tr><td><strong>Stop</strong></td><td>Instance powers off, stays in your account</td><td>EBS volumes: YES, Instance store: NO</td><td>NO (new IP on start)</td><td>No compute charge, EBS storage still charged</td></tr><tr><td><strong>Start</strong></td><td>Instance powers on (possibly on different physical host)</td><td>EBS volumes: YES</td><td>Gets NEW public IP</td><td>Compute billing resumes</td></tr><tr><td><strong>Reboot</strong></td><td>Restart without changing physical host</td><td>All data preserved</td><td>YES (same IP)</td><td>No billing change</td></tr><tr><td><strong>Terminate</strong></td><td>Instance DESTROYED permanently</td><td>EBS root volume: DELETED (default)</td><td>N/A</td><td>All billing stops</td></tr><tr><td><strong>Hibernate</strong></td><td>RAM contents saved to EBS, instance stops</td><td>RAM + EBS: YES</td><td>NO (new IP on start)</td><td>No compute charge, EBS charged</td></tr></tbody></table>
+<p>→ STOP ≠ TERMINATE — this distinction is CRITICAL<br>
+→ Stop = Pause (resume later)<br>
+→ Terminate = Delete (gone forever)<br>
+→ Priya confused these two → lost her instance</p>
+<p><strong>Termination Protection:</strong><br>
+→ When enabled → "Terminate" action is blocked<br>
+→ To terminate → must first disable protection → then terminate<br>
+→ This two-step process prevents accidents</p>
+<hr>
+<h3>STEP 6 — UNDERSTAND PUBLIC IP vs ELASTIC IP</h3>
+<p><strong>The Problem:</strong><br>
+→ Priya stops her instance at night → starts it in the morning → IP changed<br>
+→ All SSH configs, bookmarks, DNS entries break</p>
+<p><strong>Why does the IP change?</strong></p>
+<p>→ When you launch with "Auto-assign public IP: Enable"<br>
+→ AWS assigns a PUBLIC IP from its pool<br>
+→ This IP is EPHEMERAL — it belongs to AWS, not to you<br>
+→ When you stop the instance → the IP is released back to AWS's pool<br>
+→ When you start again → AWS assigns a DIFFERENT IP from the pool</p>
+<p><strong>Solution: Elastic IP (EIP)</strong></p>
+<p>→ An Elastic IP is a STATIC public IPv4 address that YOU own<br>
+→ It stays the same until you explicitly release it<br>
+→ You can attach it to any instance and detach/reattach freely</p>
+<p><strong>Configuration:</strong></p>
+<p>→ EC2 Console → Elastic IPs (left sidebar under Network &amp; Security) → "Allocate Elastic IP address"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Network border group</td><td>ap-south-1 (your region)</td></tr><tr><td>Public IPv4 address pool</td><td>Amazon's pool of IPv4 addresses</td></tr></tbody></table>
+<p>→ Click "Allocate"<br>
+→ You get an IP like <code>13.234.176.89</code><br>
+→ This IP is NOW YOURS until you release it</p>
+<p><strong>Associate Elastic IP to Instance:</strong></p>
+<p>→ Select the Elastic IP → Actions → "Associate Elastic IP address"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Resource type</td><td>Instance</td></tr><tr><td>Instance</td><td>shopnow-product-catalog-dev (select from dropdown)</td></tr><tr><td>Private IP address</td><td>Auto-populated (the instance's private IP)</td></tr><tr><td>Allow reassociation</td><td>Check (allows moving this EIP to another instance)</td></tr></tbody></table>
+<p>→ Click "Associate"<br>
+→ Now the instance has a FIXED public IP: <code>13.234.176.89</code><br>
+→ Stop/start the instance → IP stays the same<br>
+→ This solves Priya's changing IP problem</p>
+<p><strong>CRITICAL Pricing Rule:</strong></p>
+<table><thead><tr><th>EIP State</th><th>Cost</th></tr></thead><tbody><tr><td>Associated with a RUNNING instance</td><td>FREE</td></tr><tr><td>Associated with a STOPPED instance</td><td>CHARGED (~$3.65/month)</td></tr><tr><td>Allocated but NOT associated with any instance</td><td>CHARGED (~$3.65/month)</td></tr><tr><td>Released (back to AWS pool)</td><td>No further charge</td></tr></tbody></table>
+<p>→ AWS charges for WASTED Elastic IPs — to discourage hoarding IPv4 addresses<br>
+→ IPv4 addresses are scarce → AWS wants you to use them or release them<br>
+→ Additionally: Starting February 2024, AWS charges $0.005/hour for ALL public IPv4 addresses (including auto-assigned)</p>
+<hr>
+<h3>STEP 7 — CONNECT VIA SSH SUCCESSFULLY</h3>
+<p>→ Now we have:</p>
+<ul>
+<li>Running instance with public IP (Elastic IP: <code>13.234.176.89</code>)</li>
+<li>Key pair file: <code>shopnow-dev-key-aps1.pem</code></li>
+<li>Security Group allowing SSH (port 22) from our IP</li>
+<li>AMI: Amazon Linux 2023 → default user: <code>ec2-user</code></li>
+</ul>
+<p><strong>SSH Connection Parameters:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Username</td><td><code>ec2-user</code></td><td>AMI-specific default user</td></tr><tr><td>Host</td><td><code>13.234.176.89</code></td><td>Elastic IP of the instance</td></tr><tr><td>Port</td><td>22</td><td>SSH default port</td></tr><tr><td>Authentication</td><td>Private key file</td><td><code>shopnow-dev-key-aps1.pem</code></td></tr></tbody></table>
+<p><strong>Connection Verification Checklist:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CHECK 1: Is the instance in "Running" state?
+</span>         EC2 Console → Instances → Status: "Running" ✓
+
+CHECK 2: Does the Security Group allow inbound SSH?
+         Instance → Security tab → Inbound rules → Port 22 from your IP ✓
+
+CHECK 3: Is the public IP / Elastic IP assigned?
+         Instance → Details → Public IPv4 address: 13.234.176.89 ✓
+
+CHECK 4: Is the key file permissions correct?
+         Local machine → file permission is 400 (read-only owner) ✓
+
+CHECK 5: Are you using the correct username?
+         Amazon Linux = ec2-user (NOT root, NOT admin, NOT ubuntu) ✓
+
+CHECK 6: Is port 22 open on the OS-level firewall?
+         Amazon Linux 2023 → SSH enabled by default ✓
+         (Some AMIs may have iptables/firewalld blocking — rare for AWS AMIs)</code></pre></div>
+<p>→ If ALL 6 checks pass → SSH connection succeeds<br>
+→ Priya's failures mapped to: CHECK 2 (no SG rule), CHECK 4 (wrong permissions), CHECK 5 (wrong username)</p>
+<p><strong>Alternative Connection Methods:</strong></p>
+<table><thead><tr><th>Method</th><th>When to Use</th><th>Requirements</th></tr></thead><tbody><tr><td>SSH (Key-based)</td><td>Standard Linux access</td><td>Key pair, port 22 open, public IP</td></tr><tr><td>EC2 Instance Connect</td><td>Quick browser-based SSH</td><td>Amazon Linux/Ubuntu only, port 22 open</td></tr><tr><td>Session Manager (SSM)</td><td>No SSH needed, no port 22, no public IP</td><td>SSM Agent installed, IAM Role with SSM permissions</td></tr><tr><td>RDP</td><td>Windows instances</td><td>Key pair (to decrypt admin password), port 3389 open</td></tr><tr><td>EC2 Serial Console</td><td>Emergency debugging when SSH fails</td><td>Enabled at account level, password-based</td></tr></tbody></table>
+<p>→ Session Manager is increasingly preferred because:</p>
+<ul>
+<li>No need to open port 22 (better security)</li>
+<li>No need for public IP (instance can be in private subnet)</li>
+<li>All sessions are logged in CloudWatch (audit trail)</li>
+<li>Requires IAM Role on instance (Project 11)</li>
+</ul>
+<hr>
+<h3>STEP 8 — UNDERSTAND INSTANCE METADATA (IMDS)</h3>
+<p>→ Every EC2 instance can query information ABOUT ITSELF<br>
+→ This is called the Instance Metadata Service (IMDS)<br>
+→ Available at a special link-local address: <code>http://169.254.169.254/latest/meta-data/</code><br>
+→ This address is ONLY accessible from WITHIN the instance — not from the internet</p>
+<p><strong>What Metadata Provides:</strong></p>
+<table><thead><tr><th>Metadata Path</th><th>Returns</th></tr></thead><tbody><tr><td><code>/latest/meta-data/instance-id</code></td><td><code>i-0abcdef1234567890</code></td></tr><tr><td><code>/latest/meta-data/instance-type</code></td><td><code>t3.micro</code></td></tr><tr><td><code>/latest/meta-data/ami-id</code></td><td><code>ami-0abcdef1234567890</code></td></tr><tr><td><code>/latest/meta-data/public-ipv4</code></td><td><code>13.234.176.89</code></td></tr><tr><td><code>/latest/meta-data/local-ipv4</code></td><td><code>172.31.16.55</code> (private IP)</td></tr><tr><td><code>/latest/meta-data/placement/availability-zone</code></td><td><code>ap-south-1a</code></td></tr><tr><td><code>/latest/meta-data/security-groups</code></td><td><code>shopnow-dev-ssh-sg</code></td></tr><tr><td><code>/latest/meta-data/iam/security-credentials/{role-name}</code></td><td>Temporary IAM credentials (Project 11)</td></tr></tbody></table>
+<p><strong>IMDSv1 vs IMDSv2:</strong></p>
+<table><thead><tr><th>Version</th><th>How It Works</th><th>Security Level</th></tr></thead><tbody><tr><td>IMDSv1</td><td>Simple GET request to <code>169.254.169.254</code></td><td>Vulnerable to SSRF attacks (Server-Side Request Forgery)</td></tr><tr><td>IMDSv2</td><td>Requires a TOKEN first (PUT request), then GET with token in header</td><td>Protected against SSRF — token cannot be forwarded</td></tr></tbody></table>
+<p><strong>IMDSv2 Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Request a token
+</span>        PUT http://169.254.169.254/latest/api/token
+        Header: X-aws-ec2-metadata-token-ttl-seconds: 21600
+        → Returns: temporary token (valid for specified TTL)
+
+Step 2: Use token to query metadata
+        GET http://169.254.169.254/latest/meta-data/instance-id
+        Header: X-aws-ec2-metadata-token: {token from step 1}
+        → Returns: i-0abcdef1234567890</code></pre></div>
+<p>→ We configured "Metadata version: V2 only (IMDSv2)" during launch<br>
+→ This BLOCKS IMDSv1 requests — only token-based (IMDSv2) requests work<br>
+→ Always use IMDSv2 — IMDSv1 is a known attack vector (Capital One breach 2019 exploited IMDSv1)</p>
+<p><strong>Why Metadata Matters:</strong><br>
+→ Applications running on EC2 use metadata to discover their own environment<br>
+→ IAM Role credentials are delivered through metadata (Project 11)<br>
+→ Auto-scaling scripts use metadata to identify which instance they're running on<br>
+→ Configuration management tools use metadata for dynamic setup</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable Termination Protection on important instances<br>
+→ Always use Elastic IPs for instances that need stable public addresses<br>
+→ Always use IMDSv2 only — disable IMDSv1<br>
+→ Always set "Shutdown behavior" to "Stop" not "Terminate"<br>
+→ Always use key pairs — never rely on password-based SSH<br>
+→ Always restrict Security Group SSH source to specific IPs — never <code>0.0.0.0/0</code><br>
+→ Always store private key files securely — treat them like passwords<br>
+→ Always tag instances with Name, Environment, Owner, Department<br>
+→ Always choose gp3 over gp2 for new EBS volumes — better performance, lower cost<br>
+→ Always right-size instances — start small, monitor, scale up if needed<br>
+→ Always use Session Manager when possible — reduces network attack surface<br>
+→ Always verify the correct default SSH username for your chosen AMI</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never launch instances without a key pair (unless using Session Manager exclusively)<br>
+→ Never set SSH Security Group source to <code>0.0.0.0/0</code> — bots scan for open port 22 constantly<br>
+→ Never confuse Stop with Terminate — Terminate is irreversible<br>
+→ Never leave Elastic IPs allocated but unassociated — you pay for waste<br>
+→ Never use <code>t2</code> family for new instances — <code>t3</code> is superior in every way (newer, cheaper, better networking)<br>
+→ Never store private key files in shared locations, email, or version control (Git)<br>
+→ Never leave IMDSv1 enabled — it's an SSRF attack vector<br>
+→ Never launch in the default VPC for production workloads — use custom VPC (Project 5)<br>
+→ Never skip Termination Protection for production instances<br>
+→ Never assume instance store data survives a stop — it doesn't (only EBS persists)<br>
+→ Never choose an instance type without understanding if you need burstable (t) or fixed (m) performance</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>EC2 Solution</th></tr></thead><tbody><tr><td>Simple web application, dev environment</td><td><code>t3.micro</code> or <code>t3.small</code> — burstable, cheapest</td></tr><tr><td>Production application server with consistent load</td><td><code>m6i.large</code> or <code>m6i.xlarge</code> — fixed performance</td></tr><tr><td>CPU-intensive batch processing</td><td><code>c6i</code> family — compute optimized</td></tr><tr><td>In-memory caching or database</td><td><code>r6i</code> family — memory optimized</td></tr><tr><td>Machine learning training</td><td><code>p4d</code> or <code>g5</code> family — GPU instances</td></tr><tr><td>Big data with local storage needs</td><td><code>i3</code> or <code>d3</code> family — storage optimized</td></tr><tr><td>Need stable public IP</td><td>Elastic IP</td></tr><tr><td>Need SSH access from internet</td><td>Security Group + port 22 + key pair</td></tr><tr><td>Need access without opening ports</td><td>Session Manager (SSM)</td></tr><tr><td>Need Windows server</td><td>Windows AMI + RDP (port 3389)</td></tr><tr><td>Need to save money on dev instances</td><td>Stop instances outside business hours</td></tr><tr><td>Need to run server 24/7 for 1-3 years</td><td>Reserved Instances or Savings Plans (Project 56)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE EC2</h2>
+<table><thead><tr><th>Scenario</th><th>Better Alternative</th><th>Why</th></tr></thead><tbody><tr><td>Running a simple function triggered by events</td><td>Lambda (Project 26)</td><td>No server to manage, pay per execution</td></tr><tr><td>Hosting a container/microservice</td><td>ECS/EKS/Fargate</td><td>Container orchestration built-in</td></tr><tr><td>Running a database</td><td>RDS (Project 9)</td><td>Managed backups, patching, replication</td></tr><tr><td>Hosting static website</td><td>S3 + CloudFront (Project 1)</td><td>Cheaper, scalable, no server maintenance</td></tr><tr><td>Running queries on data in S3</td><td>Athena (Project 18)</td><td>Serverless, no infrastructure</td></tr><tr><td>ETL data processing</td><td>Glue (Project 17)</td><td>Managed Spark, no cluster management</td></tr><tr><td>Need auto-scaling web tier</td><td>EC2 + Auto Scaling (Project 33) works BUT consider Fargate for zero-management</td><td></td></tr></tbody></table>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → WHAT HAPPENS WHEN YOU CLICK "LAUNCH INSTANCE"</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>You click "Launch Instance"
+</span>        │
+        ▼
+Step 1: AWS EC2 API receives RunInstances request
+        │
+        ▼
+Step 2: IAM authenticates and authorizes the request
+        (Does this IAM user/role have ec2:RunInstances permission?
+         — uses IAM evaluation logic from Project 2)
+        │
+        ▼
+Step 3: EC2 Placement Engine selects a physical host
+        │
+        ├── Considers: Availability Zone requested
+        ├── Considers: Instance type hardware requirements
+        ├── Considers: Tenancy (shared vs dedicated)
+        ├── Considers: Capacity availability
+        └── Considers: Spread/cluster placement groups (if specified)
+        │
+        ▼
+Step 4: Hypervisor (AWS Nitro System) creates the VM
+        │
+        ├── Nitro Hypervisor: Lightweight, purpose-built by AWS
+        ├── Nitro Cards: Offload networking, storage, security to dedicated hardware
+        ├── Nitro Security Chip: Prevents unauthorized access to physical host
+        └── VM gets allocated: vCPUs, RAM, network bandwidth as per instance type
+        │
+        ▼
+Step 5: EBS volume is attached
+        │
+        ├── Root volume created from AMI snapshot
+        ├── EBS volume is network-attached storage (NOT local disk)
+        ├── Data travels over dedicated EBS network (separate from instance network)
+        └── Volume appears as /dev/xvda or /dev/nvme0n1 to the OS
+        │
+        ▼
+Step 6: Network interface (ENI) is attached
+        │
+        ├── Primary ENI created in the specified subnet
+        ├── Private IP assigned from subnet CIDR range
+        ├── Public IP assigned from AWS pool (if enabled)
+        ├── Security Groups applied to the ENI
+        └── MAC address assigned
+        │
+        ▼
+Step 7: Instance boots
+        │
+        ├── Hypervisor starts the VM
+        ├── OS boots from EBS root volume
+        ├── Cloud-init runs (configures SSH keys, hostname, etc.)
+        ├── User Data script executes (if provided)
+        └── Instance state changes: Pending → Running
+        │
+        ▼
+Step 8: Instance Metadata Service (IMDS) becomes available
+        │
+        └── 169.254.169.254 responds with instance information</code></pre></div>
+<hr>
+<h3>2 → THE NITRO SYSTEM (AWS's Secret Weapon)</h3>
+<p>→ Pre-Nitro (before ~2017): AWS used Xen hypervisor</p>
+<ul>
+<li>Xen consumed host CPU/RAM for virtualization overhead</li>
+<li>Networking and storage I/O went through the hypervisor</li>
+<li>Security relied on software isolation</li>
+</ul>
+<p>→ Nitro System (current):</p>
+<ul>
+<li>Custom hardware cards handle networking, storage, and security</li>
+<li>The hypervisor is stripped to bare minimum — almost all host resources go to customer VMs</li>
+<li>This is why modern instances (t3, m6i, c6i) are faster and cheaper than older generations</li>
+</ul>
+<table><thead><tr><th>Nitro Component</th><th>Function</th></tr></thead><tbody><tr><td>Nitro Cards</td><td>Offload VPC networking, EBS storage I/O, instance monitoring</td></tr><tr><td>Nitro Security Chip</td><td>Hardware root of trust, prevents unauthorized firmware changes</td></tr><tr><td>Nitro Hypervisor</td><td>Minimal hypervisor — CPU and memory only, everything else offloaded</td></tr><tr><td>Nitro Enclaves</td><td>Isolated compute environments for sensitive data processing</td></tr></tbody></table>
+<hr>
+<h3>3 → HOW EBS WORKS WITH EC2</h3>
+<p>→ EBS (Elastic Block Store) volumes are NOT local disks<br>
+→ They are network-attached storage — living on separate infrastructure from the EC2 host</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────┐         Network          ┌───────────────────┐
+</span>│   EC2 Instance    │◄──────(dedicated)───────►│   EBS Volume      │
+│   (Compute Host)  │         EBS Network       │   (Storage Array) │
+│                   │                           │                   │
+│   Runs your OS    │                           │   Stores your     │
+│   and application │                           │   data blocks     │
+└───────────────────┘                           └───────────────────┘</code></pre></div>
+<p><strong>Implications:</strong></p>
+<table><thead><tr><th>Characteristic</th><th>Meaning</th></tr></thead><tbody><tr><td>Network-attached</td><td>Slight latency compared to local SSD — but consistent</td></tr><tr><td>Independent lifecycle</td><td>EBS volume can outlive the instance (if "delete on termination" = No)</td></tr><tr><td>Snapshot-capable</td><td>Can create point-in-time backup of entire volume</td></tr><tr><td>Resizable</td><td>Can increase size without stopping instance (for most volume types)</td></tr><tr><td>Single-AZ</td><td>EBS volume exists in ONE Availability Zone — must match instance AZ</td></tr><tr><td>Replicated within AZ</td><td>EBS automatically replicates data within the AZ for hardware failure protection</td></tr></tbody></table>
+<p><strong>Instance Store (Alternative to EBS):</strong></p>
+<p>→ Some instance types have LOCAL SSDs physically attached to the host<br>
+→ Called "Instance Store" or "Ephemeral Storage"</p>
+<table><thead><tr><th>Feature</th><th>EBS</th><th>Instance Store</th></tr></thead><tbody><tr><td>Persistence</td><td>Survives stop/start</td><td>LOST on stop/terminate</td></tr><tr><td>Performance</td><td>Consistent, tunable</td><td>Extremely fast (NVMe local)</td></tr><tr><td>Cost</td><td>Pay separately</td><td>Included in instance price</td></tr><tr><td>Snapshot</td><td>Yes</td><td>No</td></tr><tr><td>Use case</td><td>Boot volumes, databases</td><td>Temporary cache, scratch space</td></tr></tbody></table>
+<p>→ For ShopNow → EBS only (no instance store on t3 instances)</p>
+<hr>
+<h3>4 → HOW NETWORKING WORKS (ENI)</h3>
+<p>→ Every EC2 instance has at least one Elastic Network Interface (ENI)<br>
+→ The ENI is the actual network identity of the instance</p>
+<table><thead><tr><th>ENI Property</th><th>Description</th></tr></thead><tbody><tr><td>Private IPv4 address</td><td>Assigned from subnet CIDR, persists through stop/start</td></tr><tr><td>Public IPv4 address</td><td>From AWS pool, ephemeral (changes on stop/start) OR Elastic IP (static)</td></tr><tr><td>MAC address</td><td>Fixed for the ENI's lifetime</td></tr><tr><td>Security Groups</td><td>Attached to the ENI (not to the instance directly)</td></tr><tr><td>Source/Dest Check</td><td>Enabled by default — must disable for NAT instances</td></tr></tbody></table>
+<p>→ You can attach MULTIPLE ENIs to a single instance (multi-homed)<br>
+→ You can DETACH an ENI and ATTACH to another instance (moving network identity)<br>
+→ This is useful for failover scenarios — move the ENI with its IP to a replacement instance</p>
+<hr>
+<h3>5 → HOW BILLING WORKS</h3>
+<table><thead><tr><th>Component</th><th>Billing Model</th></tr></thead><tbody><tr><td>Instance (compute)</td><td>Per-second billing (minimum 60 seconds) — only while Running</td></tr><tr><td>EBS Volume</td><td>Per GB-month provisioned — charged even when instance is stopped</td></tr><tr><td>Elastic IP (associated + running)</td><td>Free</td></tr><tr><td>Elastic IP (not associated OR stopped instance)</td><td>~$0.005/hour</td></tr><tr><td>Public IPv4 (any)</td><td>$0.005/hour (since Feb 2024)</td></tr><tr><td>Data transfer IN</td><td>Free</td></tr><tr><td>Data transfer OUT to internet</td><td>Per GB after first 100 GB/month free</td></tr><tr><td>Data transfer within same AZ</td><td>Free</td></tr><tr><td>Data transfer between AZs</td><td>~$0.01/GB each direction</td></tr></tbody></table>
+<p><strong>Cost Optimization for ShopNow:</strong><br>
+→ Stop dev instance outside business hours (12 hours/day × 30 days = 50% savings on compute)<br>
+→ BUT — EBS volume still charged even when stopped<br>
+→ AND — public IP charged when stopped (release Elastic IP if instance stays stopped for long)</p>
+<hr>
+<h3>6 → WHAT HAPPENS DURING STOP vs TERMINATE INTERNALLY</h3>
+<p><strong>STOP:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. EC2 API sends "stop" signal to hypervisor
+</span>2. Guest OS receives ACPI shutdown signal
+3. OS performs graceful shutdown
+4. VM is deallocated from physical host
+5. EBS volumes are DETACHED from compute host but remain intact
+6. Private IP is RETAINED (stays associated with ENI)
+7. Public IP is RELEASED (back to AWS pool)
+8. Elastic IP stays associated (if one was attached)
+9. Instance state: "Stopped"
+10. Compute billing STOPS — EBS billing CONTINUES</code></pre></div>
+<p><strong>TERMINATE:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. EC2 API sends "terminate" signal
+</span>2. Guest OS receives shutdown signal
+3. VM is deallocated and destroyed
+4. EBS root volume is DELETED (if "delete on termination" = Yes)
+5. Additional EBS volumes: depends on their "delete on termination" setting
+6. ENI is deleted (primary ENI)
+7. Private IP is released back to subnet pool
+8. Public IP / Elastic IP is disassociated
+9. Instance state: "Terminated" → eventually disappears from console
+10. ALL billing stops
+11. IRREVERSIBLE — instance cannot be recovered</code></pre></div>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>SSH timeout after launch</td><td>Security Group has no inbound rule for port 22</td><td>Verify SG rules before attempting connection</td></tr><tr><td>2</td><td>"Permission denied (publickey)"</td><td>Wrong username, wrong key file, or key file permissions too open</td><td>Check AMI username table, verify key file permissions</td></tr><tr><td>3</td><td>IP changes after stop/start</td><td>Using auto-assigned public IP instead of Elastic IP</td><td>Allocate and associate Elastic IP</td></tr><tr><td>4</td><td>Accidental termination</td><td>Confused "Terminate" with "Stop"</td><td>Enable Termination Protection</td></tr><tr><td>5</td><td>Instance unreachable after reboot</td><td>Instance got new physical host where networking differs</td><td>Verify Security Group and route tables</td></tr><tr><td>6</td><td>T3 instance becomes very slow</td><td>CPU credits exhausted — performance capped at baseline</td><td>Enable Unlimited mode or switch to M-family</td></tr><tr><td>7</td><td>EBS volume full — instance unresponsive</td><td>Root volume (8 GB) filled with logs or temp files</td><td>Monitor disk usage via CloudWatch (Project 8), increase volume size</td></tr><tr><td>8</td><td>Launched in wrong AZ — can't attach existing EBS volume</td><td>EBS volumes are AZ-specific</td><td>Always check AZ when launching</td></tr><tr><td>9</td><td>Forgot key pair — locked out of instance</td><td>No private key = no SSH access</td><td>Use Session Manager (SSM) as backup access method</td></tr><tr><td>10</td><td>Paying for stopped instances</td><td>EBS volumes + Elastic IPs still billing</td><td>Terminate instances you don't need, release unused EIPs</td></tr><tr><td>11</td><td>Using t2 instead of t3</td><td>t2 is older, more expensive, less features</td><td>Always use t3 or t3a (AMD variant — even cheaper)</td></tr><tr><td>12</td><td>Launched in default VPC for production</td><td>Default VPC has public subnets with auto-assign public IP</td><td>Use custom VPC (Project 5) for production</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Vertical Scaling (Scale Up)</strong></p>
+<ul>
+<li>Stop instance → Change instance type → Start instance</li>
+<li>Example: <code>t3.micro</code> → <code>t3.large</code> → <code>m6i.xlarge</code></li>
+<li>Requires downtime (stop/start)</li>
+<li>Simple but has upper limits (largest instance: <code>u-24tb1.metal</code> with 24 TB RAM)</li>
+</ul>
+<p>→ <strong>Horizontal Scaling (Scale Out)</strong></p>
+<ul>
+<li>Launch MORE instances behind a load balancer</li>
+<li>Each instance handles a portion of traffic</li>
+<li>No upper limit (theoretically)</li>
+<li>Requires application to be stateless or use shared state (database, cache)</li>
+<li>Auto Scaling Groups automate this (Project 33)</li>
+</ul>
+<p>→ <strong>Instance Limits</strong></p>
+<ul>
+<li>Default: 20 On-Demand instances per instance family per region (soft limit)</li>
+<li>Can request increase via Service Quotas console</li>
+<li>Spot instances have separate limits</li>
+</ul>
+<p>→ <strong>EBS Scalability</strong></p>
+<ul>
+<li>Maximum EBS volume size: 64 TiB</li>
+<li>Can modify volume size, type, IOPS without detaching (online modification)</li>
+<li>Takes time to apply (minutes to hours depending on size)</li>
+</ul>
+<p>→ <strong>Network Scalability</strong></p>
+<ul>
+<li>Instance type determines network bandwidth</li>
+<li><code>t3.micro</code>: Up to 5 Gbps</li>
+<li><code>m6i.32xlarge</code>: 50 Gbps</li>
+<li>Enhanced Networking (ENA): Higher PPS (packets per second), lower latency — enabled by default on modern instances</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify your instance is correctly configured:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected Value</th></tr></thead><tbody><tr><td>Instance state</td><td>EC2 Console → Instances → "Instance state"</td><td>Running</td></tr><tr><td>Status checks passed</td><td>EC2 Console → Instances → "Status check"</td><td>2/2 checks passed</td></tr><tr><td>Correct AMI</td><td>Instance details → AMI ID</td><td>Your chosen AMI</td></tr><tr><td>Correct instance type</td><td>Instance details → Instance type</td><td>t3.micro</td></tr><tr><td>Public IP assigned</td><td>Instance details → Public IPv4 address</td><td>Your Elastic IP</td></tr><tr><td>Key pair attached</td><td>Instance details → Key pair name</td><td>shopnow-dev-key-aps1</td></tr><tr><td>Security Group correct</td><td>Instance → Security tab</td><td>shopnow-dev-ssh-sg with port 22 rule</td></tr><tr><td>Termination protection</td><td>Instance → Details → "Termination protection"</td><td>Enabled</td></tr><tr><td>IMDSv2 enforced</td><td>Instance → Details → "Metadata version"</td><td>V2 only (token required)</td></tr></tbody></table>
+<p>→ <strong>EC2 Status Checks (two types):</strong></p>
+<table><thead><tr><th>Check</th><th>What It Monitors</th><th>Failure Means</th></tr></thead><tbody><tr><td>System Status Check</td><td>AWS infrastructure (host hardware, network, power)</td><td>AWS problem — stop/start instance (moves to new host)</td></tr><tr><td>Instance Status Check</td><td>Guest OS (kernel panic, network misconfiguration, disk issues)</td><td>Your problem — reboot or troubleshoot OS</td></tr></tbody></table>
+<p>→ Both should show "passed" — if either fails, the instance may be unreachable</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ EC2 is the foundational compute service — understanding it is essential for everything else<br>
+→ AMI = template, Instance Type = hardware specs, Key Pair = SSH authentication<br>
+→ Stop ≠ Terminate — stop preserves your instance, terminate destroys it permanently<br>
+→ Public IPs are ephemeral — use Elastic IPs for stable addressing<br>
+→ Security Groups control network access — without port 22 open, SSH will timeout<br>
+→ IMDSv2 is mandatory for security — blocks SSRF attacks on metadata<br>
+→ EBS is network-attached storage — independent lifecycle from the instance<br>
+→ Connection to Project 1: EC2 instances will read/write to S3 buckets (Project 11 enables this via IAM Roles)<br>
+→ Connection to Project 2: IAM policies control who can launch/stop/terminate instances (<code>ec2:RunInstances</code>, <code>ec2:TerminateInstances</code>)<br>
+→ Every future project that involves "servers" will reference this:</p>
+<ul>
+<li>Project 4: Security Groups deep-dive (network rules protecting this instance)</li>
+<li>Project 5: VPC (the private network this instance lives in)</li>
+<li>Project 11: IAM Roles for EC2 (giving the instance AWS permissions without access keys)</li>
+<li>Project 14: EC2 connecting to RDS MariaDB</li>
+<li>Project 19: CloudWatch Agent on EC2 for log collection</li>
+<li>Project 33: Auto Scaling Groups (multiple EC2 instances scaling automatically)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow's EC2 instance is running and Priya can SSH into it<br>
+→ But the CTO asks: "If our Security Group allows SSH from Priya's IP, what about the rest of the team?"<br>
+→ New developer joins from a different city → can't SSH → different IP<br>
+→ The web application needs to serve HTTP traffic on port 80 and HTTPS on port 443<br>
+→ But they also need the database port (3306) open ONLY between EC2 and the database server<br>
+→ And they heard about something called "NACLs" that also control traffic — how is it different from Security Groups?</p>
+<p>→ <strong>This is exactly what Project 4 solves</strong><br>
+→ Project 4 deep-dives into Security Groups vs NACLs<br>
+→ It explains stateful vs stateless firewalls<br>
+→ It explains rule evaluation order (why NACLs have numbered rules)<br>
+→ It builds directly on this project's Security Group introduction</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 4: "The Database That Nobody Could Reach — Security Groups vs NACLs"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-2.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 3/60</span></div><a class="nav-btn next" href="project-4.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

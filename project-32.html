@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 32: THE PIPELINE THAT NEEDED HUMAN APPROVAL — Step Functions Multi-Servi — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 32: THE PIPELINE THAT NEEDED HUMAN APPROVAL — Step Functions Multi-Service Orchestration</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's Glue Workflow (Project 31) runs perfectly every morning at 6 AM<br>
+→ But the Head of Data keeps getting escalations:</p>
+<p><strong>Escalation 1 — No Post-ETL Actions:</strong><br>
+→ After the Glue Workflow completes, someone must manually run a Redshift COPY command (Project 22 pattern) to load enriched data into the warehouse<br>
+→ The analyst who does this forgets every other day<br>
+→ Dashboards show stale data → CEO frustrated</p>
+<p><strong>Escalation 2 — No Human Approval Gate:</strong><br>
+→ One morning, the enrichment Job produced garbage data (MariaDB source had corrupt records)<br>
+→ The data flowed straight into Redshift → wrong numbers in board presentation<br>
+→ The Data Quality team says: "We MUST review a sample before data goes to Redshift"<br>
+→ They want a manual approval step — pipeline pauses, human reviews, approves or rejects</p>
+<p><strong>Escalation 3 — No Failure Notification:</strong><br>
+→ The Glue Workflow fails silently (as noted in Project 31 — no native alerting)<br>
+→ Nobody knows until analysts complain about missing data at 10 AM<br>
+→ The team needs SNS notification on any step failure</p>
+<p><strong>Escalation 4 — No Retry Logic:</strong><br>
+→ The MariaDB enrichment Job sometimes fails because the database connection times out during peak hours<br>
+→ If retried 5 minutes later, it usually works<br>
+→ Currently — failure means the entire pipeline stops and requires manual intervention<br>
+→ They need automatic retry with increasing wait times (exponential backoff)</p>
+<p><strong>Escalation 5 — No Dynamic Branching:</strong><br>
+→ On month-end days, data volume is 10x normal<br>
+→ The standard Glue Job config (5 DPUs) takes 3 hours on month-end vs 20 minutes normally<br>
+→ They want: "If it's the last day of the month → trigger the large-capacity Job; otherwise → trigger the standard Job"<br>
+→ Glue Workflow's DAG is static — no runtime decisions possible</p>
+<p><strong>Escalation 6 — Cross-Service Coordination:</strong><br>
+→ The pipeline now spans: Glue Crawlers → Glue Jobs → Redshift → SNS → Human Approval<br>
+→ Glue Workflow can only orchestrate Glue components<br>
+→ They need an orchestrator that coordinates ANY AWS service</p>
+<p>→ The CTO says: "We need a state machine — something that manages the entire flow with conditions, retries, approvals, and notifications across all services"</p>
+<p>→ This is EXACTLY what AWS Step Functions solves</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the fundamental difference between Glue Workflow and Step Functions</p>
+<table><thead><tr><th>Dimension</th><th>Glue Workflow (Project 31)</th><th>Step Functions</th></tr></thead><tbody><tr><td>Scope</td><td>Glue Crawlers + Glue Jobs ONLY</td><td>ANY AWS service + HTTP endpoints</td></tr><tr><td>Branching</td><td>Static DAG — no runtime decisions</td><td>Dynamic — Choice state with runtime conditions</td></tr><tr><td>Retry</td><td>Delegated to individual Job retry settings</td><td>Built-in per-state Retry with backoff configuration</td></tr><tr><td>Error Handling</td><td>Pipeline stops on failure — no catch mechanism</td><td>Catch blocks per state — route errors to fallback states</td></tr><tr><td>Human Approval</td><td>Not supported</td><td>Wait for Callback pattern — pauses until external signal</td></tr><tr><td>Notifications</td><td>Not built-in</td><td>Native SNS/SQS/Lambda integration as states</td></tr><tr><td>Parallel Execution</td><td>Supported via fan-out triggers</td><td>Native Parallel state with branch-level error handling</td></tr><tr><td>Loops</td><td>Not supported</td><td>Supported via Choice + state transitions</td></tr><tr><td>Execution Model</td><td>Event-driven polling</td><td>State machine with explicit transitions</td></tr><tr><td>Cost</td><td>Free (pay for Jobs/Crawlers)</td><td>Pay per state transition</td></tr><tr><td>Definition Language</td><td>Console visual builder</td><td>Amazon States Language (ASL) — JSON-based</td></tr></tbody></table>
+<p>→ Step Functions uses a STATE MACHINE model<br>
+→ Every step in the pipeline is a "State"<br>
+→ States have types — each type does something different</p>
+<p><strong>Core State Types:</strong></p>
+<table><thead><tr><th>State Type</th><th>What It Does</th><th>ShopNow Use Case</th></tr></thead><tbody><tr><td>Task</td><td>Executes an action (calls an AWS service)</td><td>Start Glue Job, Run Redshift query, Send SNS message</td></tr><tr><td>Choice</td><td>Makes a runtime decision based on input data</td><td>"Is today month-end?" → branch to large or small Job</td></tr><tr><td>Wait</td><td>Pauses execution for a duration or until a timestamp</td><td>Wait 5 minutes before retry</td></tr><tr><td>Parallel</td><td>Executes multiple branches simultaneously</td><td>Run two independent crawlers at the same time</td></tr><tr><td>Map</td><td>Iterates over a list and processes each item</td><td>Process each file in a batch</td></tr><tr><td>Pass</td><td>Passes input to output (optionally transforms data)</td><td>Inject static values or restructure JSON</td></tr><tr><td>Succeed</td><td>Marks execution as successful and stops</td><td>Terminal state for happy path</td></tr><tr><td>Fail</td><td>Marks execution as failed with error/cause</td><td>Terminal state for error path</td></tr></tbody></table>
+<p>→ Step Functions comes in TWO workflow types:</p>
+<table><thead><tr><th>Type</th><th>Execution Duration</th><th>Execution Rate</th><th>Cost</th><th>Use Case</th></tr></thead><tbody><tr><td>Standard</td><td>Up to 1 year</td><td>2,000 per second</td><td>$0.025 per 1,000 transitions</td><td>Long-running ETL pipelines, human approval</td></tr><tr><td>Express</td><td>Up to 5 minutes</td><td>100,000 per second</td><td>Per execution + duration</td><td>High-volume event processing</td></tr></tbody></table>
+<p>→ ShopNow needs Standard — their pipeline runs 30+ minutes and includes human approval (which could take hours)</p>
+<hr>
+<h3>THE COMPLETE PIPELINE DESIGN</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[EventBridge Scheduled Rule: 6 AM Daily]
+</span>        │
+        ▼
+[Step Function Execution Starts]
+        │
+        ▼
+[State 1: Start Glue Crawler - Raw CSV]
+        │ (wait for completion)
+        ▼
+[State 2: Start Glue Job - CSV to Parquet]
+        │ (with Retry: 3 attempts, exponential backoff)
+        ▼
+[State 3: Start Glue Crawler - Catalog Parquet]
+        │
+        ▼
+[State 4: Choice - Is today month-end?]
+       / \
+      ▼   ▼
+[State 5A: Start     [State 5B: Start
+ Large Enrichment     Standard Enrichment
+ Job - 20 DPU]        Job - 5 DPU]
+      \   /
+       ▼ ▼
+[State 6: Start Glue Crawler - Catalog Enriched]
+        │
+        ▼
+[State 7: Human Approval - Wait for Callback]
+       / \
+      ▼   ▼
+[APPROVED]  [REJECTED]
+      │         │
+      ▼         ▼
+[State 8:    [State 9:
+ Redshift     Send SNS
+ COPY from    "Rejected"
+ S3]          Alert]
+      │         │
+      ▼         ▼
+[State 10:   [Fail State]
+ Send SNS
+ "Pipeline
+ Complete"]
+      │
+      ▼
+[Succeed State]</code></pre></div>
+<p>→ Error handling wraps around ALL states:</p>
+<ul>
+<li>Any unhandled error → Catch → Send SNS "Pipeline Failed" → Fail State</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE THE IAM ROLE FOR STEP FUNCTIONS</h3>
+<p>→ Navigate to IAM Console → Roles → Create Role</p>
+<p><strong>Setting: Trusted Entity</strong><br>
+→ AWS Service → Step Functions<br>
+→ This creates a trust policy allowing Step Functions to assume this role</p>
+<p><strong>Setting: Permissions Policies to Attach</strong></p>
+<table><thead><tr><th>Policy</th><th>Why</th></tr></thead><tbody><tr><td><code>AWSGlueConsoleFullAccess</code> (or scoped custom policy)</td><td>Step Functions needs to start/monitor Glue Crawlers and Jobs</td></tr><tr><td><code>AmazonSNSFullAccess</code> (or scoped custom policy)</td><td>Step Functions needs to publish to SNS topics</td></tr><tr><td><code>AmazonRedshiftDataFullAccess</code></td><td>Step Functions needs to call Redshift Data API</td></tr><tr><td><code>CloudWatchLogsFullAccess</code></td><td>Step Functions needs to write execution logs</td></tr></tbody></table>
+<p>→ In production → use LEAST PRIVILEGE custom policies instead of full access<br>
+→ Custom policy example structure:</p>
+<table><thead><tr><th>Permission</th><th>Resource ARN</th><th>Justification</th></tr></thead><tbody><tr><td><code>glue:StartJobRun</code></td><td><code>arn:aws:glue:REGION:ACCOUNT:job/shopnow-*</code></td><td>Start only ShopNow Glue Jobs</td></tr><tr><td><code>glue:GetJobRun</code></td><td><code>arn:aws:glue:REGION:ACCOUNT:job/shopnow-*</code></td><td>Monitor Job run status</td></tr><tr><td><code>glue:StartCrawler</code></td><td><code>arn:aws:glue:REGION:ACCOUNT:crawler/shopnow-*</code></td><td>Start only ShopNow Crawlers</td></tr><tr><td><code>glue:GetCrawler</code></td><td><code>arn:aws:glue:REGION:ACCOUNT:crawler/shopnow-*</code></td><td>Monitor Crawler status</td></tr><tr><td><code>sns:Publish</code></td><td><code>arn:aws:sns:REGION:ACCOUNT:shopnow-*</code></td><td>Publish to ShopNow topics only</td></tr><tr><td><code>redshift-data:ExecuteStatement</code></td><td><code>*</code></td><td>Execute Redshift queries</td></tr><tr><td><code>redshift-data:DescribeStatement</code></td><td><code>*</code></td><td>Check query completion</td></tr></tbody></table>
+<p><strong>Setting: Role Name</strong><br>
+→ <code>StepFunctions-ShopNow-Pipeline-Role</code></p>
+<p>→ Create Role</p>
+<hr>
+<h3>STEP 2 — CREATE SNS TOPICS FOR NOTIFICATIONS</h3>
+<p>→ Three SNS Topics needed (using patterns from Project 6):</p>
+<table><thead><tr><th>Topic Name</th><th>Purpose</th><th>Subscribers</th></tr></thead><tbody><tr><td><code>shopnow-pipeline-approval-request</code></td><td>Notify Data Quality team to review data</td><td>DQ team email</td></tr><tr><td><code>shopnow-pipeline-success</code></td><td>Notify on successful completion</td><td>Engineering + Analytics teams</td></tr><tr><td><code>shopnow-pipeline-failure</code></td><td>Notify on any failure</td><td>On-call engineer email + PagerDuty</td></tr></tbody></table>
+<p>→ Creation process: Same as Project 6 — SNS Console → Create Topic → Standard → Subscribe emails<br>
+→ Ensure subscription confirmation is completed for all subscribers</p>
+<hr>
+<h3>STEP 3 — CREATE THE STATE MACHINE</h3>
+<p>→ Navigate to AWS Step Functions Console → State machines → Create state machine</p>
+<p><strong>Setting: Authoring Method</strong><br>
+→ Two options:</p>
+<table><thead><tr><th>Option</th><th>Description</th><th>Recommendation</th></tr></thead><tbody><tr><td>Design visually (Workflow Studio)</td><td>Drag-and-drop visual builder → generates ASL JSON</td><td>Best for learning and simple workflows</td></tr><tr><td>Write workflow in code</td><td>Write ASL JSON directly</td><td>Best for complex logic and version control</td></tr></tbody></table>
+<p>→ For this project → Start with Workflow Studio to understand → then review generated ASL</p>
+<p><strong>Setting: Type</strong><br>
+→ Standard (not Express)<br>
+→ Reason: Pipeline runs 30+ minutes, includes human approval that may take hours</p>
+<p><strong>Setting: Name</strong><br>
+→ <code>shopnow-daily-pipeline-orchestrator</code></p>
+<p><strong>Setting: Execution Role</strong><br>
+→ Select: <code>StepFunctions-ShopNow-Pipeline-Role</code> (created in Step 1)</p>
+<p><strong>Setting: Logging</strong><br>
+→ Log level: ALL<br>
+→ CloudWatch Logs group: <code>/aws/stepfunctions/shopnow-daily-pipeline</code><br>
+→ Include execution data: Yes (logs input/output of each state)<br>
+→ This is CRITICAL for debugging — without logging, you only see state transitions, not data flow</p>
+<p><strong>Setting: Tracing</strong><br>
+→ Enable X-Ray tracing: Yes<br>
+→ Provides end-to-end latency visualization across all states and service calls</p>
+<hr>
+<h3>STEP 4 — DEFINE STATE 1: START GLUE CRAWLER (Raw CSV)</h3>
+<p>→ In Workflow Studio → Drag "AWS Glue: StartCrawler" action</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Crawl-Raw-CSV-Data</code></td></tr><tr><td>API</td><td><code>StartCrawler</code></td></tr><tr><td>Crawler Name</td><td><code>shopnow-crawler-raw-orders</code> (from Project 17)</td></tr><tr><td>Integration Pattern</td><td>See below</td></tr></tbody></table>
+<p><strong>Understanding Integration Patterns — CRITICAL CONCEPT:</strong></p>
+<table><thead><tr><th>Pattern</th><th>Behavior</th><th>Syntax Suffix</th><th>Use Case</th></tr></thead><tbody><tr><td>Request Response</td><td>Calls the API and immediately moves to next state — does NOT wait for completion</td><td>None (default)</td><td>Fire-and-forget actions like SNS Publish</td></tr><tr><td>Run a Job (.sync)</td><td>Calls the API and WAITS until the job/crawler completes before moving to next state</td><td><code>.sync</code></td><td>Glue Jobs, Glue Crawlers, ECS Tasks — anything long-running</td></tr><tr><td>Wait for Callback (.waitForTaskToken)</td><td>Pauses execution, sends a task token, waits until external system sends success/failure signal</td><td><code>.waitForTaskToken</code></td><td>Human approval, external system callbacks</td></tr></tbody></table>
+<p>→ For Crawler → Use <code>.sync</code> pattern<br>
+→ Step Functions calls <code>StartCrawler</code> → then automatically polls <code>GetCrawler</code> until status = READY<br>
+→ Only then does it transition to the next state</p>
+<p><strong>Error Handling for this state:</strong></p>
+<p>→ Add Retry configuration:</p>
+<table><thead><tr><th>Retry Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Error Equals</td><td><code>States.ALL</code></td><td>Catch any error type</td></tr><tr><td>Interval Seconds</td><td>60</td><td>Wait 60 seconds before first retry</td></tr><tr><td>Max Attempts</td><td>2</td><td>Retry up to 2 times</td></tr><tr><td>Backoff Rate</td><td>2.0</td><td>Second retry waits 120 seconds (60 × 2)</td></tr></tbody></table>
+<p>→ Add Catch configuration:</p>
+<table><thead><tr><th>Catch Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Error Equals</td><td><code>States.ALL</code></td><td>If all retries exhausted</td></tr><tr><td>Next State</td><td><code>Notify-Pipeline-Failure</code></td><td>Route to failure notification state</td></tr><tr><td>Result Path</td><td><code>$.error</code></td><td>Store error details in the state output under "error" key</td></tr></tbody></table>
+<hr>
+<h3>STEP 5 — DEFINE STATE 2: START GLUE JOB (CSV to Parquet)</h3>
+<p>→ Drag "AWS Glue: StartJobRun" action</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Convert-CSV-to-Parquet</code></td></tr><tr><td>API</td><td><code>StartJobRun</code></td></tr><tr><td>Job Name</td><td><code>shopnow-csv-to-parquet-job</code> (from Project 21)</td></tr><tr><td>Integration Pattern</td><td><code>.sync</code> (wait for Job completion)</td></tr><tr><td>Arguments (optional)</td><td>Can pass runtime arguments to the Job</td></tr></tbody></table>
+<p><strong>Job Arguments passed from Step Functions:</strong></p>
+<table><thead><tr><th>Argument Key</th><th>Value Source</th><th>Purpose</th></tr></thead><tbody><tr><td><code>--processing_date</code></td><td><code>$.processing_date</code> (from state machine input)</td><td>Tell the Job which date to process</td></tr><tr><td><code>--source_path</code></td><td><code>$.source_path</code></td><td>Dynamic source path</td></tr></tbody></table>
+<p>→ These arguments appear as Job parameters inside the Glue Job — same as if you passed them via console</p>
+<p><strong>Retry Configuration (More aggressive for this state):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>Error Equals</td><td><code>Glue.JobRunException</code></td><td>Specific Glue error</td></tr><tr><td>Interval Seconds</td><td>300</td><td>Wait 5 minutes — database might be under load</td></tr><tr><td>Max Attempts</td><td>3</td><td>Try 3 times total</td></tr><tr><td>Backoff Rate</td><td>2.0</td><td>5 min → 10 min → 20 min between retries</td></tr></tbody></table>
+<p>→ ALSO add a second retry entry:</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>Error Equals</td><td><code>States.Timeout</code></td><td>Job exceeded timeout</td></tr><tr><td>Interval Seconds</td><td>600</td><td>Wait 10 minutes</td></tr><tr><td>Max Attempts</td><td>1</td><td>Only retry once for timeout</td></tr><tr><td>Backoff Rate</td><td>1.0</td><td>No backoff increase</td></tr></tbody></table>
+<p>→ Retry entries are evaluated IN ORDER — first matching error type wins<br>
+→ This is why you put specific errors before <code>States.ALL</code></p>
+<p><strong>Catch Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Error Equals</td><td><code>States.ALL</code></td></tr><tr><td>Next State</td><td><code>Notify-Pipeline-Failure</code></td></tr><tr><td>Result Path</td><td><code>$.error</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 6 — DEFINE STATE 3: START GLUE CRAWLER (Catalog Parquet)</h3>
+<p>→ Same pattern as State 1 with different Crawler:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Crawl-Parquet-Data</code></td></tr><tr><td>Crawler Name</td><td><code>shopnow-crawler-processed-orders</code> (from Project 31, Step 1)</td></tr><tr><td>Integration Pattern</td><td><code>.sync</code></td></tr><tr><td>Retry</td><td>Same as State 1</td></tr><tr><td>Catch</td><td>→ <code>Notify-Pipeline-Failure</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 7 — DEFINE STATE 4: CHOICE STATE (Month-End Decision)</h3>
+<p>→ Drag "Choice" state type</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Is-Month-End</code></td></tr></tbody></table>
+<p><strong>Understanding Choice State Rules:</strong></p>
+<p>→ Choice state evaluates CONDITIONS against the state input<br>
+→ Each condition has a comparison operator and a "Next" state</p>
+<p><strong>How the input gets the date information:</strong><br>
+→ The state machine input (provided when execution starts) includes:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Input to state machine:
+</span>{
+  "processing_date": "2025-01-31",
+  "is_month_end": true,
+  "source_path": "s3://shopnow-data-lake/raw/orders/"
+}</code></pre></div>
+<p>→ This input is passed by EventBridge when triggering the execution (configured in Step 13)<br>
+→ OR can be enriched by a Lambda Task state that determines if today is month-end</p>
+<p><strong>Choice Rules Configuration:</strong></p>
+<table><thead><tr><th>Rule #</th><th>Variable</th><th>Comparison</th><th>Value</th><th>Next State</th></tr></thead><tbody><tr><td>Rule 1</td><td><code>$.is_month_end</code></td><td>BooleanEquals</td><td><code>true</code></td><td><code>Run-Large-Enrichment-Job</code></td></tr><tr><td>Default</td><td>(no condition — fallback)</td><td>—</td><td>—</td><td><code>Run-Standard-Enrichment-Job</code></td></tr></tbody></table>
+<p><strong>Understanding Choice Operators:</strong></p>
+<table><thead><tr><th>Operator</th><th>Use Case</th><th>Example</th></tr></thead><tbody><tr><td>StringEquals</td><td>Exact string match</td><td><code>$.status</code> equals <code>"approved"</code></td></tr><tr><td>NumericGreaterThan</td><td>Numeric comparison</td><td><code>$.record_count</code> &gt; 1000000</td></tr><tr><td>BooleanEquals</td><td>Boolean check</td><td><code>$.is_month_end</code> equals <code>true</code></td></tr><tr><td>TimestampLessThan</td><td>Time comparison</td><td><code>$.deadline</code> &lt; <code>"2025-02-01T00:00:00Z"</code></td></tr><tr><td>IsPresent</td><td>Check if field exists</td><td><code>$.optional_field</code> is present</td></tr><tr><td>StringMatches</td><td>Wildcard matching</td><td><code>$.filename</code> matches <code>"*.csv"</code></td></tr><tr><td>And/Or/Not</td><td>Compound conditions</td><td><code>$.count</code> &gt; 100 AND <code>$.type</code> equals <code>"premium"</code></td></tr></tbody></table>
+<p>→ Choice state has NO Retry or Catch — it's a pure routing decision<br>
+→ If no rule matches AND no Default → execution fails with <code>States.NoChoiceMatched</code> error</p>
+<hr>
+<h3>STEP 8 — DEFINE STATES 5A AND 5B: ENRICHMENT JOB BRANCHES</h3>
+<p><strong>State 5A — Large Enrichment Job:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Run-Large-Enrichment-Job</code></td></tr><tr><td>API</td><td><code>StartJobRun</code></td></tr><tr><td>Job Name</td><td><code>shopnow-mariadb-enrichment-job-large</code></td></tr><tr><td>Integration Pattern</td><td><code>.sync</code></td></tr><tr><td>Arguments</td><td><code>--num_workers: 20</code>, <code>--worker_type: G.2X</code></td></tr><tr><td>Next State</td><td><code>Crawl-Enriched-Data</code></td></tr><tr><td>Retry</td><td>3 attempts, 300s interval, 2.0 backoff</td></tr><tr><td>Catch</td><td>→ <code>Notify-Pipeline-Failure</code></td></tr></tbody></table>
+<p><strong>State 5B — Standard Enrichment Job:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Run-Standard-Enrichment-Job</code></td></tr><tr><td>API</td><td><code>StartJobRun</code></td></tr><tr><td>Job Name</td><td><code>shopnow-mariadb-enrichment-job</code> (from Project 24)</td></tr><tr><td>Integration Pattern</td><td><code>.sync</code></td></tr><tr><td>Arguments</td><td><code>--num_workers: 5</code>, <code>--worker_type: G.1X</code></td></tr><tr><td>Next State</td><td><code>Crawl-Enriched-Data</code></td></tr><tr><td>Retry</td><td>3 attempts, 300s interval, 2.0 backoff</td></tr><tr><td>Catch</td><td>→ <code>Notify-Pipeline-Failure</code></td></tr></tbody></table>
+<p>→ Both branches converge to the SAME next state: <code>Crawl-Enriched-Data</code><br>
+→ This is how branching works in Step Functions — diverge via Choice, converge by pointing to same Next</p>
+<hr>
+<h3>STEP 9 — DEFINE STATE 6: CRAWL ENRICHED DATA</h3>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Crawl-Enriched-Data</code></td></tr><tr><td>Crawler Name</td><td><code>shopnow-crawler-enriched-orders</code> (from Project 31, Step 2)</td></tr><tr><td>Integration Pattern</td><td><code>.sync</code></td></tr><tr><td>Retry</td><td>Standard retry config</td></tr><tr><td>Catch</td><td>→ <code>Notify-Pipeline-Failure</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 10 — DEFINE STATE 7: HUMAN APPROVAL (Wait for Callback)</h3>
+<p>→ This is the most sophisticated state in this pipeline<br>
+→ Drag "SNS: Publish" action with <code>.waitForTaskToken</code> integration pattern</p>
+<p><strong>How Wait for Callback Works — Conceptual Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step Functions                    Human World
+</span>     │                                │
+     ├─ Generate Task Token           │
+     ├─ Send SNS with Token ────────► │ DQ Team receives email with token
+     ├─ PAUSE execution               │
+     │  (can wait hours/days)         │
+     │                                │ DQ Team reviews data
+     │                                │ DQ Team calls SendTaskSuccess
+     │                                │   or SendTaskFailure with token
+     │◄────────────────────────────────┤
+     ├─ RESUME execution              │
+     ▼                                │
+  Next State                          │</code></pre></div>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Wait-For-DQ-Approval</code></td></tr><tr><td>API</td><td><code>SNS:Publish</code></td></tr><tr><td>Integration Pattern</td><td><code>.waitForTaskToken</code></td></tr><tr><td>Topic ARN</td><td><code>arn:aws:sns:REGION:ACCOUNT:shopnow-pipeline-approval-request</code></td></tr><tr><td>Message</td><td>See below</td></tr></tbody></table>
+<p><strong>Message Configuration:</strong><br>
+→ The message sent to SNS must include the Task Token<br>
+→ The DQ team uses this token to signal approval or rejection</p>
+<p><strong>Message structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "pipeline": "shopnow-daily-orders",
+  "execution_id": provided by context object,
+  "processing_date": from $.processing_date,
+  "task_token": from $$.Task.Token,
+  "message": "Please review enriched data and approve or reject",
+  "approve_instructions": "Call SendTaskSuccess API with this task token",
+  "reject_instructions": "Call SendTaskFailure API with this task token"
+}</code></pre></div>
+<p>→ <code>$$.Task.Token</code> — this is a SPECIAL context variable<br>
+→ Step Functions automatically generates a unique token for each <code>.waitForTaskToken</code> invocation<br>
+→ The <code>$$</code> prefix means "context object" (metadata about the execution), not the state input (<code>$</code>)</p>
+<p><strong>Timeout Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>Timeout Seconds</td><td>28800 (8 hours)</td><td>If nobody approves within 8 hours → timeout → catch → failure notification</td></tr><tr><td>Heartbeat Seconds</td><td>3600 (1 hour)</td><td>Optional — if no heartbeat received in 1 hour, assume stuck</td></tr></tbody></table>
+<p>→ Without timeout → execution could wait FOREVER → costs accumulate → state machine stuck</p>
+<p><strong>How the DQ Team Responds:</strong></p>
+<p>→ Option 1 — API Call (recommended for automation):</p>
+<ul>
+<li>Approve: Call <code>SendTaskSuccess</code> with <code>taskToken</code> and output <code>{"decision": "approved"}</code></li>
+<li>Reject: Call <code>SendTaskFailure</code> with <code>taskToken</code> and error <code>"DataQualityRejection"</code></li>
+</ul>
+<p>→ Option 2 — Build a simple approval UI:</p>
+<ul>
+<li>API Gateway + Lambda that receives approve/reject click</li>
+<li>Lambda calls <code>SendTaskSuccess</code> or <code>SendTaskFailure</code></li>
+<li>This is the production pattern — but requires API Gateway (covered in Project 59)</li>
+</ul>
+<p>→ Option 3 — CLI (for testing):</p>
+<ul>
+<li>AWS CLI: <code>aws stepfunctions send-task-success --task-token "TOKEN" --task-output '{"decision":"approved"}'</code></li>
+</ul>
+<p><strong>After callback received:</strong><br>
+→ The state resumes<br>
+→ Output includes whatever was passed in <code>SendTaskSuccess</code> → <code>{"decision": "approved"}</code><br>
+→ Next state can use this output for further routing</p>
+<hr>
+<h3>STEP 11 — DEFINE CHOICE STATE AFTER APPROVAL</h3>
+<p>→ Add another Choice state to route based on approval decision</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Approval-Decision-Router</code></td></tr></tbody></table>
+<p><strong>Rules:</strong></p>
+<table><thead><tr><th>Rule #</th><th>Variable</th><th>Comparison</th><th>Next State</th></tr></thead><tbody><tr><td>Rule 1</td><td><code>$.decision</code></td><td>StringEquals <code>"approved"</code></td><td><code>Load-Data-To-Redshift</code></td></tr><tr><td>Default</td><td>—</td><td>—</td><td><code>Notify-Rejection</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 12A — DEFINE STATE 8: REDSHIFT COPY (On Approval)</h3>
+<p>→ Drag "Amazon Redshift Data API: ExecuteStatement" action</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Load-Data-To-Redshift</code></td></tr><tr><td>API</td><td><code>redshift-data:ExecuteStatement</code></td></tr><tr><td>Integration Pattern</td><td><code>.sync</code> (wait for query completion)</td></tr><tr><td>Cluster Identifier</td><td><code>shopnow-redshift-cluster</code> (from Project 16)</td></tr><tr><td>Database</td><td><code>shopnow_warehouse</code></td></tr><tr><td>Db User</td><td><code>admin</code> (or use Secrets Manager ARN — Project 37)</td></tr><tr><td>SQL Statement</td><td>COPY command configuration (see below)</td></tr></tbody></table>
+<p><strong>SQL Statement (Redshift COPY — configured per Project 22 patterns):</strong></p>
+<p>→ The SQL statement is passed as a string parameter:</p>
+<ul>
+<li><code>COPY enriched_orders FROM 's3://shopnow-data-lake/enriched/orders/' IAM_ROLE 'arn:aws:iam::ACCOUNT:role/RedshiftS3ReadRole' FORMAT AS PARQUET;</code></li>
+</ul>
+<p>→ Step Functions passes this as a static string or can inject dynamic paths from state input</p>
+<p><strong>Retry Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Error Equals</td><td><code>Redshift.ExecuteStatementException</code></td></tr><tr><td>Interval Seconds</td><td>120</td></tr><tr><td>Max Attempts</td><td>2</td></tr><tr><td>Backoff Rate</td><td>2.0</td></tr></tbody></table>
+<p><strong>Catch:</strong><br>
+→ → <code>Notify-Pipeline-Failure</code></p>
+<p><strong>Next State:</strong><br>
+→ <code>Notify-Pipeline-Success</code></p>
+<hr>
+<h3>STEP 12B — DEFINE STATE 9: REJECTION NOTIFICATION</h3>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Notify-Rejection</code></td></tr><tr><td>API</td><td><code>SNS:Publish</code></td></tr><tr><td>Integration Pattern</td><td>Request Response (fire and forget)</td></tr><tr><td>Topic ARN</td><td><code>arn:aws:sns:REGION:ACCOUNT:shopnow-pipeline-failure</code></td></tr><tr><td>Message</td><td>"Pipeline rejected by Data Quality team for date: $.processing_date"</td></tr><tr><td>Next State</td><td><code>Pipeline-Rejected-Fail</code></td></tr></tbody></table>
+<p><strong>Fail State:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Pipeline-Rejected-Fail</code></td></tr><tr><td>Error</td><td><code>DataQualityRejection</code></td></tr><tr><td>Cause</td><td><code>Data quality team rejected the enriched dataset</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 12C — DEFINE STATE 10: SUCCESS NOTIFICATION</h3>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Notify-Pipeline-Success</code></td></tr><tr><td>API</td><td><code>SNS:Publish</code></td></tr><tr><td>Integration Pattern</td><td>Request Response</td></tr><tr><td>Topic ARN</td><td><code>arn:aws:sns:REGION:ACCOUNT:shopnow-pipeline-success</code></td></tr><tr><td>Message</td><td>"Daily pipeline completed successfully for date: $.processing_date. Data loaded to Redshift."</td></tr><tr><td>Next State</td><td><code>Pipeline-Succeeded</code></td></tr></tbody></table>
+<p><strong>Succeed State:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Pipeline-Succeeded</code></td></tr><tr><td>Type</td><td>Succeed</td></tr></tbody></table>
+<hr>
+<h3>STEP 12D — DEFINE GLOBAL FAILURE NOTIFICATION STATE</h3>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Notify-Pipeline-Failure</code></td></tr><tr><td>API</td><td><code>SNS:Publish</code></td></tr><tr><td>Integration Pattern</td><td>Request Response</td></tr><tr><td>Topic ARN</td><td><code>arn:aws:sns:REGION:ACCOUNT:shopnow-pipeline-failure</code></td></tr><tr><td>Message</td><td>"ALERT: Daily pipeline FAILED. Error: $.error. Check Step Functions execution for details."</td></tr><tr><td>Next State</td><td><code>Pipeline-Failed</code></td></tr></tbody></table>
+<p><strong>Fail State:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Pipeline-Failed</code></td></tr><tr><td>Error</td><td><code>PipelineExecutionFailed</code></td></tr><tr><td>Cause</td><td><code>One or more pipeline steps failed after all retries</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 13 — TRIGGER THE STATE MACHINE VIA EVENTBRIDGE</h3>
+<p>→ The state machine is defined — now it needs to be triggered daily<br>
+→ Navigate to Amazon EventBridge Console → Rules → Create Rule (pattern from Project 38)</p>
+<p><strong>Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule Name</td><td><code>shopnow-daily-pipeline-trigger</code></td></tr><tr><td>Event Bus</td><td>Default</td></tr><tr><td>Rule Type</td><td>Schedule</td></tr><tr><td>Schedule Expression</td><td><code>cron(0 6 * * ? *)</code> — 6 AM UTC daily</td></tr><tr><td>Target</td><td>Step Functions state machine</td></tr><tr><td>State Machine ARN</td><td><code>arn:aws:states:REGION:ACCOUNT:stateMachine:shopnow-daily-pipeline-orchestrator</code></td></tr><tr><td>Input</td><td>Constant (JSON) — see below</td></tr><tr><td>IAM Role</td><td>Create new role — EventBridge needs <code>states:StartExecution</code> permission</td></tr></tbody></table>
+<p><strong>Input to State Machine:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "processing_date": "2025-01-31",
+  "is_month_end": true,
+  "source_path": "s3://shopnow-data-lake/raw/orders/",
+  "target_path": "s3://shopnow-data-lake/enriched/orders/"
+}</code></pre></div>
+<p>→ Problem: This input is STATIC — <code>is_month_end</code> is hardcoded<br>
+→ Solution 1: Use EventBridge Input Transformer to inject current date<br>
+→ Solution 2: Add a Lambda Task state at the beginning of the state machine that calculates <code>is_month_end</code> dynamically<br>
+→ Solution 2 is more flexible — recommended</p>
+<p><strong>Adding a Lambda "Determine Date Context" state at the start:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State Name</td><td><code>Determine-Date-Context</code></td></tr><tr><td>Resource</td><td>Lambda function ARN</td></tr><tr><td>Integration Pattern</td><td>Request Response</td></tr><tr><td>Next State</td><td><code>Crawl-Raw-CSV-Data</code></td></tr></tbody></table>
+<p>→ Lambda receives empty or minimal input → returns:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "processing_date": "2025-01-31",
+  "is_month_end": true,
+  "source_path": "s3://shopnow-data-lake/raw/orders/2025/01/31/",
+  "target_path": "s3://shopnow-data-lake/enriched/orders/2025/01/31/"
+}</code></pre></div>
+<p>→ This output flows through the entire state machine as the execution context</p>
+<hr>
+<h3>STEP 14 — CONFIGURE STATE MACHINE EXECUTION SETTINGS</h3>
+<p>→ Back in Step Functions Console → State Machine → Edit</p>
+<p><strong>Setting: Execution Timeout</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>Timeout Seconds</td><td>43200 (12 hours)</td><td>Maximum time for entire execution including human approval wait</td></tr></tbody></table>
+<p>→ Without this — a stuck execution runs indefinitely → costs accumulate</p>
+<p><strong>Setting: Execution History Retention</strong></p>
+<p>→ Standard workflows retain execution history for 90 days<br>
+→ For longer retention → configure CloudWatch Logs (already done in Step 3)</p>
+<hr>
+<h3>FINAL STATE MACHINE VISUAL SUMMARY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[EventBridge: 6 AM Daily]
+</span>        │
+        ▼
+[Determine-Date-Context] ← Lambda
+        │
+        ▼
+[Crawl-Raw-CSV-Data] ← Glue Crawler (.sync)
+        │ (Retry 2x → Catch → Notify-Failure)
+        ▼
+[Convert-CSV-to-Parquet] ← Glue Job (.sync)
+        │ (Retry 3x exponential → Catch → Notify-Failure)
+        ▼
+[Crawl-Parquet-Data] ← Glue Crawler (.sync)
+        │ (Retry 2x → Catch → Notify-Failure)
+        ▼
+[Is-Month-End?] ← Choice
+       / \
+      ▼   ▼
+[Large Job]  [Standard Job] ← Glue Jobs (.sync)
+      \   /                    (Retry 3x → Catch → Notify-Failure)
+       ▼ ▼
+[Crawl-Enriched-Data] ← Glue Crawler (.sync)
+        │
+        ▼
+[Wait-For-DQ-Approval] ← SNS + waitForTaskToken
+        │ (Timeout 8 hours → Catch → Notify-Failure)
+        ▼
+[Approval-Decision-Router] ← Choice
+       / \
+      ▼   ▼
+[Load to    [Notify
+ Redshift]   Rejection]
+      │         │
+      ▼         ▼
+[Notify     [Pipeline
+ Success]    Rejected
+      │      Fail]
+      ▼
+[Pipeline
+ Succeeded]
+
+[Notify-Pipeline-Failure] ← Global error handler
+        │
+        ▼
+[Pipeline-Failed]</code></pre></div>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use <code>.sync</code> integration pattern for long-running tasks (Glue, ECS, Redshift)</p>
+<ul>
+<li>Without <code>.sync</code> → Step Functions fires the task and immediately moves on → you lose sequencing</li>
+</ul>
+<p>→ Always add Retry with exponential backoff on EVERY Task state</p>
+<ul>
+<li>Transient errors (network timeouts, throttling) often resolve on retry</li>
+<li>Pattern: specific errors first → <code>States.ALL</code> last</li>
+</ul>
+<p>→ Always add Catch on EVERY Task state pointing to a failure notification state</p>
+<ul>
+<li>Uncaught errors terminate the execution silently</li>
+</ul>
+<p>→ Always set execution timeout on the state machine level</p>
+<ul>
+<li>Prevents runaway executions from accumulating cost</li>
+</ul>
+<p>→ Always set timeout on <code>.waitForTaskToken</code> states</p>
+<ul>
+<li>Without timeout → execution waits forever → stuck indefinitely</li>
+</ul>
+<p>→ Always enable CloudWatch Logs with level ALL during development</p>
+<ul>
+<li>Switch to ERROR level in production to reduce log volume and cost</li>
+</ul>
+<p>→ Always enable X-Ray tracing for debugging latency issues across states</p>
+<p>→ Always use <code>ResultPath</code> and <code>OutputPath</code> to control data flow between states</p>
+<ul>
+<li><code>ResultPath: $.result</code> → appends task output to input under "result" key</li>
+<li><code>OutputPath: $.result</code> → passes only the "result" key to next state</li>
+<li>Without these → output replaces input → you lose context</li>
+</ul>
+<p>→ Always version-control your ASL definition in Git</p>
+<ul>
+<li>The console visual builder is great for design — but production deployments should use Infrastructure as Code</li>
+</ul>
+<p>→ Always use least-privilege IAM role — scope permissions to specific Glue Jobs, SNS Topics, Redshift clusters</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use Express workflow for long-running ETL — 5-minute limit will kill your execution<br>
+→ Never forget to activate the EventBridge rule after creation — inactive rule = no triggers<br>
+→ Never pass sensitive data (credentials, tokens) through state machine input/output</p>
+<ul>
+<li>State data is visible in execution history and CloudWatch Logs</li>
+<li>Use Secrets Manager (Project 37) for credentials</li>
+</ul>
+<p>→ Never create deeply nested state machines (30+ sequential states)</p>
+<ul>
+<li>Break into child state machines using <code>StepFunctions:StartExecution</code> (.sync) — nested execution pattern</li>
+</ul>
+<p>→ Never use <code>ResultPath: null</code> unless you intentionally want to discard task output</p>
+<ul>
+<li>Common mistake: task succeeds but output is thrown away → next state has no data</li>
+</ul>
+<p>→ Never rely on execution history alone for auditing — history is purged after 90 days</p>
+<ul>
+<li>Always enable CloudWatch Logs for permanent retention</li>
+</ul>
+<p>→ Never hardcode ARNs in the ASL definition</p>
+<ul>
+<li>Use CloudFormation/CDK parameters or SSM Parameter Store references</li>
+</ul>
+<p>→ Never use Choice state without a Default branch</p>
+<ul>
+<li>If no rule matches and no Default → <code>States.NoChoiceMatched</code> error → execution fails</li>
+</ul>
+<p>→ Never put business logic inside the state machine definition</p>
+<ul>
+<li>State machines should ORCHESTRATE — not compute</li>
+<li>Business logic belongs in Lambda functions or Glue Jobs</li>
+</ul>
+<p>→ Never ignore the state machine execution cost</p>
+<ul>
+<li>Every state transition costs money</li>
+<li>A state machine with 100 states running 1000 times/day = significant cost</li>
+</ul>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE STEP FUNCTIONS</h2>
+<table><thead><tr><th>Scenario</th><th>Use Step Functions?</th></tr></thead><tbody><tr><td>Orchestrate multiple AWS services in sequence/parallel</td><td>✅ Yes — primary use case</td></tr><tr><td>Need human approval or external callback</td><td>✅ Yes — waitForTaskToken</td></tr><tr><td>Need dynamic branching based on runtime data</td><td>✅ Yes — Choice state</td></tr><tr><td>Need retry with exponential backoff per step</td><td>✅ Yes — built-in Retry</td></tr><tr><td>Need error handling with fallback paths</td><td>✅ Yes — Catch blocks</td></tr><tr><td>Pipeline spans Glue + Redshift + Lambda + SNS</td><td>✅ Yes — multi-service orchestration</td></tr><tr><td>Need execution audit trail and visual debugging</td><td>✅ Yes — execution history + visual graph</td></tr><tr><td>All-Glue pipeline with simple sequential steps</td><td>⚠️ Consider Glue Workflow first (Project 31) — simpler + free</td></tr><tr><td>High-volume event processing (100K+ events/sec)</td><td>✅ Use Express workflows</td></tr><tr><td>Simple cron-triggered single Lambda</td><td>❌ Overkill — use EventBridge + Lambda directly (Project 38)</td></tr><tr><td>Need full DAG scheduling like Airflow (backfill, SLA, complex dependencies)</td><td>⚠️ Consider Amazon MWAA (Managed Apache Airflow)</td></tr><tr><td>Long-running batch job with no branching or approval</td><td>⚠️ Consider Glue Workflow (Project 31) — free orchestration</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE STEP FUNCTIONS</h2>
+<p>→ When you have a simple event → action pattern with no orchestration</p>
+<ul>
+<li>S3 upload → Lambda → done? → Just use S3 Event Notification + Lambda (Project 15, 26)</li>
+</ul>
+<p>→ When you need sub-second execution with thousands of concurrent workflows</p>
+<ul>
+<li>Standard workflows have 2,000/sec start rate → use Express for high volume</li>
+</ul>
+<p>→ When your pipeline is exclusively Glue components with no external services</p>
+<ul>
+<li>Glue Workflow (Project 31) is free and simpler for Glue-only chains</li>
+</ul>
+<p>→ When you need a full-featured workflow scheduler with backfill capabilities</p>
+<ul>
+<li>Step Functions doesn't natively support backfill</li>
+<li>Consider Amazon MWAA (Managed Apache Airflow) for complex scheduling needs</li>
+</ul>
+<p>→ When your workflow exceeds 25,000 execution history events</p>
+<ul>
+<li>Standard workflow limit per execution</li>
+<li>For extremely long workflows → use child executions (nested state machines)</li>
+</ul>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — THE STATE MACHINE EXECUTION MODEL</h3>
+<p>→ When <code>StartExecution</code> is called:</p>
+<ol>
+<li>Step Functions creates an Execution object with unique Execution ARN</li>
+<li>The ASL definition is parsed and the start state is identified</li>
+<li>The input JSON is passed to the start state</li>
+<li>Each state executes → produces output → the engine evaluates "Next" field</li>
+<li>Output of current state becomes input of next state (unless modified by ResultPath/OutputPath)</li>
+<li>Execution continues until it reaches a Succeed or Fail terminal state</li>
+<li>All state transitions are durably recorded in execution history</li>
+</ol>
+<p>→ KEY PROPERTY: Step Functions is DURABLE</p>
+<ul>
+<li>Every state transition is checkpointed</li>
+<li>If the Step Functions infrastructure itself has a failure → it resumes from the last checkpoint</li>
+<li>This is why it can run for up to 1 year — it doesn't keep a persistent process running</li>
+<li>It's event-driven internally — "wake up when this thing completes"</li>
+</ul>
+<hr>
+<h3>MECHANIC 2 — THE .sync INTEGRATION PATTERN (Deep Dive)</h3>
+<p>→ When a Task state uses <code>.sync</code> (e.g., Glue StartJobRun.sync):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step Functions                     AWS Glue
+</span>     │                                │
+     ├─ Call StartJobRun API ────────►│ Returns JobRunId
+     │                                │
+     ├─ Store JobRunId internally     │ Job starts running
+     │                                │
+     ├─ Poll GetJobRun API ──────────►│ Returns RUNNING
+     │  (periodic polling)            │
+     ├─ Poll GetJobRun API ──────────►│ Returns RUNNING
+     │                                │
+     ├─ Poll GetJobRun API ──────────►│ Returns SUCCEEDED
+     │                                │
+     ├─ State transitions to Next     │
+     ▼                                │
+  Next State                          │</code></pre></div>
+<p>→ The polling is handled by Step Functions internally — you don't configure polling intervals<br>
+→ Step Functions uses an optimized polling strategy (not fixed interval — adapts based on expected duration)<br>
+→ You are NOT charged for polling API calls — they're part of the Step Functions service<br>
+→ But you ARE charged for the state transition when the task completes</p>
+<hr>
+<h3>MECHANIC 3 — THE .waitForTaskToken PATTERN (Deep Dive)</h3>
+<p>→ When a Task state uses <code>.waitForTaskToken</code>:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step Functions                     External World
+</span>     │                                │
+     ├─ Generate unique Task Token    │
+     │  (UUID-like string)            │
+     ├─ Execute the API (e.g.,        │
+     │  SNS:Publish) with token       │
+     │  embedded in the payload ─────►│ Human receives email with token
+     │                                │
+     ├─ PAUSE ◄─── execution stops    │
+     │  here — no polling, no cost    │ Human reviews data
+     │  for waiting (Standard only)   │
+     │                                │
+     │                                │ Human calls SendTaskSuccess
+     │◄──── (token, output) ──────────┤ with the task token
+     │                                │
+     ├─ Validate token matches        │
+     ├─ Resume execution with         │
+     │  provided output               │
+     ▼                                │
+  Next State                          │</code></pre></div>
+<p>→ The Task Token is generated by Step Functions — guaranteed unique<br>
+→ The token is available via <code>$$.Task.Token</code> in the state definition<br>
+→ Whoever has the token can call <code>SendTaskSuccess</code> or <code>SendTaskFailure</code><br>
+→ Security implication: Treat task tokens as sensitive — anyone with the token can resume the execution<br>
+→ Standard workflows: No charge during wait time (event-driven, not polling)<br>
+→ Express workflows: CANNOT use <code>.waitForTaskToken</code> — not supported</p>
+<hr>
+<h3>MECHANIC 4 — DATA FLOW BETWEEN STATES</h3>
+<p>→ This is the most misunderstood mechanic — and the #1 source of debugging pain</p>
+<p><strong>Core Concept: Every state receives INPUT and produces OUTPUT</strong></p>
+<p>→ By default: The OUTPUT of state N becomes the INPUT of state N+1<br>
+→ This can be controlled with 4 filters:</p>
+<table><thead><tr><th>Filter</th><th>Applied When</th><th>What It Does</th></tr></thead><tbody><tr><td>InputPath</td><td>Before task execution</td><td>Selects a portion of the state input to pass to the task</td></tr><tr><td>Parameters</td><td>Before task execution</td><td>Constructs a new JSON object to pass to the task (can mix static values + input references)</td></tr><tr><td>ResultPath</td><td>After task execution</td><td>Determines WHERE the task result is placed within the original input</td></tr><tr><td>OutputPath</td><td>After ResultPath</td><td>Selects a portion of the combined result to pass to the next state</td></tr></tbody></table>
+<p><strong>Execution Order:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>State Input
+</span>    │
+    ▼ InputPath (filter input)
+    │
+    ▼ Parameters (construct task input)
+    │
+    ▼ [Task Executes]
+    │
+    ▼ ResultSelector (filter task output)
+    │
+    ▼ ResultPath (merge result into original input)
+    │
+    ▼ OutputPath (filter final output)
+    │
+    ▼ Next State Input</code></pre></div>
+<p><strong>Common Patterns:</strong></p>
+<table><thead><tr><th>Goal</th><th>Configuration</th></tr></thead><tbody><tr><td>Pass entire input through, append task result</td><td><code>ResultPath: $.taskResult</code></td></tr><tr><td>Discard task result, keep original input</td><td><code>ResultPath: null</code></td></tr><tr><td>Pass only the task result to next state</td><td><code>ResultPath: $.taskResult</code>, <code>OutputPath: $.taskResult</code></td></tr><tr><td>Replace entire input with task result</td><td>Default (no configuration needed)</td></tr></tbody></table>
+<p>→ ShopNow Example:</p>
+<ul>
+<li><code>Determine-Date-Context</code> Lambda returns <code>{"processing_date": "2025-01-31", "is_month_end": true}</code></li>
+<li>This becomes the input for ALL subsequent states (flows through)</li>
+<li><code>Crawl-Raw-CSV-Data</code> completes → its output (crawler details) is irrelevant to the next state</li>
+<li>Set <code>ResultPath: $.crawler1_result</code> → appends crawler output but KEEPS the original date context</li>
+<li>Next state still has <code>$.processing_date</code> and <code>$.is_month_end</code> available</li>
+</ul>
+<hr>
+<h3>MECHANIC 5 — RETRY INTERNAL BEHAVIOR</h3>
+<p>→ When Retry is configured on a state:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Task executes → FAILS with error "Glue.JobRunException"
+</span>     │
+     ▼
+Retry evaluator checks retry rules IN ORDER:
+     │
+     ├─ Rule 1: Error matches "Glue.JobRunException"? → YES
+     │   ├─ Attempts remaining? (MaxAttempts - current attempt)
+     │   │   ├─ YES → Wait (IntervalSeconds × BackoffRate^attempt) → Re-execute task
+     │   │   └─ NO → Move to Catch evaluator
+     │
+     ├─ Rule 2: (next rule if Rule 1 didn't match)
+     │
+     └─ No rules matched → Move to Catch evaluator</code></pre></div>
+<p><strong>Backoff Calculation Example:</strong></p>
+<table><thead><tr><th>Attempt</th><th>IntervalSeconds</th><th>BackoffRate</th><th>Actual Wait</th></tr></thead><tbody><tr><td>1st retry</td><td>300</td><td>2.0</td><td>300 seconds (5 min)</td></tr><tr><td>2nd retry</td><td>300</td><td>2.0</td><td>600 seconds (10 min)</td></tr><tr><td>3rd retry</td><td>300</td><td>2.0</td><td>1200 seconds (20 min)</td></tr></tbody></table>
+<p>→ Formula: <code>wait = IntervalSeconds × (BackoffRate ^ retryAttemptNumber)</code><br>
+→ Optional: <code>MaxDelaySeconds</code> caps the maximum wait time</p>
+<p>→ Important: Each retry is a FULL re-execution of the task<br>
+→ The task receives the SAME input as the original attempt<br>
+→ Retries are NOT visible as separate state transitions in the visual graph<br>
+→ They appear in the detailed execution event history</p>
+<hr>
+<h3>MECHANIC 6 — CATCH INTERNAL BEHAVIOR</h3>
+<p>→ When all retries are exhausted OR no retry rule matches:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Catch evaluator checks catch rules IN ORDER:
+</span>     │
+     ├─ Rule 1: Error matches "States.ALL"? → YES
+     │   ├─ Store error info at ResultPath (e.g., $.error)
+     │   ├─ Transition to "Next" state (e.g., Notify-Pipeline-Failure)
+     │   └─ DONE
+     │
+     └─ No catch rules matched → Execution FAILS with unhandled error</code></pre></div>
+<p><strong>Error Information Structure (stored at ResultPath):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Error": "Glue.JobRunException",
+  "Cause": "Job run failed with status FAILED: OutOfMemoryError in executor"
+}</code></pre></div>
+<p>→ The Catch "Next" state receives the original input + error information<br>
+→ The failure notification state can include <code>$.error.Error</code> and <code>$.error.Cause</code> in the SNS message</p>
+<hr>
+<h3>MECHANIC 7 — STANDARD vs EXPRESS EXECUTION ENGINE</h3>
+<table><thead><tr><th>Aspect</th><th>Standard</th><th>Express</th></tr></thead><tbody><tr><td>State persistence</td><td>Every transition durably checkpointed</td><td>No checkpointing — runs in memory</td></tr><tr><td>Recovery</td><td>Resumes from last checkpoint on infrastructure failure</td><td>Lost on infrastructure failure — must re-execute</td></tr><tr><td>Execution history</td><td>Stored per-execution — queryable via API</td><td>Sent to CloudWatch Logs only</td></tr><tr><td>Idempotency</td><td>Exactly-once execution semantics</td><td>At-least-once (may re-execute on failure)</td></tr><tr><td>Pricing</td><td>Per state transition ($0.025 / 1,000)</td><td>Per execution + duration</td></tr><tr><td>Max duration</td><td>1 year</td><td>5 minutes</td></tr><tr><td>Concurrency</td><td>1,000,000 open executions</td><td>100,000 starts per second</td></tr><tr><td>waitForTaskToken</td><td>✅ Supported</td><td>❌ Not supported</td></tr></tbody></table>
+<p>→ ShopNow uses Standard because:</p>
+<ul>
+<li>Pipeline runs &gt; 5 minutes</li>
+<li>Needs human approval (waitForTaskToken)</li>
+<li>Needs exactly-once execution (data loading to Redshift should not duplicate)</li>
+</ul>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Using Request Response instead of .sync for Glue Job</td><td>Step Functions starts the Job and immediately moves to next state — Job hasn't finished</td><td>Always use <code>.sync</code> for long-running tasks</td></tr><tr><td>2</td><td>Forgetting to include <code>$$.Task.Token</code> in waitForTaskToken message</td><td>Task token not sent to human — nobody can signal completion — execution hangs until timeout</td><td>Always verify token is in the message payload</td></tr><tr><td>3</td><td>No timeout on waitForTaskToken state</td><td>Execution waits forever — stuck permanently</td><td>Always set <code>TimeoutSeconds</code></td></tr><tr><td>4</td><td>ResultPath misconfiguration losing context</td><td>Next state can't access processing_date because task output replaced it</td><td>Use <code>ResultPath: $.stepResult</code> to append, not replace</td></tr><tr><td>5</td><td>Choice state without Default branch</td><td><code>States.NoChoiceMatched</code> error when no rule matches</td><td>Always define a Default</td></tr><tr><td>6</td><td>Retry with BackoffRate 1.0 for transient errors</td><td>All retries fire at same interval — doesn't give service time to recover</td><td>Use BackoffRate 2.0+ for transient errors</td></tr><tr><td>7</td><td>Catch block with <code>ResultPath: $</code></td><td>Error info replaces ALL state data — original context lost</td><td>Use <code>ResultPath: $.error</code> to append error info</td></tr><tr><td>8</td><td>IAM role missing permissions for specific service</td><td>Task fails with AccessDeniedException</td><td>Test each task individually before building full pipeline</td></tr><tr><td>9</td><td>State machine input too large (&gt;256 KB)</td><td>StartExecution API rejects the request</td><td>Keep input small — reference S3 paths, not data content</td></tr><tr><td>10</td><td>Not handling Glue Crawler .sync correctly</td><td>Crawler StartCrawler doesn't natively support .sync — need custom polling</td><td>Use Glue StartJobRun.sync (natively supported) — for Crawlers, use Lambda wrapper or check service integration support</td></tr><tr><td>11</td><td>Execution history exceeds 25,000 events</td><td>Execution fails with <code>ExecutionHistory</code> limit error</td><td>Break into child state machines for very long workflows</td></tr><tr><td>12</td><td>Testing only the happy path</td><td>First production failure reveals missing Catch blocks</td><td>Test failure scenarios: kill a Glue Job mid-run, reject approval, timeout</td></tr></tbody></table>
+<p>→ <strong>CRITICAL NOTE on Pitfall 10:</strong><br>
+→ Not all AWS services support <code>.sync</code> natively<br>
+→ Natively supported .sync services include: Lambda, Glue Jobs, ECS, Batch, Step Functions (nested), SageMaker, CodeBuild, Redshift Data API<br>
+→ For services WITHOUT native .sync → use a polling loop pattern:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[Start Service Task (Request Response)]
+</span>        │
+        ▼
+[Wait State: 60 seconds]
+        │
+        ▼
+[Check Status Task (Lambda or API)]
+        │
+        ▼
+[Choice: Is Complete?]
+       / \
+      ▼   ▼
+  [YES]   [NO → loop back to Wait State]
+      │
+      ▼
+[Next State]</code></pre></div>
+<p>→ Glue Crawlers may require this pattern depending on the Step Functions service integration version<br>
+→ Always check the latest AWS documentation for supported .sync integrations</p>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Concurrent Executions</strong></p>
+<ul>
+<li>Standard: Up to 1,000,000 open executions per account per region</li>
+<li>Express: Up to 100,000 execution starts per second</li>
+<li>For ShopNow's daily pipeline → 1 execution/day → nowhere near limits</li>
+</ul>
+<p>→ <strong>State Machine Complexity</strong></p>
+<ul>
+<li>No hard limit on number of states</li>
+<li>ASL definition size limit: 1 MB</li>
+<li>Execution history limit: 25,000 events per execution</li>
+<li>For very complex pipelines → use nested state machines (child executions)</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Pipeline Complexity</th><th>States</th><th>Daily Runs</th><th>Monthly Transitions</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>ShopNow (this project)</td><td>~12 states</td><td>1</td><td>~360</td><td>&lt; $0.01</td></tr><tr><td>Medium pipeline</td><td>30 states</td><td>24 (hourly)</td><td>~21,600</td><td>~$0.54</td></tr><tr><td>Large pipeline</td><td>50 states</td><td>100 (event-driven)</td><td>~150,000</td><td>~$3.75</td></tr><tr><td>High-volume Express</td><td>10 states</td><td>1,000,000/day</td><td>N/A (per execution pricing)</td><td>Varies significantly</td></tr></tbody></table>
+<p>→ Standard workflow cost is negligible for most ETL pipelines<br>
+→ Cost becomes significant for high-volume event-driven patterns → use Express</p>
+<p>→ <strong>Payload Size Scaling</strong></p>
+<ul>
+<li>Maximum payload between states: 256 KB</li>
+<li>If you need to pass large data → store in S3, pass the S3 path as reference</li>
+<li>Never pass actual data content through state machine — only references</li>
+</ul>
+<p>→ <strong>Timeout Scaling</strong></p>
+<ul>
+<li>Standard: Up to 1 year execution duration</li>
+<li>Plan timeout budgets: Sum of all possible wait times + task durations + human approval wait</li>
+<li>Set execution-level timeout as safety net</li>
+</ul>
+<p>→ <strong>Regional Scaling</strong></p>
+<ul>
+<li>State machines are regional</li>
+<li>For multi-region patterns → use EventBridge cross-region to trigger state machines in other regions</li>
+<li>Cross-region state machine orchestration explored in Project 55 (DR patterns)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the state machine is correctly configured:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th></tr></thead><tbody><tr><td>State machine exists and is ACTIVE</td><td>Step Functions Console → State machines</td><td>Status: ACTIVE</td></tr><tr><td>Visual graph shows correct flow</td><td>State machine → Definition → Visual</td><td>All states connected with correct transitions</td></tr><tr><td>IAM role has correct permissions</td><td>IAM Console → Role → Permissions tab</td><td>Glue, SNS, Redshift Data API, CloudWatch Logs</td></tr><tr><td>EventBridge rule is enabled</td><td>EventBridge Console → Rules</td><td>Rule status: ENABLED</td></tr><tr><td>EventBridge target is correct state machine</td><td>Rule → Targets tab</td><td>Correct state machine ARN</td></tr><tr><td>SNS topics exist and have confirmed subscriptions</td><td>SNS Console → Topics → Subscriptions</td><td>Status: Confirmed for all subscribers</td></tr><tr><td>Logging is enabled</td><td>State machine → Logging configuration</td><td>Log level: ALL, Log group configured</td></tr></tbody></table>
+<p>→ <strong>How to validate a successful execution:</strong></p>
+<table><thead><tr><th>Step</th><th>Validation Method</th></tr></thead><tbody><tr><td>Execution started</td><td>Step Functions Console → Executions → New execution appears</td></tr><tr><td>Each state shows green</td><td>Click execution → Visual tab → All states green</td></tr><tr><td>Glue Jobs completed</td><td>Glue Console → Jobs → Job runs show SUCCEEDED</td></tr><tr><td>Choice took correct branch</td><td>Execution visual → follow highlighted path</td></tr><tr><td>Human approval paused execution</td><td>Execution status: RUNNING, current state: Wait-For-DQ-Approval</td></tr><tr><td>Approval resumed execution</td><td>After SendTaskSuccess → execution continues to Redshift load</td></tr><tr><td>Redshift data loaded</td><td>Redshift Console → Query enriched_orders table</td></tr><tr><td>SNS notifications received</td><td>Check email inbox for success notification</td></tr></tbody></table>
+<p>→ <strong>How to debug a failed execution:</strong></p>
+<table><thead><tr><th>Failure Symptom</th><th>Debug Steps</th></tr></thead><tbody><tr><td>State shows red in visual graph</td><td>Click the failed state → "Step input" tab shows what went in → "Step output" shows error</td></tr><tr><td>Execution shows FAILED</td><td>Check "Events" tab → scroll to last events → find error details</td></tr><tr><td>Task timeout</td><td>Check if the underlying service (Glue/Redshift) is still running → might be slow, not failed</td></tr><tr><td>Access Denied error</td><td>Check IAM role permissions → verify the specific API action is allowed on the specific resource</td></tr><tr><td>waitForTaskToken stuck</td><td>Verify task token was sent correctly → verify external system received it → try manual SendTaskSuccess via CLI</td></tr><tr><td>Choice went wrong branch</td><td>Check "Step input" of Choice state → verify the condition variable has expected value</td></tr><tr><td>Data missing in next state</td><td>Check ResultPath/OutputPath configuration → verify data flow between states</td></tr></tbody></table>
+<p>→ <strong>Execution Event History — The Ultimate Debug Tool:</strong><br>
+→ Every execution maintains a detailed event log:</p>
+<table><thead><tr><th>Event Type</th><th>Information</th></tr></thead><tbody><tr><td>ExecutionStarted</td><td>Input payload</td></tr><tr><td>TaskStateEntered</td><td>State name, input to state</td></tr><tr><td>TaskScheduled</td><td>API call being made, parameters</td></tr><tr><td>TaskStarted</td><td>Confirmation API was called</td></tr><tr><td>TaskSucceeded</td><td>API response / task output</td></tr><tr><td>TaskStateExited</td><td>Output from state</td></tr><tr><td>ChoiceStateEntered</td><td>Input to choice</td></tr><tr><td>ChoiceStateExited</td><td>Which branch was selected</td></tr><tr><td>ExecutionSucceeded</td><td>Final output</td></tr><tr><td>ExecutionFailed</td><td>Error and Cause</td></tr></tbody></table>
+<p>→ This event log is the single most powerful debugging tool<br>
+→ You can trace EXACTLY what data flowed through each state and where things went wrong</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Step Functions is the UNIVERSAL orchestrator — it coordinates ANY AWS service, not just Glue<br>
+→ It solves every limitation of Glue Workflow identified in Project 31:</p>
+<ul>
+<li>Cross-service coordination → Task states calling Glue, Redshift, Lambda, SNS</li>
+<li>Human approval → waitForTaskToken pattern</li>
+<li>Dynamic branching → Choice state with runtime conditions</li>
+<li>Retry with backoff → built-in Retry configuration per state</li>
+<li>Error handling → Catch blocks routing to failure notification states</li>
+<li>Notifications → SNS Publish as a native task</li>
+</ul>
+<p>→ The three integration patterns are the KEY decision:</p>
+<ul>
+<li>Request Response → fire and forget</li>
+<li>.sync → wait for completion</li>
+<li>.waitForTaskToken → wait for external signal</li>
+</ul>
+<p>→ Data flow between states (InputPath → Parameters → ResultPath → OutputPath) is the hardest concept<br>
+→ Master this → you master Step Functions</p>
+<p>→ Standard vs Express → choose based on duration and volume<br>
+→ Cost is per state transition (Standard) — negligible for daily ETL, significant for high-volume</p>
+<p>→ <strong>Connection to Previous Projects:</strong></p>
+<ul>
+<li>Project 31 → Glue Workflow was the Glue-only orchestrator — Step Functions replaces and extends it</li>
+<li>Project 17, 21, 24 → The Crawlers and Jobs being orchestrated</li>
+<li>Project 22 → Redshift COPY command now automated as a state</li>
+<li>Project 6 → SNS notifications now integrated as states</li>
+<li>Project 26 → Lambda integration pattern deepened here</li>
+<li>Project 38 → EventBridge triggers the state machine (same pattern)</li>
+</ul>
+<p>→ <strong>What this project unlocked:</strong></p>
+<ul>
+<li>ShopNow now has a fully automated, error-resilient, human-gated pipeline</li>
+<li>Any failure → SNS alert → on-call engineer investigates</li>
+<li>Month-end → automatic scaling of Glue Job resources</li>
+<li>Data quality gate → prevents bad data from reaching Redshift</li>
+<li>Single visual dashboard shows entire pipeline status</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow's pipeline is robust — but the web application serving product pages has a different problem<br>
+→ Every Black Friday, traffic spikes 10x<br>
+→ The single EC2 instance (from Project 3) crashes under load<br>
+→ The site goes down for 3 hours — $200,000 in lost revenue</p>
+<p>→ They need:</p>
+<ul>
+<li>Multiple EC2 instances that scale automatically based on traffic</li>
+<li>CloudWatch alarms that trigger scaling (Project 8 patterns)</li>
+<li>A Launch Template that defines the instance configuration</li>
+<li>Health checks that replace unhealthy instances automatically</li>
+</ul>
+<p>→ <strong>Project 33 introduces Auto Scaling Groups — the solution to elastic compute capacity</strong><br>
+→ While Project 32 orchestrated the DATA pipeline, Project 33 orchestrates the COMPUTE infrastructure</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 33: "The Application That Crashed Every Black Friday — EC2 Auto Scaling with CloudWatch Triggers"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-31.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 32/60</span></div><a class="nav-btn next" href="project-33.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

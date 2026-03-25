@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 25: THE COMPANY THAT WANTED SELF-SERVICE ANALYTICS — S3 → Glue Crawler → — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 25: THE COMPANY THAT WANTED SELF-SERVICE ANALYTICS — S3 → Glue Crawler → Glue Catalog → Athena End-to-End Pipeline</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow has built an impressive set of individual components over the last 24 projects<br>
+→ The data lake has three data origins flowing into S3:</p>
+<table><thead><tr><th>Origin</th><th>Pipeline</th><th>Data Available</th></tr></thead><tbody><tr><td>File uploads</td><td>Raw CSV/JSON → Glue ETL (Project 21) → Parquet</td><td>Clickstream, historical orders</td></tr><tr><td>Redshift computations</td><td>Redshift → UNLOAD (Project 23) → Parquet</td><td>Daily revenue summaries, customer segments</td></tr><tr><td>MariaDB operations</td><td>MariaDB → Glue JDBC (Project 24) → Parquet</td><td>Customers, orders, products, payments, inventory</td></tr></tbody></table>
+<p>→ But the data engineering team is drowning in manual work:</p>
+<p>→ <strong>Problem 1: Manual Pipeline Orchestration</strong></p>
+<ul>
+<li>Every morning the data engineer must:
+<ol>
+<li>Verify raw files landed in S3 (uploaded overnight by external vendors)</li>
+<li>Manually trigger the Glue Crawler on raw data</li>
+<li>Wait for Crawler to complete</li>
+<li>Manually trigger the Glue ETL job</li>
+<li>Wait for ETL to complete</li>
+<li>Manually trigger another Crawler on transformed data</li>
+<li>Wait for Crawler to complete</li>
+<li>Notify analysts that data is ready</li>
+</ol>
+</li>
+<li>This takes 45 minutes of babysitting every single morning</li>
+<li>If the engineer is sick → pipeline doesn't run → analysts have stale data</li>
+</ul>
+<p>→ <strong>Problem 2: Analysts Can't Self-Serve</strong></p>
+<ul>
+<li>15 analysts need different views of the same data</li>
+<li>Marketing wants: customer profiles joined with purchase behavior</li>
+<li>Finance wants: revenue by region, category, and payment method</li>
+<li>Product team wants: inventory levels joined with sales velocity</li>
+<li>Each analyst writes their own complex JOIN queries in Athena</li>
+<li>Same 4-table JOIN is written 15 different ways → inconsistent results</li>
+<li>When schema changes → all 15 analysts must update their queries individually</li>
+</ul>
+<p>→ <strong>Problem 3: Athena Performance on Complex Queries</strong></p>
+<ul>
+<li>Analysts run multi-table JOINs directly in Athena on base Parquet tables</li>
+<li>A 4-table JOIN across 50GB of data takes 45 seconds and scans 12 GB → $0.06/query</li>
+<li>This query runs 200 times/day across all analysts → $12/day → $360/month for ONE report pattern</li>
+<li>Pre-computing the JOIN result would reduce this to scanning 2 GB → $0.01/query → $60/month</li>
+</ul>
+<p>→ <strong>Problem 4: Partition Management Overhead</strong></p>
+<ul>
+<li>New partitions appear daily (year=2025/month=01/day=16, day=17, day=18...)</li>
+<li>Glue Crawler must run AFTER every ETL to register new partitions</li>
+<li>If Crawler doesn't run → Athena returns incomplete results (missing the latest day)</li>
+<li>Running Crawler on large tables (millions of partitions) takes 10+ minutes itself</li>
+<li>There must be a better way to handle partitions without constant Crawler runs</li>
+</ul>
+<p>→ <strong>Problem 5: No Single Source of Truth</strong></p>
+<ul>
+<li>Three separate Glue Catalog databases exist:
+<ul>
+<li><code>shopnow_raw_db</code> (raw CSV tables — Project 17)</li>
+<li><code>shopnow_transformed_db</code> (Parquet tables — Project 21)</li>
+<li><code>shopnow_mariadb_catalog</code> (MariaDB tables — Project 24)</li>
+</ul>
+</li>
+<li>Plus a curated database from Redshift UNLOAD:
+<ul>
+<li><code>shopnow_curated_db</code> (aggregated tables — Project 23)</li>
+</ul>
+</li>
+<li>Analysts don't know which database to query</li>
+<li>"Should I use <code>transformed.orders</code> or <code>mariadb_orders</code> or <code>curated.daily_revenue</code>?"</li>
+<li>No governance layer defining WHICH tables are the official "blessed" versions</li>
+</ul>
+<p>→ The CTO says: "I want a self-service analytics platform where any analyst can find, understand, and query any data — without needing a data engineer to run pipelines or explain schemas"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This project is NOT about introducing new AWS services<br>
+→ It's about CONNECTING services already learned into a cohesive, automated, self-service platform<br>
+→ Every component was introduced individually — now we orchestrate them together</p>
+<p>→ The approach has five layers:</p>
+<table><thead><tr><th>Layer</th><th>Purpose</th><th>Components</th></tr></thead><tbody><tr><td>1. Automated Pipeline</td><td>Eliminate manual steps</td><td>Crawler schedules + ETL schedules + dependency ordering</td></tr><tr><td>2. Catalog Organization</td><td>Single source of truth</td><td>Database naming, table naming, descriptions, tags</td></tr><tr><td>3. Athena Views</td><td>Reusable query definitions</td><td>Named views that analysts reference instead of writing JOINs</td></tr><tr><td>4. CTAS (Create Table As Select)</td><td>Pre-computed results</td><td>Materialized query results stored as optimized Parquet</td></tr><tr><td>5. Partition Projection</td><td>Eliminate Crawler for partitions</td><td>Athena infers partitions from patterns without Crawler</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Design the catalog organization (naming conventions, databases, descriptions)</li>
+<li>Step 2 — Automate the end-to-end pipeline (schedule + dependency chain)</li>
+<li>Step 3 — Create Athena Views for common query patterns</li>
+<li>Step 4 — Use CTAS to pre-compute expensive JOINs</li>
+<li>Step 5 — Implement Partition Projection to eliminate Crawler dependency</li>
+<li>Step 6 — Build the analyst self-service interface</li>
+<li>Step 7 — Implement cost controls and governance</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — DESIGN THE CATALOG ORGANIZATION</h3>
+<p>→ Currently four separate databases exist with inconsistent naming<br>
+→ Redesign into a clear, navigable structure</p>
+<p><strong>New Catalog Database Structure:</strong></p>
+<table><thead><tr><th>Database Name</th><th>Purpose</th><th>Contains</th><th>Source</th></tr></thead><tbody><tr><td><code>shopnow_raw</code></td><td>Landing zone — untouched source data</td><td>Raw CSV/JSON tables</td><td>Glue Crawler on <code>s3://…/raw/</code></td></tr><tr><td><code>shopnow_staging</code></td><td>Cleaned and transformed — intermediate</td><td>Parquet tables from ETL</td><td>Glue ETL output (Project 21)</td></tr><tr><td><code>shopnow_operational</code></td><td>Operational database extracts</td><td>MariaDB-sourced Parquet</td><td>Glue JDBC ETL (Project 24)</td></tr><tr><td><code>shopnow_warehouse</code></td><td>Redshift-computed exports</td><td>Curated aggregations</td><td>Redshift UNLOAD (Project 23)</td></tr><tr><td><code>shopnow_analytics</code></td><td><strong>Analyst-facing — blessed data products</strong></td><td>Views + CTAS tables</td><td>This project</td></tr></tbody></table>
+<p>→ The key innovation: <strong><code>shopnow_analytics</code> database</strong><br>
+→ This is the ONLY database analysts should query<br>
+→ It contains Views and CTAS tables that JOIN, clean, and present data from all other databases<br>
+→ Analysts never touch raw, staging, operational, or warehouse databases directly</p>
+<p><strong>Visual representation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────┐
+</span>│                    ANALYST LAYER (Query Here)                     │
+│                                                                   │
+│   shopnow_analytics                                               │
+│   ├── v_customer_360          (VIEW joining 3 sources)           │
+│   ├── v_daily_revenue         (VIEW on warehouse data)           │
+│   ├── v_product_performance   (VIEW joining products + orders)   │
+│   ├── t_customer_segments     (CTAS — pre-computed monthly)      │
+│   └── t_sales_funnel          (CTAS — pre-computed daily)        │
+│                                                                   │
+├───────────────────────────┬──────────────────────────────────────┤
+│       DATA LAYER          │         (Don't Query Directly)       │
+│                           │                                      │
+│  shopnow_staging          │  shopnow_operational                 │
+│  ├── orders (Parquet)     │  ├── mariadb_customers (Parquet)     │
+│  ├── clickstream (Parquet)│  ├── mariadb_orders (Parquet)        │
+│  └── products (Parquet)   │  ├── mariadb_products (Parquet)      │
+│                           │  ├── mariadb_payments (Parquet)      │
+│  shopnow_raw              │  └── mariadb_inventory (Parquet)     │
+│  ├── orders_csv           │                                      │
+│  ├── clickstream_csv      │  shopnow_warehouse                   │
+│  └── products_csv         │  ├── daily_revenue_summary           │
+│                           │  └── customer_segments               │
+└───────────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<p><strong>Table Naming Conventions:</strong></p>
+<table><thead><tr><th>Prefix</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>(none)</td><td>Base table from Crawler/ETL</td><td><code>orders</code>, <code>customers</code></td></tr><tr><td><code>v_</code></td><td>Athena View (virtual — no storage)</td><td><code>v_customer_360</code></td></tr><tr><td><code>t_</code></td><td>CTAS table (materialized — stored as Parquet)</td><td><code>t_customer_segments</code></td></tr><tr><td><code>mariadb_</code></td><td>Sourced from MariaDB extraction</td><td><code>mariadb_customers</code></td></tr><tr><td><code>tmp_</code></td><td>Temporary/experimental</td><td><code>tmp_test_query</code></td></tr></tbody></table>
+<hr>
+<p><strong>Table Descriptions and Properties:</strong></p>
+<p>→ Navigate to Glue Console → Data Catalog → Tables → Edit Table</p>
+<table><thead><tr><th>Property</th><th>Where to Set</th><th>Purpose</th></tr></thead><tbody><tr><td>Description</td><td>Table properties</td><td>"Daily order transactions — source: MariaDB, refreshed: daily 03:00 UTC"</td></tr><tr><td>Classification</td><td>Table properties</td><td><code>parquet</code>, <code>csv</code>, <code>json</code></td></tr><tr><td>Owner</td><td>Table properties</td><td>"data-engineering-team"</td></tr><tr><td>Parameters → <code>data_owner</code></td><td>Custom parameter</td><td>"marketing-team"</td></tr><tr><td>Parameters → <code>refresh_frequency</code></td><td>Custom parameter</td><td>"daily"</td></tr><tr><td>Parameters → <code>sla</code></td><td>Custom parameter</td><td>"available by 05:00 UTC"</td></tr><tr><td>Parameters → <code>pii_classification</code></td><td>Custom parameter</td><td>"contains-pii" or "no-pii"</td></tr></tbody></table>
+<p>→ These descriptions become the DATA CATALOG — analysts can browse and understand tables without asking engineers<br>
+→ Glue Console → Data Catalog → Tables → Search → descriptions are searchable</p>
+<hr>
+<p><strong>Column-Level Descriptions:</strong></p>
+<p>→ Navigate to Glue Console → Data Catalog → Table → Edit Schema</p>
+<table><thead><tr><th>Column</th><th>Description</th></tr></thead><tbody><tr><td><code>customer_id</code></td><td>"Unique customer identifier — joins with customers table"</td></tr><tr><td><code>order_date</code></td><td>"Date the order was placed — partition key (year/month)"</td></tr><tr><td><code>total_amount</code></td><td>"Total order value in USD — includes tax, excludes shipping"</td></tr><tr><td><code>order_status</code></td><td>"Current status: PENDING, PROCESSING, SHIPPED, DELIVERED, CANCELLED"</td></tr><tr><td><code>extract_date</code></td><td>"Date this snapshot was taken from MariaDB — use latest for current state"</td></tr></tbody></table>
+<p>→ Column descriptions appear in Athena when analysts browse table schemas<br>
+→ This eliminates the "what does this column mean?" question</p>
+<hr>
+<h3>STEP 2 — AUTOMATE THE END-TO-END PIPELINE</h3>
+<p>→ The pipeline has dependencies — each step depends on the previous</p>
+<p><strong>Complete Daily Pipeline:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>02:00 UTC ─── MariaDB Extraction Jobs (Project 24)
+</span>                ├── shopnow-mariadb-products-to-s3      (1 min)
+                ├── shopnow-mariadb-customers-to-s3     (4 min)
+                ├── shopnow-mariadb-orders-to-s3        (10 min)
+                ├── shopnow-mariadb-order-items-to-s3   (25 min)
+                ├── shopnow-mariadb-inventory-to-s3     (35 min)
+                └── shopnow-mariadb-payments-to-s3      (8 min)
+                        │
+02:45 UTC ─── Crawler: Operational Data
+                │       Crawls s3://…/transformed/mariadb/
+                │       Updates shopnow_operational catalog
+                │       (10 min)
+                │
+03:00 UTC ─── Glue ETL: CSV to Parquet (Project 21)
+                ├── shopnow-orders-csv-to-parquet        (12 min)
+                ├── shopnow-products-csv-to-parquet      (5 min)
+                ├── shopnow-customers-json-to-parquet    (8 min)
+                └── shopnow-clickstream-csv-to-parquet   (20 min)
+                        │
+03:30 UTC ─── Crawler: Staging Data
+                │       Crawls s3://…/transformed/ (non-mariadb)
+                │       Updates shopnow_staging catalog
+                │       (8 min)
+                │
+03:45 UTC ─── CTAS Refresh: Pre-computed Tables
+                ├── Rebuild t_customer_segments
+                ├── Rebuild t_sales_funnel
+                └── Rebuild t_product_performance
+                        │
+04:00 UTC ─── Redshift COPY (Project 22)
+                │       Loads latest Parquet into Redshift
+                │       (15 min)
+                │
+04:15 UTC ─── Redshift UNLOAD (Project 23)
+                │       Exports curated aggregations to S3
+                │       (10 min)
+                │
+04:30 UTC ─── Crawler: Warehouse Data
+                │       Crawls s3://…/curated/
+                │       Updates shopnow_warehouse catalog
+                │       (5 min)
+                │
+04:35 UTC ─── SNS Notification (Project 6)
+                │       "Daily data refresh complete — data available for querying"
+                │
+05:00 UTC ─── Analysts begin querying fresh data ✅</code></pre></div>
+<hr>
+<p><strong>Scheduling Method 1: Individual Glue Schedules (Simple but Fragile)</strong></p>
+<p>→ Each job has its own cron schedule<br>
+→ Time-based dependencies: "ETL starts at 03:00 because extraction finishes by 02:45"</p>
+<table><thead><tr><th>Problem</th><th>Impact</th></tr></thead><tbody><tr><td>Extraction runs late (large data day)</td><td>ETL starts before extraction finishes → processes stale data</td></tr><tr><td>ETL runs late</td><td>Crawler runs on incomplete data</td></tr><tr><td>Any step fails</td><td>Downstream steps run anyway on incomplete data</td></tr></tbody></table>
+<p>→ Time-based scheduling is FRAGILE — it assumes fixed durations<br>
+→ Better approach: Event-driven dependencies (Glue Workflow — Project 31)</p>
+<p><strong>Scheduling Method 2: Glue Workflow (Recommended — Preview for Project 31)</strong></p>
+<p>→ Glue Workflow chains jobs and crawlers with TRIGGERS based on completion events</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Workflow: shopnow-daily-pipeline
+</span>  │
+  ├── TRIGGER: Scheduled (02:00 UTC daily)
+  │     └── STARTS: Extraction Jobs (parallel)
+  │
+  ├── TRIGGER: On completion of ALL extraction jobs (SUCCESS)
+  │     └── STARTS: Crawler - operational data
+  │
+  ├── TRIGGER: On completion of operational Crawler (SUCCESS)
+  │     └── STARTS: ETL Jobs (parallel)
+  │
+  ├── TRIGGER: On completion of ALL ETL jobs (SUCCESS)
+  │     └── STARTS: Crawler - staging data
+  │
+  ├── TRIGGER: On completion of staging Crawler (SUCCESS)
+  │     └── STARTS: CTAS refresh queries (via Lambda)
+  │
+  └── TRIGGER: On completion of CTAS refresh (SUCCESS)
+        └── STARTS: SNS notification</code></pre></div>
+<p>→ Event-driven: Each step starts ONLY when the previous step SUCCEEDS<br>
+→ If extraction fails → nothing downstream runs → no stale data corruption<br>
+→ If extraction takes 60 minutes instead of 45 → ETL waits until extraction completes</p>
+<p>→ Glue Workflow deep dive is in Project 31<br>
+→ For now — understand that THIS is the production-grade orchestration method</p>
+<p><strong>Scheduling Method 3: EventBridge + Step Functions (Advanced — Project 32, 38)</strong></p>
+<p>→ For complex branching logic, parallel paths with independent error handling, and human approval steps<br>
+→ More powerful than Glue Workflow but more complex to configure<br>
+→ Used when pipeline spans beyond Glue (Lambda, Redshift, SNS, etc.)</p>
+<p>→ For ShopNow's current needs → Glue Workflow (Method 2) is sufficient<br>
+→ We'll implement it fully in Project 31</p>
+<hr>
+<h3>STEP 3 — CREATE ATHENA VIEWS FOR COMMON QUERY PATTERNS</h3>
+<p>→ An Athena View is a SAVED query definition that acts like a virtual table<br>
+→ No data is stored — the View's SQL executes every time the View is queried<br>
+→ Views are stored in the Glue Data Catalog as table entries with <code>TableType: VIRTUAL_VIEW</code></p>
+<p><strong>Why Views solve the analyst problem:</strong></p>
+<ul>
+<li>Write the complex JOIN once → analysts reference the View by name</li>
+<li>Schema changes → update the View definition → all analysts automatically get the new schema</li>
+<li>Consistent results — everyone queries the same logic</li>
+<li>Simpler queries — analysts write <code>SELECT * FROM v_customer_360</code> instead of a 40-line JOIN</li>
+</ul>
+<hr>
+<p><strong>View 1: Customer 360 (Complete Customer Profile)</strong></p>
+<p>→ Navigate to Athena Console → Query Editor → Select database: <code>shopnow_analytics</code></p>
+<p><strong>View Definition Logic:</strong></p>
+<table><thead><tr><th>Source Table</th><th>Database</th><th>Columns Used</th><th>Join Key</th></tr></thead><tbody><tr><td><code>mariadb_customers</code></td><td><code>shopnow_operational</code></td><td>customer_id, name, email, address, registration_date</td><td>customer_id</td></tr><tr><td><code>mariadb_orders</code></td><td><code>shopnow_operational</code></td><td>(aggregated) total_orders, total_revenue, last_order_date</td><td>customer_id</td></tr><tr><td><code>mariadb_payments</code></td><td><code>shopnow_operational</code></td><td>(aggregated) preferred_payment_method</td><td>customer_id (via orders)</td></tr><tr><td><code>clickstream</code></td><td><code>shopnow_staging</code></td><td>(aggregated) total_pageviews, last_visit_date</td><td>user_id = customer_id</td></tr></tbody></table>
+<p><strong>What the View computes:</strong></p>
+<table><thead><tr><th>Output Column</th><th>Source</th><th>Logic</th></tr></thead><tbody><tr><td><code>customer_id</code></td><td>mariadb_customers</td><td>Direct</td></tr><tr><td><code>customer_name</code></td><td>mariadb_customers</td><td>Direct</td></tr><tr><td><code>email</code></td><td>mariadb_customers</td><td>Direct (or masked for non-privileged users)</td></tr><tr><td><code>registration_date</code></td><td>mariadb_customers</td><td>Direct</td></tr><tr><td><code>total_orders</code></td><td>mariadb_orders</td><td>COUNT of orders per customer</td></tr><tr><td><code>total_revenue</code></td><td>mariadb_orders</td><td>SUM of total_amount per customer</td></tr><tr><td><code>avg_order_value</code></td><td>mariadb_orders</td><td>AVG of total_amount per customer</td></tr><tr><td><code>last_order_date</code></td><td>mariadb_orders</td><td>MAX of order_date per customer</td></tr><tr><td><code>days_since_last_order</code></td><td>Computed</td><td>CURRENT_DATE - last_order_date</td></tr><tr><td><code>preferred_payment</code></td><td>mariadb_payments</td><td>MODE of payment_method per customer</td></tr><tr><td><code>total_pageviews</code></td><td>clickstream</td><td>COUNT of events per user</td></tr><tr><td><code>last_visit_date</code></td><td>clickstream</td><td>MAX of event_date per user</td></tr><tr><td><code>customer_segment</code></td><td>Computed</td><td>CASE: high_value / medium_value / low_value / dormant</td></tr></tbody></table>
+<p><strong>Segmentation Logic within the View:</strong></p>
+<table><thead><tr><th>Segment</th><th>Rule</th></tr></thead><tbody><tr><td><code>high_value</code></td><td>total_revenue &gt; 5000 AND last_order within 90 days</td></tr><tr><td><code>medium_value</code></td><td>total_revenue &gt; 1000 AND last_order within 180 days</td></tr><tr><td><code>low_value</code></td><td>total_revenue &gt; 0 AND last_order within 365 days</td></tr><tr><td><code>dormant</code></td><td>No orders in 365+ days</td></tr><tr><td><code>new</code></td><td>Registration within 30 days, no orders yet</td></tr></tbody></table>
+<p>→ Execute the CREATE VIEW statement in Athena<br>
+→ View is created in <code>shopnow_analytics</code> database</p>
+<p>→ Now ANY analyst can run:<br>
+<code>SELECT * FROM shopnow_analytics.v_customer_360 WHERE customer_segment = 'high_value'</code><br>
+→ No need to understand the underlying JOINs, aggregations, or source tables</p>
+<hr>
+<p><strong>View 2: Daily Revenue Dashboard</strong></p>
+<p><strong>Source Tables:</strong></p>
+<table><thead><tr><th>Source</th><th>Database</th><th>Purpose</th></tr></thead><tbody><tr><td><code>mariadb_orders</code></td><td><code>shopnow_operational</code></td><td>Order amounts and dates</td></tr><tr><td><code>mariadb_order_items</code></td><td><code>shopnow_operational</code></td><td>Line item details</td></tr><tr><td><code>mariadb_products</code></td><td><code>shopnow_operational</code></td><td>Product category</td></tr></tbody></table>
+<p><strong>Output Columns:</strong></p>
+<table><thead><tr><th>Column</th><th>Logic</th></tr></thead><tbody><tr><td><code>order_date</code></td><td>Date dimension</td></tr><tr><td><code>category</code></td><td>Product category</td></tr><tr><td><code>region</code></td><td>Customer region</td></tr><tr><td><code>total_revenue</code></td><td>SUM of line item amounts</td></tr><tr><td><code>total_orders</code></td><td>COUNT DISTINCT of order_id</td></tr><tr><td><code>avg_order_value</code></td><td>total_revenue / total_orders</td></tr><tr><td><code>total_units_sold</code></td><td>SUM of quantities</td></tr><tr><td><code>revenue_vs_previous_day</code></td><td>Current day revenue - previous day revenue (window function)</td></tr><tr><td><code>revenue_7day_avg</code></td><td>Rolling 7-day average revenue (window function)</td></tr></tbody></table>
+<p>→ Analyst query: <code>SELECT * FROM shopnow_analytics.v_daily_revenue WHERE order_date &gt;= DATE '2025-01-01'</code></p>
+<hr>
+<p><strong>View 3: Product Performance</strong></p>
+<p><strong>Output Columns:</strong></p>
+<table><thead><tr><th>Column</th><th>Logic</th></tr></thead><tbody><tr><td><code>product_id</code></td><td>Product identifier</td></tr><tr><td><code>product_name</code></td><td>Product name</td></tr><tr><td><code>category</code></td><td>Product category</td></tr><tr><td><code>current_price</code></td><td>Latest price from products table</td></tr><tr><td><code>current_inventory</code></td><td>Latest inventory level</td></tr><tr><td><code>total_units_sold_30d</code></td><td>Units sold in last 30 days</td></tr><tr><td><code>total_revenue_30d</code></td><td>Revenue in last 30 days</td></tr><tr><td><code>days_of_stock_remaining</code></td><td>current_inventory / (total_units_sold_30d / 30)</td></tr><tr><td><code>sell_through_rate</code></td><td>total_units_sold / total_units_received</td></tr><tr><td><code>stock_status</code></td><td>CASE: overstocked / healthy / low / critical / out_of_stock</td></tr></tbody></table>
+<p>→ Product team query: <code>SELECT * FROM shopnow_analytics.v_product_performance WHERE stock_status = 'critical'</code></p>
+<hr>
+<p><strong>View 4: Sales Funnel (Clickstream + Orders)</strong></p>
+<p><strong>Output Columns:</strong></p>
+<table><thead><tr><th>Column</th><th>Logic</th></tr></thead><tbody><tr><td><code>date</code></td><td>Event date</td></tr><tr><td><code>visitors</code></td><td>COUNT DISTINCT users with page_view events</td></tr><tr><td><code>product_viewers</code></td><td>COUNT DISTINCT users with product_detail_view events</td></tr><tr><td><code>cart_adders</code></td><td>COUNT DISTINCT users with add_to_cart events</td></tr><tr><td><code>checkout_starters</code></td><td>COUNT DISTINCT users with checkout_start events</td></tr><tr><td><code>purchasers</code></td><td>COUNT DISTINCT users with purchase events (from orders)</td></tr><tr><td><code>view_to_cart_rate</code></td><td>cart_adders / product_viewers</td></tr><tr><td><code>cart_to_purchase_rate</code></td><td>purchasers / cart_adders</td></tr><tr><td><code>overall_conversion_rate</code></td><td>purchasers / visitors</td></tr></tbody></table>
+<hr>
+<p><strong>View Limitations to Understand:</strong></p>
+<table><thead><tr><th>Limitation</th><th>Impact</th><th>Mitigation</th></tr></thead><tbody><tr><td>Views execute the full query every time</td><td>Complex JOINs across 50 GB are slow on every access</td><td>Use CTAS for expensive queries (Step 4)</td></tr><tr><td>Views cannot be indexed</td><td>No performance optimization on the View itself</td><td>Optimize underlying table format and partitioning</td></tr><tr><td>Views inherit source table permissions</td><td>User must have access to ALL underlying tables</td><td>Configure IAM policies on each source table</td></tr><tr><td>Views cannot have their own partitions</td><td>Cannot apply partition pruning on the View</td><td>Apply partition filters on underlying tables within the View</td></tr><tr><td>Athena Views are stored in Glue Catalog</td><td>Schema changes to underlying tables may break Views</td><td>Version control View definitions; test after schema changes</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — USE CTAS TO PRE-COMPUTE EXPENSIVE QUERIES</h3>
+<p>→ CTAS = Create Table As Select<br>
+→ Unlike a View (virtual — executes on every query), CTAS MATERIALIZES results as physical Parquet files in S3<br>
+→ The result is a NEW table in the Glue Catalog backed by Parquet files</p>
+<p><strong>When to use View vs CTAS:</strong></p>
+<table><thead><tr><th>Criteria</th><th>Use View</th><th>Use CTAS</th></tr></thead><tbody><tr><td>Underlying data changes frequently</td><td>✅ Always shows latest</td><td>❌ Shows snapshot at creation time</td></tr><tr><td>Query is expensive (large JOINs)</td><td>❌ Expensive on every access</td><td>✅ Pre-computed — fast reads</td></tr><tr><td>Many users run the same query</td><td>❌ Each user pays full scan cost</td><td>✅ All users read pre-computed result</td></tr><tr><td>Result set is small (&lt; 100 MB)</td><td>✅ Negligible scan cost</td><td>Either works</td></tr><tr><td>Result set is large (&gt; 1 GB)</td><td>❌ Expensive repeated scans</td><td>✅ Scan pre-computed result instead</td></tr><tr><td>Freshness requirement: real-time</td><td>✅ Always current</td><td>❌ Only as fresh as last CTAS refresh</td></tr><tr><td>Freshness requirement: daily</td><td>Either works</td><td>✅ Refresh daily via scheduled CTAS</td></tr></tbody></table>
+<hr>
+<p><strong>CTAS 1: Customer Segments (Pre-Computed Monthly)</strong></p>
+<p>→ Navigate to Athena Console → Query Editor</p>
+<p><strong>CTAS Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Target table</td><td><code>t_customer_segments</code></td><td>Materialized table name</td></tr><tr><td>Target database</td><td><code>shopnow_analytics</code></td><td>Analytics database</td></tr><tr><td>External location</td><td><code>s3://shopnow-data-lake/analytics/customer-segments/</code></td><td>Where Parquet files are stored</td></tr><tr><td>Format</td><td>PARQUET</td><td>Optimal for analytics</td></tr><tr><td>Partitioned by</td><td><code>segment</code></td><td>Partition by segment for fast filtering</td></tr><tr><td>Bucketed by</td><td>(none)</td><td>Not needed for this size</td></tr></tbody></table>
+<p><strong>What CTAS does internally:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Athena receives CREATE TABLE AS SELECT statement
+</span>       ↓
+Athena executes the SELECT query (same as View logic)
+  ├── Joins customers + orders + payments + clickstream
+  ├── Computes aggregations per customer
+  └── Assigns segments based on rules
+       ↓
+Athena writes query results as Parquet files to specified S3 location
+  ├── s3://…/analytics/customer-segments/segment=high_value/part-00000.parquet
+  ├── s3://…/analytics/customer-segments/segment=medium_value/part-00000.parquet
+  ├── s3://…/analytics/customer-segments/segment=low_value/part-00000.parquet
+  └── s3://…/analytics/customer-segments/segment=dormant/part-00000.parquet
+       ↓
+Athena registers the new table in Glue Catalog
+  ├── Database: shopnow_analytics
+  ├── Table: t_customer_segments
+  ├── Format: Parquet
+  ├── Location: s3://…/analytics/customer-segments/
+  └── Partitions: segment=high_value, segment=medium_value, ...
+       ↓
+Table is immediately queryable</code></pre></div>
+<p><strong>Cost comparison:</strong></p>
+<table><thead><tr><th>Access Pattern</th><th>Without CTAS (View)</th><th>With CTAS</th></tr></thead><tbody><tr><td>Query complexity</td><td>4-table JOIN, aggregations, window functions</td><td>Simple SELECT on pre-computed table</td></tr><tr><td>Data scanned per query</td><td>~12 GB (all source tables)</td><td>~200 MB (pre-computed result)</td></tr><tr><td>Cost per query</td><td>$0.06</td><td>$0.001</td></tr><tr><td>Time per query</td><td>45 seconds</td><td>2 seconds</td></tr><tr><td>200 queries/day cost</td><td>$12/day ($360/month)</td><td>$0.20/day ($6/month)</td></tr><tr><td>CTAS refresh cost (daily)</td><td>N/A</td><td>$0.06/day ($1.80/month)</td></tr><tr><td><strong>Total monthly cost</strong></td><td><strong>$360</strong></td><td><strong>$7.80</strong></td></tr></tbody></table>
+<p>→ <strong>46x cost reduction</strong> by pre-computing with CTAS</p>
+<hr>
+<p><strong>CTAS 2: Sales Funnel (Pre-Computed Daily)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target table</td><td><code>t_sales_funnel</code></td></tr><tr><td>External location</td><td><code>s3://shopnow-data-lake/analytics/sales-funnel/</code></td></tr><tr><td>Format</td><td>PARQUET</td></tr><tr><td>Partitioned by</td><td><code>funnel_date</code></td></tr><tr><td>Refresh frequency</td><td>Daily</td></tr></tbody></table>
+<hr>
+<p><strong>CTAS 3: Product Performance Snapshot (Pre-Computed Daily)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target table</td><td><code>t_product_performance</code></td></tr><tr><td>External location</td><td><code>s3://shopnow-data-lake/analytics/product-performance/</code></td></tr><tr><td>Format</td><td>PARQUET</td></tr><tr><td>Partitioned by</td><td><code>snapshot_date</code></td></tr><tr><td>Refresh frequency</td><td>Daily</td></tr></tbody></table>
+<hr>
+<p><strong>CTAS Refresh Pattern:</strong></p>
+<p>→ CTAS creates a table ONCE — but data goes stale<br>
+→ To refresh, you must:</p>
+<ol>
+<li>Drop the existing table (removes Catalog entry)</li>
+<li>Delete the S3 files (removes old data)</li>
+<li>Re-run the CTAS (creates new data + catalog entry)</li>
+</ol>
+<p>→ Or use INSERT INTO pattern:</p>
+<ol>
+<li>Keep existing table</li>
+<li>Use INSERT INTO with new partition values</li>
+<li>Old partitions remain, new partition added</li>
+</ol>
+<p><strong>For daily append (sales funnel):</strong></p>
+<p>→ Each day adds a new partition: <code>funnel_date=2025-01-16</code><br>
+→ Use INSERT INTO to add new partition without touching historical data</p>
+<p><strong>For full refresh (customer segments):</strong></p>
+<p>→ Segments change as customers' behavior changes<br>
+→ Full CTAS refresh monthly — drop + recreate</p>
+<p><strong>Automation via Athena Scheduled Queries:</strong></p>
+<p>→ Navigate to Athena Console → Scheduled Queries → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Query name</td><td><code>refresh-customer-segments</code></td></tr><tr><td>Schedule</td><td>Monthly, 1st day, 04:00 UTC</td></tr><tr><td>SQL</td><td>DROP TABLE IF EXISTS + CTAS statement</td></tr><tr><td>Result location</td><td><code>s3://shopnow-athena-results/scheduled/</code></td></tr><tr><td>IAM Role</td><td>Athena scheduled query execution role</td></tr><tr><td>Notification</td><td>SNS topic on failure</td></tr></tbody></table>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Query name</td><td><code>refresh-sales-funnel-daily</code></td></tr><tr><td>Schedule</td><td>Daily, 03:50 UTC</td></tr><tr><td>SQL</td><td>INSERT INTO with today's date filter</td></tr><tr><td>Result location</td><td><code>s3://shopnow-athena-results/scheduled/</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 5 — IMPLEMENT PARTITION PROJECTION</h3>
+<p>→ This is a game-changer for eliminating Crawler dependency for partitioned tables</p>
+<p><strong>The Problem with Crawlers for Partitions:</strong></p>
+<table><thead><tr><th>Issue</th><th>Impact</th></tr></thead><tbody><tr><td>Crawler must run after every ETL to discover new partitions</td><td>Adds 5-15 minutes to pipeline</td></tr><tr><td>Large tables with thousands of partitions → Crawler is slow</td><td>10,000 partitions → 10+ minute Crawler run</td></tr><tr><td>If Crawler fails or is delayed → Athena shows stale data</td><td>Missing latest partition = missing latest data</td></tr><tr><td>Crawler creates Glue Catalog entries for each partition</td><td>Millions of partition entries = Catalog bloat</td></tr><tr><td>Crawler costs money</td><td>Each Crawler run is billed by DPU-hour</td></tr></tbody></table>
+<p><strong>The Solution: Partition Projection</strong></p>
+<p>→ Instead of CRAWLING S3 to discover partitions → TELL Athena the partition pattern<br>
+→ Athena INFERS partitions mathematically — no Crawler needed<br>
+→ No Glue Catalog partition entries created — Athena generates them on the fly</p>
+<p><strong>How it works conceptually:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT Partition Projection:
+</span>  Athena: "What partitions exist for this table?"
+  → Asks Glue Catalog → Catalog returns list from last Crawler run
+  → If new partition not yet crawled → Athena doesn't know about it
+
+WITH Partition Projection:
+  Athena: "What partitions exist for this table?"
+  → Checks table properties: "year is integer 2020-2030, month is integer 1-12, day is integer 1-31"
+  → Generates ALL possible partition combinations mathematically
+  → For each partition in the query's WHERE clause → constructs S3 path → checks if files exist
+  → No Catalog lookup, no Crawler needed</code></pre></div>
+<hr>
+<p><strong>Configuring Partition Projection:</strong></p>
+<p>→ Navigate to Glue Console → Data Catalog → Table → Edit Table → Table Properties</p>
+<p><strong>OR</strong> set via Athena ALTER TABLE</p>
+<p><strong>Example: Orders table with year/month/day partitions</strong></p>
+<p><strong>Table Properties to Add:</strong></p>
+<table><thead><tr><th>Property Key</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>projection.enabled</code></td><td><code>true</code></td><td>Enables partition projection</td></tr><tr><td><code>projection.year.type</code></td><td><code>integer</code></td><td>Year is an integer</td></tr><tr><td><code>projection.year.range</code></td><td><code>2020,2030</code></td><td>Valid year range</td></tr><tr><td><code>projection.month.type</code></td><td><code>integer</code></td><td>Month is an integer</td></tr><tr><td><code>projection.month.range</code></td><td><code>1,12</code></td><td>Valid month range</td></tr><tr><td><code>projection.day.type</code></td><td><code>integer</code></td><td>Day is an integer</td></tr><tr><td><code>projection.day.range</code></td><td><code>1,31</code></td><td>Valid day range</td></tr><tr><td><code>storage.location.template</code></td><td><code>s3://shopnow-data-lake/transformed/mariadb/orders/year=${year}/month=${month}/day=${day}/</code></td><td>S3 path pattern</td></tr></tbody></table>
+<p><strong>What these properties mean:</strong></p>
+<p>→ <code>projection.year.range = 2020,2030</code> → Athena knows years go from 2020 to 2030<br>
+→ <code>projection.month.range = 1,12</code> → Months go from 1 to 12<br>
+→ <code>projection.day.range = 1,31</code> → Days go from 1 to 31<br>
+→ <code>storage.location.template</code> → For year=2025, month=1, day=15 → Athena constructs path:<br>
+<code>s3://shopnow-data-lake/transformed/mariadb/orders/year=2025/month=1/day=15/</code></p>
+<p><strong>Query behavior:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Query: SELECT * FROM orders WHERE year = 2025 AND month = 1 AND day = 15
+</span>
+WITHOUT Partition Projection:
+  1. Athena asks Glue Catalog for partition year=2025/month=1/day=15
+  2. If Crawler hasn't run → partition not in Catalog → returns 0 results
+  3. Even if data exists in S3
+
+WITH Partition Projection:
+  1. Athena generates path: s3://…/orders/year=2025/month=1/day=15/
+  2. Athena checks S3 directly → files exist
+  3. Athena reads files → returns results
+  4. No Catalog lookup, no Crawler dependency</code></pre></div>
+<hr>
+<p><strong>Projection Types:</strong></p>
+<table><thead><tr><th>Type</th><th>Use Case</th><th>Configuration</th></tr></thead><tbody><tr><td><code>integer</code></td><td>Numeric partitions (year, month, day)</td><td><code>range</code>: min,max; optional <code>digits</code>: zero-padding</td></tr><tr><td><code>date</code></td><td>Date-based partitions</td><td><code>range</code>: start,NOW; <code>format</code>: yyyy-MM-dd; <code>interval</code>: 1; <code>interval.unit</code>: DAYS</td></tr><tr><td><code>enum</code></td><td>Fixed set of values</td><td><code>values</code>: value1,value2,value3</td></tr><tr><td><code>injected</code></td><td>Dynamic values from query</td><td>No range — value comes from WHERE clause</td></tr></tbody></table>
+<p><strong>Date type example (more elegant than separate year/month/day):</strong></p>
+<table><thead><tr><th>Property Key</th><th>Value</th></tr></thead><tbody><tr><td><code>projection.enabled</code></td><td><code>true</code></td></tr><tr><td><code>projection.dt.type</code></td><td><code>date</code></td></tr><tr><td><code>projection.dt.format</code></td><td><code>yyyy-MM-dd</code></td></tr><tr><td><code>projection.dt.range</code></td><td><code>2020-01-01,NOW</code></td></tr><tr><td><code>projection.dt.interval</code></td><td><code>1</code></td></tr><tr><td><code>projection.dt.interval.unit</code></td><td><code>DAYS</code></td></tr><tr><td><code>storage.location.template</code></td><td><code>s3://shopnow-data-lake/transformed/orders/dt=${dt}/</code></td></tr></tbody></table>
+<p>→ <code>NOW</code> automatically expands to current date — new partitions are always included<br>
+→ No Crawler needed — today's partition is automatically recognized</p>
+<p><strong>Enum type example (for category partitions):</strong></p>
+<table><thead><tr><th>Property Key</th><th>Value</th></tr></thead><tbody><tr><td><code>projection.category.type</code></td><td><code>enum</code></td></tr><tr><td><code>projection.category.values</code></td><td><code>electronics,clothing,home,sports,books</code></td></tr></tbody></table>
+<p>→ Athena knows exactly 5 possible partition values<br>
+→ Query with <code>WHERE category = 'electronics'</code> → directly constructs S3 path</p>
+<hr>
+<p><strong>Tables to Enable Partition Projection On:</strong></p>
+<table><thead><tr><th>Table</th><th>Partition Keys</th><th>Projection Type</th><th>Benefit</th></tr></thead><tbody><tr><td><code>orders</code> (staging)</td><td>year, month, day</td><td>integer ranges</td><td>Eliminate daily Crawler</td></tr><tr><td><code>mariadb_orders</code> (operational)</td><td>year, month</td><td>integer ranges</td><td>Eliminate daily Crawler</td></tr><tr><td><code>clickstream</code> (staging)</td><td>year, month, day</td><td>integer ranges</td><td>Eliminate daily Crawler (largest table)</td></tr><tr><td><code>mariadb_inventory</code> (operational)</td><td>extract_date</td><td>date range with NOW</td><td>Always includes latest extract</td></tr><tr><td><code>daily_revenue_summary</code> (warehouse)</td><td>year, month</td><td>integer ranges</td><td>Eliminate post-UNLOAD Crawler</td></tr><tr><td><code>t_sales_funnel</code> (analytics)</td><td>funnel_date</td><td>date range with NOW</td><td>CTAS output auto-discovered</td></tr></tbody></table>
+<p>→ After enabling Partition Projection → you can REMOVE scheduled Crawlers for these tables<br>
+→ Saves Crawler DPU costs + eliminates Crawler-related pipeline delays</p>
+<p><strong>What you STILL need Crawlers for:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Why Crawler Still Needed</th></tr></thead><tbody><tr><td>Initial schema discovery</td><td>First time — don't know column names/types yet</td></tr><tr><td>Schema evolution detection</td><td>New columns added to source → Crawler detects them</td></tr><tr><td>Non-predictable partition patterns</td><td>Partitions that don't follow a regular pattern</td></tr><tr><td>JDBC sources (MariaDB)</td><td>Crawl database tables to catalog schema (Project 24 Step 5)</td></tr></tbody></table>
+<p>→ Crawlers shift from "run daily for partitions" to "run weekly/monthly for schema changes"</p>
+<hr>
+<h3>STEP 6 — BUILD THE ANALYST SELF-SERVICE INTERFACE</h3>
+<p><strong>Component 1: Athena Workgroups (Access Control + Cost Management)</strong></p>
+<p>→ Navigate to Athena Console → Workgroups → Create Workgroup</p>
+<p><strong>Workgroup: <code>marketing-analysts</code></strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Workgroup name</td><td><code>marketing-analysts</code></td><td>Marketing team's workspace</td></tr><tr><td>Query result location</td><td><code>s3://shopnow-athena-results/marketing/</code></td><td>Isolated result storage</td></tr><tr><td>Per-query data scan limit</td><td>10 GB</td><td>Prevent accidentally scanning entire data lake</td></tr><tr><td>Workgroup data scan limit</td><td>100 GB per day</td><td>Daily budget control</td></tr><tr><td>Encryption</td><td>SSE-S3</td><td>Encrypt query results</td></tr><tr><td>Publish metrics to CloudWatch</td><td>Enabled</td><td>Monitor query patterns and costs</td></tr><tr><td>Override client-side settings</td><td>Enabled</td><td>Force result location and encryption</td></tr></tbody></table>
+<p><strong>Workgroup: <code>finance-analysts</code></strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Workgroup name</td><td><code>finance-analysts</code></td><td>Finance team's workspace</td></tr><tr><td>Query result location</td><td><code>s3://shopnow-athena-results/finance/</code></td><td>Isolated</td></tr><tr><td>Per-query data scan limit</td><td>20 GB</td><td>Finance queries are larger</td></tr><tr><td>Workgroup data scan limit</td><td>200 GB per day</td><td>Higher budget</td></tr><tr><td>Encryption</td><td>SSE-KMS</td><td>Finance data requires KMS encryption</td></tr></tbody></table>
+<p><strong>Workgroup: <code>data-engineering</code></strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Workgroup name</td><td><code>data-engineering</code></td><td>Engineering team — no limits</td></tr><tr><td>Per-query data scan limit</td><td>No limit</td><td>Engineers need full access for ETL development</td></tr><tr><td>Workgroup data scan limit</td><td>No limit</td><td>Engineering budget managed separately</td></tr></tbody></table>
+<p><strong>Why Workgroups matter:</strong></p>
+<table><thead><tr><th>Without Workgroups</th><th>With Workgroups</th></tr></thead><tbody><tr><td>All analysts share one result location</td><td>Each team has isolated results</td></tr><tr><td>No query cost limits</td><td>Per-query and daily limits prevent accidents</td></tr><tr><td>No team-level cost tracking</td><td>CloudWatch metrics per workgroup</td></tr><tr><td>One analyst's bad query costs everyone</td><td>Limits contain blast radius</td></tr><tr><td>No encryption enforcement</td><td>Encryption enforced per workgroup</td></tr></tbody></table>
+<hr>
+<p><strong>Component 2: Saved Queries (Reusable Templates)</strong></p>
+<p>→ Navigate to Athena Console → Saved Queries → Save</p>
+<table><thead><tr><th>Saved Query Name</th><th>Description</th><th>Used By</th></tr></thead><tbody><tr><td><code>Monthly Revenue by Region</code></td><td>Revenue breakdown by region for any month — parameterize month</td><td>Finance</td></tr><tr><td><code>Customer Acquisition Funnel</code></td><td>Funnel conversion rates for any date range</td><td>Marketing</td></tr><tr><td><code>Low Stock Alert</code></td><td>Products with &lt; 7 days of stock remaining</td><td>Product team</td></tr><tr><td><code>Top 100 Customers by Revenue</code></td><td>Ranked customer list with segment details</td><td>Sales</td></tr><tr><td><code>Daily Order Summary</code></td><td>Order count, revenue, avg order value by day</td><td>Operations</td></tr></tbody></table>
+<p>→ Analysts browse Saved Queries → find what they need → modify parameters → run<br>
+→ No need to write SQL from scratch</p>
+<hr>
+<p><strong>Component 3: Named Queries via Tags (Organization)</strong></p>
+<p>→ Tag saved queries for discoverability:</p>
+<table><thead><tr><th>Tag Key</th><th>Tag Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>department</code></td><td><code>marketing</code> / <code>finance</code> / <code>product</code></td><td>Filter by team</td></tr><tr><td><code>data-domain</code></td><td><code>customers</code> / <code>orders</code> / <code>inventory</code></td><td>Filter by data subject</td></tr><tr><td><code>complexity</code></td><td><code>simple</code> / <code>intermediate</code> / <code>advanced</code></td><td>Filter by skill level</td></tr><tr><td><code>refresh</code></td><td><code>real-time</code> / <code>daily</code> / <code>weekly</code></td><td>Data freshness expectation</td></tr></tbody></table>
+<hr>
+<h3>STEP 7 — IMPLEMENT COST CONTROLS AND GOVERNANCE</h3>
+<p><strong>Cost Control 1: Workgroup Limits (configured in Step 6)</strong></p>
+<p>→ Per-query limit: Prevents single query from scanning entire lake<br>
+→ Daily limit: Prevents runaway automated queries from exhausting budget</p>
+<p><strong>Cost Control 2: Athena Query Result Reuse</strong></p>
+<p>→ Navigate to Workgroup Settings → Query Result Reuse</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Enable query result reuse</td><td>Yes</td><td>If identical query ran recently, return cached result</td></tr><tr><td>Maximum age for reuse</td><td>60 minutes</td><td>Results older than 60 min are re-executed</td></tr></tbody></table>
+<p>→ If Analyst A runs a query at 09:00 and Analyst B runs the IDENTICAL query at 09:15:</p>
+<ul>
+<li>Without reuse: Both scan the full data → double the cost</li>
+<li>With reuse: Analyst B gets Analyst A's cached result → zero additional scan cost</li>
+</ul>
+<p>→ Savings potential: 30-50% reduction in total scan costs for common queries</p>
+<p><strong>Cost Control 3: Require Partition Filters</strong></p>
+<p>→ Problem: Analyst forgets WHERE clause on partition columns → full table scan<br>
+→ <code>SELECT * FROM orders</code> without date filter → scans ALL 50 GB across ALL dates</p>
+<p>→ Solution: Enforce partition filter requirement</p>
+<p>→ Navigate to Workgroup Settings</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Require partition filter</td><td>Enabled</td><td>Queries MUST include partition column in WHERE clause</td></tr></tbody></table>
+<p>→ <code>SELECT * FROM orders</code> → ERROR: "Query requires a partition filter"<br>
+→ <code>SELECT * FROM orders WHERE year = 2025 AND month = 1</code> → ✅ Succeeds</p>
+<p>→ This single setting can reduce costs by 80%+ by preventing accidental full table scans</p>
+<p><strong>Cost Control 4: S3 Requester Pays (Advanced)</strong></p>
+<p>→ If data is shared across accounts (Project 39) → the QUERYING account pays for S3 access<br>
+→ Not relevant for single-account setups — but important for data mesh (Project 60)</p>
+<hr>
+<p><strong>Governance 1: IAM Policies for Database/Table Access</strong></p>
+<p>→ Control which analysts can access which databases</p>
+<p><strong>Marketing Team IAM Policy:</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>athena:StartQueryExecution</code>, <code>athena:GetQueryResults</code></td></tr><tr><td>Resource</td><td><code>*</code> (Athena workgroup controls access)</td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>glue:GetTable</code>, <code>glue:GetTables</code>, <code>glue:GetDatabase</code>, <code>glue:GetPartitions</code></td></tr><tr><td>Resource</td><td><code>arn:aws:glue:ap-south-1:123456789012:catalog</code>, <code>arn:aws:glue:…:database/shopnow_analytics</code>, <code>arn:aws:glue:…:table/shopnow_analytics/*</code></td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Deny</td></tr><tr><td>Action</td><td><code>glue:GetTable</code>, <code>glue:GetTables</code></td></tr><tr><td>Resource</td><td><code>arn:aws:glue:…:database/shopnow_raw</code>, <code>arn:aws:glue:…:table/shopnow_raw/*</code></td></tr></tbody></table>
+<p>→ Marketing can ONLY access <code>shopnow_analytics</code> database<br>
+→ Cannot access raw, staging, or operational databases<br>
+→ This enforces the "query the analytics layer only" principle</p>
+<p><strong>For column-level security and fine-grained access → Lake Formation (Project 47)</strong></p>
+<hr>
+<p><strong>Governance 2: Query Logging and Audit</strong></p>
+<p>→ Athena Workgroups with CloudWatch metrics enabled provide:</p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th></tr></thead><tbody><tr><td><code>DataScannedInBytes</code> per workgroup</td><td>Total data scanned by team</td></tr><tr><td><code>EngineExecutionTime</code> per workgroup</td><td>Total query execution time</td></tr><tr><td><code>QueryCount</code> per workgroup</td><td>Number of queries run</td></tr><tr><td><code>FailedQueryCount</code> per workgroup</td><td>Failed query count</td></tr></tbody></table>
+<p>→ CloudWatch Dashboard (Project 8) with Athena widgets:</p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>Daily scan by workgroup</td><td><code>DataScannedInBytes</code> grouped by workgroup</td><td>Cost attribution per team</td></tr><tr><td>Failed query rate</td><td><code>FailedQueryCount</code> / <code>QueryCount</code></td><td>Data quality indicator</td></tr><tr><td>Top scanning queries</td><td>Athena query history</td><td>Identify optimization targets</td></tr></tbody></table>
+<p>→ Additionally — CloudTrail (Project 57) logs ALL Athena API calls<br>
+→ Who ran what query, when, how much data scanned</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create a dedicated <code>analytics</code> database for analyst-facing Views and CTAS tables<br>
+→ Always add descriptions to every table and column in Glue Catalog — this IS your data catalog<br>
+→ Always use Views for lightweight, frequently-changing queries — real-time freshness<br>
+→ Always use CTAS for expensive JOINs that multiple users run — pre-compute saves 90%+ cost<br>
+→ Always enable Partition Projection on date-partitioned tables — eliminates Crawler dependency<br>
+→ Always create Workgroups per team — cost isolation, query limits, encryption enforcement<br>
+→ Always enable query result reuse — 30-50% cost savings for common queries<br>
+→ Always require partition filters in analyst Workgroups — prevents accidental full table scans<br>
+→ Always schedule CTAS refreshes AFTER upstream pipeline completes — stale CTAS = stale analytics<br>
+→ Always use consistent naming conventions (v_ for Views, t_ for CTAS) — analysts instantly understand table type<br>
+→ Always version-control View definitions — store CREATE VIEW statements in git repository<br>
+→ Always test Views after upstream schema changes — broken Views return errors to analysts</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never let analysts query raw or staging databases directly — use the analytics layer<br>
+→ Never create Views with SELECT * from huge tables without filters — View executes on every access<br>
+→ Never forget to refresh CTAS tables — stale pre-computed data is worse than no pre-computed data<br>
+→ Never rely solely on Crawlers for partition discovery when patterns are predictable — use Partition Projection<br>
+→ Never skip Workgroup configuration — one analyst without limits can scan the entire lake<br>
+→ Never create Views that join more than 5-6 tables — performance degrades exponentially<br>
+→ Never use CTAS without specifying format as Parquet — default may be less optimal<br>
+→ Never store CTAS output in the same S3 prefix as source data — creates confusion<br>
+→ Never skip table/column descriptions — undocumented tables become "dark data" nobody uses<br>
+→ Never assume Views are free — every View query scans underlying data; complex Views on large tables are expensive<br>
+→ Never create circular View dependencies (View A references View B which references View A) — Athena will error<br>
+→ Never enable Partition Projection with wrong path template — Athena constructs incorrect S3 paths → returns 0 results</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE EACH COMPONENT</h2>
+<table><thead><tr><th>Component</th><th>Use When</th><th>Don't Use When</th></tr></thead><tbody><tr><td><strong>Athena View</strong></td><td>Query logic is complex but data scanned is small; freshness is critical</td><td>Underlying scan &gt; 5 GB and query runs frequently</td></tr><tr><td><strong>CTAS</strong></td><td>Expensive query runs many times daily; freshness within hours is acceptable</td><td>Data must be real-time; result set changes every minute</td></tr><tr><td><strong>Partition Projection</strong></td><td>Partitions follow predictable patterns (dates, known enums)</td><td>Partitions are unpredictable or irregular</td></tr><tr><td><strong>Crawler</strong></td><td>Initial schema discovery; schema evolution detection; non-S3 sources (JDBC)</td><td>Daily partition discovery on predictable patterns</td></tr><tr><td><strong>Workgroup</strong></td><td>Multiple teams with different cost/security requirements</td><td>Single user or single team</td></tr><tr><td><strong>Saved Queries</strong></td><td>Common query patterns that analysts reuse with parameter changes</td><td>One-off exploratory queries</td></tr><tr><td><strong>Query Result Reuse</strong></td><td>Same queries run repeatedly within short time windows</td><td>Every query needs fresh results</td></tr><tr><td><strong>Partition Filter Requirement</strong></td><td>Analyst workgroups where accidental full scans are likely</td><td>Engineering workgroups that need flexibility</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE THIS PATTERN</h2>
+<p>→ When data volumes exceed 100 TB and queries need sub-second response → Redshift (Project 16) is better suited than Athena<br>
+→ When you need real-time dashboards with &lt; 1 second refresh → Athena's minimum latency is 2-5 seconds → consider Redshift or ElastiCache<br>
+→ When data governance requires row-level and column-level security → Athena alone is insufficient → add Lake Formation (Project 47)<br>
+→ When pipeline orchestration requires complex branching, retries, and human approval → Glue Workflow is limited → use Step Functions (Project 32)<br>
+→ When the organization has 100+ analysts with diverse skill levels → consider adding QuickSight (Project 59) for visual analytics on top of Athena</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → ATHENA VIEW EXECUTION INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Analyst runs: SELECT * FROM v_customer_360 WHERE customer_segment = 'high_value'
+</span>       ↓
+Athena resolves View definition from Glue Catalog
+  ├── Catalog entry type: VIRTUAL_VIEW
+  ├── Stored SQL: The full CREATE VIEW SELECT statement
+  └── Athena REPLACES the View reference with the actual SQL
+       ↓
+Expanded query becomes the full JOIN with WHERE clause
+  ├── FROM shopnow_operational.mariadb_customers c
+  ├── LEFT JOIN shopnow_operational.mariadb_orders o ON c.customer_id = o.customer_id
+  ├── LEFT JOIN shopnow_staging.clickstream cl ON c.customer_id = cl.user_id
+  ├── WHERE computed_segment = 'high_value'
+  └── (full aggregation and CASE logic)
+       ↓
+Athena query optimizer analyzes expanded query
+  ├── Identifies partition filters → applies partition pruning
+  ├── Identifies column usage → applies column pruning (Parquet benefit)
+  └── Generates distributed execution plan
+       ↓
+Athena executes plan against S3 data
+  ├── Reads only needed columns from Parquet files
+  ├── Reads only needed partitions
+  └── Performs JOINs, aggregations, CASE logic
+       ↓
+Results returned to analyst
+       ↓
+COST: Same as running the expanded query directly
+  (View adds zero overhead — it's pure SQL substitution)</code></pre></div>
+<p>→ Key insight: Views have ZERO runtime overhead — they are syntactic sugar<br>
+→ The query optimizer sees through the View and optimizes the underlying query<br>
+→ This is why expensive Views on large data are still expensive — there's no magic caching</p>
+<hr>
+<h3>2 → CTAS EXECUTION INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CTAS command: CREATE TABLE t_customer_segments AS SELECT ...
+</span>       ↓
+Athena executes the SELECT query (same as any query)
+       ↓
+Instead of returning results to client:
+  ├── Results are formatted as Parquet
+  ├── Results are compressed with Snappy
+  ├── Results are partitioned by specified columns
+  └── Results are written to specified S3 location
+       ↓
+Athena creates Glue Catalog entry:
+  ├── Table name: t_customer_segments
+  ├── Database: shopnow_analytics
+  ├── Location: s3://shopnow-data-lake/analytics/customer-segments/
+  ├── Format: Parquet
+  ├── Columns: (from SELECT output schema)
+  └── Partitions: (from PARTITIONED BY clause)
+       ↓
+Table is immediately queryable
+       ↓
+COST: Data scanned for the SELECT + S3 storage for output
+  (Same scan cost as running the query once)
+  (But subsequent reads of the CTAS table scan ONLY the pre-computed result)</code></pre></div>
+<p><strong>CTAS File Output Behavior:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th></tr></thead><tbody><tr><td>Default file count</td><td>Athena determines based on data size and parallelism</td></tr><tr><td>File format</td><td>Specified in CTAS (Parquet, ORC, JSON, CSV, AVRO)</td></tr><tr><td>File size</td><td>Typically 64-256 MB per file</td></tr><tr><td>Compression</td><td>Snappy for Parquet (default), GZIP for CSV</td></tr><tr><td>Partition layout</td><td>Hive-style <code>key=value/</code> directories</td></tr></tbody></table>
+<p><strong>CTAS vs INSERT INTO behavior:</strong></p>
+<table><thead><tr><th>Operation</th><th>Creates New Table?</th><th>Appends to Existing?</th><th>Overwrites?</th></tr></thead><tbody><tr><td>CTAS</td><td>Yes — fails if table exists</td><td>No</td><td>No</td></tr><tr><td>INSERT INTO</td><td>No — table must exist</td><td>Yes — adds new data</td><td>No</td></tr><tr><td>DROP + CTAS</td><td>Yes (after drop)</td><td>No</td><td>Effectively yes</td></tr></tbody></table>
+<p>→ For full refresh: DROP TABLE → CTAS<br>
+→ For incremental append: INSERT INTO existing table</p>
+<hr>
+<h3>3 → PARTITION PROJECTION INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Query: SELECT * FROM orders WHERE year = 2025 AND month = 1 AND day = 15
+</span>
+WITHOUT Partition Projection:
+  1. Athena → Glue Catalog: "List partitions for orders table matching year=2025, month=1, day=15"
+  2. Glue Catalog → Scans partition index → Returns matching partition entry
+  3. Partition entry contains S3 location: s3://…/orders/year=2025/month=1/day=15/
+  4. Athena reads from that S3 location
+  
+  Problem: If Crawler hasn't discovered this partition → Catalog returns nothing → 0 results
+
+WITH Partition Projection:
+  1. Athena reads table properties:
+       projection.enabled = true
+       projection.year.type = integer, range = 2020,2030
+       projection.month.type = integer, range = 1,12
+       projection.day.type = integer, range = 1,31
+       storage.location.template = s3://…/orders/year=${year}/month=${month}/day=${day}/
+  
+  2. Athena validates: year=2025 within [2020,2030]? ✅
+                       month=1 within [1,12]? ✅
+                       day=15 within [1,31]? ✅
+  
+  3. Athena constructs path: s3://…/orders/year=2025/month=1/day=15/
+  
+  4. Athena reads from that S3 path directly
+  
+  5. NO Glue Catalog partition lookup
+     NO Crawler dependency
+     Works immediately when data lands in S3</code></pre></div>
+<p><strong>Partition Projection Performance:</strong></p>
+<table><thead><tr><th>Metric</th><th>Without Projection</th><th>With Projection</th></tr></thead><tbody><tr><td>Partition discovery time</td><td>100ms - 5s (Catalog lookup)</td><td>&lt; 10ms (mathematical generation)</td></tr><tr><td>New partition availability</td><td>After Crawler runs</td><td>Immediately when data lands in S3</td></tr><tr><td>Catalog storage</td><td>One entry per partition (millions possible)</td><td>Zero partition entries</td></tr><tr><td>GetPartitions API calls</td><td>Proportional to partition count</td><td>Zero</td></tr></tbody></table>
+<p>→ For tables with thousands of partitions → Projection is dramatically faster<br>
+→ For tables with millions of partitions → Projection is the ONLY viable option (Catalog can't handle millions)</p>
+<p><strong>Edge case: What if projection generates a path that doesn't exist in S3?</strong><br>
+→ Athena constructs the path → S3 returns "no objects found" → Athena returns 0 rows for that partition<br>
+→ No error — just empty result<br>
+→ This is fine — not every day may have data (e.g., no orders on a holiday)</p>
+<hr>
+<h3>4 → WORKGROUP QUERY LIMIT ENFORCEMENT</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Analyst submits query: SELECT * FROM large_table (no WHERE clause)
+</span>       ↓
+Athena estimates data scan size: ~50 GB
+       ↓
+Workgroup per-query limit: 10 GB
+       ↓
+50 GB &gt; 10 GB → QUERY REJECTED before execution
+       ↓
+Error: "Query would scan more than the configured maximum"
+       ↓
+Analyst adds WHERE clause: WHERE year = 2025 AND month = 1
+       ↓
+Athena estimates data scan size: ~2 GB
+       ↓
+2 GB &lt; 10 GB → QUERY ACCEPTED → executes normally</code></pre></div>
+<p>→ Limits are enforced BEFORE query execution — no partial scans<br>
+→ Athena uses table statistics and partition information to estimate scan size<br>
+→ Estimation may be slightly off — actual scan could be higher than estimate<br>
+→ If actual scan exceeds limit during execution → query is terminated</p>
+<p><strong>Daily workgroup limit:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>09:00 - Analyst A runs query: scans 5 GB → Daily total: 5 GB
+</span>09:15 - Analyst B runs query: scans 8 GB → Daily total: 13 GB
+09:30 - Analyst A runs query: scans 3 GB → Daily total: 16 GB
+...
+15:00 - Analyst C runs query: estimated 90 GB → Daily total would be 106 GB
+         Workgroup daily limit: 100 GB → QUERY REJECTED
+         "Workgroup has exceeded its daily data scan limit"</code></pre></div>
+<p>→ Resets at midnight UTC (or configurable)<br>
+→ Prevents runaway costs from automated or repeated queries</p>
+<hr>
+<h3>5 → QUERY RESULT REUSE INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>09:00 - Analyst A: SELECT count(*) FROM v_daily_revenue WHERE order_date = '2025-01-15'
+</span>  ├── Athena checks result cache: No cached result
+  ├── Executes query → Scans 500 MB → Takes 3 seconds
+  ├── Returns result: 15,234
+  └── Stores result in cache with hash of: query text + table versions + partition metadata
+
+09:15 - Analyst B: SELECT count(*) FROM v_daily_revenue WHERE order_date = '2025-01-15'
+  ├── Athena checks result cache:
+  │     ├── Query text hash matches ✅
+  │     ├── Underlying table metadata unchanged ✅
+  │     ├── Cache age (15 min) &lt; max age (60 min) ✅
+  │     └── CACHE HIT
+  ├── Returns cached result: 15,234
+  ├── Data scanned: 0 bytes (no S3 read)
+  └── Cost: $0.00
+
+09:45 - ETL job updates underlying table → table metadata changes
+10:00 - Analyst A: SELECT count(*) FROM v_daily_revenue WHERE order_date = '2025-01-15'
+  ├── Athena checks result cache:
+  │     ├── Query text hash matches ✅
+  │     ├── Underlying table metadata CHANGED ❌ (ETL updated data)
+  │     └── CACHE MISS (stale)
+  ├── Executes query fresh → Scans 500 MB
+  └── Returns updated result: 15,567</code></pre></div>
+<p>→ Cache invalidation is automatic when underlying data changes<br>
+→ No risk of returning stale results after ETL updates<br>
+→ Cache key includes: query text + database + table + partition metadata + workgroup</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>View returns stale data</td><td>Results don't include today's data</td><td>Upstream ETL or Crawler hasn't run yet</td><td>Verify pipeline completion before analyst hours; use Partition Projection</td></tr><tr><td>2</td><td>CTAS fails with "Table already exists"</td><td>Error on CTAS refresh</td><td>CTAS cannot overwrite — table must be dropped first</td><td>Use DROP TABLE IF EXISTS before CTAS</td></tr><tr><td>3</td><td>Partition Projection returns 0 results</td><td>Query runs but no data</td><td><code>storage.location.template</code> path doesn't match actual S3 structure</td><td>Verify S3 path matches template exactly (check slashes, case, padding)</td></tr><tr><td>4</td><td>Partition Projection includes non-existent dates</td><td>Feb 30, Feb 31 generated</td><td>Integer range 1-31 generates all days including invalid ones</td><td>Athena handles gracefully — empty partitions return 0 rows; no error</td></tr><tr><td>5</td><td>View breaks after schema change</td><td>"Column not found" error</td><td>Upstream table added/renamed/dropped a column</td><td>Update View definition to match new schema; version-control Views</td></tr><tr><td>6</td><td>CTAS output has too many small files</td><td>Downstream queries slow</td><td>Athena's parallelism creates many small files for small result sets</td><td>Use bucketing in CTAS or post-process with Glue to merge files</td></tr><tr><td>7</td><td>Workgroup limit too restrictive</td><td>Legitimate queries rejected</td><td>Per-query limit set too low for the team's actual needs</td><td>Analyze query patterns → adjust limit to 90th percentile scan size</td></tr><tr><td>8</td><td>Query result reuse returns unexpected results</td><td>Same query, different results for different users</td><td>Users in different workgroups — reuse is per-workgroup</td><td>Expected behavior — each workgroup has independent cache</td></tr><tr><td>9</td><td>Analyst queries wrong database</td><td>Inconsistent or unexpected results</td><td>No governance enforcement — analyst queries staging instead of analytics</td><td>Implement IAM policies restricting access to analytics database only</td></tr><tr><td>10</td><td>CTAS refresh job fails silently</td><td>Analysts see stale pre-computed data</td><td>Scheduled CTAS refresh failed but no notification configured</td><td>Add SNS notification on scheduled query failure</td></tr><tr><td>11</td><td>View on View on View — performance degradation</td><td>Multi-layered View queries are very slow</td><td>Each View layer adds another full query expansion — no caching between layers</td><td>Limit View nesting to 2 levels maximum; use CTAS for intermediate results</td></tr><tr><td>12</td><td>Partition Projection with wrong zero-padding</td><td>0 results for months 1-9</td><td>S3 paths use <code>month=01</code> (zero-padded) but projection generates <code>month=1</code></td><td>Set <code>projection.month.digits</code> = <code>2</code> for zero-padding</td></tr><tr><td>13</td><td>INSERT INTO CTAS table creates duplicates</td><td>Running INSERT INTO twice for same date</td><td>No idempotency check — INSERT always appends</td><td>Delete partition before INSERT INTO; or check if partition exists</td></tr><tr><td>14</td><td>Athena charges for failed queries</td><td>Budget consumed by syntax errors</td><td>Athena charges for data scanned even if query fails mid-execution</td><td>Use EXPLAIN before running expensive queries; fix syntax on small datasets first</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scaling</strong></p>
+<table><thead><tr><th>Data Lake Size</th><th>Views Viable?</th><th>CTAS Viable?</th><th>Partition Projection?</th></tr></thead><tbody><tr><td>&lt; 10 GB</td><td>✅ Views work well</td><td>Optional — Views are fast enough</td><td>Optional — few partitions</td></tr><tr><td>10-100 GB</td><td>✅ Views with partition filters</td><td>✅ CTAS for cross-table JOINs</td><td>✅ Recommended</td></tr><tr><td>100 GB - 1 TB</td><td>⚠️ Views need careful partition filters</td><td>✅ CTAS essential for common queries</td><td>✅ Required</td></tr><tr><td>1-10 TB</td><td>⚠️ Views only for simple queries</td><td>✅ CTAS for all common patterns</td><td>✅ Required</td></tr><tr><td>&gt; 10 TB</td><td>❌ Views too expensive for JOINs</td><td>✅ CTAS essential</td><td>✅ Required + consider Redshift</td></tr></tbody></table>
+<p>→ <strong>User Scaling</strong></p>
+<table><thead><tr><th>Users</th><th>Workgroup Strategy</th><th>Cost Control</th></tr></thead><tbody><tr><td>1-5</td><td>Single default workgroup</td><td>Per-query limits</td></tr><tr><td>5-20</td><td>One workgroup per team (3-5 workgroups)</td><td>Per-query + daily limits</td></tr><tr><td>20-100</td><td>Workgroups per team + role-based access</td><td>All limits + query result reuse</td></tr><tr><td>100+</td><td>Workgroups + Lake Formation + QuickSight (Project 59)</td><td>Full governance stack</td></tr></tbody></table>
+<p>→ <strong>Concurrent Query Scaling</strong></p>
+<table><thead><tr><th>Athena Limit</th><th>Default</th><th>Requestable</th></tr></thead><tbody><tr><td>Concurrent DML queries per account</td><td>25</td><td>Yes — up to 100+</td></tr><tr><td>Concurrent DDL queries per account</td><td>20</td><td>Yes</td></tr><tr><td>Concurrent CTAS queries</td><td>5</td><td>Yes</td></tr><tr><td>Query queue (when concurrency exceeded)</td><td>Queries queued for up to 30 minutes</td><td>Auto-dequeue</td></tr></tbody></table>
+<p>→ 15 analysts running queries simultaneously → well within 25 concurrent limit<br>
+→ If 50+ analysts → request limit increase or stagger workload via workgroup scheduling<br>
+→ Query result reuse reduces actual query executions → effectively increases concurrency capacity</p>
+<p>→ <strong>CTAS Refresh Scaling</strong></p>
+<table><thead><tr><th>Number of CTAS Tables</th><th>Refresh Strategy</th><th>Scheduling</th></tr></thead><tbody><tr><td>1-5</td><td>Sequential refresh</td><td>One after another in pipeline</td></tr><tr><td>5-15</td><td>Parallel where independent</td><td>Group by dependency; parallelize independent ones</td></tr><tr><td>15-50</td><td>Prioritized refresh</td><td>Tier 1 (critical) refresh first; Tier 2 (nice-to-have) refresh later</td></tr><tr><td>50+</td><td>Consider Redshift materialized views</td><td>Athena CTAS management overhead becomes significant</td></tr></tbody></table>
+<p>→ <strong>Partition Projection Scaling</strong></p>
+<table><thead><tr><th>Partition Count</th><th>Crawler Performance</th><th>Projection Performance</th></tr></thead><tbody><tr><td>100</td><td>2 minutes</td><td>&lt; 10ms</td></tr><tr><td>1,000</td><td>5 minutes</td><td>&lt; 10ms</td></tr><tr><td>10,000</td><td>15 minutes</td><td>&lt; 10ms</td></tr><tr><td>100,000</td><td>45+ minutes (may timeout)</td><td>&lt; 10ms</td></tr><tr><td>1,000,000</td><td>Not viable</td><td>&lt; 10ms</td></tr></tbody></table>
+<p>→ Partition Projection's performance is CONSTANT regardless of partition count<br>
+→ This is because it's mathematical generation, not catalog lookup</p>
+<p>→ <strong>Cost Scaling Summary</strong></p>
+<table><thead><tr><th>Optimization</th><th>Monthly Savings</th><th>Effort</th></tr></thead><tbody><tr><td>Parquet + Snappy (Project 21)</td><td>75% scan reduction</td><td>Medium (one-time ETL setup)</td></tr><tr><td>Partitioning (Project 21)</td><td>90%+ scan reduction for filtered queries</td><td>Low (configure partition keys)</td></tr><tr><td>Partition Projection (this project)</td><td>Crawler DPU costs eliminated</td><td>Low (table properties)</td></tr><tr><td>CTAS pre-computation (this project)</td><td>90%+ for repeated expensive queries</td><td>Medium (create + schedule refresh)</td></tr><tr><td>Query result reuse (this project)</td><td>30-50% for identical queries</td><td>Low (workgroup setting)</td></tr><tr><td>Partition filter requirement (this project)</td><td>80%+ by preventing full scans</td><td>Low (workgroup setting)</td></tr><tr><td>Workgroup limits (this project)</td><td>Prevents budget overruns</td><td>Low (workgroup setting)</td></tr><tr><td><strong>Combined effect</strong></td><td><strong>95-99% reduction from unoptimized baseline</strong></td><td>—</td></tr></tbody></table>
+<p>→ An unoptimized data lake querying raw CSV without partitions: $3,000/month<br>
+→ Fully optimized with all techniques from Projects 21 + 25: $30-60/month<br>
+→ Same data, same queries, same analysts — 50-100x cheaper</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the complete pipeline is working:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>How to Check</th><th>Expected Result</th></tr></thead><tbody><tr><td>Raw data landed?</td><td>S3 Console → raw/ prefix</td><td>New files for today's date</td></tr><tr><td>Extraction completed?</td><td>Glue Console → Job Runs</td><td>All MariaDB extraction jobs: SUCCEEDED</td></tr><tr><td>ETL completed?</td><td>Glue Console → Job Runs</td><td>All CSV-to-Parquet jobs: SUCCEEDED</td></tr><tr><td>Catalog updated?</td><td>Glue → Data Catalog → Tables</td><td>Tables show today's partition</td></tr><tr><td>Partition Projection working?</td><td>Athena → query with today's date filter</td><td>Returns results without Crawler</td></tr><tr><td>Views returning data?</td><td>Athena → SELECT * FROM v_customer_360 LIMIT 10</td><td>Results returned</td></tr><tr><td>CTAS refreshed?</td><td>Athena → query t_customer_segments</td><td>Data reflects latest extract</td></tr><tr><td>Workgroup limits active?</td><td>Run a large query → verify limit enforcement</td><td>Query rejected if over limit</td></tr><tr><td>Result reuse active?</td><td>Run same query twice → check "Data scanned"</td><td>Second run: 0 bytes scanned</td></tr><tr><td>SNS notification received?</td><td>Check email/SMS</td><td>"Daily data refresh complete" message</td></tr></tbody></table>
+<p>→ <strong>Analyst Self-Service Verification:</strong></p>
+<table><thead><tr><th>Test</th><th>Action</th><th>Expected</th></tr></thead><tbody><tr><td>New analyst onboarding</td><td>Assign to workgroup → grant IAM → point to analytics database</td><td>Can browse tables, see descriptions, run saved queries</td></tr><tr><td>Schema discovery</td><td>Browse Glue Catalog → shopnow_analytics</td><td>All tables with descriptions, all columns with descriptions</td></tr><tr><td>Query execution</td><td>Run saved query with parameters</td><td>Results in &lt; 10 seconds for CTAS-backed queries</td></tr><tr><td>Cost control</td><td>Run query exceeding per-query limit</td><td>Query rejected with clear error message</td></tr><tr><td>Data freshness</td><td>Check extract_date or partition date in results</td><td>Shows today's date (or yesterday's for overnight pipeline)</td></tr></tbody></table>
+<p>→ <strong>Operational Health Dashboard:</strong></p>
+<table><thead><tr><th>Widget</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>Pipeline completion time</td><td>Glue Workflow status</td><td>Verify pipeline finishes before analyst hours</td></tr><tr><td>CTAS refresh status</td><td>Athena scheduled query history</td><td>All CTAS refreshes succeeded</td></tr><tr><td>Athena scan cost by workgroup (daily)</td><td>CloudWatch → Athena metrics</td><td>Cost attribution per team</td></tr><tr><td>Athena query count by workgroup</td><td>CloudWatch → Athena metrics</td><td>Usage patterns</td></tr><tr><td>Failed query rate by workgroup</td><td>CloudWatch → Athena metrics</td><td>Data quality / query quality indicator</td></tr><tr><td>Top 10 most expensive queries (weekly)</td><td>Athena query history → sort by data scanned</td><td>Optimization targets</td></tr><tr><td>Partition Projection coverage</td><td>Manual audit — % of tables with projection enabled</td><td>Track migration progress</td></tr></tbody></table>
+<p>→ <strong>Data Quality Checks (Automated):</strong></p>
+<table><thead><tr><th>Check</th><th>Frequency</th><th>Method</th><th>Alert If</th></tr></thead><tbody><tr><td>Row count per table vs previous day</td><td>Daily</td><td>Athena scheduled query</td><td>Count drops &gt; 20%</td></tr><tr><td>NULL percentage per key column</td><td>Daily</td><td>Athena scheduled query</td><td>NULL % exceeds threshold</td></tr><tr><td>Extract_date freshness</td><td>Daily</td><td>Athena scheduled query</td><td>Latest extract_date != today</td></tr><tr><td>CTAS table row count vs View row count</td><td>After CTAS refresh</td><td>Athena comparison query</td><td>Counts don't match (within tolerance)</td></tr><tr><td>Duplicate check on primary keys</td><td>Daily</td><td>Athena COUNT vs COUNT DISTINCT</td><td>Duplicates detected</td></tr></tbody></table>
+<p>→ Results of data quality checks → write to a <code>data_quality_log</code> table in S3<br>
+→ Alert via SNS (Project 6) when quality checks fail<br>
+→ This becomes the foundation for data observability (Project 60)</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ This project is the SYNTHESIS of everything built in Projects 1-24<br>
+→ Individual services (S3, Glue, Athena, Redshift) are powerful alone — but transformative when connected<br>
+→ The five layers create a complete self-service analytics platform:</p>
+<table><thead><tr><th>Layer</th><th>What It Solves</th><th>Key Technique</th></tr></thead><tbody><tr><td>Automated Pipeline</td><td>"I have to manually trigger everything"</td><td>Scheduled jobs with dependency chains</td></tr><tr><td>Catalog Organization</td><td>"I don't know what data exists or what it means"</td><td>Database structure + table/column descriptions</td></tr><tr><td>Athena Views</td><td>"Everyone writes the same JOIN differently"</td><td>Named, reusable query definitions</td></tr><tr><td>CTAS Pre-Computation</td><td>"Expensive queries cost too much when repeated"</td><td>Materialized results refreshed on schedule</td></tr><tr><td>Partition Projection</td><td>"Crawlers are slow and new data isn't discoverable"</td><td>Mathematical partition inference without Crawler</td></tr></tbody></table>
+<p>→ Cost impact: 95-99% reduction from unoptimized baseline<br>
+→ Time impact: Analysts go from "wait for engineer to run pipeline" to "data is ready every morning at 5 AM"<br>
+→ Quality impact: Consistent results across all analysts via Views and CTAS<br>
+→ Governance impact: Workgroups enforce cost limits, access control, and audit trails</p>
+<p>→ The data lake architecture is now complete:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA SOURCES                    DATA LAKE (S3)                    ANALYTICS LAYER
+</span>                                                                   
+File uploads ──────────▶ raw/ ──────────▶ staging/                 
+                         (CSV/JSON)       (Parquet)        ┌──── shopnow_analytics ────┐
+                              │                            │                           │
+MariaDB ───────────────▶ operational/                      │  v_customer_360           │
+  (Glue JDBC)              (Parquet)      ──────────▶      │  v_daily_revenue          │
+                              │                            │  v_product_performance    │
+Redshift ──────────────▶ warehouse/                        │  t_customer_segments      │
+  (UNLOAD)                 (Parquet)                       │  t_sales_funnel           │
+                              │                            │                           │
+                              ▼                            └───────────┬───────────────┘
+                         Glue Catalog                                  │
+                         (Databases,                                   ▼
+                          Tables,                              Athena Workgroups
+                          Partitions,                          ├── marketing-analysts
+                          Descriptions)                        ├── finance-analysts
+                                                               ├── product-analysts
+                                                               └── data-engineering</code></pre></div>
+<p>→ This project connects to:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 17 (Crawler)</td><td>Crawlers for schema discovery; Partition Projection replaces Crawlers for partition discovery</td></tr><tr><td>Project 18 (Athena)</td><td>Views, CTAS, Workgroups, Partition Projection are all Athena features</td></tr><tr><td>Project 21 (Glue ETL)</td><td>ETL output feeds the staging layer; CTAS output feeds the analytics layer</td></tr><tr><td>Project 22 (COPY)</td><td>Redshift COPY loads staging data; pipeline chains ETL → COPY</td></tr><tr><td>Project 23 (UNLOAD)</td><td>UNLOAD feeds the warehouse layer; pipeline chains UNLOAD → Crawler</td></tr><tr><td>Project 24 (MariaDB ETL)</td><td>MariaDB extraction feeds the operational layer</td></tr><tr><td>Project 26 (Lambda)</td><td>Lambda can trigger CTAS refresh or pipeline steps</td></tr><tr><td>Project 28 (Spectrum)</td><td>Redshift Spectrum can query the same catalog tables Athena uses</td></tr><tr><td>Project 31 (Glue Workflow)</td><td>Production orchestration of the pipeline designed in this project</td></tr><tr><td>Project 35 (Federated Query)</td><td>Athena federated query extends beyond S3 to live databases</td></tr><tr><td>Project 47 (Lake Formation)</td><td>Fine-grained access control on the catalog tables and databases</td></tr><tr><td>Project 51 (Enterprise Data Lake)</td><td>This project's pattern scaled to enterprise with governance</td></tr><tr><td>Project 59 (QuickSight)</td><td>Visual analytics layer on top of the Athena analytics database</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The self-service analytics platform is operational<br>
+→ Analysts query Views and CTAS tables through Athena Workgroups<br>
+→ But the pipeline currently has NO event-driven automation beyond time-based scheduling</p>
+<p>→ Consider this scenario:</p>
+<ul>
+<li>A vendor uploads a new product catalog CSV to S3 at an unpredictable time</li>
+<li>Currently → the pipeline runs at 02:00 UTC regardless</li>
+<li>If the vendor uploads at 01:00 → data is processed at 02:00 → 1 hour delay (acceptable)</li>
+<li>If the vendor uploads at 03:00 → data isn't processed until NEXT day's 02:00 → 23 hour delay (unacceptable)</li>
+</ul>
+<p>→ What's needed: "When a file lands in S3 → AUTOMATICALLY trigger processing"<br>
+→ This is EVENT-DRIVEN architecture — the system reacts to events, not schedules</p>
+<p>→ The pattern: S3 upload event → SNS notification (Project 15) → SQS queue (Project 7) → Lambda function processes the event<br>
+→ Lambda can trigger Glue ETL, validate the file, notify teams, or update databases</p>
+<p>→ <strong>This is exactly what Project 26 solves</strong><br>
+→ Project 26 introduces the SNS → SQS → Lambda event-driven pipeline<br>
+→ You will learn how Lambda functions are triggered by SQS messages, how batch processing works, how error handling connects to DLQs (Project 20), and how this pattern enables reactive architectures<br>
+→ This transforms the platform from "runs on a schedule" to "reacts to events in real-time"</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 26: "The Order Processing System That Needed Decoupling — SNS → SQS → Lambda Event-Driven Pipeline"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-24.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 25/60</span></div><a class="nav-btn next" href="project-26.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

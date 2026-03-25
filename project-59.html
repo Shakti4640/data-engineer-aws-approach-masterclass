@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 59: THE FULLY SERVERLESS ANALYTICS PLATFORM — API Gateway → Lambda → S3  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 59: THE FULLY SERVERLESS ANALYTICS PLATFORM — API Gateway → Lambda → S3 → Glue → Athena → QuickSight</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ DataPulse Corp has built an impressive data infrastructure over the past 58 projects:</p>
+<ul>
+<li>S3 Data Lake with raw, curated, and refined zones (Project 1, 12, 25, 51)</li>
+<li>Glue Data Catalog with crawled and cataloged tables (Project 17, 25)</li>
+<li>Athena for serverless SQL queries on S3 (Project 18, 25)</li>
+<li>Redshift for high-performance warehouse analytics (Project 16, 22, 53)</li>
+<li>Migrated acquisition data flowing through the pipeline (Project 58)</li>
+<li>Security hardened with Zero-Trust architecture (Project 57)</li>
+<li>Cost optimized with Intelligent-Tiering and reserved capacity (Project 56)</li>
+</ul>
+<p>→ But there's a fundamental ACCESS problem:</p>
+<p><strong>The Business Users:</strong><br>
+→ 45 marketing analysts who need daily campaign performance data<br>
+→ They don't know SQL — they use Excel and PowerPoint<br>
+→ Currently they email the data team every morning: "Can you pull last week's numbers?"<br>
+→ Data team spends 3 hours/day answering ad-hoc requests — instead of building pipelines</p>
+<p><strong>The Mobile App Team:</strong><br>
+→ Building a customer-facing mobile app that shows order history and spending trends<br>
+→ App needs a REST API that returns JSON analytics results<br>
+→ Currently NO API exists — the app team mocks data because they can't access the warehouse<br>
+→ They need sub-3-second response times for user-facing queries</p>
+<p><strong>The Partner Integration Team:</strong><br>
+→ 8 external partners need programmatic access to aggregated (non-PII) analytics<br>
+→ Partners need API keys with rate limiting<br>
+→ Currently partners receive monthly CSV exports via email — stale by the time they arrive<br>
+→ Partners want real-time API access with their own dashboards</p>
+<p><strong>The Executive Team:</strong><br>
+→ CEO and VP-level executives want a single dashboard showing:</p>
+<ul>
+<li>Revenue trends (daily/weekly/monthly)</li>
+<li>Customer acquisition costs across all acquired companies (Project 58)</li>
+<li>Product performance across unified catalog</li>
+<li>Regional breakdowns<br>
+→ They want to open a browser → see the dashboard → filter by date/region/product → done<br>
+→ No SQL, no AWS Console, no technical knowledge required</li>
+</ul>
+<p><strong>The Finance Team:</strong><br>
+→ Needs row-level security: Each regional finance manager sees ONLY their region's data<br>
+→ The CFO sees ALL regions<br>
+→ Currently everyone sees everything — compliance violation</p>
+<p><strong>Current State of Analytics Access:</strong></p>
+<table><thead><tr><th>User Group</th><th>Current Access Method</th><th>Pain Point</th></tr></thead><tbody><tr><td>Data Engineers</td><td>Athena Console, Redshift SQL Client</td><td>✅ Works for them</td></tr><tr><td>Marketing Analysts</td><td>Email requests to data team</td><td>❌ 24-48 hour delay</td></tr><tr><td>Mobile App</td><td>No access</td><td>❌ Completely blocked</td></tr><tr><td>Partners</td><td>Monthly CSV email</td><td>❌ Stale data, manual process</td></tr><tr><td>Executives</td><td>Screenshots in email from data team</td><td>❌ No interactivity</td></tr><tr><td>Finance</td><td>Shared Redshift credentials</td><td>❌ No row-level security</td></tr></tbody></table>
+<p>→ Requirement: Build a FULLY SERVERLESS analytics platform that serves ALL these user groups<br>
+→ No EC2 instances to manage<br>
+→ No servers to patch<br>
+→ Scales to zero when idle — scales to thousands of concurrent users during peak<br>
+→ Secure with authentication, authorization, and row-level security</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a MULTI-LAYER platform — each layer serves a different consumer:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────┐
+</span>│                    CONSUMER LAYER                                  │
+│                                                                    │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐ │
+│  │ QuickSight │  │ Mobile App │  │ Partner    │  │ Internal   │ │
+│  │ Dashboards │  │ (REST API) │  │ API Access │  │ Tools      │ │
+│  │ (Execs,    │  │            │  │            │  │ (Analysts) │ │
+│  │  Finance,  │  │            │  │            │  │            │ │
+│  │  Marketing)│  │            │  │            │  │            │ │
+│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘ │
+│        │               │               │               │         │
+├────────┼───────────────┼───────────────┼───────────────┼─────────┤
+│        │          GATEWAY LAYER         │               │         │
+│        │               │               │               │         │
+│        │         ┌─────▼───────────────▼──────┐        │         │
+│        │         │    API GATEWAY              │        │         │
+│        │         │    (REST API + Auth)        │        │         │
+│        │         └─────────────┬───────────────┘        │         │
+│        │                       │                        │         │
+├────────┼───────────────────────┼────────────────────────┼─────────┤
+│        │            COMPUTE LAYER                       │         │
+│        │                       │                        │         │
+│  ┌─────▼──────┐         ┌─────▼──────┐          ┌─────▼──────┐  │
+│  │ QuickSight │         │  Lambda    │          │ Athena     │  │
+│  │ SPICE      │         │  Functions │          │ Direct     │  │
+│  │ Engine     │         │            │          │ Query      │  │
+│  └─────┬──────┘         └─────┬──────┘          └─────┬──────┘  │
+│        │                      │                       │          │
+├────────┼──────────────────────┼───────────────────────┼──────────┤
+│        │             QUERY LAYER                      │          │
+│        │                      │                       │          │
+│        │         ┌────────────▼───────────────┐       │          │
+│        ├────────▶│         ATHENA             │◀──────┘          │
+│        │         │    (Serverless SQL)        │                  │
+│        │         └────────────┬───────────────┘                  │
+│        │                      │                                  │
+├────────┼──────────────────────┼──────────────────────────────────┤
+│        │           CATALOG LAYER                                 │
+│        │                      │                                  │
+│        │         ┌────────────▼───────────────┐                  │
+│        │         │      GLUE DATA CATALOG     │                  │
+│        │         │    (Metadata + Schema)      │                  │
+│        │         └────────────┬───────────────┘                  │
+│        │                      │                                  │
+├────────┼──────────────────────┼──────────────────────────────────┤
+│                    STORAGE LAYER                                  │
+│                               │                                  │
+│              ┌────────────────▼─────────────────┐                │
+│              │           S3 DATA LAKE            │                │
+│              │   (Parquet, partitioned, encrypted)│                │
+│              └──────────────────────────────────┘                │
+└──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Approach:</p>
+<ol>
+<li>Verify and optimize the data layer (S3 + Glue Catalog) — already built</li>
+<li>Build the API layer (API Gateway + Lambda + Athena) — for mobile app and partners</li>
+<li>Build the visualization layer (QuickSight) — for executives, marketing, finance</li>
+<li>Implement security across all layers — authentication, authorization, row-level security</li>
+<li>Connect everything — single platform serving all consumer types</li>
+</ol>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>SECTION A — DATA LAYER OPTIMIZATION (Preparing S3 + Glue for Serving)</h3>
+<hr>
+<p><strong>Step A1 — Verify Data Lake Structure</strong></p>
+<p>→ S3 data lake (from Projects 1, 25, 51) should have clear zones:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://datapulse-data-lake-prod/
+</span>├── raw/                          ← Raw ingested data (CSV, JSON)
+│   ├── core/                     ← DataPulse original data
+│   └── acquired/                 ← InsightWorks migrated data (Project 58)
+│       └── insightworks/
+├── curated/                      ← Cleaned, deduplicated, typed (Parquet)
+│   ├── customers/
+│   │   └── year=2025/month=01/
+│   ├── transactions/
+│   │   └── year=2025/month=01/day=15/
+│   └── products/
+├── refined/                      ← Business-ready aggregations (Parquet)
+│   ├── daily_revenue/
+│   │   └── year=2025/month=01/day=15/
+│   ├── customer_acquisition_cost/
+│   │   └── year=2025/quarter=Q1/
+│   ├── product_performance/
+│   │   └── year=2025/month=01/
+│   └── regional_summary/
+│       └── year=2025/month=01/
+└── athena-results/               ← Athena query output location
+    └── workgroup-results/</code></pre></div>
+<p>→ The <code>refined/</code> zone is what QuickSight and the API will primarily query<br>
+→ Pre-aggregated data = faster queries = lower Athena scan costs = better user experience</p>
+<p><strong>Step A2 — Create Pre-Aggregated Refined Tables via Glue ETL</strong></p>
+<p>→ Builds on Project 21 (Glue ETL) and Project 31 (Glue Workflow)<br>
+→ Create Glue ETL jobs that produce business-ready aggregations:</p>
+<p><strong>Glue Job: Daily Revenue Aggregation</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job Name</td><td><code>etl-daily-revenue-aggregation</code></td></tr><tr><td>Source</td><td>Glue Catalog → <code>curated_db.transactions</code></td></tr><tr><td>Transformation</td><td>Group by date, region, product_category → SUM(revenue), COUNT(orders)</td></tr><tr><td>Target</td><td><code>s3://datapulse-data-lake-prod/refined/daily_revenue/</code></td></tr><tr><td>Format</td><td>Parquet with Snappy compression</td></tr><tr><td>Partition Keys</td><td>year, month, day</td></tr><tr><td>Schedule</td><td>Daily at 6 AM via Glue Workflow (Project 31)</td></tr></tbody></table>
+<p><strong>Glue Job: Customer Acquisition Cost</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job Name</td><td><code>etl-customer-acquisition-cost</code></td></tr><tr><td>Source</td><td>Glue Catalog → <code>curated_db.customers</code> + <code>curated_db.marketing_spend</code></td></tr><tr><td>Transformation</td><td>JOIN customers with marketing spend → Calculate CAC per region/channel</td></tr><tr><td>Target</td><td><code>s3://datapulse-data-lake-prod/refined/customer_acquisition_cost/</code></td></tr><tr><td>Format</td><td>Parquet</td></tr><tr><td>Partition Keys</td><td>year, quarter</td></tr><tr><td>Schedule</td><td>Weekly</td></tr></tbody></table>
+<p><strong>Glue Job: Product Performance</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job Name</td><td><code>etl-product-performance</code></td></tr><tr><td>Source</td><td>Glue Catalog → <code>curated_db.transactions</code> + <code>curated_db.products</code></td></tr><tr><td>Transformation</td><td>JOIN → Calculate units_sold, revenue, avg_price per product per month</td></tr><tr><td>Target</td><td><code>s3://datapulse-data-lake-prod/refined/product_performance/</code></td></tr><tr><td>Format</td><td>Parquet</td></tr><tr><td>Partition Keys</td><td>year, month</td></tr><tr><td>Schedule</td><td>Daily</td></tr></tbody></table>
+<p><strong>Glue Job: Regional Summary</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job Name</td><td><code>etl-regional-summary</code></td></tr><tr><td>Source</td><td>Multiple curated tables</td></tr><tr><td>Transformation</td><td>Aggregate revenue, customers, orders, returns per region per month</td></tr><tr><td>Target</td><td><code>s3://datapulse-data-lake-prod/refined/regional_summary/</code></td></tr><tr><td>Format</td><td>Parquet</td></tr><tr><td>Partition Keys</td><td>year, month</td></tr><tr><td>Schedule</td><td>Daily</td></tr></tbody></table>
+<p><strong>Step A3 — Crawl Refined Zone into Glue Catalog</strong></p>
+<p>→ Glue Console → Crawlers → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler Name</td><td><code>refined-zone-crawler</code></td></tr><tr><td>Data Source</td><td>S3 → <code>s3://datapulse-data-lake-prod/refined/</code></td></tr><tr><td>IAM Role</td><td>Glue service role</td></tr><tr><td>Database</td><td><code>refined_db</code></td></tr><tr><td>Table Prefix</td><td><code>rpt_</code> (report tables)</td></tr><tr><td>Schedule</td><td>Daily after ETL jobs complete (triggered by Glue Workflow)</td></tr></tbody></table>
+<p>→ After crawling, Glue Catalog contains:</p>
+<table><thead><tr><th>Table</th><th>Location</th><th>Partitions</th></tr></thead><tbody><tr><td><code>refined_db.rpt_daily_revenue</code></td><td><code>s3://.../refined/daily_revenue/</code></td><td>year, month, day</td></tr><tr><td><code>refined_db.rpt_customer_acquisition_cost</code></td><td><code>s3://.../refined/customer_acquisition_cost/</code></td><td>year, quarter</td></tr><tr><td><code>refined_db.rpt_product_performance</code></td><td><code>s3://.../refined/product_performance/</code></td><td>year, month</td></tr><tr><td><code>refined_db.rpt_regional_summary</code></td><td><code>s3://.../refined/regional_summary/</code></td><td>year, month</td></tr></tbody></table>
+<p><strong>Step A4 — Configure Athena Workgroups</strong></p>
+<p>→ Builds on Project 18 (Athena basics)<br>
+→ Athena Console → Workgroups → Create</p>
+<p><strong>Workgroup 1: API Queries</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Workgroup Name</td><td><code>api-queries</code></td></tr><tr><td>Query Result Location</td><td><code>s3://datapulse-data-lake-prod/athena-results/api/</code></td></tr><tr><td>Data Usage Control</td><td>Per-query limit: 100 MB scanned (prevent expensive runaway queries)</td></tr><tr><td>Per-workgroup limit</td><td>10 GB per day (cost control for API tier)</td></tr><tr><td>Encryption</td><td>SSE-KMS with <code>alias/datapulse-datalake</code> (Project 57)</td></tr><tr><td>Publish CloudWatch Metrics</td><td>✅ Yes</td></tr><tr><td>Requester Pays</td><td>❌ No</td></tr></tbody></table>
+<p><strong>Workgroup 2: QuickSight Queries</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Workgroup Name</td><td><code>quicksight-queries</code></td></tr><tr><td>Query Result Location</td><td><code>s3://datapulse-data-lake-prod/athena-results/quicksight/</code></td></tr><tr><td>Data Usage Control</td><td>Per-query limit: 500 MB scanned</td></tr><tr><td>Per-workgroup limit</td><td>50 GB per day</td></tr><tr><td>Encryption</td><td>SSE-KMS</td></tr><tr><td>Publish CloudWatch Metrics</td><td>✅ Yes</td></tr></tbody></table>
+<p><strong>Workgroup 3: Analyst Queries</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Workgroup Name</td><td><code>analyst-queries</code></td></tr><tr><td>Query Result Location</td><td><code>s3://datapulse-data-lake-prod/athena-results/analysts/</code></td></tr><tr><td>Data Usage Control</td><td>Per-query limit: 1 GB scanned</td></tr><tr><td>Per-workgroup limit</td><td>100 GB per day</td></tr><tr><td>Encryption</td><td>SSE-KMS</td></tr></tbody></table>
+<p>→ Workgroups provide:</p>
+<ul>
+<li>Cost isolation: Track and limit spending per consumer group</li>
+<li>Result isolation: Separate query results per group</li>
+<li>Security: Different IAM permissions per workgroup</li>
+<li>Monitoring: CloudWatch metrics per workgroup</li>
+</ul>
+<hr>
+<h3>SECTION B — API LAYER: API GATEWAY + LAMBDA + ATHENA</h3>
+<hr>
+<p><strong>Step B1 — Understand the API Architecture</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────┐
+</span>│  Mobile App  │     │  API Gateway │     │   Lambda     │     │  Athena  │
+│  or Partner  │────▶│  (REST API)  │────▶│  Function    │────▶│  Query   │
+│  Client      │     │              │     │              │     │          │
+│              │◄────│  (Response)  │◄────│  (Format     │◄────│  (Results│
+│              │     │              │     │   response)  │     │   from   │
+└──────────────┘     └──────────────┘     └──────────────┘     │   S3)    │
+                                                                └──────────┘</code></pre></div>
+<p>→ Challenge: Athena queries are ASYNCHRONOUS</p>
+<ul>
+<li>You submit a query → Athena returns a Query Execution ID</li>
+<li>You poll for completion → Athena returns results when ready</li>
+<li>Query time: 2-30 seconds depending on data volume</li>
+<li>API consumers expect synchronous response (request → wait → response)</li>
+</ul>
+<p>→ Two patterns to handle this:</p>
+<p><strong>Pattern 1: Synchronous (Lambda waits for Athena)</strong></p>
+<code>Client → API Gateway → Lambda → Start Athena Query → Poll until complete → Return results</code>
+<p>→ Pros: Simple, single request/response<br>
+→ Cons: Lambda runs for entire query duration (2-30 seconds), higher cost, API Gateway 29-second timeout</p>
+<p><strong>Pattern 2: Asynchronous (Two API calls)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Call 1: Client → API Gateway → Lambda → Start Athena Query → Return Query ID
+</span>Call 2: Client → API Gateway → Lambda → Check Query Status → Return results (if ready)</code></pre></div>
+<p>→ Pros: Lambda runs briefly each call, no timeout issues<br>
+→ Cons: Client must poll, more complex client implementation</p>
+<p>→ DataPulse decision: <strong>Pattern 1 (Synchronous)</strong> for refined/aggregated queries (&lt; 5 seconds)<br>
+→ <strong>Pattern 2 (Asynchronous)</strong> for ad-hoc complex queries (potentially &gt; 29 seconds)<br>
+→ Pre-aggregated refined tables ensure most queries complete in 2-5 seconds</p>
+<p><strong>Step B2 — Create Lambda Execution Role</strong></p>
+<p>→ IAM Console → Roles → Create Role</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted Entity</td><td>AWS Service → Lambda</td></tr><tr><td>Role Name</td><td><code>datapulse-api-lambda-role</code></td></tr></tbody></table>
+<p>→ Attach policies:</p>
+<p><strong>Policy 1: Athena Query Permissions</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>athena:StartQueryExecution</code></td><td><code>arn:aws:athena:*:*:workgroup/api-queries</code></td><td>Start queries in API workgroup only</td></tr><tr><td><code>athena:GetQueryExecution</code></td><td><code>*</code></td><td>Check query status</td></tr><tr><td><code>athena:GetQueryResults</code></td><td><code>*</code></td><td>Retrieve results</td></tr><tr><td><code>athena:StopQueryExecution</code></td><td><code>*</code></td><td>Cancel runaway queries</td></tr></tbody></table>
+<p><strong>Policy 2: S3 Permissions</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::datapulse-data-lake-prod/refined/*</code></td><td>Athena reads data</td></tr><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::datapulse-data-lake-prod/athena-results/api/*</code></td><td>Read query results</td></tr><tr><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::datapulse-data-lake-prod/athena-results/api/*</code></td><td>Athena writes results</td></tr><tr><td><code>s3:GetBucketLocation</code></td><td><code>arn:aws:s3:::datapulse-data-lake-prod</code></td><td>Athena needs bucket location</td></tr></tbody></table>
+<p><strong>Policy 3: Glue Catalog Permissions</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>glue:GetDatabase</code></td><td><code>arn:aws:glue:*:*:database/refined_db</code></td><td>Read catalog database</td></tr><tr><td><code>glue:GetTable</code></td><td><code>arn:aws:glue:*:*:table/refined_db/*</code></td><td>Read catalog tables</td></tr><tr><td><code>glue:GetPartitions</code></td><td><code>arn:aws:glue:*:*:table/refined_db/*</code></td><td>Read partition metadata</td></tr></tbody></table>
+<p><strong>Policy 4: KMS Permissions</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>kms:Decrypt</code></td><td>ARN of <code>alias/datapulse-datalake</code></td><td>Decrypt S3 data</td></tr><tr><td><code>kms:GenerateDataKey</code></td><td>ARN of <code>alias/datapulse-datalake</code></td><td>Encrypt Athena results</td></tr></tbody></table>
+<p><strong>Policy 5: CloudWatch Logs</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>logs:CreateLogGroup</code></td><td><code>arn:aws:logs:*:*:log-group:/aws/lambda/*</code></td><td>Create log group</td></tr><tr><td><code>logs:CreateLogStream</code></td><td><code>*</code></td><td>Create log stream</td></tr><tr><td><code>logs:PutLogEvents</code></td><td><code>*</code></td><td>Write logs</td></tr></tbody></table>
+<p>→ This follows least privilege (Project 57) — Lambda can ONLY query the refined database in the API workgroup</p>
+<p><strong>Step B3 — Create Lambda Functions</strong></p>
+<p><strong>Lambda Function 1: Query Revenue</strong></p>
+<p>→ Lambda Console → Create Function</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function Name</td><td><code>datapulse-api-query-revenue</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Architecture</td><td>arm64 (Graviton — cheaper and faster)</td></tr><tr><td>Execution Role</td><td><code>datapulse-api-lambda-role</code></td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>29 seconds (matches API Gateway maximum)</td></tr><tr><td>Environment Variables</td><td>WORKGROUP=api-queries, DATABASE=refined_db, OUTPUT_LOCATION=s3://...athena-results/api/</td></tr></tbody></table>
+<p>→ Function logic (configuration-relevant settings, not code):</p>
+<ol>
+<li>Receive request parameters (start_date, end_date, region) from API Gateway event</li>
+<li>Construct parameterized Athena query against <code>refined_db.rpt_daily_revenue</code></li>
+<li>Execute query in <code>api-queries</code> workgroup</li>
+<li>Poll for completion (with timeout)</li>
+<li>Retrieve results</li>
+<li>Format as JSON</li>
+<li>Return to API Gateway</li>
+</ol>
+<p><strong>Lambda Function 2: Query Product Performance</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function Name</td><td><code>datapulse-api-query-products</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>29 seconds</td></tr><tr><td>Environment Variables</td><td>Same pattern as Function 1</td></tr></tbody></table>
+<p><strong>Lambda Function 3: Query Regional Summary</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function Name</td><td><code>datapulse-api-query-regional</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>29 seconds</td></tr><tr><td>Environment Variables</td><td>Same pattern</td></tr></tbody></table>
+<p><strong>Lambda Function 4: Query Customer Metrics</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function Name</td><td><code>datapulse-api-query-customers</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>29 seconds</td></tr></tbody></table>
+<p><strong>Lambda Function 5: Async Query Submission (for complex queries)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function Name</td><td><code>datapulse-api-submit-query</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Memory</td><td>128 MB</td></tr><tr><td>Timeout</td><td>10 seconds</td></tr></tbody></table>
+<p>→ Submits query → Returns query execution ID immediately</p>
+<p><strong>Lambda Function 6: Async Query Status/Results</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function Name</td><td><code>datapulse-api-get-query-results</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>10 seconds</td></tr></tbody></table>
+<p>→ Accepts query execution ID → Returns status (RUNNING/SUCCEEDED/FAILED) and results if complete</p>
+<p><strong>Step B4 — Create API Gateway REST API</strong></p>
+<p>→ API Gateway Console → Create API → REST API</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>API Name</td><td><code>datapulse-analytics-api</code></td></tr><tr><td>Description</td><td>DataPulse Analytics Platform REST API</td></tr><tr><td>Endpoint Type</td><td>Regional</td></tr></tbody></table>
+<p>→ Why Regional (not Edge-optimized)?</p>
+<ul>
+<li>Edge-optimized uses CloudFront → adds latency for same-region clients</li>
+<li>Regional is optimal when most clients are in the same region</li>
+<li>Can add CloudFront later if needed for global distribution</li>
+</ul>
+<p><strong>Step B5 — Define API Resources and Methods</strong></p>
+<p>→ API Gateway Console → Select API → Resources → Create</p>
+<p><strong>API Structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>/
+</span>├── /v1
+│   ├── /revenue
+│   │   └── GET  → Lambda: datapulse-api-query-revenue
+│   │
+│   ├── /products
+│   │   └── GET  → Lambda: datapulse-api-query-products
+│   │
+│   ├── /regional
+│   │   └── GET  → Lambda: datapulse-api-query-regional
+│   │
+│   ├── /customers
+│   │   └── GET  → Lambda: datapulse-api-query-customers
+│   │
+│   └── /query
+│       ├── POST → Lambda: datapulse-api-submit-query
+│       │          (Submit ad-hoc query)
+│       │
+│       └── /{queryId}
+│           └── GET → Lambda: datapulse-api-get-query-results
+│                      (Get results by query ID)</code></pre></div>
+<p><strong>For each resource/method:</strong></p>
+<p>→ Select Resource → Create Method → GET</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Integration Type</td><td>Lambda Function</td></tr><tr><td>Lambda Proxy Integration</td><td>✅ Yes (passes full request to Lambda)</td></tr><tr><td>Lambda Function</td><td>Select corresponding function</td></tr><tr><td>Lambda Region</td><td>Same region as Lambda</td></tr></tbody></table>
+<p>→ Lambda Proxy Integration means:</p>
+<ul>
+<li>API Gateway passes the ENTIRE HTTP request to Lambda (headers, query params, body, path)</li>
+<li>Lambda returns a structured response (statusCode, headers, body)</li>
+<li>No request/response mapping templates needed — simplest integration</li>
+</ul>
+<p><strong>Step B6 — Configure API Gateway Query Parameters</strong></p>
+<p>→ For <code>/v1/revenue</code> GET method:<br>
+→ Method Request → URL Query String Parameters</p>
+<table><thead><tr><th>Parameter</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td>start_date</td><td>✅ Yes</td><td>Start date (YYYY-MM-DD)</td></tr><tr><td>end_date</td><td>✅ Yes</td><td>End date (YYYY-MM-DD)</td></tr><tr><td>region</td><td>❌ No</td><td>Filter by region (default: all)</td></tr><tr><td>granularity</td><td>❌ No</td><td>daily/weekly/monthly (default: daily)</td></tr></tbody></table>
+<p>→ For <code>/v1/products</code> GET method:</p>
+<table><thead><tr><th>Parameter</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td>month</td><td>✅ Yes</td><td>Month (YYYY-MM)</td></tr><tr><td>category</td><td>❌ No</td><td>Product category filter</td></tr><tr><td>limit</td><td>❌ No</td><td>Number of results (default: 50, max: 500)</td></tr></tbody></table>
+<p>→ For <code>/v1/regional</code> GET method:</p>
+<table><thead><tr><th>Parameter</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td>month</td><td>✅ Yes</td><td>Month (YYYY-MM)</td></tr><tr><td>region</td><td>❌ No</td><td>Specific region (default: all)</td></tr></tbody></table>
+<p>→ Request validation ensures required parameters are present before Lambda is invoked<br>
+→ API Gateway Console → Method Request → Request Validator → "Validate query string parameters and headers"</p>
+<p><strong>Step B7 — Configure API Gateway Authentication</strong></p>
+<p>→ Three authentication methods for three consumer types:</p>
+<p><strong>Method 1: API Key + Usage Plan (for Partners)</strong></p>
+<p>→ API Gateway Console → API Keys → Create API Key</p>
+<table><thead><tr><th>Partner</th><th>API Key Name</th></tr></thead><tbody><tr><td>Partner Alpha</td><td><code>partner-alpha-key</code></td></tr><tr><td>Partner Beta</td><td><code>partner-beta-key</code></td></tr><tr><td>Partner Gamma</td><td><code>partner-gamma-key</code></td></tr></tbody></table>
+<p>→ Create Usage Plan:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Usage Plan Name</td><td><code>partner-standard-plan</code></td></tr><tr><td>Throttling Rate</td><td>10 requests/second</td></tr><tr><td>Throttling Burst</td><td>20 requests</td></tr><tr><td>Quota</td><td>10,000 requests/month</td></tr></tbody></table>
+<p>→ Associate API Keys with Usage Plan<br>
+→ Associate Usage Plan with API Stage</p>
+<p>→ For each method that partners access:<br>
+→ Method Request → API Key Required → ✅ True</p>
+<p>→ Partners include API key in request header: <code>x-api-key: &lt;their-key&gt;</code><br>
+→ API Gateway validates the key and enforces rate limits automatically</p>
+<p><strong>Method 2: Cognito User Pool (for Mobile App Users)</strong></p>
+<p>→ Cognito Console → Create User Pool</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Pool Name</td><td><code>datapulse-analytics-users</code></td></tr><tr><td>Sign-in Options</td><td>Email</td></tr><tr><td>Password Policy</td><td>Min 8 chars, uppercase, lowercase, number, symbol</td></tr><tr><td>MFA</td><td>✅ Required (SMS or TOTP)</td></tr><tr><td>Account Recovery</td><td>Email verification</td></tr><tr><td>Self-Registration</td><td>❌ Disabled (admin creates accounts)</td></tr><tr><td>Email Verification</td><td>✅ Required</td></tr></tbody></table>
+<p>→ Create App Client:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>App Client Name</td><td><code>mobile-app-client</code></td></tr><tr><td>Authentication Flows</td><td>USER_SRP_AUTH (Secure Remote Password)</td></tr><tr><td>Token Expiration</td><td>Access Token: 1 hour, Refresh Token: 30 days</td></tr><tr><td>Generate Client Secret</td><td>❌ No (public client for mobile)</td></tr></tbody></table>
+<p>→ Create Cognito Authorizer in API Gateway:<br>
+→ API Gateway Console → Authorizers → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Authorizer Name</td><td><code>cognito-mobile-auth</code></td></tr><tr><td>Type</td><td>Cognito</td></tr><tr><td>Cognito User Pool</td><td><code>datapulse-analytics-users</code></td></tr><tr><td>Token Source</td><td>Authorization header</td></tr><tr><td>Token Validation</td><td>(leave blank — Cognito validates automatically)</td></tr></tbody></table>
+<p>→ For mobile app endpoints:<br>
+→ Method Request → Authorization → Select <code>cognito-mobile-auth</code></p>
+<p>→ Mobile app flow:</p>
+<ol>
+<li>User signs in via Cognito → receives JWT token</li>
+<li>App includes token in Authorization header: <code>Bearer &lt;jwt-token&gt;</code></li>
+<li>API Gateway validates token with Cognito</li>
+<li>If valid → request proceeds to Lambda</li>
+<li>Lambda receives user identity from Cognito claims in the event</li>
+</ol>
+<p><strong>Method 3: IAM Authorization (for Internal Tools)</strong></p>
+<p>→ For internal tools and data engineering access:<br>
+→ Method Request → Authorization → AWS_IAM</p>
+<p>→ Internal tools sign requests with AWS Signature V4<br>
+→ IAM policies control which endpoints each internal role can access<br>
+→ Most secure — uses existing IAM infrastructure (Project 2)</p>
+<p><strong>Step B8 — Configure API Gateway Throttling and Caching</strong></p>
+<p><strong>Account-Level Throttling:</strong></p>
+<p>→ API Gateway Console → Settings</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Default throttling rate</td><td>100 requests/second</td></tr><tr><td>Default throttling burst</td><td>200 requests</td></tr></tbody></table>
+<p><strong>Stage-Level Throttling:</strong></p>
+<p>→ API Gateway Console → Stages → prod → Stage Editor</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Throttling Rate</td><td>50 requests/second</td></tr><tr><td>Throttling Burst</td><td>100 requests</td></tr></tbody></table>
+<p><strong>Method-Level Throttling (override per endpoint):</strong></p>
+<table><thead><tr><th>Endpoint</th><th>Rate</th><th>Burst</th><th>Reasoning</th></tr></thead><tbody><tr><td>GET /v1/revenue</td><td>20 req/s</td><td>50</td><td>Most popular endpoint</td></tr><tr><td>GET /v1/products</td><td>10 req/s</td><td>30</td><td>Moderate usage</td></tr><tr><td>GET /v1/regional</td><td>10 req/s</td><td>30</td><td>Moderate usage</td></tr><tr><td>POST /v1/query</td><td>5 req/s</td><td>10</td><td>Ad-hoc queries — limit to control Athena costs</td></tr></tbody></table>
+<p><strong>API Gateway Caching:</strong></p>
+<p>→ Stages → prod → Settings → Cache Settings</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Enable API Cache</td><td>✅ Yes</td></tr><tr><td>Cache Capacity</td><td>0.5 GB</td></tr><tr><td>Cache TTL</td><td>300 seconds (5 minutes)</td></tr><tr><td>Encryption</td><td>✅ Yes</td></tr><tr><td>Cache Key Parameters</td><td>Include query string parameters</td></tr></tbody></table>
+<p>→ How caching works:</p>
+<ul>
+<li>First request: API Gateway → Lambda → Athena → Response cached</li>
+<li>Subsequent identical requests within 5 minutes: Response served from cache</li>
+<li>No Lambda invocation, no Athena query — instant response</li>
+<li>Dramatically reduces Athena costs and improves latency</li>
+</ul>
+<p>→ Cache invalidation:</p>
+<ul>
+<li>Automatic: TTL expires after 5 minutes</li>
+<li>Manual: Client sends <code>Cache-Control: max-age=0</code> header (requires authorization)</li>
+<li>After ETL: EventBridge rule triggers cache flush when new data is loaded</li>
+</ul>
+<p><strong>Step B9 — Enable API Gateway Logging and Monitoring</strong></p>
+<p>→ Stages → prod → Logs/Tracing</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>CloudWatch Logs</td><td>✅ Enable</td></tr><tr><td>Log Level</td><td>INFO (or ERROR for production cost savings)</td></tr><tr><td>Log Full Requests/Responses</td><td>❌ No in production (PII risk + cost)</td></tr><tr><td>Detailed CloudWatch Metrics</td><td>✅ Enable</td></tr><tr><td>X-Ray Tracing</td><td>✅ Enable (end-to-end request tracing)</td></tr></tbody></table>
+<p>→ Metrics available in CloudWatch:</p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th></tr></thead><tbody><tr><td>Count</td><td>Total API requests</td></tr><tr><td>4XXError</td><td>Client errors (auth failures, bad requests)</td></tr><tr><td>5XXError</td><td>Server errors (Lambda failures, timeouts)</td></tr><tr><td>Latency</td><td>End-to-end response time</td></tr><tr><td>IntegrationLatency</td><td>Time spent in Lambda</td></tr><tr><td>CacheHitCount</td><td>Requests served from cache</td></tr><tr><td>CacheMissCount</td><td>Requests that went to Lambda</td></tr></tbody></table>
+<p><strong>Step B10 — Deploy API</strong></p>
+<p>→ API Gateway Console → Actions → Deploy API</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Deployment Stage</td><td>Create new stage: <code>prod</code></td></tr><tr><td>Stage Description</td><td>Production deployment</td></tr></tbody></table>
+<p>→ After deployment, API is accessible at:<br>
+→ <code>https://{api-id}.execute-api.{region}.amazonaws.com/prod/v1/revenue?start_date=2025-01-01&amp;end_date=2025-01-31</code></p>
+<p><strong>Step B11 — Configure Custom Domain Name (Optional but Recommended)</strong></p>
+<p>→ API Gateway Console → Custom Domain Names → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Domain Name</td><td><code>api.datapulse.com</code></td></tr><tr><td>Security Policy</td><td>TLS 1.2</td></tr><tr><td>Endpoint Type</td><td>Regional</td></tr><tr><td>ACM Certificate</td><td>Request/import certificate for <code>api.datapulse.com</code> in ACM</td></tr></tbody></table>
+<p>→ Create Base Path Mapping:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Base Path</td><td><code>analytics</code></td></tr><tr><td>API</td><td><code>datapulse-analytics-api</code></td></tr><tr><td>Stage</td><td><code>prod</code></td></tr></tbody></table>
+<p>→ Create Route 53 ALIAS record: <code>api.datapulse.com</code> → API Gateway custom domain<br>
+→ Final URL: <code>https://api.datapulse.com/analytics/v1/revenue?start_date=...</code></p>
+<hr>
+<h3>SECTION C — VISUALIZATION LAYER: AMAZON QUICKSIGHT</h3>
+<hr>
+<p><strong>Step C1 — Sign Up for QuickSight Enterprise Edition</strong></p>
+<p>→ QuickSight Console → Sign Up</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Edition</td><td>Enterprise (required for row-level security, SPICE auto-refresh, embedding)</td></tr><tr><td>Authentication</td><td>Active Directory / Cognito / QuickSight-managed users</td></tr><tr><td>Region</td><td>Same as data lake (ap-south-1)</td></tr><tr><td>QuickSight Account Name</td><td><code>datapulse-analytics</code></td></tr><tr><td>Notification Email</td><td><code>quicksight-admin@datapulse.com</code></td></tr></tbody></table>
+<p>→ Enterprise vs Standard:</p>
+<table><thead><tr><th>Feature</th><th>Standard</th><th>Enterprise</th></tr></thead><tbody><tr><td>Row-Level Security</td><td>❌</td><td>✅</td></tr><tr><td>Column-Level Security</td><td>❌</td><td>✅</td></tr><tr><td>Hourly SPICE Refresh</td><td>❌</td><td>✅</td></tr><tr><td>Dashboard Embedding</td><td>❌</td><td>✅</td></tr><tr><td>Active Directory Integration</td><td>❌</td><td>✅</td></tr><tr><td>Encryption at Rest (customer KMS)</td><td>❌</td><td>✅</td></tr><tr><td>Private VPC Connection</td><td>❌</td><td>✅</td></tr><tr><td>Reader Pricing</td><td>$0.30/session (max $5/month)</td><td>$0.30/session (max $5/month)</td></tr><tr><td>Author Pricing</td><td>$12/month</td><td>$18/month</td></tr></tbody></table>
+<p>→ DataPulse needs: Row-level security, embedding, enterprise auth → Enterprise Edition</p>
+<p><strong>Step C2 — Configure QuickSight Permissions</strong></p>
+<p>→ QuickSight Console → Manage QuickSight → Security &amp; Permissions</p>
+<p><strong>S3 Access:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>S3 Buckets</td><td>Select <code>datapulse-data-lake-prod</code></td></tr><tr><td>Specific Prefixes</td><td><code>refined/</code>, <code>athena-results/quicksight/</code></td></tr></tbody></table>
+<p><strong>Athena Access:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Athena Workgroups</td><td>Select <code>quicksight-queries</code></td></tr></tbody></table>
+<p><strong>IAM Role for QuickSight:</strong></p>
+<p>→ QuickSight creates a service role: <code>aws-quicksight-service-role-v0</code><br>
+→ Verify this role has:</p>
+<table><thead><tr><th>Permission</th><th>Resource</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::datapulse-data-lake-prod/refined/*</code></td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::datapulse-data-lake-prod</code></td></tr><tr><td><code>athena:*</code></td><td>Workgroup <code>quicksight-queries</code></td></tr><tr><td><code>glue:GetDatabase</code>, <code>glue:GetTable</code>, <code>glue:GetPartitions</code></td><td><code>refined_db</code></td></tr><tr><td><code>kms:Decrypt</code></td><td>Data lake KMS key</td></tr></tbody></table>
+<p><strong>Step C3 — Create QuickSight Data Sources</strong></p>
+<p>→ QuickSight Console → Datasets → New Dataset → Athena</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Data Source Name</td><td><code>datapulse-athena-refined</code></td></tr><tr><td>Athena Workgroup</td><td><code>quicksight-queries</code></td></tr></tbody></table>
+<p>→ Alternative: Direct Redshift connection (for warehouse-level queries)</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Data Source Name</td><td><code>datapulse-redshift-warehouse</code></td></tr><tr><td>Connection Type</td><td>Redshift (auto-discovered if in same VPC)</td></tr><tr><td>Cluster</td><td>DataPulse Redshift cluster</td></tr><tr><td>Database</td><td><code>analytics</code></td></tr><tr><td>Credentials</td><td>From Secrets Manager (Project 37)</td></tr></tbody></table>
+<p>→ For this project: Use Athena for refined S3 data (serverless, no cluster management)<br>
+→ Use Redshift for complex analytical queries requiring joins across many tables</p>
+<p><strong>Step C4 — Create QuickSight Datasets</strong></p>
+<p><strong>Dataset 1: Daily Revenue</strong></p>
+<p>→ QuickSight Console → Datasets → New Dataset → Select <code>datapulse-athena-refined</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database</td><td><code>refined_db</code></td></tr><tr><td>Table</td><td><code>rpt_daily_revenue</code></td></tr><tr><td>Import Mode</td><td>SPICE (see explanation below)</td></tr><tr><td>Dataset Name</td><td><code>Daily Revenue Report</code></td></tr></tbody></table>
+<p><strong>SPICE vs Direct Query:</strong></p>
+<table><thead><tr><th>Mode</th><th>How It Works</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>SPICE</td><td>Data imported into QuickSight's in-memory engine</td><td>Fastest queries, no Athena cost per dashboard view, supports calculated fields</td><td>Data is a snapshot — needs refresh schedule, SPICE capacity limits</td></tr><tr><td>Direct Query</td><td>Every dashboard interaction runs Athena query</td><td>Always current data, no SPICE limits</td><td>Slower, Athena charges per query, dependent on Athena availability</td></tr></tbody></table>
+<p>→ DataPulse chooses SPICE for all refined datasets:</p>
+<ul>
+<li>Refined data is updated daily by Glue ETL</li>
+<li>SPICE refresh scheduled after ETL completes</li>
+<li>Dashboard users get instant response (no waiting for Athena)</li>
+<li>No per-query Athena costs for dashboard views</li>
+</ul>
+<p><strong>SPICE Refresh Schedule:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Refresh Type</td><td>Full refresh</td></tr><tr><td>Schedule</td><td>Daily at 7 AM (after 6 AM ETL completes)</td></tr><tr><td>Timezone</td><td>Asia/Kolkata</td></tr><tr><td>Failure Notification</td><td>SNS topic → data team</td></tr></tbody></table>
+<p>→ Enterprise Edition supports HOURLY refresh if needed</p>
+<p><strong>Dataset 2: Product Performance</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Table</td><td><code>rpt_product_performance</code></td></tr><tr><td>Import Mode</td><td>SPICE</td></tr><tr><td>Refresh</td><td>Daily at 7 AM</td></tr></tbody></table>
+<p><strong>Dataset 3: Regional Summary</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Table</td><td><code>rpt_regional_summary</code></td></tr><tr><td>Import Mode</td><td>SPICE</td></tr><tr><td>Refresh</td><td>Daily at 7 AM</td></tr></tbody></table>
+<p><strong>Dataset 4: Customer Acquisition Cost</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Table</td><td><code>rpt_customer_acquisition_cost</code></td></tr><tr><td>Import Mode</td><td>SPICE</td></tr><tr><td>Refresh</td><td>Weekly (data updates weekly)</td></tr></tbody></table>
+<p><strong>Step C5 — Add Calculated Fields to Datasets</strong></p>
+<p>→ Select Dataset → Edit → Add Calculated Field</p>
+<table><thead><tr><th>Dataset</th><th>Calculated Field</th><th>Formula Logic</th><th>Purpose</th></tr></thead><tbody><tr><td>Daily Revenue</td><td><code>revenue_growth_pct</code></td><td>(current_day_revenue - previous_day_revenue) / previous_day_revenue × 100</td><td>Day-over-day growth</td></tr><tr><td>Daily Revenue</td><td><code>cumulative_revenue</code></td><td>Running sum of revenue partitioned by month</td><td>Month-to-date tracking</td></tr><tr><td>Product Performance</td><td><code>revenue_per_unit</code></td><td>total_revenue / units_sold</td><td>Unit economics</td></tr><tr><td>Regional Summary</td><td><code>orders_per_customer</code></td><td>total_orders / unique_customers</td><td>Customer engagement</td></tr></tbody></table>
+<p><strong>Step C6 — Configure Row-Level Security (RLS)</strong></p>
+<p>→ This is the CRITICAL feature for the Finance team requirement</p>
+<p><strong>Create RLS Dataset (Permission Dataset):</strong></p>
+<p>→ Create a CSV file defining who sees what:</p>
+<table><thead><tr><th>UserName</th><th>region</th></tr></thead><tbody><tr><td><code>finance-manager-north</code></td><td>North</td></tr><tr><td><code>finance-manager-south</code></td><td>South</td></tr><tr><td><code>finance-manager-east</code></td><td>East</td></tr><tr><td><code>finance-manager-west</code></td><td>West</td></tr><tr><td><code>cfo-john</code></td><td>North</td></tr><tr><td><code>cfo-john</code></td><td>South</td></tr><tr><td><code>cfo-john</code></td><td>East</td></tr><tr><td><code>cfo-john</code></td><td>West</td></tr></tbody></table>
+<p>→ Upload to S3: <code>s3://datapulse-data-lake-prod/quicksight-config/rls-rules.csv</code><br>
+→ Create dataset from this CSV in QuickSight</p>
+<p><strong>Apply RLS to Dataset:</strong></p>
+<p>→ QuickSight Console → Datasets → Select <code>Regional Summary</code> → Permissions</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Row-Level Security</td><td>✅ Enable</td></tr><tr><td>Permission Dataset</td><td><code>rls-rules</code></td></tr><tr><td>Permission Policy Column</td><td><code>region</code> (column in the analytics dataset to filter)</td></tr><tr><td>Identity Column</td><td><code>UserName</code> (column in RLS dataset matching QuickSight username)</td></tr></tbody></table>
+<p>→ How RLS works internally:</p>
+<ul>
+<li>When <code>finance-manager-north</code> views the dashboard</li>
+<li>QuickSight automatically appends filter: <code>WHERE region = 'North'</code></li>
+<li>User ONLY sees data for their region</li>
+<li>No additional configuration needed in the dashboard itself</li>
+<li>CFO has all 4 regions listed → sees all data</li>
+<li>RLS applies to ALL visuals in ALL dashboards using this dataset</li>
+</ul>
+<p>→ Apply RLS to ALL datasets that contain regional data</p>
+<p><strong>Step C7 — Create QuickSight Analysis (Dashboard Builder)</strong></p>
+<p>→ QuickSight Console → Analyses → New Analysis</p>
+<p><strong>Analysis: Executive Dashboard</strong></p>
+<p>→ Select datasets: Daily Revenue, Regional Summary, Product Performance, Customer Acquisition</p>
+<p><strong>Sheet 1: Revenue Overview</strong></p>
+<table><thead><tr><th>Visual Type</th><th>Dataset</th><th>Configuration</th></tr></thead><tbody><tr><td>KPI</td><td>Daily Revenue</td><td>Value: SUM(revenue) for current month, Comparison: previous month</td></tr><tr><td>Line Chart</td><td>Daily Revenue</td><td>X-axis: date, Y-axis: revenue, Color: region</td></tr><tr><td>Bar Chart</td><td>Daily Revenue</td><td>X-axis: region, Y-axis: SUM(revenue), Sort: descending</td></tr><tr><td>Table</td><td>Daily Revenue</td><td>Columns: date, region, revenue, orders, avg_order_value</td></tr></tbody></table>
+<p><strong>Sheet 2: Product Performance</strong></p>
+<table><thead><tr><th>Visual Type</th><th>Dataset</th><th>Configuration</th></tr></thead><tbody><tr><td>Treemap</td><td>Product Performance</td><td>Size: revenue, Color: units_sold, Group: category</td></tr><tr><td>Horizontal Bar</td><td>Product Performance</td><td>Y-axis: product_name, X-axis: revenue, Top 20</td></tr><tr><td>Scatter Plot</td><td>Product Performance</td><td>X-axis: units_sold, Y-axis: revenue_per_unit, Color: category</td></tr></tbody></table>
+<p><strong>Sheet 3: Regional Breakdown</strong></p>
+<table><thead><tr><th>Visual Type</th><th>Dataset</th><th>Configuration</th></tr></thead><tbody><tr><td>Map (Geospatial)</td><td>Regional Summary</td><td>Location: region, Size: revenue, Color: growth_pct</td></tr><tr><td>Pie Chart</td><td>Regional Summary</td><td>Value: revenue, Group: region</td></tr><tr><td>Comparative Bar</td><td>Regional Summary</td><td>X-axis: region, Y-axis: orders_per_customer</td></tr></tbody></table>
+<p><strong>Sheet 4: Customer Acquisition</strong></p>
+<table><thead><tr><th>Visual Type</th><th>Dataset</th><th>Configuration</th></tr></thead><tbody><tr><td>Line Chart</td><td>CAC</td><td>X-axis: quarter, Y-axis: acquisition_cost, Color: channel</td></tr><tr><td>Stacked Bar</td><td>CAC</td><td>X-axis: quarter, Y-axis: new_customers, Color: source_company</td></tr><tr><td>KPI</td><td>CAC</td><td>Value: average CAC current quarter, Comparison: previous quarter</td></tr></tbody></table>
+<p><strong>Add Interactive Filters:</strong></p>
+<p>→ Analysis → Add Filter</p>
+<table><thead><tr><th>Filter</th><th>Type</th><th>Applies To</th></tr></thead><tbody><tr><td>Date Range</td><td>Date picker (relative or absolute)</td><td>All visuals on all sheets</td></tr><tr><td>Region</td><td>Dropdown (multi-select)</td><td>All visuals on all sheets</td></tr><tr><td>Product Category</td><td>Dropdown</td><td>Product Performance sheet</td></tr><tr><td>Source Company</td><td>Dropdown (DataPulse, InsightWorks)</td><td>Customer Acquisition sheet</td></tr></tbody></table>
+<p>→ Filters are interactive: Users click to filter → all visuals update instantly<br>
+→ No SQL knowledge required</p>
+<p><strong>Step C8 — Publish Dashboard</strong></p>
+<p>→ Analysis → Share → Publish Dashboard</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Dashboard Name</td><td><code>DataPulse Executive Analytics</code></td></tr><tr><td>Allow Users to</td><td>Filter data, download CSV</td></tr><tr><td>Disallow</td><td>Edit visuals, add visuals</td></tr><tr><td>Enable Advanced Options</td><td>✅ Reset filters, ✅ Undo/Redo</td></tr></tbody></table>
+<p><strong>Step C9 — Share Dashboard with Users</strong></p>
+<p>→ Dashboard → Share → Manage Dashboard Access</p>
+<table><thead><tr><th>User/Group</th><th>Permission Level</th></tr></thead><tbody><tr><td>CEO</td><td>Viewer (sees all data — no RLS restriction)</td></tr><tr><td>CFO</td><td>Viewer (sees all regions via RLS)</td></tr><tr><td>VP Marketing</td><td>Viewer (sees all data)</td></tr><tr><td>Regional Finance Managers</td><td>Viewer (sees only their region via RLS)</td></tr><tr><td>Marketing Analysts</td><td>Viewer (sees all data)</td></tr></tbody></table>
+<p>→ QuickSight User Types and Costs:</p>
+<table><thead><tr><th>User Type</th><th>What They Can Do</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Admin</td><td>Full QuickSight management</td><td>$18/month</td></tr><tr><td>Author</td><td>Create analyses, datasets, dashboards</td><td>$18/month</td></tr><tr><td>Reader</td><td>View dashboards, apply filters, download</td><td>$0.30/session (max $5/month)</td></tr></tbody></table>
+<p>→ DataPulse Reader pricing:</p>
+<ul>
+<li>45 marketing analysts × $5/month max = $225/month</li>
+<li>5 executives × $5/month max = $25/month</li>
+<li>4 finance managers × $5/month max = $20/month</li>
+<li>2 Authors (data team) × $18/month = $36/month</li>
+<li>1 Admin × $18/month = $18/month</li>
+<li><strong>Total QuickSight: ~$324/month</strong> for 57 users</li>
+</ul>
+<p><strong>Step C10 — Configure QuickSight Email Reports</strong></p>
+<p>→ Dashboard → Schedule → Create Email Report</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Schedule</td><td>Every Monday 8 AM</td></tr><tr><td>Recipients</td><td>CEO, CFO, VP Marketing</td></tr><tr><td>Format</td><td>PDF attachment + embedded visuals in email body</td></tr><tr><td>Subject</td><td><code>DataPulse Weekly Analytics Report — {date}</code></td></tr><tr><td>Include</td><td>Sheet 1 (Revenue) + Sheet 3 (Regional)</td></tr></tbody></table>
+<p>→ Executives receive automated visual reports without logging in<br>
+→ No data team involvement needed</p>
+<p><strong>Step C11 — Configure Dashboard Embedding (for Internal Portal)</strong></p>
+<p>→ Enterprise Edition feature — embed QuickSight dashboards in external websites</p>
+<p><strong>Embedding Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+</span>│  Internal Portal │     │  Backend Server   │     │  QuickSight      │
+│  (Browser)       │     │  (Lambda + API GW)│     │  Service         │
+│                  │     │                   │     │                  │
+│  1. User visits  │────▶│  2. Generate      │────▶│  3. Return       │
+│     portal page  │     │     embedding URL │     │     signed URL   │
+│                  │◄────│     via QS API    │◄────│     with token   │
+│  4. Render       │     │                   │     │                  │
+│     dashboard    │     │                   │     │                  │
+│     in iframe    │     │                   │     │                  │
+└──────────────────┘     └──────────────────┘     └──────────────────┘</code></pre></div>
+<p>→ QuickSight Console → Manage QuickSight → Domains and Embedding</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Allowed Domains</td><td><code>https://portal.datapulse.com</code></td></tr><tr><td>Embedding Type</td><td>Anonymous embedding OR authenticated embedding</td></tr></tbody></table>
+<p>→ For authenticated embedding:</p>
+<ul>
+<li>Backend generates embedding URL using QuickSight <code>GenerateEmbedUrlForRegisteredUser</code> API</li>
+<li>URL is time-limited and user-specific</li>
+<li>RLS still applies — embedded dashboard shows only user's authorized data</li>
+</ul>
+<hr>
+<h3>SECTION D — SECURITY ACROSS ALL LAYERS</h3>
+<hr>
+<p><strong>Step D1 — API Security Summary</strong></p>
+<table><thead><tr><th>Layer</th><th>Security Mechanism</th><th>Configuration</th></tr></thead><tbody><tr><td>API Gateway</td><td>TLS 1.2 encryption in transit</td><td>Default — all API Gateway endpoints are HTTPS</td></tr><tr><td>API Gateway</td><td>Authentication</td><td>API Keys (partners), Cognito (mobile), IAM (internal)</td></tr><tr><td>API Gateway</td><td>Rate Limiting</td><td>Usage Plans per consumer type</td></tr><tr><td>API Gateway</td><td>Request Validation</td><td>Required parameters validated before Lambda</td></tr><tr><td>API Gateway</td><td>WAF Integration</td><td>See Step D2</td></tr><tr><td>Lambda</td><td>Least privilege IAM role</td><td>Only refined_db access, only api-queries workgroup</td></tr><tr><td>Lambda</td><td>Environment variable encryption</td><td>KMS-encrypted environment variables</td></tr><tr><td>Athena</td><td>Workgroup isolation</td><td>Separate workgroups per consumer type</td></tr><tr><td>Athena</td><td>Query data limit</td><td>Per-query scan limits in workgroup</td></tr><tr><td>S3</td><td>Encryption at rest</td><td>SSE-KMS (Project 57)</td></tr><tr><td>S3</td><td>Bucket policy</td><td>Only authorized roles can read refined zone</td></tr><tr><td>QuickSight</td><td>Row-Level Security</td><td>Users see only their authorized data</td></tr><tr><td>QuickSight</td><td>Column-Level Security</td><td>Sensitive columns hidden from specific groups</td></tr><tr><td>QuickSight</td><td>Enterprise encryption</td><td>Customer KMS key</td></tr></tbody></table>
+<p><strong>Step D2 — Attach AWS WAF to API Gateway</strong></p>
+<p>→ WAF Console → Create Web ACL</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Web ACL Name</td><td><code>datapulse-api-waf</code></td></tr><tr><td>Resource Type</td><td>Regional (API Gateway)</td></tr><tr><td>Associated Resource</td><td><code>datapulse-analytics-api</code> (prod stage)</td></tr></tbody></table>
+<p>→ Add Managed Rules:</p>
+<table><thead><tr><th>Rule Group</th><th>Purpose</th></tr></thead><tbody><tr><td>AWS Managed Rules — Common Rule Set</td><td>Block common attack patterns (XSS, SQLi)</td></tr><tr><td>AWS Managed Rules — Known Bad Inputs</td><td>Block requests with known malicious content</td></tr><tr><td>AWS Managed Rules — IP Reputation List</td><td>Block known malicious IPs</td></tr><tr><td>Rate-Based Rule</td><td>Block IPs making &gt; 100 requests in 5 minutes</td></tr></tbody></table>
+<p>→ Custom Rules:</p>
+<table><thead><tr><th>Rule Name</th><th>Condition</th><th>Action</th></tr></thead><tbody><tr><td>Block non-HTTPS</td><td>Request not using HTTPS</td><td>Block</td></tr><tr><td>Geo-restriction</td><td>Request from countries not in allowed list</td><td>Block (if applicable)</td></tr><tr><td>Size restriction</td><td>Request body &gt; 10 KB</td><td>Block (API shouldn't receive large payloads)</td></tr></tbody></table>
+<p><strong>Step D3 — Configure QuickSight Column-Level Security</strong></p>
+<p>→ QuickSight Console → Datasets → Select Dataset → Column-Level Permissions</p>
+<table><thead><tr><th>Column</th><th>Restricted For</th><th>Reason</th></tr></thead><tbody><tr><td>customer_email</td><td>Marketing Analysts (Readers)</td><td>PII — only Authors and Admins see</td></tr><tr><td>customer_phone</td><td>All Readers</td><td>PII — never shown in dashboards</td></tr><tr><td>internal_cost</td><td>All except CFO and Finance</td><td>Confidential pricing data</td></tr></tbody></table>
+<p>→ CLS works alongside RLS:</p>
+<ul>
+<li>RLS filters ROWS (which records you see)</li>
+<li>CLS filters COLUMNS (which fields you see)</li>
+<li>Combined: Regional Finance Manager sees only their region's data AND only non-sensitive columns</li>
+</ul>
+<hr>
+<h3>SECTION E — MONITORING AND COST MANAGEMENT</h3>
+<hr>
+<p><strong>Step E1 — Create CloudWatch Dashboard for Platform Monitoring</strong></p>
+<p>→ CloudWatch Console → Dashboards → Create</p>
+<p><strong>Dashboard: DataPulse Analytics Platform</strong></p>
+<table><thead><tr><th>Widget</th><th>Metrics</th><th>Purpose</th></tr></thead><tbody><tr><td>API Request Count</td><td>API Gateway: Count by endpoint</td><td>Track API usage patterns</td></tr><tr><td>API Latency</td><td>API Gateway: Latency P50, P90, P99</td><td>Identify slow endpoints</td></tr><tr><td>API Errors</td><td>API Gateway: 4XX, 5XX by endpoint</td><td>Detect auth failures, Lambda errors</td></tr><tr><td>Cache Hit Rate</td><td>API Gateway: CacheHitCount / (CacheHitCount + CacheMissCount)</td><td>Measure cache effectiveness</td></tr><tr><td>Lambda Duration</td><td>Lambda: Duration by function</td><td>Identify slow functions</td></tr><tr><td>Lambda Errors</td><td>Lambda: Errors by function</td><td>Detect function failures</td></tr><tr><td>Lambda Concurrency</td><td>Lambda: ConcurrentExecutions</td><td>Capacity planning</td></tr><tr><td>Athena Query Time</td><td>Athena: TotalExecutionTime by workgroup</td><td>Monitor query performance</td></tr><tr><td>Athena Data Scanned</td><td>Athena: DataScannedInBytes by workgroup</td><td>Cost monitoring</td></tr><tr><td>SPICE Refresh Status</td><td>QuickSight: SPICE ingestion metrics</td><td>Verify data freshness</td></tr></tbody></table>
+<p><strong>Step E2 — Cost Breakdown for Serverless Platform</strong></p>
+<table><thead><tr><th>Component</th><th>Pricing Model</th><th>Estimated Monthly Cost</th></tr></thead><tbody><tr><td>API Gateway</td><td>$3.50 per million requests + cache ($0.02/hr for 0.5 GB)</td><td>~$50</td></tr><tr><td>Lambda</td><td>$0.20 per million requests + $0.0000166667 per GB-second</td><td>~$30</td></tr><tr><td>Athena</td><td>$5 per TB scanned (reduced by caching + SPICE)</td><td>~$100</td></tr><tr><td>QuickSight</td><td>Readers: $5/max/user/month, Authors: $18/month</td><td>~$324</td></tr><tr><td>S3 (refined zone)</td><td>Already accounted in data lake costs</td><td>$0 incremental</td></tr><tr><td>WAF</td><td>$5/month + $1/million requests</td><td>~$10</td></tr><tr><td>Cognito</td><td>Free tier: 50,000 MAU</td><td>~$0</td></tr><tr><td>CloudWatch</td><td>Logs + Metrics + Dashboard</td><td>~$20</td></tr><tr><td><strong>Total Platform</strong></td><td></td><td><strong>~$534/month</strong></td></tr></tbody></table>
+<p>→ Compare to alternative: Running EC2-based analytics servers</p>
+<ul>
+<li>3 EC2 instances for web dashboards: ~$500/month</li>
+<li>Application Load Balancer: ~$25/month</li>
+<li>RDS for dashboard metadata: ~$100/month</li>
+<li>Server patching, monitoring, scaling management: ~$2,000/month (engineer time)</li>
+<li>Total: ~$2,625/month<br>
+→ Serverless saves ~$2,091/month AND eliminates operational overhead</li>
+</ul>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always pre-aggregate data into refined zone — don't make QuickSight or API query raw data<br>
+→ Always use SPICE for QuickSight dashboards — eliminates per-view Athena costs<br>
+→ Always configure SPICE refresh AFTER ETL completes — use EventBridge or schedule dependency<br>
+→ Always use separate Athena workgroups per consumer type — cost isolation and query limits<br>
+→ Always enable API Gateway caching for frequently requested endpoints — massive cost and latency savings<br>
+→ Always use Lambda Proxy Integration — simplest pattern, full request context in Lambda<br>
+→ Always implement authentication on every API endpoint — no public anonymous access<br>
+→ Always use API Keys + Usage Plans for external partners — rate limiting prevents abuse<br>
+→ Always use Cognito for mobile/web user authentication — managed auth, no custom auth code<br>
+→ Always configure Row-Level Security for multi-tenant data access — compliance requirement<br>
+→ Always attach WAF to API Gateway — first line of defense against attacks<br>
+→ Always use Parquet format in refined zone — columnar format minimizes Athena scan costs<br>
+→ Always partition refined data — Athena only scans relevant partitions, reducing cost 10-100x<br>
+→ Always set per-query scan limits in Athena workgroups — prevents expensive runaway queries<br>
+→ Always monitor API Gateway cache hit rate — low hit rate means cache is misconfigured<br>
+→ Always use Regional API Gateway endpoint when clients are in same region — lower latency than Edge</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never point QuickSight directly at raw S3 data — performance will be terrible and Athena costs will explode<br>
+→ Never use Direct Query mode in QuickSight for dashboards viewed by many users — each view triggers Athena query<br>
+→ Never expose Lambda functions directly without API Gateway — no auth, no throttling, no caching<br>
+→ Never hardcode database credentials in Lambda environment variables — use Secrets Manager (Project 37)<br>
+→ Never set Lambda timeout higher than API Gateway timeout (29 seconds) — request will timeout at gateway level<br>
+→ Never skip request validation in API Gateway — invalid requests should never reach Lambda<br>
+→ Never allow unlimited Athena query scan in API workgroup — one bad query can cost hundreds of dollars<br>
+→ Never share QuickSight Author licenses with users who only need to view — Readers are 70% cheaper<br>
+→ Never embed QuickSight dashboards without domain whitelisting — security violation<br>
+→ Never skip WAF on public-facing APIs — SQL injection and XSS attacks are constant<br>
+→ Never use API Gateway Edge-optimized endpoint for same-region clients — adds unnecessary CloudFront hop<br>
+→ Never configure SPICE refresh at the same time as ETL — refresh may pull stale data<br>
+→ Never grant QuickSight access to entire S3 bucket — restrict to refined zone prefixes only<br>
+→ Never use single API key for all partners — each partner needs individual key for tracking and revocation<br>
+→ Never ignore API Gateway 429 (Too Many Requests) errors — indicates throttling is too aggressive or client is misbehaving</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Right Tool</th></tr></thead><tbody><tr><td>Business users need interactive visual dashboards</td><td>QuickSight</td></tr><tr><td>Mobile/web apps need JSON API responses</td><td>API Gateway + Lambda + Athena</td></tr><tr><td>External partners need programmatic data access</td><td>API Gateway with API Keys + Usage Plans</td></tr><tr><td>Need sub-second dashboard response</td><td>QuickSight SPICE</td></tr><tr><td>Need real-time data (&lt; 1 minute freshness)</td><td>QuickSight Direct Query OR API Gateway (no cache)</td></tr><tr><td>Need daily-refresh analytics (acceptable 1-day lag)</td><td>QuickSight SPICE with daily refresh</td></tr><tr><td>Need row-level data access control</td><td>QuickSight RLS OR Lambda-level filtering</td></tr><tr><td>Need to embed analytics in external website</td><td>QuickSight Embedded Dashboards</td></tr><tr><td>Need automated email reports</td><td>QuickSight Email Reports</td></tr><tr><td>Need API rate limiting per consumer</td><td>API Gateway Usage Plans</td></tr><tr><td>Need to protect API from attacks</td><td>WAF + API Gateway</td></tr><tr><td>Need user authentication for web/mobile</td><td>Cognito User Pools</td></tr><tr><td>Need authentication for internal AWS tools</td><td>IAM Authorization on API Gateway</td></tr><tr><td>Need to query S3 data without managing servers</td><td>Athena</td></tr><tr><td>Need complex multi-table joins with sub-second response</td><td>Redshift (not Athena)</td></tr><tr><td>Need to cache API responses</td><td>API Gateway Caching</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use QuickSight when users need to write custom SQL — use Athena directly<br>
+→ Do NOT use Athena through API Gateway for transactional operations (INSERT/UPDATE) — Athena is read-only on S3<br>
+→ Do NOT use API Gateway for real-time streaming — use WebSocket API or AppSync<br>
+→ Do NOT use Lambda for queries that take &gt; 29 seconds — use async pattern or Step Functions (Project 32)<br>
+→ Do NOT use SPICE for data that changes every minute — use Direct Query for near-real-time<br>
+→ Do NOT use QuickSight for pixel-perfect formatted reports — use a reporting tool like JasperReports<br>
+→ Do NOT use API Gateway REST API for GraphQL — use AWS AppSync<br>
+→ Do NOT use Cognito User Pools for machine-to-machine auth — use API Keys or IAM<br>
+→ Do NOT use QuickSight Reader licenses for users who need to create their own analyses — they need Author<br>
+→ Do NOT use API Gateway caching for data that changes every few seconds — stale cache will serve wrong data<br>
+→ Do NOT use single Lambda function for all API endpoints — separate functions per endpoint for independent scaling and deployment</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>API GATEWAY INTERNAL MECHANICS</h3>
+<p><strong>1 → Request Processing Pipeline</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Client Request
+</span>      │
+      ▼
+┌─────────────────────┐
+│  1. TLS TERMINATION │  ← HTTPS decrypted at API Gateway edge
+└──────────┬──────────┘
+           │
+┌──────────▼──────────┐
+│  2. WAF EVALUATION  │  ← WAF rules checked (if attached)
+│     (if configured) │     Block/Allow decision
+└──────────┬──────────┘
+           │
+┌──────────▼──────────┐
+│  3. THROTTLING      │  ← Token bucket algorithm
+│     CHECK           │     Account level → Stage level → Method level
+│                     │     If exceeded → 429 Too Many Requests
+└──────────┬──────────┘
+           │
+┌──────────▼──────────┐
+│  4. AUTHENTICATION  │  ← API Key validation / Cognito JWT / IAM Sig V4
+│     &amp; AUTHORIZATION │     If failed → 401 Unauthorized or 403 Forbidden
+└──────────┬──────────┘
+           │
+┌──────────▼──────────┐
+│  5. REQUEST         │  ← Check required parameters, headers, body schema
+│     VALIDATION      │     If invalid → 400 Bad Request
+└──────────┬──────────┘
+           │
+┌──────────▼──────────┐
+│  6. CACHE LOOKUP    │  ← Check if response is cached for this request
+│     (if enabled)    │     If cache hit → return cached response (skip steps 7-8)
+└──────────┬──────────┘
+           │ (cache miss)
+┌──────────▼──────────┐
+│  7. INTEGRATION     │  ← Forward request to Lambda (or HTTP, AWS service)
+│     (Lambda invoke) │     Wait for response
+└──────────┬──────────┘
+           │
+┌──────────▼──────────┐
+│  8. RESPONSE        │  ← Map Lambda response to HTTP response
+│     MAPPING         │     Store in cache (if enabled)
+│                     │     Return to client
+└─────────────────────┘</code></pre></div>
+<p><strong>2 → Throttling: Token Bucket Algorithm</strong></p>
+<p>→ API Gateway uses a token bucket algorithm for rate limiting:</p>
+<ul>
+<li>Bucket holds up to <code>burst</code> tokens</li>
+<li>Tokens are added at <code>rate</code> tokens per second</li>
+<li>Each request consumes one token</li>
+<li>If bucket is empty → request is throttled (429 response)</li>
+</ul>
+<p>→ Example: Rate = 10 req/s, Burst = 20</p>
+<ul>
+<li>Bucket starts full: 20 tokens</li>
+<li>20 requests arrive simultaneously → all served (bucket now empty)</li>
+<li>Tokens refill at 10/second</li>
+<li>11th request 0.5 seconds later → only 5 tokens available → served</li>
+<li>If 100 requests arrive at once → 20 served, 80 throttled</li>
+</ul>
+<p><strong>3 → API Gateway Caching Internals</strong></p>
+<p>→ Cache is an in-memory store (similar to ElastiCache) managed by API Gateway<br>
+→ Cache key = HTTP method + resource path + query string parameters + headers (configurable)<br>
+→ Same cache key → same cached response<br>
+→ Cache is per-stage (prod, dev have separate caches)<br>
+→ Cache is NOT shared across API Gateway instances — each instance has its own cache<br>
+→ Cache invalidation: TTL expiry OR explicit <code>Cache-Control: max-age=0</code> header</p>
+<p><strong>4 → Lambda Proxy Integration Data Flow</strong></p>
+<p>→ When Lambda Proxy Integration is enabled:</p>
+<p>→ API Gateway sends to Lambda:</p>
+<table><thead><tr><th>Field</th><th>Content</th><th>Required</th></tr></thead><tbody><tr><td>statusCode</td><td>HTTP status code (200, 400, 500)</td><td>✅ Yes</td></tr><tr><td>headers</td><td>Response headers (Content-Type, CORS headers)</td><td>✅ Yes</td></tr><tr><td>body</td><td>JSON string of response data</td><td>✅ Yes</td></tr><tr><td>isBase64Encoded</td><td>Boolean — true if body is base64</td><td>❌ Optional</td></tr></tbody></table>
+<p>→ If Lambda returns ANY other format → API Gateway returns 502 Bad Gateway<br>
+→ This is the #1 cause of mysterious 502 errors — Lambda response format mismatch</p>
+<p>→ Example successful response structure:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>statusCode</td><td>200</td></tr><tr><td>headers</td><td><code>{ "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }</code></td></tr><tr><td>body</td><td><code>"{ \"data\": [...], \"metadata\": { \"query_time_ms\": 2340, \"rows\": 31 } }"</code></td></tr></tbody></table>
+<p>→ Example error response structure:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>statusCode</td><td>400</td></tr><tr><td>headers</td><td><code>{ "Content-Type": "application/json" }</code></td></tr><tr><td>body</td><td><code>"{ \"error\": \"Missing required parameter: start_date\" }"</code></td></tr></tbody></table>
+<p><strong>5 → API Gateway Stages Internals</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>API Definition (Resources + Methods)
+</span>           │
+           │ Deploy
+           │
+     ┌─────▼─────────────────────────────────┐
+     │           DEPLOYMENTS                   │
+     │                                         │
+     │  Deploy-001 (Jan 15) ──► Stage: prod   │
+     │  Deploy-002 (Jan 20) ──► Stage: staging│
+     │  Deploy-003 (Jan 25) ──► (not mapped)  │
+     │  Deploy-004 (Feb 01) ──► Stage: prod   │
+     │                          (updated)      │
+     └─────────────────────────────────────────┘</code></pre></div>
+<p>→ A Deployment is a snapshot of the API configuration<br>
+→ A Stage is a named reference to a deployment (like a Git branch pointing to a commit)<br>
+→ You can roll back by pointing the stage to a previous deployment<br>
+→ Each stage has its own:</p>
+<ul>
+<li>URL: <code>https://{api-id}.execute-api.{region}.amazonaws.com/{stage-name}/</code></li>
+<li>Stage variables (like environment variables for the stage)</li>
+<li>Throttling settings</li>
+<li>Cache settings</li>
+<li>Logging settings</li>
+</ul>
+<p>→ DataPulse stages:</p>
+<table><thead><tr><th>Stage</th><th>Purpose</th><th>Lambda Alias</th><th>Cache</th></tr></thead><tbody><tr><td>prod</td><td>Production traffic</td><td>$LATEST or prod alias</td><td>✅ Enabled</td></tr><tr><td>staging</td><td>Pre-production testing</td><td>staging alias</td><td>❌ Disabled</td></tr><tr><td>dev</td><td>Development testing</td><td>dev alias</td><td>❌ Disabled</td></tr></tbody></table>
+<hr>
+<h3>QUICKSIGHT SPICE INTERNAL MECHANICS</h3>
+<p><strong>1 → What is SPICE?</strong></p>
+<p>→ SPICE = Super-fast, Parallel, In-memory Calculation Engine<br>
+→ It is a purpose-built columnar in-memory data store<br>
+→ When you import data into SPICE:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
+</span>│  Data Source  │     │  SPICE Import    │     │  SPICE Storage   │
+│  (Athena/    │────▶│  Engine          │────▶│  (In-Memory)     │
+│   Redshift/  │     │                  │     │                  │
+│   S3)        │     │  • Column encode │     │  • Compressed    │
+│              │     │  • Compress      │     │  • Columnar      │
+│              │     │  • Partition     │     │  • Indexed       │
+│              │     │  • Index         │     │  • Distributed   │
+└──────────────┘     └──────────────────┘     └──────────────────┘</code></pre></div>
+<p><strong>2 → SPICE Data Processing</strong></p>
+<p>→ During import, SPICE:</p>
+<ol>
+<li>Reads data from source (Athena query, S3 file, Redshift query)</li>
+<li>Encodes each column independently (columnar format)</li>
+<li>Applies automatic compression (dictionary encoding, run-length encoding)</li>
+<li>Creates internal indexes for filter and aggregation operations</li>
+<li>Distributes data across SPICE cluster nodes</li>
+<li>Stores entirely in memory (with SSD spillover for very large datasets)</li>
+</ol>
+<p>→ Compression ratio: Typically 10:1 to 20:1<br>
+→ 100 GB of raw CSV data → ~5-10 GB in SPICE<br>
+→ This is why SPICE capacity is measured differently than raw data size</p>
+<p><strong>3 → SPICE Query Processing</strong></p>
+<p>→ When a user interacts with a dashboard (clicks filter, hovers over chart):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User Action (click filter "Region = North")
+</span>           │
+           ▼
+┌─────────────────────┐
+│  QuickSight Frontend │
+│  (Browser)           │
+│                      │
+│  Translates to       │
+│  internal query      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  SPICE Engine        │
+│                      │
+│  • Scan only "region"│     ← Columnar: reads only needed columns
+│    column            │
+│  • Apply filter      │     ← In-memory: microsecond filtering
+│  • Aggregate         │     ← Parallel: across SPICE nodes
+│  • Return result     │
+│                      │
+│  Typical time:       │
+│  10-500 milliseconds │     ← Sub-second for most operations
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Visual Updated      │
+│  (Chart re-renders)  │
+└─────────────────────┘</code></pre></div>
+<p>→ No Athena query executed<br>
+→ No S3 scan performed<br>
+→ No network call to data source<br>
+→ Pure in-memory computation → sub-second response</p>
+<p><strong>4 → SPICE Capacity Management</strong></p>
+<p>→ Each QuickSight author gets 10 GB of SPICE capacity included<br>
+→ Additional SPICE: $0.25/GB/month (Enterprise)</p>
+<p>→ DataPulse SPICE calculation:</p>
+<table><thead><tr><th>Dataset</th><th>Raw Size</th><th>Estimated SPICE Size</th><th>Refresh Frequency</th></tr></thead><tbody><tr><td>Daily Revenue</td><td>2 GB</td><td>~200 MB</td><td>Daily</td></tr><tr><td>Product Performance</td><td>1 GB</td><td>~100 MB</td><td>Daily</td></tr><tr><td>Regional Summary</td><td>500 MB</td><td>~50 MB</td><td>Daily</td></tr><tr><td>Customer Acquisition</td><td>300 MB</td><td>~30 MB</td><td>Weekly</td></tr><tr><td><strong>Total</strong></td><td><strong>3.8 GB</strong></td><td><strong>~380 MB</strong></td><td></td></tr></tbody></table>
+<p>→ 2 Authors × 10 GB included = 20 GB total SPICE capacity<br>
+→ 380 MB used → well within free allocation<br>
+→ No additional SPICE charges</p>
+<p><strong>5 → SPICE Refresh Internals</strong></p>
+<p>→ Full Refresh:</p>
+<ul>
+<li>SPICE runs the source query (Athena query against refined_db)</li>
+<li>Downloads ALL data</li>
+<li>Replaces the entire in-memory dataset atomically</li>
+<li>During refresh: Users see OLD data until refresh completes</li>
+<li>After refresh: Users instantly see NEW data (no partial state)</li>
+</ul>
+<p>→ Incremental Refresh (Enterprise):</p>
+<ul>
+<li>SPICE runs a filtered query (e.g., WHERE date &gt; last_refresh_date)</li>
+<li>Downloads only NEW/CHANGED data</li>
+<li>Merges with existing SPICE data</li>
+<li>Faster than full refresh for large datasets with small daily additions</li>
+</ul>
+<p>→ Refresh failure handling:</p>
+<ul>
+<li>If refresh fails → old data remains (users see stale but valid data)</li>
+<li>QuickSight sends failure notification to configured email/SNS</li>
+<li>Common failure causes: Athena timeout, S3 permission change, schema change</li>
+</ul>
+<hr>
+<h3>COGNITO INTERNAL MECHANICS</h3>
+<p><strong>1 → Authentication Flow (Mobile App)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: User opens mobile app → enters email + password
+</span>           │
+           ▼
+Step 2: App sends credentials to Cognito User Pool
+           │
+           ▼
+Step 3: Cognito validates credentials
+        │
+        ├── If MFA enabled → Cognito sends MFA challenge
+        │   │
+        │   └── User enters MFA code → Cognito validates
+        │
+        └── If credentials valid + MFA passed:
+           │
+           ▼
+Step 4: Cognito returns THREE tokens:
+        ┌────────────────────────────────────────┐
+        │  ID Token (JWT)                         │
+        │  • Contains user identity claims        │
+        │  • email, sub (user ID), custom attrs   │
+        │  • Expires: 1 hour                      │
+        │                                         │
+        │  Access Token (JWT)                     │
+        │  • Contains authorization scopes        │
+        │  • Used for API access                  │
+        │  • Expires: 1 hour                      │
+        │                                         │
+        │  Refresh Token                          │
+        │  • Used to get new ID/Access tokens     │
+        │  • Without re-entering credentials      │
+        │  • Expires: 30 days (configurable)      │
+        └────────────────────────────────────────┘
+           │
+           ▼
+Step 5: App stores tokens securely on device
+           │
+           ▼
+Step 6: App makes API request with Access Token:
+        Header: Authorization: Bearer &lt;access-token&gt;
+           │
+           ▼
+Step 7: API Gateway Cognito Authorizer validates token:
+        │
+        ├── Verifies JWT signature (using Cognito public keys)
+        ├── Checks token expiration
+        ├── Verifies issuer matches User Pool
+        ├── Verifies audience matches App Client ID
+        │
+        └── If valid → request proceeds to Lambda
+            Lambda receives user claims from token</code></pre></div>
+<p><strong>2 → JWT Token Validation at API Gateway</strong></p>
+<p>→ API Gateway does NOT call Cognito to validate each token<br>
+→ Instead, it uses JWT signature verification:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Cognito signs tokens with RSA private key
+</span>           │
+           ▼
+API Gateway has Cognito's public key (JWKS - JSON Web Key Set)
+           │
+           ▼
+For each request:
+  1. Extract JWT from Authorization header
+  2. Decode JWT header → get key ID (kid)
+  3. Look up public key matching kid from JWKS
+  4. Verify JWT signature using public key
+  5. Check exp (expiration) claim
+  6. Check iss (issuer) claim matches User Pool URL
+  7. Check aud (audience) claim matches App Client ID
+  8. If ALL checks pass → request authorized</code></pre></div>
+<p>→ This is STATELESS validation — no database lookup, no network call to Cognito<br>
+→ Sub-millisecond authorization overhead<br>
+→ Scales infinitely — no bottleneck at Cognito</p>
+<p><strong>3 → Token Refresh Flow</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Access Token expired (after 1 hour)
+</span>           │
+           ▼
+App detects 401 response from API
+           │
+           ▼
+App sends Refresh Token to Cognito
+           │
+           ▼
+Cognito validates Refresh Token
+           │
+           ├── If valid → returns new ID Token + Access Token
+           │   (Refresh Token remains the same)
+           │
+           └── If expired/revoked → returns error
+               App redirects user to login screen</code></pre></div>
+<p>→ User experience: Seamless — app automatically refreshes tokens in background<br>
+→ User only re-authenticates when Refresh Token expires (30 days)</p>
+<hr>
+<h3>ATHENA QUERY EXECUTION INTERNAL MECHANICS (DEEP DIVE)</h3>
+<p><strong>1 → Query Lifecycle Through Lambda</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda invokes Athena StartQueryExecution
+</span>           │
+           ▼
+┌─────────────────────────────────────────┐
+│  ATHENA QUERY PROCESSING                 │
+│                                           │
+│  Step 1: PARSE                           │
+│  • Parse SQL syntax                      │
+│  • Resolve table names via Glue Catalog  │
+│  • Identify partitions to scan           │
+│                                           │
+│  Step 2: PLAN                            │
+│  • Generate query execution plan         │
+│  • Determine which S3 objects to read    │
+│  • Partition pruning (skip irrelevant    │
+│    partitions based on WHERE clause)     │
+│  • Column pruning (read only needed      │
+│    columns from Parquet)                 │
+│                                           │
+│  Step 3: EXECUTE                         │
+│  • Distribute work across Athena workers │
+│  • Each worker reads assigned S3 objects │
+│  • Apply filters, aggregations in        │
+│    parallel                              │
+│  • Combine results                       │
+│                                           │
+│  Step 4: WRITE RESULTS                   │
+│  • Write query results to S3             │
+│    (athena-results/ location)            │
+│  • Results in CSV format by default      │
+│                                           │
+│  Step 5: SIGNAL COMPLETION               │
+│  • Query state → SUCCEEDED               │
+│  • Lambda polls GetQueryExecution         │
+│  • Lambda calls GetQueryResults           │
+│  • Results returned to Lambda             │
+└─────────────────────────────────────────┘</code></pre></div>
+<p><strong>2 → Why Partitioning Saves Money (Quantified)</strong></p>
+<p>→ <code>rpt_daily_revenue</code> table partitioned by year/month/day<br>
+→ Total data: 2 GB across all partitions</p>
+<p>→ Query: "Revenue for January 2025"</p>
+<table><thead><tr><th>Scenario</th><th>Data Scanned</th><th>Athena Cost</th><th>Time</th></tr></thead><tbody><tr><td>NO partitioning</td><td>2 GB (full table scan)</td><td>$0.01</td><td>~5 seconds</td></tr><tr><td>WITH partitioning (year=2025/month=01)</td><td>65 MB (only Jan 2025 files)</td><td>$0.000325</td><td>~1.5 seconds</td></tr><tr><td>Savings</td><td>97% less data scanned</td><td>97% cheaper</td><td>70% faster</td></tr></tbody></table>
+<p>→ At API scale (10,000 queries/month):</p>
+<table><thead><tr><th>Scenario</th><th>Monthly Athena Cost</th></tr></thead><tbody><tr><td>Without partitioning</td><td>$100</td></tr><tr><td>With partitioning</td><td>$3.25</td></tr><tr><td>With partitioning + API Gateway cache (80% hit rate)</td><td>$0.65</td></tr></tbody></table>
+<p>→ This is why data preparation (Section A) is critical for a cost-effective API</p>
+<p><strong>3 → Why Parquet Format Saves Money (Quantified)</strong></p>
+<p>→ Parquet is COLUMNAR — query reads only the columns needed</p>
+<p>→ <code>rpt_daily_revenue</code> has 12 columns<br>
+→ Revenue query needs only 3 columns: date, region, revenue</p>
+<table><thead><tr><th>Format</th><th>Data Read</th><th>Reason</th></tr></thead><tbody><tr><td>CSV</td><td>65 MB (all columns)</td><td>Row-based — must read entire row to get any column</td></tr><tr><td>Parquet</td><td>~16 MB (3/12 columns)</td><td>Columnar — reads only requested columns</td></tr><tr><td>Savings</td><td>75% less data read</td><td>75% cheaper and faster</td></tr></tbody></table>
+<p>→ Combined savings: Partitioning (97%) + Parquet column pruning (75% of remaining)<br>
+→ Original 2 GB scan → reduced to ~4 MB<br>
+→ Athena cost: $0.00002 per query</p>
+<hr>
+<h3>WAF INTERNAL MECHANICS</h3>
+<p><strong>1 → Rule Evaluation Order</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Request arrives at WAF
+</span>           │
+           ▼
+┌─────────────────────────────────────────┐
+│  RULE EVALUATION (Priority Order)        │
+│                                           │
+│  Priority 1: Rate-Based Rule             │
+│  • Count requests per IP in 5-min window │
+│  • If &gt; threshold → BLOCK + add to       │
+│    blocked IP set for remaining window   │
+│                                           │
+│  Priority 2: IP Reputation List          │
+│  • Check source IP against AWS threat DB │
+│  • If match → BLOCK                     │
+│                                           │
+│  Priority 3: Common Rule Set             │
+│  • Check for XSS patterns in params     │
+│  • Check for SQL injection patterns     │
+│  • Check for command injection           │
+│  • If match → BLOCK                     │
+│                                           │
+│  Priority 4: Known Bad Inputs            │
+│  • Check for known exploit payloads      │
+│  • If match → BLOCK                     │
+│                                           │
+│  Priority 5: Custom Geo Rule             │
+│  • Check source country                  │
+│  • If not in allowed list → BLOCK        │
+│                                           │
+│  Default Action: ALLOW                   │
+│  (If no rule blocks → request proceeds)  │
+│                                           │
+└──────────┬──────────────────────────────┘
+           │
+           ▼
+    Request proceeds to API Gateway</code></pre></div>
+<p>→ Rules are evaluated in PRIORITY ORDER (lowest number = highest priority)<br>
+→ First matching BLOCK rule stops evaluation → request blocked<br>
+→ If NO rule blocks → default action applies (ALLOW or BLOCK)<br>
+→ Best practice: Default action = ALLOW, explicit BLOCK rules for threats<br>
+→ Alternative: Default action = BLOCK, explicit ALLOW rules for known-good traffic (stricter)</p>
+<p><strong>2 → WAF Logging</strong></p>
+<p>→ WAF can log ALL evaluated requests to:</p>
+<ul>
+<li>S3 (for long-term analysis with Athena — connects to Project 18)</li>
+<li>CloudWatch Logs (for real-time alerting)</li>
+<li>Kinesis Data Firehose (for streaming analysis — Project 52)</li>
+</ul>
+<p>→ Each log entry contains:</p>
+<ul>
+<li>Timestamp, source IP, country, URI, headers</li>
+<li>Which rules were evaluated</li>
+<li>Which rule triggered the action (ALLOW/BLOCK/COUNT)</li>
+<li>Request body (if configured — careful with PII)</li>
+</ul>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Impact</th><th>Prevention</th></tr></thead><tbody><tr><td>1</td><td>Lambda timeout shorter than Athena query time</td><td>Lambda terminates before Athena returns results → 502 error</td><td>Set Lambda timeout = 29 seconds (API Gateway max) → use pre-aggregated data for fast queries</td></tr><tr><td>2</td><td>API Gateway 29-second timeout exceeded</td><td>504 Gateway Timeout → client gets no response</td><td>Use async pattern for long queries → pre-aggregate data to keep queries under 5 seconds</td></tr><tr><td>3</td><td>SPICE refresh scheduled BEFORE ETL completes</td><td>Dashboard shows yesterday's data (ETL hasn't finished)</td><td>Schedule SPICE refresh 30-60 minutes after ETL → use EventBridge to trigger refresh after Glue workflow completes</td></tr><tr><td>4</td><td>No API Gateway caching configured</td><td>Every request triggers Lambda + Athena → high cost, high latency</td><td>Enable caching with appropriate TTL → monitor cache hit rate</td></tr><tr><td>5</td><td>QuickSight pointing at raw zone instead of refined</td><td>Slow queries, high Athena costs, poor user experience</td><td>Always create refined zone with pre-aggregated data → point QuickSight only at refined</td></tr><tr><td>6</td><td>RLS permission dataset out of sync with user list</td><td>New employees see no data OR former employees still have access</td><td>Automate RLS dataset updates from HR system → review quarterly</td></tr><tr><td>7</td><td>Lambda response format incorrect (missing statusCode)</td><td>API Gateway returns 502 Bad Gateway → confusing error for clients</td><td>Standardize Lambda response format → add error handling wrapper in every function</td></tr><tr><td>8</td><td>API Key exposed in mobile app source code</td><td>Partners' API keys compromised → unauthorized access</td><td>Never embed API keys in client-side code → use Cognito for mobile, API keys only for server-to-server</td></tr><tr><td>9</td><td>Cognito User Pool MFA not enforced</td><td>Account takeover if password compromised</td><td>Always enforce MFA for production user pools</td></tr><tr><td>10</td><td>WAF not attached to API Gateway</td><td>API exposed to SQL injection, XSS, DDoS</td><td>Always attach WAF to public-facing API Gateway stages</td></tr><tr><td>11</td><td>Athena workgroup without scan limit</td><td>Single bad query scans entire data lake → $500 charge</td><td>Always set per-query and per-workgroup scan limits</td></tr><tr><td>12</td><td>QuickSight Author license for all users</td><td>$18/month × 45 analysts = $810/month instead of $225/month</td><td>Analysts who only VIEW dashboards need Reader license, not Author</td></tr><tr><td>13</td><td>API Gateway CORS not configured</td><td>Browser-based clients get CORS errors → API unusable from web</td><td>Enable CORS on each method → configure allowed origins, methods, headers</td></tr><tr><td>14</td><td>Lambda cold start causes timeout for first request</td><td>First request after idle period takes 5-10 seconds extra → timeout</td><td>Use Lambda Provisioned Concurrency for critical API functions → or use SnapStart</td></tr><tr><td>15</td><td>Cache key doesn't include all relevant parameters</td><td>Different queries return same cached response → wrong data</td><td>Include ALL query parameters in cache key configuration</td></tr><tr><td>16</td><td>QuickSight dashboard shared with wrong permission level</td><td>Users can edit/delete visuals instead of just viewing</td><td>Share as Viewer, not as Co-Owner → verify permissions after sharing</td></tr><tr><td>17</td><td>SPICE capacity exceeded</td><td>Refresh fails → dashboard shows stale data → no notification if not configured</td><td>Monitor SPICE usage → set up failure notifications → purchase additional capacity if needed</td></tr><tr><td>18</td><td>Cognito Refresh Token too long (365 days)</td><td>Stolen device has access for a year without re-authentication</td><td>Set Refresh Token expiry to 30 days max → implement device tracking</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>API Gateway Scaling</strong></p>
+<ul>
+<li>API Gateway scales automatically — no provisioning</li>
+<li>Default account limit: 10,000 requests/second across all APIs</li>
+<li>Can be increased via service limit request</li>
+<li>Regional API: Scales within the region</li>
+<li>Edge-optimized API: Uses CloudFront — global scale with 400+ edge locations</li>
+<li>At 1 million requests/month → ~$3.50 cost</li>
+<li>At 100 million requests/month → ~$350 cost</li>
+<li>Linear cost scaling with usage</li>
+</ul>
+<p>→ <strong>Lambda Scaling</strong></p>
+<ul>
+<li>Lambda scales automatically — one invocation per concurrent request</li>
+<li>Default concurrency limit: 1,000 per region per account</li>
+<li>Can be increased to tens of thousands via limit request</li>
+<li>Cold start consideration:
+<ul>
+<li>First invocation after idle: 200ms-2s initialization</li>
+<li>Subsequent invocations: &lt;1ms initialization (warm container reused)</li>
+<li>Provisioned Concurrency: Pre-warm N containers → eliminates cold starts → costs ~$15/month per provisioned instance</li>
+</ul>
+</li>
+<li>At 10,000 concurrent API users → need ~100-500 concurrent Lambda executions</li>
+<li>Lambda handles this automatically (within concurrency limit)</li>
+</ul>
+<p>→ <strong>Athena Scaling</strong></p>
+<ul>
+<li>Athena scales automatically — parallel query execution</li>
+<li>Default: 20 concurrent queries per account (DML)</li>
+<li>Can be increased to 200+ via limit request</li>
+<li>Each query independently scaled — more data = more parallel workers</li>
+<li>Cost scales with data scanned — not with query count</li>
+<li>At 100,000 queries/month scanning 1 MB each → $0.50/month</li>
+<li>At 100,000 queries/month scanning 1 GB each → $500/month</li>
+<li>Optimization: Caching + partitioning + Parquet = minimal scan per query</li>
+</ul>
+<p>→ <strong>QuickSight Scaling</strong></p>
+<ul>
+<li>SPICE: Up to 500 GB per dataset (Enterprise)</li>
+<li>Concurrent dashboard users: Thousands (managed by AWS)</li>
+<li>Reader pricing caps at $5/month → cost-predictable</li>
+<li>At 1,000 readers: Maximum $5,000/month (if all very active)</li>
+<li>At 1,000 readers with moderate usage: ~$1,500/month (many sessions &lt; $5)</li>
+<li>SPICE capacity: Purchased in GB increments → scales independently</li>
+</ul>
+<p>→ <strong>End-to-End Latency at Scale</strong></p>
+<table><thead><tr><th>Request Path</th><th>P50 Latency</th><th>P99 Latency</th></tr></thead><tbody><tr><td>API Gateway (no cache) → Lambda → Athena (partitioned Parquet)</td><td>2-4 seconds</td><td>8-15 seconds</td></tr><tr><td>API Gateway (cache hit)</td><td>5-20 milliseconds</td><td>50-100 milliseconds</td></tr><tr><td>QuickSight SPICE dashboard interaction</td><td>100-500 milliseconds</td><td>1-3 seconds</td></tr><tr><td>QuickSight Direct Query dashboard interaction</td><td>3-10 seconds</td><td>15-30 seconds</td></tr></tbody></table>
+<p>→ Cache hit rate is the MOST important factor for API latency<br>
+→ SPICE vs Direct Query is the MOST important factor for dashboard latency</p>
+<p>→ <strong>Multi-Region Scaling</strong></p>
+<table><thead><tr><th>Approach</th><th>Configuration</th><th>Use When</th></tr></thead><tbody><tr><td>Single region</td><td>All components in one region</td><td>Users primarily in one geography</td></tr><tr><td>API Gateway Edge-Optimized</td><td>API Gateway uses CloudFront globally</td><td>Global API users, data in one region</td></tr><tr><td>Multi-region deployment</td><td>Replicate entire stack to second region</td><td>Global users needing low latency + DR</td></tr><tr><td>CloudFront + Regional API</td><td>CloudFront distribution in front of Regional API</td><td>Global caching with regional backend</td></tr></tbody></table>
+<p>→ DataPulse: Single region (ap-south-1) sufficient for now<br>
+→ If expanding globally → add CloudFront distribution in front of API Gateway<br>
+→ S3 Cross-Region Replication (Project 30) for data → deploy parallel stack in second region</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to Verify Platform is Working Correctly:</strong></p>
+<table><thead><tr><th>Verification</th><th>Method</th><th>Expected Result</th></tr></thead><tbody><tr><td>API responds to authenticated requests</td><td>Send GET request with valid Cognito token</td><td>200 OK with JSON data</td></tr><tr><td>API rejects unauthenticated requests</td><td>Send GET request without Authorization header</td><td>401 Unauthorized</td></tr><tr><td>API enforces rate limiting</td><td>Send 200 requests in 1 second</td><td>First N succeed, rest get 429</td></tr><tr><td>Partner API key works</td><td>Send request with valid x-api-key header</td><td>200 OK</td></tr><tr><td>Partner API key rate limited</td><td>Exceed usage plan quota</td><td>429 Too Many Requests</td></tr><tr><td>Cache working</td><td>Send same request twice within TTL</td><td>Second response has lower latency</td></tr><tr><td>QuickSight dashboard loads</td><td>Open dashboard URL in browser</td><td>Visuals render within 3 seconds</td></tr><tr><td>RLS filtering works</td><td>Login as regional user → check data</td><td>Only regional data visible</td></tr><tr><td>CLS filtering works</td><td>Login as restricted user → check columns</td><td>Sensitive columns hidden</td></tr><tr><td>SPICE refresh successful</td><td>Check dataset → Last refresh timestamp</td><td>Updated after ETL completion</td></tr><tr><td>WAF blocking attacks</td><td>Send request with SQL injection pattern</td><td>403 Forbidden</td></tr></tbody></table>
+<p>→ <strong>Key Metrics Dashboard:</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>API Error Rate (5XX)</td><td>API Gateway CloudWatch</td><td>&gt; 1% of requests</td></tr><tr><td>API Latency P99</td><td>API Gateway CloudWatch</td><td>&gt; 10 seconds</td></tr><tr><td>Cache Hit Rate</td><td>API Gateway CloudWatch</td><td>&lt; 50% (investigate cache config)</td></tr><tr><td>Lambda Error Rate</td><td>Lambda CloudWatch</td><td>&gt; 0.5% of invocations</td></tr><tr><td>Lambda Duration P99</td><td>Lambda CloudWatch</td><td>&gt; 25 seconds (approaching timeout)</td></tr><tr><td>Athena Query Failures</td><td>Athena CloudWatch</td><td>Any failures</td></tr><tr><td>Athena Data Scanned/Day</td><td>Athena CloudWatch</td><td>&gt; 50 GB/day (cost alert)</td></tr><tr><td>SPICE Refresh Failures</td><td>QuickSight notifications</td><td>Any failures</td></tr><tr><td>WAF Blocked Requests</td><td>WAF CloudWatch</td><td>Sudden spike (possible attack)</td></tr><tr><td>Cognito Sign-In Failures</td><td>Cognito CloudWatch</td><td>Spike (possible brute force)</td></tr></tbody></table>
+<p>→ <strong>How to Track Business Value:</strong></p>
+<table><thead><tr><th>KPI</th><th>How to Measure</th><th>Target</th></tr></thead><tbody><tr><td>Data team time freed</td><td>Hours/week previously spent on ad-hoc requests</td><td>Reduce from 15 hrs/week to 2 hrs/week</td></tr><tr><td>Analytics self-service adoption</td><td>Number of unique QuickSight users/week</td><td>&gt; 80% of target users active</td></tr><tr><td>API adoption by mobile team</td><td>API request count/day</td><td>Growing week-over-week</td></tr><tr><td>Partner satisfaction</td><td>Partner API usage volume</td><td>Growing month-over-month</td></tr><tr><td>Data freshness</td><td>Time between ETL completion and SPICE refresh</td><td>&lt; 1 hour</td></tr><tr><td>Platform availability</td><td>API Gateway 5XX rate</td><td>&lt; 0.1%</td></tr><tr><td>Cost per analytics user</td><td>Total platform cost / active users</td><td>&lt; $10/user/month</td></tr></tbody></table>
+<p>→ <strong>X-Ray Tracing for End-to-End Debugging:</strong></p>
+<p>→ When X-Ray is enabled on API Gateway and Lambda:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Request Trace:
+</span>│
+├── API Gateway (2ms)
+│   ├── WAF evaluation (0.5ms)
+│   ├── Authentication (1ms)
+│   └── Cache lookup (0.3ms) — MISS
+│
+├── Lambda (3200ms)
+│   ├── Initialization (150ms) — cold start
+│   ├── Athena StartQueryExecution (50ms)
+│   ├── Athena Polling (2800ms)
+│   │   ├── Poll 1: RUNNING (200ms wait)
+│   │   ├── Poll 2: RUNNING (400ms wait)
+│   │   ├── Poll 3: RUNNING (800ms wait)
+│   │   └── Poll 4: SUCCEEDED
+│   ├── GetQueryResults (150ms)
+│   └── Response formatting (50ms)
+│
+├── API Gateway Response (1ms)
+│   └── Cache store (0.5ms)
+│
+└── Total: 3203ms</code></pre></div>
+<p>→ X-Ray trace shows EXACTLY where time is spent<br>
+→ If Athena polling dominates → optimize query (better partitioning, pre-aggregation)<br>
+→ If Lambda initialization dominates → use Provisioned Concurrency<br>
+→ If API Gateway overhead is high → check WAF rule complexity</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ A serverless analytics platform eliminates ALL infrastructure management while serving ALL consumer types<br>
+→ The platform has 5 layers: Storage (S3) → Catalog (Glue) → Query (Athena) → Compute (Lambda) → Gateway (API Gateway) + Visualization (QuickSight)<br>
+→ Data preparation is 80% of the work — pre-aggregate into refined zone, use Parquet, partition by common query dimensions<br>
+→ QuickSight SPICE eliminates per-view Athena costs and delivers sub-second dashboard response<br>
+→ API Gateway caching eliminates redundant Lambda/Athena invocations — cache hit rate is the #1 cost optimization lever<br>
+→ Authentication must match the consumer type: API Keys for partners, Cognito for users, IAM for internal<br>
+→ Row-Level Security in QuickSight solves multi-tenant data access without custom code<br>
+→ WAF protects public APIs from common attacks — non-negotiable for internet-facing endpoints<br>
+→ Athena workgroup scan limits prevent cost explosions from bad queries<br>
+→ Total platform cost (<del>$534/month) is dramatically lower than server-based alternatives (</del>$2,625/month)<br>
+→ This project connects backward to:</p>
+<ul>
+<li>Project 1 (S3 — the storage foundation)</li>
+<li>Project 17, 18 (Glue + Athena — the query foundation)</li>
+<li>Project 25 (S3 → Glue → Athena pipeline — the data flow)</li>
+<li>Project 26 (Lambda — serverless compute)</li>
+<li>Project 45 (Lambda in VPC — network considerations)</li>
+<li>Project 51 (Data Lake architecture — zones and governance)</li>
+<li>Project 57 (Security — KMS, IAM, encryption)</li>
+<li>Project 58 (DMS migration — acquired data now accessible through this platform)<br>
+→ This project connects forward to:</li>
+<li>Project 60 (Data Mesh) — this serverless platform becomes the CONSUMPTION LAYER of the data mesh</li>
+<li>Each domain team publishes data products → this platform makes them accessible to all consumers</li>
+<li>QuickSight dashboards become domain-specific → governed by Lake Formation (Project 47)</li>
+<li>API Gateway becomes the programmatic access layer for data products across the organization</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ DataPulse now has a complete serverless analytics platform serving all consumer types<br>
+→ But as the organization grows (5 accounts, multiple acquired companies, multiple data teams):</p>
+<p>→ A fundamental ORGANIZATIONAL challenge emerges:</p>
+<ul>
+<li>The central data team is a bottleneck — every new dataset request goes through them</li>
+<li>The marketing team wants to own their marketing analytics data</li>
+<li>The finance team wants to own their financial reporting data</li>
+<li>The InsightWorks acquisition team wants to own their migrated data</li>
+<li>Each team has different data freshness requirements, different schemas, different SLAs</li>
+<li>The central team cannot scale to serve everyone</li>
+</ul>
+<p>→ The solution is NOT more central infrastructure — it's DISTRIBUTED DATA OWNERSHIP<br>
+→ This is the <strong>Data Mesh</strong> pattern</p>
+<p>→ <strong>Project 60 solves this</strong> by implementing:</p>
+<ul>
+<li>Multi-account producer-consumer architecture</li>
+<li>Each domain team OWNS and PUBLISHES their data as "data products"</li>
+<li>Central governance account provides security, cataloging, and access control</li>
+<li>Lake Formation (Project 47) provides cross-account data sharing</li>
+<li>Organizations (Project 54) provides account structure</li>
+<li>The serverless platform from THIS project becomes the consumption layer</li>
+<li>Full observability across all domains via CloudWatch cross-account monitoring</li>
+</ul>
+<p>→ Project 60 is the CAPSTONE — it connects EVERY previous project into a unified enterprise architecture</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 60: "The Enterprise Data Mesh — Multi-Account Producer-Consumer Pattern with Full Governance &amp; Observability"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-58.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 59/60</span></div><a class="nav-btn next" href="project-60.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 24: THE OPERATIONAL DATABASE THAT NEEDED A BACKUP IN S3 — MariaDB to S3  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 24: THE OPERATIONAL DATABASE THAT NEEDED A BACKUP IN S3 — MariaDB to S3 Export via Glue ETL</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's operational stack runs on EC2 instances (Project 3) connected to an RDS MariaDB database (Project 9)<br>
+→ The MariaDB database is the single source of truth for live business operations:</p>
+<table><thead><tr><th>Table</th><th>Records</th><th>Growth Rate</th><th>Purpose</th></tr></thead><tbody><tr><td><code>customers</code></td><td>2.5 million</td><td>5,000/day</td><td>Customer profiles, addresses, preferences</td></tr><tr><td><code>orders</code></td><td>15 million</td><td>50,000/day</td><td>Order transactions, statuses, amounts</td></tr><tr><td><code>order_items</code></td><td>45 million</td><td>150,000/day</td><td>Line items per order</td></tr><tr><td><code>products</code></td><td>50,000</td><td>200/week</td><td>Product catalog, pricing, inventory</td></tr><tr><td><code>inventory_movements</code></td><td>80 million</td><td>300,000/day</td><td>Stock in/out, warehouse transfers</td></tr><tr><td><code>payments</code></td><td>12 million</td><td>40,000/day</td><td>Payment records, refunds</td></tr></tbody></table>
+<p>→ <strong>Problem 1: Analytics Team Cannot Access Operational Data</strong></p>
+<ul>
+<li>The data lake (S3) has clickstream and historical order snapshots</li>
+<li>But LIVE customer data, real-time inventory levels, and payment records are ONLY in MariaDB</li>
+<li>Analysts want to join clickstream behavior with customer profiles and purchase history</li>
+<li>They cannot query MariaDB directly — no credentials, no network access, no SQL knowledge</li>
+</ul>
+<p>→ <strong>Problem 2: Production Database Performance Degradation</strong></p>
+<ul>
+<li>A junior analyst was given read-only MariaDB credentials for a "quick report"</li>
+<li>They ran a full table scan on <code>order_items</code> (45M rows) with a complex JOIN to <code>products</code></li>
+<li>The query consumed 80% of the RDS instance's CPU for 12 minutes</li>
+<li>During that time — the e-commerce application experienced 3-second response times</li>
+<li>200 customers abandoned their shopping carts</li>
+<li>The CTO banned ALL direct analyst access to the production database</li>
+</ul>
+<p>→ <strong>Problem 3: No Historical State Tracking</strong></p>
+<ul>
+<li>MariaDB stores CURRENT state only — when a customer updates their address, the old address is overwritten</li>
+<li>When a product price changes, the old price is gone</li>
+<li>When an order status changes from "processing" to "shipped," the processing timestamp may be overwritten</li>
+<li>The analytics team needs historical state for trend analysis</li>
+<li>"What was the price of product X on January 1st?" — MariaDB cannot answer this</li>
+</ul>
+<p>→ <strong>Problem 4: Disaster Recovery Gap</strong></p>
+<ul>
+<li>RDS automated backups retain snapshots for 35 days maximum</li>
+<li>Compliance requires 7 years of transaction records</li>
+<li>If MariaDB data is corrupted or accidentally deleted — recovery is limited to 35 days</li>
+<li>Exporting to S3 creates a long-term, immutable archive</li>
+</ul>
+<p>→ <strong>Problem 5: Data Warehouse Gap</strong></p>
+<ul>
+<li>Redshift (Project 16) has historical data loaded from S3 (Project 22)</li>
+<li>But Redshift doesn't have the LATEST operational data — it's always 24+ hours behind</li>
+<li>The daily pipeline is: S3 raw files → Glue ETL (Project 21) → S3 transformed → COPY (Project 22) → Redshift</li>
+<li>MariaDB's live data never enters this pipeline</li>
+</ul>
+<p>→ The data engineering lead says: "We need to extract data FROM MariaDB, transform it, and land it in S3 as Parquet — without touching the production database during peak hours, and without giving analysts database access"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand how this differs from Project 21</p>
+<table><thead><tr><th>Aspect</th><th>Project 21 (S3 to S3)</th><th>This Project (MariaDB to S3)</th></tr></thead><tbody><tr><td>Source</td><td>S3 files (CSV/JSON)</td><td>RDS MariaDB database tables (JDBC)</td></tr><tr><td>Source access</td><td>S3 API (HTTP)</td><td>JDBC over TCP port 3306</td></tr><tr><td>Network</td><td>Public S3 endpoint or VPC endpoint</td><td>Private VPC — database not internet-accessible</td></tr><tr><td>Authentication</td><td>IAM Role for S3</td><td>Database username + password</td></tr><tr><td>Schema</td><td>Inferred by Crawler or Parquet header</td><td>Database table DDL (strongly typed)</td></tr><tr><td>Extraction</td><td>Read files from S3 path</td><td>Execute SQL SELECT over JDBC</td></tr><tr><td>Parallelism</td><td>Multiple files = multiple workers</td><td>Must configure partitioned reads from single database</td></tr><tr><td>Impact on source</td><td>None (S3 is read-only, no performance impact)</td><td>Significant — database queries consume CPU/memory/I/O</td></tr></tbody></table>
+<p>→ The critical new concept: <strong>Glue JDBC Connection</strong><br>
+→ Glue must CONNECT to MariaDB over the network — this requires:</p>
+<ol>
+<li>Network path from Glue to RDS (VPC configuration)</li>
+<li>Authentication credentials (username/password)</li>
+<li>JDBC driver (MariaDB/MySQL compatible)</li>
+<li>Proper security group rules (firewall)</li>
+</ol>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand Glue's VPC networking requirements for JDBC</li>
+<li>Step 2 — Create a Glue Connection to MariaDB</li>
+<li>Step 3 — Configure security groups for Glue ↔ RDS communication</li>
+<li>Step 4 — Test the connection</li>
+<li>Step 5 — Create Glue Crawler with JDBC source (catalog the database)</li>
+<li>Step 6 — Create Glue ETL Job with JDBC source and S3 target</li>
+<li>Step 7 — Optimize extraction (parallel reads, push-down predicates)</li>
+<li>Step 8 — Schedule during off-peak hours</li>
+<li>Step 9 — Integrate output with existing data lake pipeline</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND GLUE VPC NETWORKING FOR JDBC</h3>
+<p>→ This is the most complex and most commonly misconfigured part of Glue JDBC jobs<br>
+→ Understanding this thoroughly prevents hours of debugging</p>
+<p><strong>The problem:</strong><br>
+→ Glue is a MANAGED service — you don't control where Glue workers run<br>
+→ RDS MariaDB sits in a PRIVATE subnet (Project 5, Project 9) — not accessible from the internet<br>
+→ How does Glue reach a private database?</p>
+<p><strong>The solution: Glue Connection with VPC Configuration</strong></p>
+<p>→ When you create a Glue Connection, you specify:</p>
+<ul>
+<li>VPC ID</li>
+<li>Subnet ID</li>
+<li>Security Group ID</li>
+</ul>
+<p>→ Glue then creates Elastic Network Interfaces (ENIs) in YOUR VPC, in YOUR subnet<br>
+→ These ENIs give Glue workers a private IP address in your VPC<br>
+→ From this private IP, Glue can reach the RDS instance on port 3306</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────┐
+</span>│                        YOUR VPC                              │
+│                                                              │
+│  ┌──────────────────────┐    ┌───────────────────────────┐  │
+│  │   PRIVATE SUBNET A    │    │   PRIVATE SUBNET B        │  │
+│  │                        │    │                           │  │
+│  │  ┌──────────────────┐ │    │  ┌──────────────────────┐ │  │
+│  │  │  RDS MariaDB      │ │    │  │  Glue ENI            │ │  │
+│  │  │  (Primary)         │ │    │  │  (created by Glue)   │ │  │
+│  │  │  10.0.1.50         │ │    │  │  10.0.2.100          │ │  │
+│  │  │  Port 3306         │◀┼────┼──│  Connects via JDBC   │ │  │
+│  │  └──────────────────┘ │    │  └──────────────────────┘ │  │
+│  │                        │    │                           │  │
+│  └──────────────────────┘    └───────────────────────────┘  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Key insight: Glue workers run in AWS-managed infrastructure OUTSIDE your VPC<br>
+→ But the ENI bridges them INTO your VPC<br>
+→ The ENI gets a private IP from your subnet's CIDR range<br>
+→ Traffic flows: Glue worker → ENI (in your VPC) → Private network → RDS</p>
+<p><strong>Critical networking requirements:</strong></p>
+<table><thead><tr><th>Requirement</th><th>Why</th><th>Consequence if Missing</th></tr></thead><tbody><tr><td>Subnet must have available IP addresses</td><td>Glue creates ENIs that need IPs</td><td>Connection fails — "unable to create ENI"</td></tr><tr><td>Subnet should be PRIVATE (no internet gateway route)</td><td>Security best practice</td><td>Not required but strongly recommended</td></tr><tr><td>Security group must allow OUTBOUND to RDS</td><td>Glue ENI → RDS communication</td><td>Connection timeout</td></tr><tr><td>RDS security group must allow INBOUND from Glue SG</td><td>RDS must accept Glue's connection</td><td>Connection refused</td></tr><tr><td>Subnet must have NAT Gateway OR S3 VPC Endpoint</td><td>Glue needs to write to S3 after extraction</td><td>Job runs but FAILS on S3 write</td></tr></tbody></table>
+<p>→ That last point is critical and frequently missed:</p>
+<ul>
+<li>Glue ENI is in a PRIVATE subnet</li>
+<li>Glue needs to write Parquet files to S3</li>
+<li>S3 is a public service — requires internet access OR VPC endpoint</li>
+<li>Without NAT Gateway or S3 VPC endpoint → Glue can read from MariaDB but CANNOT write to S3</li>
+</ul>
+<p><strong>Two solutions for S3 access from Glue ENI:</strong></p>
+<table><thead><tr><th>Solution</th><th>Mechanism</th><th>Cost</th><th>Recommended</th></tr></thead><tbody><tr><td>NAT Gateway (Project 5)</td><td>Routes S3 traffic through NAT → Internet Gateway → S3</td><td>~$32/month + data transfer</td><td>Works but more expensive</td></tr><tr><td>S3 VPC Gateway Endpoint (Project 27 concept)</td><td>Direct private path to S3 — no internet</td><td>Free</td><td>✅ Preferred</td></tr></tbody></table>
+<p>→ If NAT Gateway already exists from Project 5 → Glue will use it automatically<br>
+→ If not → create an S3 VPC Gateway Endpoint (free, private, more secure)</p>
+<hr>
+<h3>STEP 2 — CREATE GLUE CONNECTION TO MARIADB</h3>
+<p>→ Navigate to AWS Glue Console → Data Catalog → Connections → Create Connection</p>
+<p><strong>Connection Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Connection name</td><td><code>shopnow-mariadb-prod</code></td><td>Descriptive name</td></tr><tr><td>Connection type</td><td>JDBC</td><td>Standard database connectivity</td></tr><tr><td>JDBC URL</td><td><code>jdbc:mysql://shopnow-prod-db.xxxxxxx.ap-south-1.rds.amazonaws.com:3306/shopnow_db</code></td><td>RDS endpoint from Project 9</td></tr></tbody></table>
+<p>→ Breaking down the JDBC URL:</p>
+<table><thead><tr><th>Component</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Protocol</td><td><code>jdbc:mysql://</code></td><td>MariaDB uses MySQL-compatible JDBC driver</td></tr><tr><td>Hostname</td><td><code>shopnow-prod-db.xxxxxxx.ap-south-1.rds.amazonaws.com</code></td><td>RDS endpoint (Project 9)</td></tr><tr><td>Port</td><td><code>3306</code></td><td>MariaDB default port</td></tr><tr><td>Database</td><td><code>shopnow_db</code></td><td>Specific database name within the RDS instance</td></tr></tbody></table>
+<p>→ Why <code>jdbc:mysql://</code> and not <code>jdbc:mariadb://</code>?</p>
+<ul>
+<li>MariaDB is MySQL-compatible</li>
+<li>Glue's built-in JDBC driver uses the MySQL connector for MariaDB</li>
+<li>The MySQL JDBC URL format works for both MySQL and MariaDB</li>
+<li>Glue does NOT include a separate MariaDB-specific driver by default</li>
+</ul>
+<p><strong>Authentication:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Username</td><td><code>glue_etl_user</code></td><td>Dedicated database user for Glue (NOT the admin user)</td></tr><tr><td>Password</td><td><code>*************</code></td><td>Database password</td></tr></tbody></table>
+<p>→ <strong>CRITICAL</strong>: Create a DEDICATED database user for Glue — never use the admin/root user</p>
+<p><strong>Why a dedicated user?</strong></p>
+<table><thead><tr><th>Concern</th><th>Admin User</th><th>Dedicated Glue User</th></tr></thead><tbody><tr><td>Permissions</td><td>Full access (DDL + DML + admin)</td><td>Read-only on specific tables</td></tr><tr><td>Audit trail</td><td>"admin did something"</td><td>"glue_etl_user extracted data"</td></tr><tr><td>Security blast radius</td><td>Compromised = total control</td><td>Compromised = read-only access to allowed tables</td></tr><tr><td>Resource limits</td><td>No limits</td><td>Can set max connections, query timeout</td></tr></tbody></table>
+<p><strong>Database user creation (done by DBA in MariaDB):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Username</td><td><code>glue_etl_user</code></td></tr><tr><td>Host restriction</td><td><code>10.0.%</code> (only from VPC private IPs)</td></tr><tr><td>Permissions</td><td>SELECT only on <code>shopnow_db.*</code></td></tr><tr><td>Max connections</td><td>5 (prevent Glue from overwhelming the database)</td></tr></tbody></table>
+<p>→ For credentials management — ideally use AWS Secrets Manager (Project 37)<br>
+→ Glue Connections support Secrets Manager integration<br>
+→ Instead of plaintext username/password → reference a Secret ARN<br>
+→ The Secret stores credentials encrypted with KMS<br>
+→ Glue retrieves credentials at runtime → never stored in connection config</p>
+<p><strong>Secret Manager Integration (Preview — Deep Dive in Project 37):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Credential type</td><td>AWS Secrets Manager</td></tr><tr><td>Secret ARN</td><td><code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/mariadb/glue-etl-AbCdEf</code></td></tr></tbody></table>
+<hr>
+<p><strong>VPC Configuration (within the Connection):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>VPC</td><td><code>vpc-0abc123def456</code></td><td>ShopNow's VPC from Project 5</td></tr><tr><td>Subnet</td><td><code>subnet-0private456</code></td><td>A private subnet (same AZ as RDS or different — both work)</td></tr><tr><td>Security Group(s)</td><td><code>sg-0glue789</code></td><td>Security group for Glue ENIs</td></tr></tbody></table>
+<p><strong>Subnet selection guidance:</strong></p>
+<table><thead><tr><th>Consideration</th><th>Recommendation</th></tr></thead><tbody><tr><td>Same AZ as RDS?</td><td>Preferred — reduces cross-AZ data transfer costs</td></tr><tr><td>Private subnet?</td><td>Required — Glue ENI should not have public IP</td></tr><tr><td>Sufficient IP addresses?</td><td>Need at least 5-10 free IPs (Glue creates multiple ENIs per job)</td></tr><tr><td>Has route to S3?</td><td>Must have NAT Gateway route OR S3 VPC Endpoint</td></tr></tbody></table>
+<p>→ Each Glue worker creates one ENI → 10 workers = 10 ENIs = 10 IP addresses consumed<br>
+→ If subnet has /28 CIDR (16 IPs, 11 usable) → only 11 Glue workers maximum<br>
+→ For larger jobs → use a subnet with larger CIDR range (/24 = 251 usable IPs)</p>
+<hr>
+<h3>STEP 3 — CONFIGURE SECURITY GROUPS</h3>
+<p>→ This is where most JDBC connection failures originate<br>
+→ Two security groups must be configured correctly:</p>
+<p><strong>Security Group 1: Glue ENI Security Group (<code>sg-0glue789</code>)</strong></p>
+<p><strong>Inbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>All TCP</td><td>TCP</td><td>0-65535</td><td><code>sg-0glue789</code> (self-reference)</td><td>Glue workers communicate with each other</td></tr></tbody></table>
+<p>→ This self-referencing rule is MANDATORY<br>
+→ Glue Spark workers need to communicate during distributed processing<br>
+→ Without it → Spark tasks fail with connection timeout between workers</p>
+<p><strong>Outbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Purpose</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>sg-0rds456</code> (RDS security group)</td><td>Glue → MariaDB connection</td></tr><tr><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code> (or S3 VPC Endpoint)</td><td>Glue → S3 for writing output</td></tr><tr><td>All TCP</td><td>TCP</td><td>0-65535</td><td><code>sg-0glue789</code> (self-reference)</td><td>Inter-worker communication</td></tr></tbody></table>
+<hr>
+<p><strong>Security Group 2: RDS Security Group (<code>sg-0rds456</code> — from Project 9)</strong></p>
+<p>→ This already has rules for EC2 application access (Project 14)<br>
+→ Add a NEW inbound rule:</p>
+<p><strong>Additional Inbound Rule:</strong></p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>sg-0glue789</code> (Glue security group)</td><td>Allow Glue to connect to MariaDB</td></tr></tbody></table>
+<p>→ This is a SECURITY GROUP CROSS-REFERENCE (Project 4 concept)<br>
+→ Any ENI with <code>sg-0glue789</code> attached can connect to any ENI with <code>sg-0rds456</code> on port 3306<br>
+→ No IP addresses hardcoded — scales automatically as Glue creates/destroys ENIs</p>
+<p><strong>Updated RDS Security Group Inbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Purpose</th><th>Added In</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-0ec2app</code></td><td>EC2 application access</td><td>Project 14</td></tr><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-0glue789</code></td><td>Glue ETL access</td><td>This project</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — TEST THE CONNECTION</h3>
+<p>→ Navigate to Glue Console → Connections → Select <code>shopnow-mariadb-prod</code> → Test Connection</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>IAM Role</td><td><code>GlueETL-ShopNow-DataLake-Role</code> (from Project 21)</td></tr></tbody></table>
+<p>→ Click "Test Connection"</p>
+<p><strong>Possible Results:</strong></p>
+<table><thead><tr><th>Result</th><th>Meaning</th><th>Action</th></tr></thead><tbody><tr><td>✅ Connection successful</td><td>All networking and authentication working</td><td>Proceed to Step 5</td></tr><tr><td>❌ Connection timed out</td><td>Network path blocked</td><td>Check security groups, subnet routing, VPC endpoint</td></tr><tr><td>❌ Authentication failed</td><td>Wrong username/password</td><td>Verify credentials in connection config</td></tr><tr><td>❌ Unable to create ENI</td><td>Subnet out of IP addresses</td><td>Use a larger subnet</td></tr><tr><td>❌ Connection refused</td><td>Port blocked or RDS not listening</td><td>Verify RDS is running, port 3306 is correct</td></tr></tbody></table>
+<p><strong>Troubleshooting Decision Tree:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Connection test failed?
+</span>  │
+  ├── "Timed out"
+  │     ├── Glue SG outbound → port 3306 → RDS SG? → Check outbound rules
+  │     ├── RDS SG inbound ← Glue SG on 3306? → Check inbound rules
+  │     ├── Glue SG self-referencing rule? → Add all TCP self-reference
+  │     ├── Subnet has route table? → Verify route table exists
+  │     └── RDS in same VPC? → Verify VPC ID matches
+  │
+  ├── "Authentication failed"
+  │     ├── Username correct? → Verify exact username
+  │     ├── Password correct? → Re-enter password
+  │     ├── User has host restriction? → Verify user allows connections from VPC CIDR
+  │     └── Database name correct? → Verify database exists
+  │
+  ├── "Unable to create ENI"
+  │     ├── Subnet has free IPs? → Check available IPs in subnet
+  │     ├── IAM Role has EC2 ENI permissions? → AWSGlueServiceRole includes these
+  │     └── Subnet exists in correct VPC? → Verify subnet-VPC association
+  │
+  └── "Connection refused"
+        ├── RDS instance running? → Check RDS Console status
+        ├── Port 3306? → Verify RDS port configuration
+        └── RDS publicly accessible = No? → Correct (private access only)</code></pre></div>
+<hr>
+<h3>STEP 5 — CREATE GLUE CRAWLER WITH JDBC SOURCE</h3>
+<p>→ Before creating the ETL Job, catalog the MariaDB tables in Glue Data Catalog<br>
+→ This allows the ETL Job to reference tables by catalog name (consistent with Project 17 pattern)</p>
+<p>→ Navigate to Glue Console → Crawlers → Create Crawler</p>
+<p><strong>Crawler Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Crawler name</td><td><code>shopnow-mariadb-catalog-crawler</code></td><td>Descriptive name</td></tr><tr><td>Data source</td><td>JDBC</td><td>Database source</td></tr><tr><td>Connection</td><td><code>shopnow-mariadb-prod</code></td><td>Connection created in Step 2</td></tr><tr><td>Include path</td><td><code>shopnow_db/%</code></td><td>Catalog ALL tables in the database</td></tr><tr><td>IAM Role</td><td><code>GlueETL-ShopNow-DataLake-Role</code></td><td>Same role as Glue ETL jobs</td></tr><tr><td>Target database</td><td><code>shopnow_mariadb_catalog</code></td><td>New Glue Catalog database for MariaDB tables</td></tr><tr><td>Table prefix</td><td><code>mariadb_</code></td><td>Prefix to distinguish from S3-based tables</td></tr><tr><td>Schedule</td><td>Weekly (or on-demand)</td><td>Schema changes are infrequent</td></tr></tbody></table>
+<p><strong>Include Path Options:</strong></p>
+<table><thead><tr><th>Path Pattern</th><th>What It Crawls</th></tr></thead><tbody><tr><td><code>shopnow_db/%</code></td><td>All tables in <code>shopnow_db</code> database</td></tr><tr><td><code>shopnow_db/orders</code></td><td>Only the <code>orders</code> table</td></tr><tr><td><code>shopnow_db/order%</code></td><td>Tables starting with "order" (orders, order_items)</td></tr><tr><td><code>%/%</code></td><td>All databases, all tables (rarely recommended)</td></tr></tbody></table>
+<p>→ Run the Crawler → It connects to MariaDB via JDBC → reads table schemas → creates Catalog entries</p>
+<p><strong>After Crawler completes:</strong></p>
+<p>→ Navigate to Glue → Data Catalog → Database: <code>shopnow_mariadb_catalog</code></p>
+<table><thead><tr><th>Catalog Table</th><th>Source Table</th><th>Columns Discovered</th><th>Classification</th></tr></thead><tbody><tr><td><code>mariadb_customers</code></td><td><code>shopnow_db.customers</code></td><td>customer_id, name, email, address, ...</td><td>mysql</td></tr><tr><td><code>mariadb_orders</code></td><td><code>shopnow_db.orders</code></td><td>order_id, customer_id, order_date, status, ...</td><td>mysql</td></tr><tr><td><code>mariadb_order_items</code></td><td><code>shopnow_db.order_items</code></td><td>item_id, order_id, product_id, quantity, price, ...</td><td>mysql</td></tr><tr><td><code>mariadb_products</code></td><td><code>shopnow_db.products</code></td><td>product_id, name, category, price, inventory, ...</td><td>mysql</td></tr><tr><td><code>mariadb_inventory_movements</code></td><td><code>shopnow_db.inventory_movements</code></td><td>movement_id, product_id, quantity, type, timestamp, ...</td><td>mysql</td></tr><tr><td><code>mariadb_payments</code></td><td><code>shopnow_db.payments</code></td><td>payment_id, order_id, amount, method, status, ...</td><td>mysql</td></tr></tbody></table>
+<p>→ These catalog tables are now available for Glue ETL Jobs and even Athena Federated Query (Project 35)</p>
+<hr>
+<h3>STEP 6 — CREATE GLUE ETL JOB: ORDERS TABLE</h3>
+<p>→ Navigate to Glue Console → ETL Jobs → Create Job → Visual Editor (same as Project 21)</p>
+<p><strong>Source Node Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Source type</td><td>Data Catalog</td><td>Using the cataloged JDBC table</td></tr><tr><td>Database</td><td><code>shopnow_mariadb_catalog</code></td><td>Catalog database from Step 5</td></tr><tr><td>Table</td><td><code>mariadb_orders</code></td><td>Orders table</td></tr></tbody></table>
+<p>→ Alternative: Direct JDBC source (without Catalog)</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Source type</td><td>JDBC</td></tr><tr><td>Connection</td><td><code>shopnow-mariadb-prod</code></td></tr><tr><td>Table name</td><td><code>shopnow_db.orders</code></td></tr></tbody></table>
+<p>→ Using Catalog is preferred (consistent with Project 21 pattern, enables Job Bookmarks)</p>
+<hr>
+<p><strong>Transform Nodes (Building on Project 21 patterns):</strong></p>
+<p><strong>Transform 1: Change Schema</strong></p>
+<table><thead><tr><th>Original Column</th><th>New Column</th><th>Type Change</th><th>Action</th></tr></thead><tbody><tr><td><code>order_id</code></td><td><code>order_id</code></td><td>INT → INT</td><td>Keep</td></tr><tr><td><code>customer_id</code></td><td><code>customer_id</code></td><td>INT → INT</td><td>Keep</td></tr><tr><td><code>order_date</code></td><td><code>order_date</code></td><td>DATETIME → DATE</td><td>Truncate time component</td></tr><tr><td><code>status</code></td><td><code>order_status</code></td><td>VARCHAR → STRING</td><td>Rename for clarity</td></tr><tr><td><code>total_amount</code></td><td><code>total_amount</code></td><td>DECIMAL(10,2) → DECIMAL(12,2)</td><td>Widen precision</td></tr><tr><td><code>created_at</code></td><td><code>created_at</code></td><td>TIMESTAMP → TIMESTAMP</td><td>Keep</td></tr><tr><td><code>updated_at</code></td><td><code>updated_at</code></td><td>TIMESTAMP → TIMESTAMP</td><td>Keep</td></tr><tr><td><code>internal_notes</code></td><td>(drop)</td><td>—</td><td>Remove PII/internal field</td></tr></tbody></table>
+<p>→ Unlike CSV sources (Project 21), MariaDB columns are already strongly typed<br>
+→ Less type conversion needed — but renaming and dropping columns is still important</p>
+<p><strong>Transform 2: Add Extraction Metadata</strong></p>
+<table><thead><tr><th>New Column</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>extract_date</code></td><td>Current date (job run date)</td><td>Track when this snapshot was taken</td></tr><tr><td><code>extract_source</code></td><td><code>'mariadb_prod'</code></td><td>Track data origin</td></tr></tbody></table>
+<p>→ This metadata is critical for the historical state tracking problem (Problem 3)<br>
+→ Each daily extract captures the state as of that day<br>
+→ Over time → you build a history: "What did this record look like on each extract date?"</p>
+<p><strong>Transform 3: Add Partition Columns</strong></p>
+<table><thead><tr><th>New Column</th><th>Derived From</th><th>Purpose</th></tr></thead><tbody><tr><td><code>year</code></td><td>Extract from <code>order_date</code></td><td>Partition key (same pattern as Project 21)</td></tr><tr><td><code>month</code></td><td>Extract from <code>order_date</code></td><td>Partition key</td></tr></tbody></table>
+<p><strong>Transform 4: Filter (Optional)</strong></p>
+<table><thead><tr><th>Condition</th><th>Purpose</th></tr></thead><tbody><tr><td><code>order_date &gt;= '2020-01-01'</code></td><td>Skip very old historical data (already archived)</td></tr><tr><td><code>status != 'DRAFT'</code></td><td>Skip draft orders not yet submitted</td></tr></tbody></table>
+<hr>
+<p><strong>Target Node Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Target type</td><td>S3</td><td>Writing to data lake</td></tr><tr><td>Format</td><td>Parquet</td><td>Standard data lake format (Project 21)</td></tr><tr><td>Compression</td><td>Snappy</td><td>Standard compression (Project 21)</td></tr><tr><td>S3 path</td><td><code>s3://shopnow-data-lake/transformed/mariadb/orders/</code></td><td>Separate prefix for MariaDB-sourced data</td></tr><tr><td>Partition keys</td><td><code>year</code>, <code>month</code></td><td>Hive-style partitioning</td></tr><tr><td>Data Catalog update</td><td>Create table in <code>shopnow_transformed_db</code></td><td>Register for Athena access</td></tr><tr><td>Table name</td><td><code>mariadb_orders</code></td><td>Distinct from S3-sourced orders table</td></tr></tbody></table>
+<p>→ Note the S3 path structure: <code>transformed/mariadb/orders/</code><br>
+→ This separates MariaDB-sourced data from file-sourced data:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/
+</span>  ├── raw/                          ← File uploads (Project 1)
+  │     └── orders/
+  ├── transformed/
+  │     ├── orders/                 ← Glue ETL from CSV (Project 21)
+  │     └── mariadb/                ← Glue ETL from MariaDB (THIS project)
+  │           ├── orders/
+  │           ├── customers/
+  │           ├── products/
+  │           └── payments/
+  └── curated/                      ← Redshift UNLOAD (Project 23)</code></pre></div>
+<hr>
+<h3>STEP 7 — CONFIGURE JOB PROPERTIES</h3>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-orders-to-s3</code></td><td>Descriptive</td></tr><tr><td>IAM Role</td><td><code>GlueETL-ShopNow-DataLake-Role</code></td><td>Needs S3 write + Glue Catalog + JDBC</td></tr><tr><td>Glue version</td><td>Glue 4.0</td><td>Latest</td></tr><tr><td>Worker type</td><td>G.1X</td><td>Standard workers</td></tr><tr><td>Number of workers</td><td>5</td><td>Start small — database extraction is I/O bound</td></tr><tr><td>Execution class</td><td>Flex</td><td>Non-urgent nightly batch</td></tr><tr><td>Job timeout</td><td>120 minutes</td><td>Allow time for large table extraction</td></tr><tr><td>Max retries</td><td>1</td><td>Retry once on transient failures</td></tr><tr><td>Job bookmark</td><td>Enable</td><td>Incremental extraction (Project 46 preview)</td></tr><tr><td>Connections</td><td><code>shopnow-mariadb-prod</code></td><td>JDBC connection to use</td></tr><tr><td>Max concurrent runs</td><td>1</td><td>Prevent multiple simultaneous extractions from same database</td></tr></tbody></table>
+<p><strong>Why fewer workers for JDBC (5) vs S3 source (10 in Project 21)?</strong></p>
+<p>→ S3 source: Each worker reads a separate FILE → more workers = more parallel file reads → faster<br>
+→ JDBC source: ALL workers read from the SAME database → more workers = more concurrent database connections</p>
+<table><thead><tr><th>Workers</th><th>Database Connections</th><th>Database Impact</th><th>Extraction Speed</th></tr></thead><tbody><tr><td>2</td><td>2 concurrent queries</td><td>Minimal</td><td>Slow</td></tr><tr><td>5</td><td>5 concurrent queries</td><td>Moderate</td><td>Good balance</td></tr><tr><td>10</td><td>10 concurrent queries</td><td>Significant</td><td>Faster but risks DB performance</td></tr><tr><td>20</td><td>20 concurrent queries</td><td>Severe</td><td>May crash the database</td></tr></tbody></table>
+<p>→ The bottleneck is NOT Glue workers — it's the MariaDB instance's capacity to serve concurrent reads<br>
+→ Start with 5 workers → monitor RDS CPU during extraction → adjust</p>
+<hr>
+<h3>STEP 8 — OPTIMIZE JDBC EXTRACTION</h3>
+<p>→ This is where JDBC extraction differs significantly from S3 file reading<br>
+→ By default, Glue reads the ENTIRE table through a single JDBC connection — no parallelism</p>
+<p><strong>Default behavior (BAD for large tables):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Worker 0: SELECT * FROM orders    ← Single connection, reads ALL 15M rows
+</span>Glue Worker 1: Idle
+Glue Worker 2: Idle
+Glue Worker 3: Idle
+Glue Worker 4: Idle</code></pre></div>
+<p>→ 4 out of 5 workers do nothing during extraction → waste of resources<br>
+→ 15M rows through single connection → 30-45 minutes</p>
+<p><strong>Optimized behavior (Partitioned JDBC Read):</strong></p>
+<p>→ Configure "hash partitioning" or "range partitioning" on the source</p>
+<p><strong>Option A: Hash Partitioning (Glue Native)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Enable partitioning</td><td>Yes</td><td>Split table read across workers</td></tr><tr><td>Partition column</td><td><code>order_id</code></td><td>Column to partition by (must be numeric)</td></tr><tr><td>Number of partitions</td><td>5</td><td>Match to worker count</td></tr><tr><td>Lower bound</td><td>1</td><td>Minimum value of partition column</td></tr><tr><td>Upper bound</td><td>15000000</td><td>Maximum value (approximate)</td></tr></tbody></table>
+<p>→ Glue generates 5 parallel queries:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Worker 0: SELECT * FROM orders WHERE order_id &gt;= 1 AND order_id &lt; 3000001
+</span>Worker 1: SELECT * FROM orders WHERE order_id &gt;= 3000001 AND order_id &lt; 6000001
+Worker 2: SELECT * FROM orders WHERE order_id &gt;= 6000001 AND order_id &lt; 9000001
+Worker 3: SELECT * FROM orders WHERE order_id &gt;= 9000001 AND order_id &lt; 12000001
+Worker 4: SELECT * FROM orders WHERE order_id &gt;= 12000001 AND order_id &lt;= 15000000</code></pre></div>
+<p>→ 5 parallel reads → 5x faster extraction → ~6-9 minutes instead of 30-45</p>
+<p><strong>Partition column selection:</strong></p>
+<table><thead><tr><th>Good Partition Column</th><th>Why</th><th>Bad Partition Column</th><th>Why</th></tr></thead><tbody><tr><td>Primary key (auto-increment)</td><td>Evenly distributed, indexed</td><td><code>status</code> (3 values)</td><td>Extreme skew — one partition gets 90% of data</td></tr><tr><td>Sequential ID</td><td>Good range distribution</td><td><code>country</code> (string)</td><td>Not numeric — can't range-partition</td></tr><tr><td>Date as integer (epoch)</td><td>Good for time-range partitioning</td><td><code>boolean_flag</code></td><td>Only 2 values — only 2 partitions</td></tr></tbody></table>
+<p>→ <code>order_id</code> (auto-increment INT) is ideal — evenly distributed, indexed, numeric</p>
+<p><strong>Option B: Predicate Push-Down</strong></p>
+<p>→ Instead of extracting the ENTIRE table, push a WHERE clause to the database</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Additional SQL condition</td><td><code>order_date &gt;= '2025-01-01'</code></td><td>Only extract recent data</td></tr></tbody></table>
+<p>→ Glue translates this into the JDBC query:<br>
+<code>SELECT * FROM orders WHERE order_date &gt;= '2025-01-01'</code><br>
+→ MariaDB filters at the database level → less data transferred → faster extraction<br>
+→ Combine with partitioning for maximum optimization</p>
+<p><strong>Option C: Custom SQL Query</strong></p>
+<p>→ Instead of reading a table, specify a custom SELECT:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Source type</td><td>JDBC (direct, not Catalog)</td></tr><tr><td>Custom SQL</td><td><code>SELECT o.*, c.customer_name, c.email FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE o.order_date &gt;= '2025-01-01'</code></td></tr></tbody></table>
+<p>→ This performs the JOIN in MariaDB (where indexes exist) rather than in Glue Spark<br>
+→ Reduces data transfer — only needed columns and rows are extracted<br>
+→ BUT: Cannot combine custom SQL with Glue's hash partitioning<br>
+→ Trade-off: Join efficiency vs extraction parallelism</p>
+<hr>
+<h3>STEP 9 — IMPACT MITIGATION ON PRODUCTION DATABASE</h3>
+<p>→ This is unique to JDBC extraction — S3 sources (Project 21) have no such concern</p>
+<p><strong>Strategy 1: Use Read Replica Instead of Primary</strong></p>
+<p>→ From Project 29 (Read Replica concept):</p>
+<ul>
+<li>RDS supports read replicas — asynchronous copies of the primary database</li>
+<li>Point Glue at the READ REPLICA endpoint instead of the primary</li>
+<li>Extraction load goes to the replica → primary is unaffected</li>
+<li>Application performance is completely isolated</li>
+</ul>
+<table><thead><tr><th>Setting</th><th>Change</th></tr></thead><tbody><tr><td>JDBC URL (original)</td><td><code>jdbc:mysql://shopnow-prod-db.xxxxxxx.rds.amazonaws.com:3306/shopnow_db</code></td></tr><tr><td>JDBC URL (replica)</td><td><code>jdbc:mysql://shopnow-prod-db-replica.xxxxxxx.rds.amazonaws.com:3306/shopnow_db</code></td></tr></tbody></table>
+<p>→ This is the #1 recommended approach for production database extraction<br>
+→ If no replica exists → create one specifically for analytics extraction (Project 29)</p>
+<p><strong>Strategy 2: Schedule During Off-Peak Hours</strong></p>
+<table><thead><tr><th>Time Period</th><th>Database Load</th><th>Extraction Safety</th></tr></thead><tbody><tr><td>02:00 - 05:00 UTC</td><td>Lowest traffic</td><td>✅ Safest window</td></tr><tr><td>09:00 - 11:00 UTC</td><td>Peak morning traffic</td><td>❌ Avoid</td></tr><tr><td>12:00 - 14:00 UTC</td><td>Moderate (lunch dip)</td><td>⚠️ Possible with small tables</td></tr><tr><td>18:00 - 22:00 UTC</td><td>Evening shopping peak</td><td>❌ Avoid</td></tr></tbody></table>
+<p>→ Schedule Glue job at 02:00 UTC → completes by 03:30 UTC → before peak hours</p>
+<p><strong>Strategy 3: Limit Concurrent Connections</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Effect</th></tr></thead><tbody><tr><td>Number of partitions</td><td>3-5</td><td>Limits parallel database connections</td></tr><tr><td>Database user max connections</td><td>5</td><td>Hard limit at database level</td></tr><tr><td>fetchSize (JDBC parameter)</td><td>1000</td><td>Rows fetched per network round-trip</td></tr></tbody></table>
+<p>→ <code>fetchSize</code> controls how many rows Glue requests per JDBC call<br>
+→ Default: 0 (database-dependent — often fetches ALL rows into memory)<br>
+→ Recommended: 1000-10000 — balances memory usage and network efficiency</p>
+<p><strong>Strategy 4: Monitor RDS During Extraction</strong></p>
+<p>→ CloudWatch Alarms (Project 8) on RDS metrics:</p>
+<table><thead><tr><th>Metric</th><th>Alert Threshold</th><th>Action</th></tr></thead><tbody><tr><td><code>CPUUtilization</code></td><td>&gt; 80%</td><td>Reduce Glue workers or pause job</td></tr><tr><td><code>DatabaseConnections</code></td><td>&gt; 80% of max</td><td>Reduce partition count</td></tr><tr><td><code>ReadIOPS</code></td><td>&gt; 90% of provisioned</td><td>Scale up RDS or reduce extraction scope</td></tr><tr><td><code>FreeableMemory</code></td><td>&lt; 500 MB</td><td>RDS under memory pressure — reduce fetchSize</td></tr></tbody></table>
+<hr>
+<h3>STEP 10 — CREATE JOBS FOR ALL TABLES</h3>
+<p>→ Repeat the pattern for each MariaDB table:</p>
+<p><strong>Job 1: Orders (Primary — detailed above)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-orders-to-s3</code></td></tr><tr><td>Source table</td><td><code>orders</code> (15M rows)</td></tr><tr><td>Partition column</td><td><code>order_id</code></td></tr><tr><td>Workers</td><td>5</td></tr><tr><td>Schedule</td><td>Daily 02:00 UTC</td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/mariadb/orders/</code></td></tr></tbody></table>
+<p><strong>Job 2: Customers</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-customers-to-s3</code></td></tr><tr><td>Source table</td><td><code>customers</code> (2.5M rows)</td></tr><tr><td>Partition column</td><td><code>customer_id</code></td></tr><tr><td>Workers</td><td>3</td></tr><tr><td>Schedule</td><td>Daily 02:30 UTC</td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/mariadb/customers/</code></td></tr><tr><td>Special handling</td><td>Mask PII (email, phone) before writing to S3</td></tr></tbody></table>
+<p><strong>Job 3: Products</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-products-to-s3</code></td></tr><tr><td>Source table</td><td><code>products</code> (50K rows — small)</td></tr><tr><td>Partition column</td><td>Not needed (small table)</td></tr><tr><td>Workers</td><td>2</td></tr><tr><td>Worker type</td><td>G.025X (smallest — 50K rows is tiny)</td></tr><tr><td>Schedule</td><td>Daily 02:15 UTC</td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/mariadb/products/</code></td></tr></tbody></table>
+<p><strong>Job 4: Payments</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-payments-to-s3</code></td></tr><tr><td>Source table</td><td><code>payments</code> (12M rows)</td></tr><tr><td>Partition column</td><td><code>payment_id</code></td></tr><tr><td>Workers</td><td>5</td></tr><tr><td>Schedule</td><td>Daily 03:00 UTC</td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/mariadb/payments/</code></td></tr><tr><td>Special handling</td><td>Encrypt with SSE-KMS (financial data) — Project 36 concept</td></tr></tbody></table>
+<p><strong>Job 5: Order Items</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-order-items-to-s3</code></td></tr><tr><td>Source table</td><td><code>order_items</code> (45M rows — largest)</td></tr><tr><td>Partition column</td><td><code>item_id</code></td></tr><tr><td>Workers</td><td>8</td></tr><tr><td>Worker type</td><td>G.1X</td></tr><tr><td>Schedule</td><td>Daily 02:00 UTC (parallel with orders — different table)</td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/mariadb/order_items/</code></td></tr></tbody></table>
+<p><strong>Job 6: Inventory Movements</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-mariadb-inventory-to-s3</code></td></tr><tr><td>Source table</td><td><code>inventory_movements</code> (80M rows — largest)</td></tr><tr><td>Partition column</td><td><code>movement_id</code></td></tr><tr><td>Workers</td><td>10</td></tr><tr><td>Worker type</td><td>G.2X (more memory for 80M rows)</td></tr><tr><td>Schedule</td><td>Daily 02:00 UTC</td></tr><tr><td>Target</td><td><code>s3://shopnow-data-lake/transformed/mariadb/inventory/</code></td></tr><tr><td>Special handling</td><td>Incremental extract only (new movements since last run — Job Bookmark)</td></tr></tbody></table>
+<hr>
+<h3>STEP 11 — FULL EXTRACTION VS INCREMENTAL EXTRACTION</h3>
+<p>→ This is a critical architectural decision for each table</p>
+<table><thead><tr><th>Strategy</th><th>Mechanism</th><th>Data Volume</th><th>Use Case</th></tr></thead><tbody><tr><td>Full extraction</td><td>Extract ALL rows every run</td><td>Entire table every time</td><td>Small tables, tables with complex updates</td></tr><tr><td>Incremental extraction</td><td>Extract only NEW/CHANGED rows since last run</td><td>Only delta</td><td>Large tables, append-only or timestamp-tracked</td></tr></tbody></table>
+<p><strong>Full Extraction:</strong></p>
+<p>→ Simple: Extract entire table → overwrite target S3 path<br>
+→ Advantage: Always complete, always consistent<br>
+→ Disadvantage: Wasteful for large tables (80M rows extracted daily when only 300K are new)</p>
+<p>→ Appropriate for:</p>
+<table><thead><tr><th>Table</th><th>Rows</th><th>Full Extract Time</th><th>Rationale</th></tr></thead><tbody><tr><td><code>products</code></td><td>50K</td><td>30 seconds</td><td>Tiny — full extract is trivial</td></tr><tr><td><code>customers</code></td><td>2.5M</td><td>3 minutes</td><td>Moderate — updates happen anywhere in the table</td></tr></tbody></table>
+<p><strong>Incremental Extraction:</strong></p>
+<p>→ Complex: Extract only rows where <code>updated_at &gt;= last_extract_timestamp</code><br>
+→ Advantage: 95%+ less data extracted, faster, less database impact<br>
+→ Disadvantage: Requires reliable timestamp column, merge logic for updates</p>
+<p>→ Appropriate for:</p>
+<table><thead><tr><th>Table</th><th>Rows</th><th>New Rows/Day</th><th>Incremental Extract Time</th><th>Rationale</th></tr></thead><tbody><tr><td><code>orders</code></td><td>15M</td><td>50K</td><td>30 seconds</td><td>Has <code>created_at</code> and <code>updated_at</code> timestamps</td></tr><tr><td><code>order_items</code></td><td>45M</td><td>150K</td><td>45 seconds</td><td>Has <code>created_at</code> timestamp</td></tr><tr><td><code>inventory_movements</code></td><td>80M</td><td>300K</td><td>60 seconds</td><td>Append-only (movements are never updated)</td></tr><tr><td><code>payments</code></td><td>12M</td><td>40K</td><td>20 seconds</td><td>Has <code>created_at</code> and <code>updated_at</code></td></tr></tbody></table>
+<p><strong>How Glue Job Bookmarks Enable Incremental JDBC Extraction:</strong></p>
+<p>→ Job Bookmark (introduced in Project 21, deep dive in Project 46) tracks extraction state<br>
+→ For JDBC sources: Bookmark stores the last extracted value of a key column</p>
+<table><thead><tr><th>Run</th><th>Bookmark State</th><th>Extracted Range</th></tr></thead><tbody><tr><td>Run 1 (first run)</td><td>No bookmark → extract all</td><td><code>order_id</code> 1 to 15,000,000</td></tr><tr><td>Run 2</td><td>Bookmark: <code>order_id = 15,000,000</code></td><td><code>order_id</code> 15,000,001 to 15,050,000</td></tr><tr><td>Run 3</td><td>Bookmark: <code>order_id = 15,050,000</code></td><td><code>order_id</code> 15,050,001 to 15,100,000</td></tr></tbody></table>
+<p>→ Each run extracts ONLY new records → fast, minimal database impact<br>
+→ Bookmark is stored by Glue automatically — no manual tracking needed</p>
+<p><strong>Limitation:</strong> Job Bookmarks work on monotonically increasing columns (auto-increment IDs, timestamps)<br>
+→ If records are UPDATED (not just inserted) → bookmark misses updates to existing rows<br>
+→ For tables with updates → use <code>updated_at</code> timestamp approach with custom SQL:<br>
+<code>WHERE updated_at &gt;= '{last_extract_time}'</code></p>
+<hr>
+<h3>STEP 12 — POST-EXTRACTION INTEGRATION</h3>
+<p>→ After Glue extracts MariaDB data to S3 as Parquet:</p>
+<p><strong>Integration Path 1: Athena Access (Immediate)</strong><br>
+→ Glue Job creates/updates Catalog table → Athena can query immediately<br>
+→ Analysts query <code>shopnow_transformed_db.mariadb_orders</code> via Athena<br>
+→ No MariaDB access needed — data is in S3</p>
+<p><strong>Integration Path 2: Redshift Loading (Pipeline)</strong></p>
+<code>MariaDB → Glue ETL (this project) → S3 Parquet → COPY (Project 22) → Redshift</code>
+<p>→ The COPY command from Project 22 can now load MariaDB-sourced Parquet files<br>
+→ Daily pipeline: Extract at 02:00 → Parquet in S3 by 03:00 → COPY at 04:00 → Redshift refreshed by 04:30</p>
+<p><strong>Integration Path 3: Cross-Dataset Joins in Athena</strong></p>
+<p>→ Now possible for the first time:</p>
+<table><thead><tr><th>Left Table (S3-sourced)</th><th>Right Table (MariaDB-sourced)</th><th>Join Key</th></tr></thead><tbody><tr><td><code>transformed.clickstream</code></td><td><code>mariadb_customers</code></td><td><code>user_id = customer_id</code></td></tr><tr><td><code>transformed.orders</code> (file-based)</td><td><code>mariadb_payments</code></td><td><code>order_id</code></td></tr><tr><td><code>curated.daily_revenue</code> (Redshift-sourced)</td><td><code>mariadb_products</code></td><td><code>product_id</code></td></tr></tbody></table>
+<p>→ All queryable in Athena — data from three different origins joined seamlessly<br>
+→ This is the power of a data lake: heterogeneous sources unified under one query engine</p>
+<p><strong>Integration Path 4: Historical State Building</strong></p>
+<p>→ Each daily extract captures current state<br>
+→ Over time, S3 accumulates snapshots:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/transformed/mariadb/customers/
+</span>  ├── extract_date=2025-01-15/
+  │     └── *.parquet    (customer state as of Jan 15)
+  ├── extract_date=2025-01-16/
+  │     └── *.parquet    (customer state as of Jan 16)
+  ├── extract_date=2025-01-17/
+  │     └── *.parquet    (customer state as of Jan 17)
+  └── ...</code></pre></div>
+<p>→ Query: "What was customer CUST-1234's address on January 15?"<br>
+→ Athena: <code>SELECT address FROM mariadb_customers WHERE customer_id = 'CUST-1234' AND extract_date = '2025-01-15'</code><br>
+→ Problem 3 solved — historical state is now available</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create a DEDICATED read-only database user for Glue — never use admin credentials<br>
+→ Always use a Read Replica for extraction — protect production database performance<br>
+→ Always configure the self-referencing security group rule on Glue SG — without it, Spark workers can't communicate<br>
+→ Always test the Glue Connection BEFORE creating jobs — connection issues are the #1 failure mode<br>
+→ Always use hash partitioning for large tables (&gt; 1M rows) — single-connection extraction is too slow<br>
+→ Always schedule extraction during off-peak hours — minimize production impact<br>
+→ Always add <code>extract_date</code> metadata column — enables historical state tracking<br>
+→ Always monitor RDS CloudWatch metrics during extraction — detect performance impact immediately<br>
+→ Always ensure the Glue ENI subnet has S3 access (NAT Gateway or VPC Endpoint) — otherwise output write fails<br>
+→ Always use incremental extraction for large, append-heavy tables — reduces extraction time by 95%+<br>
+→ Always separate MariaDB-sourced data from file-sourced data in S3 — clear lineage<br>
+→ Always use Secrets Manager for database credentials — never plaintext in Glue Connection (Project 37)<br>
+→ Always set <code>fetchSize</code> explicitly (1000-10000) — default behavior varies and may cause memory issues</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never point Glue directly at the production primary database for large extractions — use Read Replica<br>
+→ Never use the database admin/root user for Glue — blast radius is too large<br>
+→ Never forget the self-referencing security group rule — most common Glue JDBC failure<br>
+→ Never set partition count &gt; database max connections — overwhelms the database<br>
+→ Never extract entire 80M row table daily when only 300K rows are new — wasteful and slow<br>
+→ Never store database passwords in plaintext in Glue Connection — use Secrets Manager<br>
+→ Never run extraction during peak business hours without Read Replica — risks application performance<br>
+→ Never forget S3 access from Glue ENI subnet — job succeeds on extract but fails on write<br>
+→ Never use <code>fetchSize = 0</code> for large tables — may attempt to load entire result set into memory<br>
+→ Never extract sensitive data (SSN, credit cards) without masking/encrypting — compliance violation<br>
+→ Never skip the connection test — debugging a failed job is 10x harder than testing the connection first<br>
+→ Never use the same Glue Connection for dev and prod databases — create separate connections with clear naming</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE GLUE ETL WITH JDBC</h2>
+<table><thead><tr><th>Scenario</th><th>Use Glue JDBC?</th><th>Why</th></tr></thead><tbody><tr><td>Extract operational data to data lake</td><td>✅ Yes</td><td>Primary use case — this project</td></tr><tr><td>Daily/weekly database snapshot to S3</td><td>✅ Yes</td><td>Scheduled batch extraction</td></tr><tr><td>Database to data warehouse pipeline</td><td>✅ Yes</td><td>MariaDB → S3 → Redshift</td></tr><tr><td>One-time database migration to S3</td><td>✅ Yes</td><td>Historical data migration</td></tr><tr><td>Cross-database joins (database + S3)</td><td>✅ Yes</td><td>Extract both to S3, join in Athena</td></tr><tr><td>Real-time CDC (Change Data Capture)</td><td>❌ No</td><td>Use DMS (Project 58) for real-time replication</td></tr><tr><td>Sub-second database reads</td><td>❌ No</td><td>Use direct JDBC from application</td></tr><tr><td>Small lookups (&lt; 100 rows)</td><td>❌ No</td><td>Use Lambda with JDBC — Glue overhead too high</td></tr><tr><td>Continuous streaming from database</td><td>❌ No</td><td>Use DMS CDC → Kinesis → S3</td></tr><tr><td>Extract from databases with no JDBC driver</td><td>❌ No</td><td>Need custom connector or DMS</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE GLUE ETL WITH JDBC</h2>
+<p>→ When you need real-time replication → Use AWS DMS (Project 58) — supports continuous CDC<br>
+→ When extraction must have zero production impact → Use DMS with Read Replica → DMS is lighter than Glue JDBC<br>
+→ When you need to extract from non-JDBC sources (MongoDB, DynamoDB) → Use DMS or native connectors<br>
+→ When data volume is tiny (&lt; 1000 rows) → Lambda with JDBC is simpler and cheaper<br>
+→ When you need exactly-once delivery guarantees → DMS provides this; Glue JDBC may have edge cases with bookmarks<br>
+→ When the database has no primary key or sequential column → Partitioned reads are impossible → consider DMS</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → GLUE JDBC EXTRACTION LIFECYCLE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Job triggered (scheduled / manual / workflow)
+</span>       ↓
+Glue provisions Spark cluster in AWS-managed infrastructure
+       ↓
+Glue creates ENIs in YOUR VPC (specified in Connection)
+  ├── ENI 1: 10.0.2.100 (Worker 1)
+  ├── ENI 2: 10.0.2.101 (Worker 2)
+  ├── ENI 3: 10.0.2.102 (Worker 3)
+  ├── ENI 4: 10.0.2.103 (Worker 4)
+  └── ENI 5: 10.0.2.104 (Worker 5)
+       ↓
+Each ENI is attached to the specified security group (sg-0glue789)
+       ↓
+EXTRACTION PHASE:
+  ├── WITHOUT partitioning:
+  │     └── Worker 1 opens JDBC connection to MariaDB
+  │           SELECT * FROM orders
+  │           Fetches ALL rows → other workers idle
+  │
+  └── WITH partitioning (5 partitions on order_id):
+        ├── Worker 1: JDBC → SELECT * FROM orders WHERE order_id &gt;= 1 AND order_id &lt; 3000001
+        ├── Worker 2: JDBC → SELECT * FROM orders WHERE order_id &gt;= 3000001 AND order_id &lt; 6000001
+        ├── Worker 3: JDBC → SELECT * FROM orders WHERE order_id &gt;= 6000001 AND order_id &lt; 9000001
+        ├── Worker 4: JDBC → SELECT * FROM orders WHERE order_id &gt;= 9000001 AND order_id &lt; 12000001
+        └── Worker 5: JDBC → SELECT * FROM orders WHERE order_id &gt;= 12000001 AND order_id &lt;= 15000000
+       ↓
+Each worker fetches rows in batches (fetchSize rows per network round-trip)
+       ↓
+Rows loaded into Spark DynamicFrames on each worker
+       ↓
+TRANSFORMATION PHASE (same as Project 21):
+  ├── Schema changes
+  ├── Filters
+  ├── Derived columns
+  └── Type resolution
+       ↓
+WRITE PHASE:
+  ├── Workers format data as Parquet
+  ├── Workers partition by year/month
+  ├── Workers write to S3 via:
+  │     ├── NAT Gateway → Internet Gateway → S3 (if NAT exists)
+  │     └── S3 VPC Gateway Endpoint → S3 (if endpoint exists)
+  └── Each worker writes its portion in parallel
+       ↓
+Job completes → ENIs are deleted → Spark cluster terminated
+       ↓
+Job Bookmark updated with last processed key value</code></pre></div>
+<hr>
+<h3>2 → JDBC FETCHSIZE MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Worker opens JDBC connection
+</span>       ↓
+Worker sends: SELECT * FROM orders WHERE order_id &gt;= 1 AND order_id &lt; 3000001
+       ↓
+MariaDB begins executing query
+       ↓
+fetchSize = 1000:
+  ├── Worker requests first 1000 rows
+  ├── MariaDB sends 1000 rows over network
+  ├── Worker processes 1000 rows in Spark
+  ├── Worker requests next 1000 rows
+  ├── MariaDB sends next 1000 rows
+  └── ... repeats until all 3M rows fetched
+       ↓
+fetchSize = 0 (DEFAULT — DANGEROUS):
+  ├── MariaDB sends ALL 3M rows at once
+  ├── Worker must buffer ALL rows in memory
+  └── If rows exceed worker memory → OutOfMemoryError → Job fails</code></pre></div>
+<p><strong>fetchSize impact:</strong></p>
+<table><thead><tr><th>fetchSize</th><th>Memory Usage</th><th>Network Roundtrips (for 3M rows)</th><th>Speed</th></tr></thead><tbody><tr><td>0 (all at once)</td><td>Entire result in memory</td><td>1</td><td>Fastest (if memory sufficient)</td></tr><tr><td>100</td><td>Low</td><td>30,000</td><td>Slow (too many roundtrips)</td></tr><tr><td>1,000</td><td>Moderate</td><td>3,000</td><td>Good balance</td></tr><tr><td>10,000</td><td>Higher</td><td>300</td><td>Faster, more memory</td></tr><tr><td>100,000</td><td>High</td><td>30</td><td>Very fast, may cause memory pressure</td></tr></tbody></table>
+<p>→ Recommended: <strong>1,000 - 10,000</strong> depending on row size<br>
+→ Wide rows (many columns, large text fields) → use smaller fetchSize<br>
+→ Narrow rows (few columns, numeric) → use larger fetchSize</p>
+<hr>
+<h3>3 → ENI LIFECYCLE AND NETWORKING</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Job starts
+</span>  ↓
+Glue calls EC2 API: CreateNetworkInterface
+  ├── VPC: vpc-0abc123
+  ├── Subnet: subnet-0private456
+  ├── Security Groups: [sg-0glue789]
+  └── Returns: ENI eni-0xyz (IP: 10.0.2.100)
+  ↓
+ENI attached to Glue worker (in AWS-managed infrastructure)
+  ↓
+Worker's network traffic routes through ENI:
+  ├── To MariaDB: 10.0.2.100 → 10.0.1.50:3306 (private subnet routing)
+  ├── To S3: 10.0.2.100 → S3 VPC Endpoint OR NAT Gateway → S3
+  └── To other workers: 10.0.2.100 → 10.0.2.101 (via self-referencing SG)
+  ↓
+Job completes
+  ↓
+Glue calls EC2 API: DeleteNetworkInterface
+  ├── ENI eni-0xyz deleted
+  └── IP 10.0.2.100 returned to subnet pool</code></pre></div>
+<p>→ ENIs are ephemeral — created at job start, deleted at job end<br>
+→ If job fails mid-execution → ENIs may linger for a few minutes before cleanup<br>
+→ Check "Network Interfaces" in EC2 console if you see unexpected ENIs<br>
+→ Glue-created ENIs have description: "Glue ENI" or similar tag</p>
+<hr>
+<h3>4 → JOB BOOKMARK FOR JDBC SOURCES</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FIRST RUN (no bookmark exists):
+</span>  ├── Glue reads entire table: SELECT * FROM orders
+  ├── Processes all 15M rows
+  ├── After successful completion:
+  │     Bookmark saved: {table: "orders", column: "order_id", value: 15000000}
+  └── Next run will start from order_id &gt; 15000000
+
+SECOND RUN (bookmark exists):
+  ├── Glue reads bookmark: {column: "order_id", value: 15000000}
+  ├── Generates query: SELECT * FROM orders WHERE order_id &gt; 15000000
+  ├── Only new rows (50,000) are extracted
+  ├── After successful completion:
+  │     Bookmark updated: {column: "order_id", value: 15050000}
+  └── Next run will start from order_id &gt; 15050000
+
+FAILED RUN (bookmark NOT updated):
+  ├── Job fails mid-extraction
+  ├── Bookmark remains at previous value: 15000000
+  ├── Next run re-extracts from order_id &gt; 15000000
+  └── No data loss — failed run's partial data may create duplicates (handled by dedup)</code></pre></div>
+<p>→ Bookmark column must be:</p>
+<ul>
+<li>Monotonically increasing (new records have higher values)</li>
+<li>Never updated on existing records (otherwise bookmark misses updates)</li>
+<li>Typically: auto-increment primary key or <code>created_at</code> timestamp</li>
+</ul>
+<p>→ For tables with UPDATES (not just inserts):</p>
+<ul>
+<li>Bookmark on <code>order_id</code> misses updated rows (their order_id didn't change)</li>
+<li>Solution: Use <code>updated_at</code> column — but requires custom extraction logic</li>
+<li>Or: Full extraction for tables with frequent updates (customers, products)</li>
+</ul>
+<hr>
+<h3>5 → DATA TYPE MAPPING: MARIADB → GLUE → PARQUET</h3>
+<table><thead><tr><th>MariaDB Type</th><th>Glue/Spark Type</th><th>Parquet Type</th><th>Notes</th></tr></thead><tbody><tr><td>INT</td><td>IntegerType</td><td>INT32</td><td>Direct mapping</td></tr><tr><td>BIGINT</td><td>LongType</td><td>INT64</td><td>Direct mapping</td></tr><tr><td>FLOAT</td><td>FloatType</td><td>FLOAT</td><td>Direct mapping</td></tr><tr><td>DOUBLE</td><td>DoubleType</td><td>DOUBLE</td><td>Direct mapping</td></tr><tr><td>DECIMAL(p,s)</td><td>DecimalType(p,s)</td><td>FIXED_LEN_BYTE_ARRAY</td><td>Preserves precision</td></tr><tr><td>VARCHAR(n)</td><td>StringType</td><td>BYTE_ARRAY (UTF8)</td><td>Length limit lost in Parquet</td></tr><tr><td>TEXT</td><td>StringType</td><td>BYTE_ARRAY (UTF8)</td><td>Same as VARCHAR in Parquet</td></tr><tr><td>DATE</td><td>DateType</td><td>INT32 (DATE logical)</td><td>Days since epoch</td></tr><tr><td>DATETIME</td><td>TimestampType</td><td>INT96 or INT64 (TIMESTAMP)</td><td>Microsecond precision</td></tr><tr><td>TIMESTAMP</td><td>TimestampType</td><td>INT96 or INT64 (TIMESTAMP)</td><td>Microsecond precision</td></tr><tr><td>BOOLEAN/TINYINT(1)</td><td>BooleanType</td><td>BOOLEAN</td><td>Direct mapping</td></tr><tr><td>BLOB</td><td>BinaryType</td><td>BYTE_ARRAY</td><td>Binary data preserved</td></tr><tr><td>ENUM</td><td>StringType</td><td>BYTE_ARRAY (UTF8)</td><td>Enum values become strings</td></tr><tr><td>JSON</td><td>StringType</td><td>BYTE_ARRAY (UTF8)</td><td>JSON stored as string in Parquet</td></tr></tbody></table>
+<p>→ Most types map cleanly — MariaDB is well-typed, so fewer conversion issues than CSV (Project 21)<br>
+→ Watch for: DECIMAL precision loss if Glue infers as DOUBLE — always verify monetary columns</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>Connection test fails with timeout</td><td>"Connection timed out"</td><td>Security group rules missing or incorrect</td><td>Verify Glue SG outbound → RDS port 3306, RDS SG inbound ← Glue SG</td></tr><tr><td>2</td><td>Connection test fails with authentication error</td><td>"Access denied for user"</td><td>Wrong credentials or user doesn't exist</td><td>Verify username, password, database name; check user host restriction</td></tr><tr><td>3</td><td>Self-referencing SG rule missing</td><td>Job fails with Spark task communication errors</td><td>Glue workers can't talk to each other</td><td>Add All TCP inbound/outbound rule referencing the Glue SG itself</td></tr><tr><td>4</td><td>Job succeeds on extract but fails on S3 write</td><td>"Unable to connect to S3" or timeout on write</td><td>Glue ENI subnet has no route to S3</td><td>Add NAT Gateway or S3 VPC Gateway Endpoint</td></tr><tr><td>5</td><td>Extraction extremely slow (single thread)</td><td>Job takes hours for moderate table</td><td>No hash partitioning configured</td><td>Enable partitioning with numeric column and appropriate partition count</td></tr><tr><td>6</td><td>Production database CPU spikes during extraction</td><td>Application latency increases</td><td>Glue reading directly from primary with too many connections</td><td>Use Read Replica; reduce worker/partition count; schedule off-peak</td></tr><tr><td>7</td><td>Out of memory on Glue workers</td><td>Job fails with OOM</td><td>fetchSize = 0 (entire result in memory) or worker type too small</td><td>Set fetchSize = 1000-10000; upgrade to G.2X workers</td></tr><tr><td>8</td><td>Subnet runs out of IP addresses</td><td>"Unable to create ENI" error</td><td>Small subnet CIDR with too many Glue workers</td><td>Use a larger subnet (/24 instead of /28) or reduce worker count</td></tr><tr><td>9</td><td>Job Bookmark doesn't work for updated records</td><td>Stale data in S3 for modified records</td><td>Bookmark tracks insert key (order_id) — misses UPDATEs</td><td>Use <code>updated_at</code> column for incremental or full extraction for updated tables</td></tr><tr><td>10</td><td>DECIMAL precision lost</td><td>Monetary values like 19.99 become 19.9900000001</td><td>Glue inferred DECIMAL as DOUBLE (floating point)</td><td>Explicitly map to DecimalType in schema transform</td></tr><tr><td>11</td><td>Duplicate data after job retry</td><td>Same records appear twice in S3</td><td>Job failed after writing some files, bookmark not updated, retry reprocesses</td><td>Use CLEANPATH or idempotent write pattern; deduplicate downstream</td></tr><tr><td>12</td><td>Connection works but Crawler finds no tables</td><td>Crawler completes with 0 tables</td><td>Include path pattern wrong (e.g., <code>shopnow_db</code> instead of <code>shopnow_db/%</code>)</td><td>Verify include path uses <code>database_name/%</code> format</td></tr><tr><td>13</td><td>Glue can't connect after RDS failover</td><td>Job fails after Multi-AZ failover (Project 29)</td><td>Glue Connection uses old endpoint</td><td>Use RDS DNS endpoint (not IP) — DNS auto-updates on failover</td></tr><tr><td>14</td><td>Timezone mismatch in extracted timestamps</td><td>Dates appear shifted by hours</td><td>MariaDB timezone differs from Glue's UTC default</td><td>Set connection property <code>serverTimezone=UTC</code> or convert explicitly</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Table Size Scaling</strong></p>
+<table><thead><tr><th>Table Size</th><th>Workers</th><th>Partitions</th><th>Worker Type</th><th>Estimated Duration</th></tr></thead><tbody><tr><td>&lt; 100K rows</td><td>2</td><td>None needed</td><td>G.025X</td><td>1-2 minutes</td></tr><tr><td>100K - 1M rows</td><td>3</td><td>3</td><td>G.025X</td><td>2-5 minutes</td></tr><tr><td>1M - 10M rows</td><td>5</td><td>5</td><td>G.1X</td><td>5-15 minutes</td></tr><tr><td>10M - 100M rows</td><td>10</td><td>10</td><td>G.1X</td><td>15-45 minutes</td></tr><tr><td>100M - 1B rows</td><td>20</td><td>20</td><td>G.2X</td><td>45-120 minutes</td></tr><tr><td>&gt; 1B rows</td><td>20+</td><td>20+</td><td>G.2X / G.4X</td><td>2+ hours (consider DMS)</td></tr></tbody></table>
+<p>→ <strong>Database Capacity Scaling</strong></p>
+<table><thead><tr><th>RDS Instance Class</th><th>Max Connections</th><th>Safe Glue Partitions</th><th>Rationale</th></tr></thead><tbody><tr><td>db.t3.medium</td><td>90</td><td>3-5</td><td>Leave 80%+ connections for application</td></tr><tr><td>db.r5.large</td><td>300</td><td>5-10</td><td>More headroom</td></tr><tr><td>db.r5.2xlarge</td><td>600</td><td>10-15</td><td>Comfortable margin</td></tr><tr><td>db.r5.4xlarge</td><td>1200</td><td>15-20</td><td>Large extraction jobs</td></tr></tbody></table>
+<p>→ Rule: Glue connections should never exceed 10% of max database connections<br>
+→ Read Replica eliminates this constraint entirely</p>
+<p>→ <strong>Multi-Table Extraction Scheduling</strong></p>
+<table><thead><tr><th>Strategy</th><th>Approach</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Sequential</td><td>Job 1 → Job 2 → Job 3 → ...</td><td>Simple, minimal DB impact</td><td>Slow total time</td></tr><tr><td>Parallel (different tables)</td><td>Job 1 + Job 2 + Job 3 simultaneously</td><td>Fast total time</td><td>Higher DB load (sum of all connections)</td></tr><tr><td>Staggered</td><td>Job 1 at 02:00, Job 2 at 02:15, Job 3 at 02:30</td><td>Moderate speed, controlled load</td><td>Requires scheduling coordination</td></tr></tbody></table>
+<p>→ For ShopNow with 6 tables and Read Replica:</p>
+<ul>
+<li>Small tables (products): Run first — validates connection, completes in seconds</li>
+<li>Large tables (orders, order_items, inventory): Run in parallel — different tables, no lock contention</li>
+<li>Sensitive tables (payments, customers): Run sequentially — controlled monitoring</li>
+</ul>
+<p>→ Recommended schedule:</p>
+<table><thead><tr><th>Time (UTC)</th><th>Job</th><th>Table</th><th>Workers</th><th>Estimated Duration</th></tr></thead><tbody><tr><td>02:00</td><td><code>shopnow-mariadb-products-to-s3</code></td><td>products (50K)</td><td>2</td><td>1 minute</td></tr><tr><td>02:05</td><td><code>shopnow-mariadb-customers-to-s3</code></td><td>customers (2.5M)</td><td>3</td><td>4 minutes</td></tr><tr><td>02:10</td><td><code>shopnow-mariadb-orders-to-s3</code></td><td>orders (15M)</td><td>5</td><td>10 minutes</td></tr><tr><td>02:10</td><td><code>shopnow-mariadb-order-items-to-s3</code></td><td>order_items (45M)</td><td>8</td><td>25 minutes</td></tr><tr><td>02:10</td><td><code>shopnow-mariadb-inventory-to-s3</code></td><td>inventory (80M)</td><td>10</td><td>35 minutes</td></tr><tr><td>02:45</td><td><code>shopnow-mariadb-payments-to-s3</code></td><td>payments (12M)</td><td>5</td><td>8 minutes</td></tr></tbody></table>
+<p>→ Total wall-clock time: ~55 minutes (02:00 → 02:55)<br>
+→ Total if sequential: ~83 minutes<br>
+→ Parallel where possible → 34% faster overall</p>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Component</th><th>Cost Driver</th></tr></thead><tbody><tr><td>Glue DPU-hours</td><td>Workers × duration × $0.29 (Flex)</td></tr><tr><td>S3 storage</td><td>Output Parquet size × $0.023/GB/month</td></tr><tr><td>S3 requests</td><td>PUT requests during write — negligible</td></tr><tr><td>RDS impact</td><td>No direct cost — but performance impact on under-provisioned instances</td></tr><tr><td>VPC Endpoint</td><td>Free (Gateway Endpoint for S3)</td></tr><tr><td>NAT Gateway</td><td>$0.045/hour + $0.045/GB data processed (if used instead of VPC Endpoint)</td></tr></tbody></table>
+<p><strong>Monthly cost estimate for all 6 extraction jobs:</strong></p>
+<table><thead><tr><th>Job</th><th>Workers</th><th>Duration</th><th>DPU-Hours</th><th>Cost/Run (Flex)</th></tr></thead><tbody><tr><td>Products</td><td>2</td><td>1 min</td><td>0.03</td><td>$0.01</td></tr><tr><td>Customers</td><td>3</td><td>4 min</td><td>0.20</td><td>$0.06</td></tr><tr><td>Orders</td><td>5</td><td>10 min</td><td>0.83</td><td>$0.24</td></tr><tr><td>Order Items</td><td>8</td><td>25 min</td><td>3.33</td><td>$0.97</td></tr><tr><td>Inventory</td><td>10</td><td>35 min</td><td>5.83</td><td>$1.69</td></tr><tr><td>Payments</td><td>5</td><td>8 min</td><td>0.67</td><td>$0.19</td></tr><tr><td><strong>Daily Total</strong></td><td></td><td></td><td><strong>10.89</strong></td><td><strong>$3.16</strong></td></tr><tr><td><strong>Monthly Total</strong></td><td></td><td></td><td><strong>326.7</strong></td><td><strong>$94.74</strong></td></tr></tbody></table>
+<p>→ Under $100/month to extract ALL operational data from MariaDB to the data lake daily<br>
+→ Compare to the cost of analyst downtime, production DB degradation, or lost historical data</p>
+<p>→ <strong>Incremental Extraction Cost Reduction</strong></p>
+<table><thead><tr><th>Strategy</th><th>Data Extracted Daily</th><th>DPU-Hours</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Full extraction (all tables, all rows)</td><td>~155M rows</td><td>10.89/day</td><td>$94.74</td></tr><tr><td>Incremental (large tables) + Full (small tables)</td><td>~0.6M rows</td><td>2.1/day</td><td>$18.27</td></tr><tr><td><strong>Savings</strong></td><td><strong>99.6% less data</strong></td><td><strong>80% fewer DPUs</strong></td><td><strong>$76.47/month saved</strong></td></tr></tbody></table>
+<p>→ Incremental extraction (Project 46 deep dive) reduces costs by 80%<br>
+→ Enable Job Bookmarks now → realize savings immediately</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Pre-Job Verification Checklist:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Connection test passes?</td><td>Glue Console → Connections → Test</td><td>✅ Successful</td></tr><tr><td>RDS instance running?</td><td>RDS Console → Status</td><td>Available</td></tr><tr><td>Read Replica in sync?</td><td>RDS Console → Replica lag</td><td>&lt; 1 second</td></tr><tr><td>Glue SG self-reference rule?</td><td>EC2 → Security Groups → Inbound</td><td>All TCP from self</td></tr><tr><td>Glue SG → RDS SG outbound?</td><td>EC2 → Security Groups → Outbound</td><td>TCP 3306 to RDS SG</td></tr><tr><td>RDS SG ← Glue SG inbound?</td><td>EC2 → Security Groups → Inbound</td><td>TCP 3306 from Glue SG</td></tr><tr><td>Subnet has free IPs?</td><td>VPC Console → Subnets → Available IPs</td><td>&gt; worker count + 5</td></tr><tr><td>S3 route exists?</td><td>VPC Console → Route Tables → S3 endpoint or NAT</td><td>Route present</td></tr><tr><td>IAM Role has JDBC + S3 permissions?</td><td>IAM → Role → Policies</td><td>Glue + S3 policies attached</td></tr><tr><td>Database user has SELECT permission?</td><td>DBA verification</td><td>SELECT on target tables only</td></tr></tbody></table>
+<p>→ <strong>Post-Job Verification Checklist:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Job succeeded?</td><td>Glue Console → Job Runs → Status</td><td>SUCCEEDED</td></tr><tr><td>Files in S3?</td><td>S3 Console → target path</td><td>Parquet files present</td></tr><tr><td>Partition structure correct?</td><td>S3 path has <code>year=X/month=X/</code></td><td>✅</td></tr><tr><td>Row count matches?</td><td>Athena count vs MariaDB count</td><td>Match (within tolerance for incremental)</td></tr><tr><td>Schema correct?</td><td>Glue Catalog → Table → Schema</td><td>Column names and types correct</td></tr><tr><td>extract_date column present?</td><td>Athena → SELECT DISTINCT extract_date</td><td>Today's date present</td></tr><tr><td>No PII in unmasked form?</td><td>Sample query for email/phone columns</td><td>Masked or encrypted</td></tr><tr><td>RDS CPU during extraction?</td><td>CloudWatch → RDS → CPUUtilization</td><td>&lt; 50% spike (or 0% if using replica)</td></tr><tr><td>Bookmark updated?</td><td>Glue Console → Job → Bookmark details</td><td>Last processed value updated</td></tr><tr><td>File sizes optimal?</td><td>S3 → check individual file sizes</td><td>64-256 MB each</td></tr></tbody></table>
+<p>→ <strong>End-to-End Data Lineage Verification:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MariaDB: shopnow_db.orders (15M rows)
+</span>    ↓ [Glue JDBC extraction]
+S3: s3://shopnow-data-lake/transformed/mariadb/orders/year=2025/month=01/*.parquet
+    ↓ [Glue Crawler]
+Catalog: shopnow_transformed_db.mariadb_orders
+    ↓ [Athena query]
+Result: SELECT count(*) FROM mariadb_orders WHERE year = 2025 AND month = 1
+    → Should match: SELECT count(*) FROM orders WHERE order_date BETWEEN '2025-01-01' AND '2025-01-31'
+       (queried directly in MariaDB for verification)</code></pre></div>
+<p>→ <strong>Monitoring Dashboard (Extending Project 8 + Project 19):</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric/Source</th><th>Purpose</th></tr></thead><tbody><tr><td>Extraction job status</td><td>Glue Job Run status</td><td>Green = succeeded, Red = failed</td></tr><tr><td>Extraction duration trend</td><td>Glue CloudWatch <code>elapsedTime</code></td><td>Detect degradation as tables grow</td></tr><tr><td>Rows extracted per run</td><td>Glue <code>recordsRead</code> metric</td><td>Detect anomalies (sudden drop = data issue)</td></tr><tr><td>RDS CPU during extraction window</td><td>CloudWatch → RDS → CPUUtilization</td><td>Verify production not impacted</td></tr><tr><td>RDS replica lag</td><td>CloudWatch → RDS → ReplicaLag</td><td>Ensure replica is current before extraction</td></tr><tr><td>S3 output size per run</td><td>S3 metrics or Glue <code>bytesWritten</code></td><td>Track data growth</td></tr><tr><td>Job Bookmark value</td><td>Glue API → GetJobBookmark</td><td>Verify incremental progress</td></tr><tr><td>Failed job alert</td><td>CloudWatch Alarm on Glue job failure</td><td>SNS notification (Project 6)</td></tr></tbody></table>
+<p>→ <strong>Alerting Configuration:</strong></p>
+<table><thead><tr><th>Alert</th><th>Trigger</th><th>Action</th></tr></thead><tbody><tr><td>Job failed</td><td>Glue job status = FAILED</td><td>SNS → on-call engineer</td></tr><tr><td>Job running &gt; 2x normal duration</td><td>CloudWatch metric threshold</td><td>SNS → data engineering team</td></tr><tr><td>RDS CPU &gt; 70% during extraction window</td><td>CloudWatch RDS alarm</td><td>Reduce Glue workers automatically or alert</td></tr><tr><td>0 rows extracted</td><td>Glue <code>recordsRead</code> = 0</td><td>SNS → investigate data source</td></tr><tr><td>S3 output size &lt; 50% of previous run</td><td>Compare with historical baseline</td><td>SNS → data quality investigation</td></tr></tbody></table>
+<hr>
+<p>→ <strong>Troubleshooting Common Scenarios:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Investigation Path</th></tr></thead><tbody><tr><td>Job failed — where to look first?</td><td>Glue Console → Job Run → Error details → CloudWatch Logs (Project 19 for Glue continuous logging)</td></tr><tr><td>Extraction slow — where's the bottleneck?</td><td>Spark UI → Check stage durations → Is it JDBC read or S3 write?</td></tr><tr><td>Data mismatch — MariaDB vs S3 counts differ</td><td>Check filter conditions, bookmark state, extraction time window vs MariaDB timezone</td></tr><tr><td>Job succeeded but Athena shows no data</td><td>Catalog not updated — run Crawler or check if job was configured to update Catalog</td></tr><tr><td>Parquet files unreadable in Athena</td><td>Schema mismatch — compare Catalog schema with Parquet schema (column name case sensitivity)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Glue ETL with JDBC bridges the gap between OPERATIONAL databases and ANALYTICAL data lakes<br>
+→ The pattern MariaDB → Glue JDBC → S3 Parquet unlocks operational data for analytics WITHOUT impacting production<br>
+→ The critical differentiator from Project 21 (S3 source): VPC networking + security groups + database credentials<br>
+→ The self-referencing security group rule on Glue ENIs is the #1 most missed configuration<br>
+→ S3 access from Glue ENIs (NAT Gateway or VPC Endpoint) is the #2 most missed configuration<br>
+→ Read Replicas are the production-safe extraction strategy — always prefer over primary database<br>
+→ Hash partitioning transforms single-threaded extraction into parallel extraction — 5-10x faster<br>
+→ Job Bookmarks enable incremental extraction — 80%+ cost reduction for large, append-heavy tables<br>
+→ Adding <code>extract_date</code> metadata creates historical state tracking — solving a problem MariaDB alone cannot</p>
+<p>→ The data lake now has THREE data origins:</p>
+<table><thead><tr><th>Origin</th><th>Pipeline</th><th>First Introduced</th></tr></thead><tbody><tr><td>File uploads (CSV/JSON)</td><td>S3 raw → Glue ETL (Project 21) → S3 transformed</td><td>Project 1, 21</td></tr><tr><td>Redshift computations</td><td>Redshift → UNLOAD (Project 23) → S3 curated</td><td>Project 23</td></tr><tr><td>Operational database (MariaDB)</td><td>MariaDB → Glue JDBC (this project) → S3 transformed</td><td>This project</td></tr></tbody></table>
+<p>→ All three origins produce Parquet files in S3 → all queryable via Athena → all loadable into Redshift<br>
+→ The data lake is becoming a TRUE unified analytics platform</p>
+<p>→ This project connects to:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 9 (RDS MariaDB)</td><td>Source database — understanding RDS setup is prerequisite</td></tr><tr><td>Project 5 (VPC)</td><td>Networking — Glue ENIs must be in the correct VPC/subnet</td></tr><tr><td>Project 4 (Security Groups)</td><td>Firewall rules — cross-SG references between Glue and RDS</td></tr><tr><td>Project 21 (Glue ETL S3→S3)</td><td>Same Glue Job engine — different source (JDBC vs S3)</td></tr><tr><td>Project 17 (Crawler)</td><td>JDBC Crawler catalogs MariaDB tables; S3 Crawler catalogs output</td></tr><tr><td>Project 18 (Athena)</td><td>Queries the extracted data without database access</td></tr><tr><td>Project 22 (COPY)</td><td>Loads extracted Parquet into Redshift</td></tr><tr><td>Project 27 (VPC Endpoints)</td><td>S3 VPC Endpoint enables Glue ENI → S3 private access</td></tr><tr><td>Project 29 (Read Replica)</td><td>Read Replica is the recommended extraction source</td></tr><tr><td>Project 37 (Secrets Manager)</td><td>Securely stores database credentials for Glue Connection</td></tr><tr><td>Project 43 (Redshift → MariaDB)</td><td>Reverse direction — writing data BACK to MariaDB from Redshift</td></tr><tr><td>Project 46 (Job Bookmarks)</td><td>Deep dive into incremental extraction introduced here</td></tr><tr><td>Project 58 (DMS)</td><td>Alternative to Glue JDBC for real-time/CDC database extraction</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ We now have data flowing into the data lake from three sources:</p>
+<ul>
+<li>File uploads → Glue ETL → S3 (Project 21)</li>
+<li>Redshift computations → UNLOAD → S3 (Project 23)</li>
+<li>MariaDB operational data → Glue JDBC → S3 (this project)</li>
+</ul>
+<p>→ Each of these produces Parquet files in S3<br>
+→ Each requires a Glue Crawler to register in the Catalog<br>
+→ Each is queryable via Athena</p>
+<p>→ But right now — these are DISCONNECTED steps<br>
+→ An analyst asks: "Can I query the LATEST customer data joined with clickstream behavior and product information?"<br>
+→ The answer is yes — IF all the pieces are connected:</p>
+<ol>
+<li>Glue Crawler runs on raw data → catalogs it</li>
+<li>Glue ETL transforms raw to Parquet → writes to S3</li>
+<li>Glue Crawler runs on transformed data → updates catalog</li>
+<li>Athena queries the catalog</li>
+</ol>
+<p>→ Currently — each step is triggered manually<br>
+→ If the Crawler doesn't run after ETL → Athena shows stale data<br>
+→ If ETL runs before Crawler → it uses old schema<br>
+→ The steps need to be CHAINED into an automated end-to-end pipeline</p>
+<p>→ <strong>This is exactly what Project 25 solves</strong><br>
+→ Project 25 creates the complete S3 → Glue Crawler → Glue Catalog → Athena end-to-end pipeline<br>
+→ You will learn how to connect all the pieces into a self-service analytics platform<br>
+→ Including Athena Views, CTAS (Create Table As Select), and Partition Projection — techniques that make the data lake truly self-service</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 25: "The Company That Wanted Self-Service Analytics — S3 → Glue Crawler → Glue Catalog → Athena End-to-End Pipeline"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-23.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 24/60</span></div><a class="nav-btn next" href="project-25.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

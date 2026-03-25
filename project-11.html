@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 11: THE EC2 APP THAT NEEDED S3 WITHOUT HARDCODED KEYS — IAM Roles for EC — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 11: THE EC2 APP THAT NEEDED S3 WITHOUT HARDCODED KEYS — IAM Roles for EC2</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-10) now has:</p>
+<ul>
+<li>S3 bucket with bucket policies enforcing encryption and HTTPS (Projects 1, 10)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instances in a properly architected VPC (Projects 3, 4, 5)</li>
+<li>SNS topics and SQS queues for messaging (Projects 6, 7)</li>
+<li>CloudWatch monitoring (Project 8)</li>
+<li>RDS MariaDB in private subnets (Project 9)</li>
+</ul>
+<p>→ The web application running on EC2 needs to:</p>
+<ul>
+<li>READ product images from S3 (serve to customers)</li>
+<li>WRITE order confirmation PDFs to S3</li>
+<li>SEND messages to SQS (order queue — Project 7)</li>
+<li>PUBLISH notifications to SNS (alert topics — Project 6)</li>
+<li>READ database credentials from Secrets Manager (future — Project 37)</li>
+</ul>
+<p>→ Problem 1: <code>priya-dev</code> created an IAM user <code>app-service-account</code> with access keys<br>
+→ She placed the Access Key ID and Secret Access Key in a configuration file on the EC2 instance<br>
+→ The config file: <code>/opt/shopnow/config/aws-credentials.conf</code><br>
+→ File permissions were set to <code>644</code> (readable by everyone on the server)<br>
+→ A compromised web application vulnerability allowed an attacker to read local files<br>
+→ The attacker read the credentials file → used the keys to download the ENTIRE S3 bucket<br>
+→ The keys were LONG-LIVED (never rotated) → the attacker had access for weeks before detection</p>
+<p>→ Problem 2: The application was deployed to 5 EC2 instances behind a load balancer<br>
+→ Each instance had the SAME access keys hardcoded<br>
+→ When the keys needed rotation (security policy: every 90 days):</p>
+<ul>
+<li>New keys had to be generated</li>
+<li>Config files on ALL 5 instances had to be updated</li>
+<li>Application had to be restarted on ALL 5 instances</li>
+<li>During rotation → brief window where old keys are invalidated → application errors</li>
+<li>One instance was missed during rotation → it stopped working → 20% of traffic failed</li>
+</ul>
+<p>→ Problem 3: The development team copied the same credentials to the staging environment<br>
+→ The staging application accidentally wrote to PRODUCTION S3 bucket<br>
+→ Test data mixed with production data → customer reports contained garbage data<br>
+→ There was no way to distinguish which instance or environment made which API call</p>
+<p>→ Problem 4: <code>arjun-intern</code> (read-only user — Project 2) found the credentials file during debugging<br>
+→ He used them to upload a test file to S3 → the credentials had broader permissions than his IAM user<br>
+→ The service account credentials bypassed his IAM restrictions</p>
+<p>→ The CTO demands: "NO hardcoded credentials on ANY server. EVER. I want:</p>
+<ul>
+<li>Credentials that auto-rotate without application changes</li>
+<li>Credentials that are DIFFERENT per instance</li>
+<li>Credentials that are TEMPORARY — even if stolen, they expire</li>
+<li>No configuration files with secrets on any server</li>
+<li>Full audit trail of which instance accessed which resource"</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a CREDENTIAL MANAGEMENT problem for compute resources<br>
+→ The solution: IAM Roles + Instance Profiles</p>
+<p>→ An IAM Role is an identity that is NOT a user — it has no password and no permanent access keys<br>
+→ Instead, it provides TEMPORARY security credentials to whoever ASSUMES it<br>
+→ An EC2 instance can ASSUME a role → receive temporary credentials → use them to access AWS services</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE (Hardcoded Keys — BROKEN):
+</span>┌───────────────────────────────┐
+│ EC2 Instance                  │
+│                               │
+│ Config file:                  │
+│   ACCESS_KEY=AKIA...          │  ← PERMANENT credentials
+│   SECRET_KEY=wJal...          │  ← NEVER rotate automatically
+│                               │  ← If stolen → unlimited access
+│ Application reads config      │
+│ → Uses keys for S3/SQS/SNS   │
+└───────────────────────────────┘
+
+AFTER (IAM Role — CORRECT):
+┌───────────────────────────────┐
+│ EC2 Instance                  │
+│                               │
+│ Instance Metadata (IMDS):     │
+│   TEMP_ACCESS_KEY=ASIA...     │  ← TEMPORARY credentials
+│   TEMP_SECRET_KEY=abc1...     │  ← AUTO-ROTATED every ~6 hours
+│   SESSION_TOKEN=FwoG...       │  ← EXPIRES automatically
+│                               │  ← If stolen → useless after expiry
+│ Application uses AWS SDK      │
+│ → SDK auto-reads from IMDS    │
+│ → No config files needed      │
+└───────────────────────────────┘</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand IAM Roles vs IAM Users</li>
+<li>Step 2 — Understand Trust Policies (who can assume the role)</li>
+<li>Step 3 — Create an IAM Role for EC2</li>
+<li>Step 4 — Understand Instance Profiles (the bridge between Role and EC2)</li>
+<li>Step 5 — Attach the Instance Profile to an EC2 instance</li>
+<li>Step 6 — Understand how credentials are delivered via IMDS</li>
+<li>Step 7 — Understand the credential chain (how AWS SDK finds credentials)</li>
+<li>Step 8 — Verify and test the role-based access</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND IAM ROLES vs IAM USERS</h3>
+<table><thead><tr><th>Aspect</th><th>IAM User (Project 2)</th><th>IAM Role</th></tr></thead><tbody><tr><td>Identity type</td><td>Permanent identity for a person or service</td><td>Temporary identity assumed by entities</td></tr><tr><td>Authentication</td><td>Password (console) + Access Keys (API)</td><td>No password, no permanent keys</td></tr><tr><td>Credentials</td><td>LONG-LIVED (until rotated manually)</td><td>TEMPORARY (auto-expire, auto-rotate)</td></tr><tr><td>Who uses it</td><td>Humans, legacy applications</td><td>EC2, Lambda, Glue, other AWS services, cross-account access</td></tr><tr><td>Can be assumed by</td><td>Nobody — it IS the identity</td><td>EC2, Lambda, other roles, users, AWS services</td></tr><tr><td>Credential storage</td><td>Stored in config files, env vars, or credential stores</td><td>Delivered via metadata service (EC2) or STS API</td></tr><tr><td>Maximum per account</td><td>5,000</td><td>1,000 (soft limit)</td></tr><tr><td>Best for</td><td>Human console access (though IAM Identity Center is preferred)</td><td>ALL programmatic AWS service access</td></tr></tbody></table>
+<p>→ KEY INSIGHT: IAM Users are WHO you are. IAM Roles are WHAT you can become.<br>
+→ A person IS a user. An EC2 instance ASSUMES a role.<br>
+→ Think of it like:</p>
+<ul>
+<li>IAM User = Your permanent employee badge (always identifies you)</li>
+<li>IAM Role = A temporary visitor pass (anyone authorized can wear it, expires after hours)</li>
+</ul>
+<hr>
+<p><strong>Components of an IAM Role:</strong></p>
+<table><thead><tr><th>Component</th><th>Purpose</th><th>Analogy</th></tr></thead><tbody><tr><td>Trust Policy</td><td>WHO can assume this role</td><td>"Who is allowed to wear this visitor pass?"</td></tr><tr><td>Permission Policy</td><td>WHAT the role can do</td><td>"What doors does this pass open?"</td></tr><tr><td>Session Duration</td><td>HOW LONG the temporary credentials last</td><td>"When does this pass expire?"</td></tr><tr><td>Instance Profile</td><td>BRIDGE between role and EC2</td><td>"The badge holder that clips the pass to the EC2 instance"</td></tr></tbody></table>
+<hr>
+<h3>STEP 2 — UNDERSTAND TRUST POLICIES</h3>
+<p>→ A Trust Policy is a JSON document that defines WHO can assume the role<br>
+→ It's attached to the ROLE (not to the user or instance)<br>
+→ It uses the same policy language but with specific "assume" actions</p>
+<p><strong>Trust Policy for EC2:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowEC2ToAssume",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}</code></pre></div>
+<p><strong>Every Field Explained:</strong></p>
+<p>→ <code>Principal: Service: ec2.amazonaws.com</code></p>
+<ul>
+<li>This says: "The EC2 service is allowed to assume this role"</li>
+<li>It does NOT say which specific EC2 instance — ANY instance with this role attached can assume it</li>
+<li>The restriction on WHICH instance comes from the Instance Profile attachment (Step 5)</li>
+</ul>
+<p>→ <code>Action: sts:AssumeRole</code></p>
+<ul>
+<li>STS = Security Token Service</li>
+<li>AssumeRole = "Give me temporary credentials for this role"</li>
+<li>This is the ONLY action in a trust policy</li>
+</ul>
+<p><strong>Trust Policy Principals for Different Services:</strong></p>
+<table><thead><tr><th>Service</th><th>Trust Policy Principal</th><th>Use Case</th></tr></thead><tbody><tr><td>EC2</td><td><code>ec2.amazonaws.com</code></td><td>EC2 instances accessing AWS services</td></tr><tr><td>Lambda</td><td><code>lambda.amazonaws.com</code></td><td>Lambda functions (Project 26)</td></tr><tr><td>Glue</td><td><code>glue.amazonaws.com</code></td><td>Glue crawlers and jobs (Project 17)</td></tr><tr><td>Redshift</td><td><code>redshift.amazonaws.com</code></td><td>Redshift cluster accessing S3 (Project 22)</td></tr><tr><td>RDS</td><td><code>rds.amazonaws.com</code></td><td>RDS Enhanced Monitoring</td></tr><tr><td>S3</td><td><code>s3.amazonaws.com</code></td><td>S3 replication (Project 30)</td></tr><tr><td>CloudWatch</td><td><code>monitoring.amazonaws.com</code></td><td>CloudWatch Enhanced Monitoring</td></tr><tr><td>SNS</td><td><code>sns.amazonaws.com</code></td><td>SNS delivery logging</td></tr><tr><td>ECS Tasks</td><td><code>ecs-tasks.amazonaws.com</code></td><td>Container tasks</td></tr><tr><td>Another IAM User</td><td><code>arn:aws:iam::123456789012:user/priya-dev</code></td><td>User assuming role for elevated access</td></tr><tr><td>Another AWS Account</td><td><code>arn:aws:iam::987654321098:root</code></td><td>Cross-account access (Project 40)</td></tr></tbody></table>
+<p>→ Each service has its OWN service principal<br>
+→ A role can trust MULTIPLE principals (multiple statements or array of principals)<br>
+→ A role trusted by <code>ec2.amazonaws.com</code> CANNOT be assumed by Lambda → and vice versa</p>
+<p><strong>Trust Policy with Conditions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    }
+  ]
+}</code></pre></div>
+<p>→ Conditions in trust policies add extra restrictions on WHO can assume<br>
+→ This example: Only EC2 instances in <code>ap-south-1</code> can assume this role<br>
+→ More condition examples will appear in cross-account scenarios (Project 40)</p>
+<hr>
+<h3>STEP 3 — CREATE AN IAM ROLE FOR EC2</h3>
+<p>→ IAM Console → "Roles" → "Create role"</p>
+<p><strong>Step 3a: Select Trusted Entity</strong></p>
+<table><thead><tr><th>Option</th><th>Description</th></tr></thead><tbody><tr><td>AWS service</td><td>Another AWS service will assume this role</td></tr><tr><td>AWS account</td><td>Another AWS account (or this account) will assume this role</td></tr><tr><td>Web identity</td><td>Federated users (Google, Facebook, Amazon)</td></tr><tr><td>SAML 2.0 federation</td><td>Corporate identity provider (Active Directory)</td></tr><tr><td>Custom trust policy</td><td>Write your own trust policy JSON</td></tr></tbody></table>
+<p>→ Select: "AWS service"<br>
+→ Service: "EC2"<br>
+→ This automatically creates the trust policy with <code>ec2.amazonaws.com</code></p>
+<hr>
+<p><strong>Step 3b: Add Permission Policies</strong></p>
+<p>→ Now define WHAT the role can do (which AWS services and resources)</p>
+<p><strong>ShopNow Web Server Needs:</strong></p>
+<table><thead><tr><th>Action</th><th>Service</th><th>Resource</th><th>Why</th></tr></thead><tbody><tr><td>Read product images</td><td>S3</td><td>shopnow-productimages-prod-aps1/*</td><td>Serve images to customers</td></tr><tr><td>Write order PDFs</td><td>S3</td><td>shopnow-productimages-prod-aps1/orders/*</td><td>Store generated PDFs</td></tr><tr><td>Send order messages</td><td>SQS</td><td>shopnow-orders.fifo</td><td>Queue orders for processing</td></tr><tr><td>Publish notifications</td><td>SNS</td><td>shopnow-ops-alerts</td><td>Application error alerts</td></tr><tr><td>Read CloudWatch metrics</td><td>CloudWatch</td><td>*</td><td>Health monitoring</td></tr></tbody></table>
+<p><strong>Create Customer Managed Policy: <code>shopnow-web-server-policy</code></strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1:
+</span>  Sid: AllowS3ReadProductImages
+  Effect: Allow
+  Action:
+    - s3:GetObject
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/products/*
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/marketing/*
+
+Statement 2:
+  Sid: AllowS3WriteOrderPDFs
+  Effect: Allow
+  Action:
+    - s3:PutObject
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/orders/*
+
+Statement 3:
+  Sid: AllowS3ListBucket
+  Effect: Allow
+  Action:
+    - s3:ListBucket
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+  Condition:
+    StringLike:
+      s3:prefix:
+        - "products/*"
+        - "marketing/*"
+        - "orders/*"
+
+Statement 4:
+  Sid: AllowSQSSendMessages
+  Effect: Allow
+  Action:
+    - sqs:SendMessage
+    - sqs:GetQueueUrl
+    - sqs:GetQueueAttributes
+  Resource:
+    - arn:aws:sqs:ap-south-1:123456789012:shopnow-orders.fifo
+
+Statement 5:
+  Sid: AllowSNSPublish
+  Effect: Allow
+  Action:
+    - sns:Publish
+  Resource:
+    - arn:aws:sns:ap-south-1:123456789012:shopnow-ops-alerts
+
+Statement 6:
+  Sid: AllowCloudWatchReadOnly
+  Effect: Allow
+  Action:
+    - cloudwatch:GetMetricData
+    - cloudwatch:ListMetrics
+    - cloudwatch:GetMetricStatistics
+  Resource: "*"</code></pre></div>
+<p>→ Attach <code>shopnow-web-server-policy</code> to the role<br>
+→ NOTICE: Least privilege — the role can ONLY do what the web server needs<br>
+→ It CANNOT delete S3 objects, cannot read SQS messages (only send), cannot delete SNS topics<br>
+→ If the instance is compromised → attacker can only do what the role permits</p>
+<p><strong>Also Attach: AWS Managed Policy for CloudWatch Agent (for Project 19):</strong></p>
+<p>→ Search for: <code>CloudWatchAgentServerPolicy</code><br>
+→ This allows the CloudWatch Agent to publish metrics and logs<br>
+→ Attaching it now prepares for Project 19</p>
+<p><strong>Also Attach: AWS Managed Policy for SSM (for Session Manager access):</strong></p>
+<p>→ Search for: <code>AmazonSSMManagedInstanceCore</code><br>
+→ This allows Systems Manager Session Manager to connect to the instance<br>
+→ Eliminates need for SSH (port 22) → better security<br>
+→ Attaching it now enables Session Manager access</p>
+<hr>
+<p><strong>Step 3c: Name and Create</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>shopnow-web-server-role</code></td></tr><tr><td>Description</td><td>"IAM role for ShopNow web server EC2 instances — allows S3, SQS, SNS, CloudWatch access"</td></tr></tbody></table>
+<p><strong>Tags:</strong></p>
+<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody><tr><td>Environment</td><td>Production</td></tr><tr><td>Application</td><td>ShopNow-WebServer</td></tr><tr><td>ManagedBy</td><td>IAM</td></tr></tbody></table>
+<p>→ Click "Create role"</p>
+<p><strong>Role ARN Generated:</strong></p>
+<code>arn:aws:iam::123456789012:role/shopnow-web-server-role</code>
+<p>→ This ARN is used in:</p>
+<ul>
+<li>Bucket policies as Principal (Project 10)</li>
+<li>SQS access policies as Principal</li>
+<li>SNS topic policies as Principal</li>
+<li>Cross-service references</li>
+</ul>
+<hr>
+<h3>STEP 4 — UNDERSTAND INSTANCE PROFILES</h3>
+<p>→ An Instance Profile is a CONTAINER that holds exactly ONE IAM Role<br>
+→ It's the BRIDGE between the IAM Role and the EC2 instance<br>
+→ You cannot attach a Role directly to EC2 — you attach an Instance Profile which contains the Role</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────┐
+</span>│   IAM ROLE            │
+│   shopnow-web-server  │
+│   - Trust Policy      │
+│   - Permission Policy │
+└──────────┬────────────┘
+           │
+           │  contained in
+           ▼
+┌───────────────────────┐
+│   INSTANCE PROFILE    │
+│   shopnow-web-server  │
+│   (same name as role) │
+└──────────┬────────────┘
+           │
+           │  attached to
+           ▼
+┌───────────────────────┐
+│   EC2 INSTANCE        │
+│   i-0abc123def456     │
+│                       │
+│   Instance metadata   │
+│   serves temporary    │
+│   credentials from    │
+│   the role            │
+└───────────────────────┘</code></pre></div>
+<p><strong>Why Instance Profiles Exist (Historical Reason):</strong></p>
+<p>→ When IAM Roles were first created → AWS designed them to potentially hold multiple roles<br>
+→ The Instance Profile was the container that could theoretically hold multiple roles<br>
+→ In practice → Instance Profiles hold EXACTLY ONE role → the concept is mostly invisible<br>
+→ When you create a role through the AWS Console → an Instance Profile with the SAME NAME is auto-created<br>
+→ When you create a role through CLI/API → you must create the Instance Profile separately and add the role</p>
+<p><strong>Console Behavior:</strong></p>
+<table><thead><tr><th>Action</th><th>What Happens Behind the Scenes</th></tr></thead><tbody><tr><td>Create role via Console</td><td>Role created + Instance Profile with same name auto-created</td></tr><tr><td>Attach role to EC2 via Console</td><td>Instance Profile is attached (console shows "IAM Role" but actually attaches the profile)</td></tr><tr><td>Create role via CLI</td><td>ONLY the role is created — you must separately create Instance Profile</td></tr></tbody></table>
+<p>→ In the Console → you never see "Instance Profile" → you always see "IAM Role"<br>
+→ In the CLI/API → you work with Instance Profiles explicitly<br>
+→ The Console abstracts the Instance Profile away for simplicity</p>
+<hr>
+<h3>STEP 5 — ATTACH THE INSTANCE PROFILE TO EC2</h3>
+<p><strong>Method 1: During Instance Launch (New Instance)</strong></p>
+<p>→ EC2 Console → "Launch instance"<br>
+→ Advanced details → IAM instance profile → Select: <code>shopnow-web-server-role</code><br>
+→ (Console shows "IAM instance profile" but displays role names)</p>
+<p><strong>Method 2: After Launch (Existing Instance)</strong></p>
+<p>→ EC2 Console → Select instance → Actions → Security → "Modify IAM role"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>IAM role</td><td>shopnow-web-server-role</td></tr></tbody></table>
+<p>→ Click "Update IAM role"<br>
+→ Takes effect within SECONDS — no instance restart needed<br>
+→ The instance immediately starts receiving temporary credentials</p>
+<p><strong>Method 3: Replace or Remove Role</strong></p>
+<p>→ Same path: Actions → Security → "Modify IAM role"<br>
+→ Select a different role → existing role is replaced<br>
+→ Select "No IAM role" → role is detached → instance loses AWS access</p>
+<p>→ CRITICAL: Only ONE Instance Profile (and therefore one Role) per instance at a time<br>
+→ You CANNOT attach multiple roles to a single EC2 instance<br>
+→ If the instance needs permissions from multiple areas → combine into one comprehensive policy on one role<br>
+→ Or use multiple policy attachments on the single role (up to 10 managed policies per role — Project 2)</p>
+<hr>
+<h3>STEP 6 — HOW CREDENTIALS ARE DELIVERED VIA IMDS</h3>
+<p>→ This connects directly to Instance Metadata (Project 3 — Step 8)<br>
+→ When an Instance Profile is attached → IMDS provides temporary credentials</p>
+<p><strong>Credential Delivery Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EC2 Instance boots with Instance Profile attached
+</span>        │
+        ▼
+Step 1: EC2 service contacts STS (Security Token Service)
+        "I am instance i-0abc123, I have role shopnow-web-server-role attached"
+        │
+        ▼
+Step 2: STS validates:
+        - Does this instance have this role attached? YES
+        - Does the role trust ec2.amazonaws.com? YES (trust policy)
+        │
+        ▼
+Step 3: STS generates TEMPORARY credentials:
+        - AccessKeyId: ASIA... (starts with ASIA for temporary creds, not AKIA)
+        - SecretAccessKey: (temporary secret)
+        - SessionToken: (required for temporary creds — proves they're from STS)
+        - Expiration: (typically ~6 hours from now)
+        │
+        ▼
+Step 4: Credentials are placed in Instance Metadata Service (IMDS)
+        Available at: http://169.254.169.254/latest/meta-data/iam/security-credentials/shopnow-web-server-role
+        │
+        ▼
+Step 5: Application (or AWS SDK) reads credentials from IMDS
+        │
+        ▼
+Step 6: Application uses credentials to make AWS API calls
+        │
+        ▼
+Step 7: BEFORE credentials expire → EC2 service automatically requests NEW credentials from STS
+        New credentials are placed in IMDS
+        Application reads new credentials on next API call
+        OLD credentials remain valid for a brief overlap period
+        │
+        ▼
+Step 8: Continuous rotation — credentials are ALWAYS fresh</code></pre></div>
+<p><strong>What the IMDS Response Looks Like:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>GET http://169.254.169.254/latest/meta-data/iam/security-credentials/shopnow-web-server-role
+</span>
+Response:
+{
+  "Code": "Success",
+  "LastUpdated": "2025-01-15T10:00:00Z",
+  "Type": "AWS-HMAC",
+  "AccessKeyId": "[REDACTED:AWS_ACCESS_KEY]",
+  "SecretAccessKey": "abc123def456ghi789jkl012mno345",
+  "Token": "FwoGZXIvYXdzEBYaDL3k9N...(very long string)...",
+  "Expiration": "2025-01-15T16:00:00Z"
+}</code></pre></div>
+<p>→ <code>AccessKeyId</code> starts with <code>ASIA</code> → indicates TEMPORARY credentials (permanent keys start with <code>AKIA</code>)<br>
+→ <code>Token</code> (SessionToken) → MUST be included with every API call → proves the credentials are from STS<br>
+→ <code>Expiration</code> → when these credentials become invalid → new ones are generated before this time<br>
+→ <code>LastUpdated</code> → when credentials were last refreshed</p>
+<p><strong>IMDSv2 Requirement (Project 3 Reference):</strong></p>
+<p>→ Credentials are served via IMDS → IMDS must be secured<br>
+→ IMDSv2 (token-required) prevents SSRF attacks from stealing credentials<br>
+→ We configured "Metadata version: V2 only" during instance launch (Project 3)<br>
+→ This means: Even if an attacker exploits an SSRF vulnerability → they CANNOT reach IMDS without a valid token<br>
+→ The token is generated with a PUT request → SSRF attacks typically use GET → blocked</p>
+<p><strong>Credential Refresh Timeline:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Time 10:00 — Credentials generated (expire at 16:00)
+</span>Time 14:30 — EC2 service pre-emptively requests new credentials
+             (about 1.5 hours before expiry)
+Time 14:31 — New credentials placed in IMDS (expire at 20:31)
+             Old credentials (expire 16:00) still valid until 16:00
+Time 16:00 — Old credentials expire
+             New credentials continue working until 20:31
+Time 19:00 — Another refresh cycle begins
+
+→ There is ALWAYS a valid set of credentials in IMDS
+→ The overlap period prevents any gap in access
+→ Applications using AWS SDK never notice the rotation</code></pre></div>
+<hr>
+<h3>STEP 7 — THE CREDENTIAL CHAIN (HOW AWS SDK FINDS CREDENTIALS)</h3>
+<p>→ AWS SDKs (used in application code) search for credentials in a specific ORDER<br>
+→ This is called the "Default Credential Provider Chain"<br>
+→ Understanding this chain prevents credential confusion</p>
+<p><strong>Credential Chain Order (SDK searches top to bottom, uses FIRST found):</strong></p>
+<table><thead><tr><th>Priority</th><th>Source</th><th>How It's Set</th><th>Persistence</th></tr></thead><tbody><tr><td>1</td><td>Explicit code</td><td>Hardcoded in application code</td><td>PERMANENT (DON'T DO THIS)</td></tr><tr><td>2</td><td>Environment variables</td><td><code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>, <code>AWS_SESSION_TOKEN</code></td><td>Until shell session ends</td></tr><tr><td>3</td><td>Shared credentials file</td><td><code>~/.aws/credentials</code> (profiles)</td><td>Until file is changed</td></tr><tr><td>4</td><td>AWS config file</td><td><code>~/.aws/config</code> (profiles with role_arn)</td><td>Until file is changed</td></tr><tr><td>5</td><td>Container credentials</td><td>ECS task role (via container metadata)</td><td>TEMPORARY</td></tr><tr><td>6</td><td><strong>Instance Profile (IMDS)</strong></td><td>IAM Role attached to EC2</td><td><strong>TEMPORARY — AUTO-ROTATED</strong></td></tr><tr><td>7</td><td>SSO credentials</td><td>IAM Identity Center</td><td>TEMPORARY</td></tr></tbody></table>
+<p><strong>Why This Order Matters:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCENARIO: Developer troubleshooting on the EC2 instance
+</span>→ Developer runs: export AWS_ACCESS_KEY_ID=AKIAXXXXX (their personal keys)
+→ Developer runs an AWS CLI command → uses their PERSONAL keys (Priority 2)
+→ Developer forgets to unset the environment variables
+→ Application restarts → picks up environment variables → uses WRONG credentials
+→ Application now uses the developer's keys instead of the role → WRONG permissions
+
+SOLUTION: Never set environment variables on EC2 instances with IAM Roles
+→ Let the SDK naturally fall through to Priority 6 (Instance Profile)
+→ No environment variables → No credentials file → SDK uses IMDS → Correct role credentials</code></pre></div>
+<p><strong>How the SDK Uses Instance Profile Credentials:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application makes AWS API call (e.g., S3 GetObject)
+</span>        │
+        ▼
+AWS SDK: Do I have cached credentials that are still valid?
+        │
+        ├── YES (and not near expiry) → Use cached credentials
+        │
+        └── NO (or near expiry) → Refresh credentials
+            │
+            ▼
+            SDK calls IMDS:
+            GET http://169.254.169.254/latest/meta-data/iam/security-credentials/
+            → Returns role name: "shopnow-web-server-role"
+            │
+            GET http://169.254.169.254/latest/meta-data/iam/security-credentials/shopnow-web-server-role
+            → Returns: AccessKeyId, SecretAccessKey, Token, Expiration
+            │
+            ▼
+            SDK caches these credentials
+            SDK includes AccessKeyId + SecretAccessKey + Token in the API request
+            (SigV4 signature — Project 2)
+            │
+            ▼
+            AWS service receives request → validates credentials → authorizes via role's policies</code></pre></div>
+<p>→ This is COMPLETELY AUTOMATIC — no application code needed to manage credentials<br>
+→ The SDK handles: finding credentials, caching, refreshing before expiry<br>
+→ The application just says: "Get this object from S3" → SDK handles all credential logistics</p>
+<hr>
+<h3>STEP 8 — VERIFY AND TEST ROLE-BASED ACCESS</h3>
+<p><strong>Verification Checklist:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CHECK 1: Is the IAM Role created with correct trust policy?
+</span>         IAM Console → Roles → shopnow-web-server-role
+         → Trust relationships tab → ec2.amazonaws.com present ✓
+
+CHECK 2: Are the correct permission policies attached?
+         IAM Console → Roles → shopnow-web-server-role
+         → Permissions tab → shopnow-web-server-policy attached ✓
+         → CloudWatchAgentServerPolicy attached ✓
+         → AmazonSSMManagedInstanceCore attached ✓
+
+CHECK 3: Is the Instance Profile attached to the EC2 instance?
+         EC2 Console → Select instance → Details tab
+         → IAM Role: shopnow-web-server-role ✓
+
+CHECK 4: Can the instance reach IMDS?
+         SSH/Session Manager into instance
+         → Test IMDSv2 token request (should return token)
+         → Test credential endpoint (should return JSON with AccessKeyId)
+
+CHECK 5: Can the instance access S3?
+         From the instance → AWS CLI: aws s3 ls s3://shopnow-productimages-prod-aps1/products/
+         → Should list objects ✓
+
+CHECK 6: Can the instance access SQS?
+         From the instance → AWS CLI: aws sqs get-queue-url --queue-name shopnow-orders.fifo
+         → Should return queue URL ✓
+
+CHECK 7: Is access DENIED for unauthorized actions?
+         From the instance → AWS CLI: aws s3 rm s3://shopnow-productimages-prod-aps1/products/shoe.jpg
+         → Should return "Access Denied" ✓ (no s3:DeleteObject in policy)
+
+CHECK 8: Do credentials show as temporary?
+         From the instance → AWS CLI: aws sts get-caller-identity
+         → Returns:
+            Account: 123456789012
+            Arn: arn:aws:sts::123456789012:assumed-role/shopnow-web-server-role/i-0abc123def456
+            → Note: "assumed-role" in ARN confirms temporary role credentials
+            → The instance ID appears in the assumed role session name</code></pre></div>
+<p><strong>Understanding the Assumed Role ARN:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>arn:aws:sts::123456789012:assumed-role/shopnow-web-server-role/i-0abc123def456
+</span>     │                      │              │                       │
+     │                      │              │                       └── Session name (instance ID)
+     │                      │              └── Role name
+     │                      └── "assumed-role" (indicates temporary credentials)
+     └── STS service (not IAM — because credentials are temporary)</code></pre></div>
+<p>→ This ARN appears in CloudTrail logs → you can trace EXACTLY which instance made which API call<br>
+→ The instance ID in the session name → identifies the specific EC2 instance<br>
+→ This solves Problem 3: Each instance has a unique session name → distinguishable in audit logs</p>
+<hr>
+<h3>STEP 9 — CREATING ROLES FOR OTHER SHOPNOW SERVICES</h3>
+<p><strong>Role for Order Processor (SQS Consumer):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>shopnow-order-processor-role</code></td></tr><tr><td>Trust</td><td>ec2.amazonaws.com</td></tr></tbody></table>
+<p><strong>Permissions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1: Allow reading from SQS
+</span>  Action: sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-orders.fifo
+
+Statement 2: Allow writing to RDS (via network — no IAM action needed for SQL)
+  (RDS access is controlled by Security Groups — Project 4, 9 — not IAM actions)
+
+Statement 3: Allow publishing to SNS for alerts
+  Action: sns:Publish
+  Resource: arn:aws:sns:ap-south-1:123456789012:shopnow-batch-alerts
+
+Statement 4: Allow CloudWatch metrics
+  Action: cloudwatch:PutMetricData
+  Resource: "*"</code></pre></div>
+<p>→ This role can READ from SQS (receive + delete) but CANNOT send to SQS<br>
+→ The web server role can SEND to SQS but CANNOT read from SQS<br>
+→ LEAST PRIVILEGE: Each instance does ONLY what its application requires</p>
+<hr>
+<p><strong>Role for Glue Service (Preview for Project 17):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>shopnow-glue-service-role</code></td></tr><tr><td>Trust</td><td>glue.amazonaws.com</td></tr></tbody></table>
+<p><strong>Permissions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1: Allow Glue to read/write S3
+</span>  Action: s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket
+  Resource: arn:aws:s3:::shopnow-data-lake-*
+
+Statement 2: Allow Glue to manage Glue Catalog
+  Action: glue:*
+  Resource: "*"
+
+Statement 3: Allow Glue to write CloudWatch Logs
+  Action: logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents
+  Resource: arn:aws:logs:*:*:/aws-glue/*</code></pre></div>
+<p>→ Trust policy: <code>glue.amazonaws.com</code> (not EC2)<br>
+→ Glue assumes this role when running crawlers and ETL jobs<br>
+→ This is the role referenced in Project 17 and 21</p>
+<hr>
+<p><strong>Role for Redshift (Preview for Project 22):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>shopnow-redshift-s3-role</code></td></tr><tr><td>Trust</td><td>redshift.amazonaws.com</td></tr></tbody></table>
+<p><strong>Permissions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1: Allow Redshift to read from S3
+</span>  Action: s3:GetObject, s3:GetBucketLocation, s3:ListBucket
+  Resource:
+    - arn:aws:s3:::shopnow-data-lake-*
+    - arn:aws:s3:::shopnow-data-lake-*/*
+
+Statement 2: Allow Redshift to write to S3 (UNLOAD)
+  Action: s3:PutObject
+  Resource: arn:aws:s3:::shopnow-data-lake-exports/*</code></pre></div>
+<p>→ Trust policy: <code>redshift.amazonaws.com</code><br>
+→ Redshift associates this role and uses it for COPY/UNLOAD operations<br>
+→ This is the role referenced in Projects 22 and 23</p>
+<hr>
+<h3>STEP 10 — UNDERSTANDING ROLE SWITCHING AND SESSION DURATION</h3>
+<p><strong>Session Duration:</strong></p>
+<p>→ When EC2 assumes a role → credentials are valid for a default period<br>
+→ EC2 Instance Profile credentials: ~6 hours (managed by AWS, auto-refreshed)<br>
+→ For manual AssumeRole calls (cross-account — Project 40): 1-12 hours (configurable)</p>
+<p><strong>Role Maximum Session Duration:</strong></p>
+<p>→ IAM Console → Roles → Select role → "Edit" → Maximum session duration</p>
+<table><thead><tr><th>Setting</th><th>Options</th><th>Default</th></tr></thead><tbody><tr><td>Maximum session duration</td><td>1 hour, 2 hours, 4 hours, 8 hours, 12 hours</td><td>1 hour</td></tr></tbody></table>
+<p>→ This limits how long manually-assumed credentials can last<br>
+→ Does NOT affect EC2 Instance Profile auto-rotation (always ~6 hours)<br>
+→ Affects: CLI <code>aws sts assume-role</code>, cross-account assumption (Project 40)</p>
+<p><strong>Role Chaining:</strong></p>
+<p>→ A role can assume ANOTHER role → this is called "role chaining"<br>
+→ Maximum session duration for chained roles: 1 hour (hard limit)<br>
+→ Example: User assumes Role A → Role A assumes Role B → Role B credentials last max 1 hour<br>
+→ Used in complex cross-account scenarios (Project 40)</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use IAM Roles for EC2 instead of hardcoded access keys — no exceptions<br>
+→ Always follow least privilege — the role should have ONLY the permissions the application needs<br>
+→ Always use specific resource ARNs in permission policies — avoid <code>Resource: "*"</code> where possible<br>
+→ Always enforce IMDSv2 on all instances (Project 3) — prevents SSRF credential theft<br>
+→ Always use the AWS SDK's default credential chain — don't manually read from IMDS<br>
+→ Always create SEPARATE roles for different application tiers (web role, processor role, admin role)<br>
+→ Always name roles descriptively: <code>{application}-{component}-role</code><br>
+→ Always attach the SSM managed policy for Session Manager access — eliminates SSH key management<br>
+→ Always verify role permissions with <code>aws sts get-caller-identity</code> from the instance<br>
+→ Always test DENIED actions to confirm least privilege is working<br>
+→ Always tag roles with Environment, Application, and ManagedBy<br>
+→ Always create roles through the Console for simplicity (auto-creates Instance Profile)</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never hardcode access keys in application code, config files, or environment variables on EC2<br>
+→ Never attach <code>AdministratorAccess</code> to an EC2 role — if the instance is compromised, the attacker owns your account<br>
+→ Never use <code>Resource: "*"</code> when you know the specific resource ARNs<br>
+→ Never share the same role between production and development environments<br>
+→ Never set environment variables (<code>AWS_ACCESS_KEY_ID</code>) on instances with IAM Roles — they override IMDS<br>
+→ Never create IAM Users for applications running on AWS services — always use Roles<br>
+→ Never attach more than one Instance Profile to an EC2 instance — it's not supported<br>
+→ Never forget to update the bucket policy (Project 10) to reference the role as Principal<br>
+→ Never skip IMDSv2 enforcement — IMDSv1 is vulnerable to SSRF attacks<br>
+→ Never use the same role for web servers and database servers — different trust levels<br>
+→ Never forget that RDS access is via Security Groups (network) not IAM actions (API) — IAM Role doesn't grant SQL access<br>
+→ Never leave unused roles attached to terminated instances — clean up regularly</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>EC2 instance needs AWS service access</td><td>IAM Role + Instance Profile (this project)</td></tr><tr><td>Lambda function needs AWS service access</td><td>IAM Role trusted by lambda.amazonaws.com (Project 26)</td></tr><tr><td>Glue job needs S3 and Catalog access</td><td>IAM Role trusted by glue.amazonaws.com (Project 17)</td></tr><tr><td>Redshift needs to COPY from S3</td><td>IAM Role trusted by redshift.amazonaws.com (Project 22)</td></tr><tr><td>Human needs temporary elevated permissions</td><td>IAM Role assumed by IAM User (with MFA condition)</td></tr><tr><td>Cross-account access</td><td>IAM Role with cross-account trust policy (Project 40)</td></tr><tr><td>Container (ECS/EKS) needs AWS access</td><td>Task Role trusted by ecs-tasks.amazonaws.com</td></tr><tr><td>Application on developer's laptop</td><td>IAM User with access keys (Project 2) OR SSO</td></tr><tr><td>CI/CD pipeline in GitHub Actions</td><td>OIDC federation with IAM Role (no long-lived keys)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use IAM Roles for human console access → Use IAM Users or IAM Identity Center<br>
+→ Do NOT use IAM Roles for database authentication (SQL queries) → Use database username/password or IAM DB Auth<br>
+→ Do NOT use IAM Roles for network-level access control → Use Security Groups (Project 4)<br>
+→ Do NOT use EC2 Instance Profiles for Lambda → Lambda has its own execution role mechanism<br>
+→ Do NOT use a single "god role" for all services → Create specific roles per service/component</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE COMPLETE ASSUME ROLE FLOW FOR EC2</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EC2 Instance i-0abc123 launches with Instance Profile: shopnow-web-server-role
+</span>        │
+        ▼
+Step 1: EC2 Service (control plane) detects Instance Profile attachment
+        │
+        ▼
+Step 2: EC2 Service calls STS on behalf of the instance:
+        API: sts:AssumeRole
+        RoleArn: arn:aws:iam::123456789012:role/shopnow-web-server-role
+        RoleSessionName: i-0abc123def456
+        │
+        ▼
+Step 3: STS validates:
+        a) Does the role exist? → YES
+        b) Does the trust policy allow ec2.amazonaws.com? → YES
+        c) Any conditions in trust policy met? → YES
+        │
+        ▼
+Step 4: STS generates temporary credentials:
+        AccessKeyId:[REDACTED:AWS_ACCESS_KEY]5
+        SecretAccessKey: (temporary)
+        SessionToken: FwoGZXIv... (long token)
+        Expiration: 2025-01-15T16:00:00Z
+        │
+        ▼
+Step 5: EC2 Service places credentials in IMDS for instance i-0abc123
+        Path: /latest/meta-data/iam/security-credentials/shopnow-web-server-role
+        │
+        ▼
+Step 6: Application on the instance needs to call S3
+        AWS SDK checks credential chain → finds IMDS credentials (Priority 6)
+        │
+        ▼
+Step 7: SDK creates SigV4 signed request:
+        - Includes AccessKeyId in Authorization header
+        - Includes SessionToken in X-Amz-Security-Token header
+        - Signs the request with SecretAccessKey
+        │
+        ▼
+Step 8: S3 receives the request
+        a) Validates SigV4 signature → Authentication OK
+        b) Identifies caller: assumed-role/shopnow-web-server-role/i-0abc123
+        c) Evaluates IAM permissions (role's policies) → s3:GetObject allowed?
+        d) Evaluates bucket policy (Project 10) → role principal allowed?
+        e) No explicit deny → explicit allow found → ALLOWED
+        │
+        ▼
+Step 9: S3 returns the object → Application receives it
+
+Step 10: CloudTrail records:
+         userIdentity:
+           type: AssumedRole
+           arn: arn:aws:sts::123456789012:assumed-role/shopnow-web-server-role/i-0abc123
+         eventName: GetObject
+         sourceIPAddress: 10.0.1.50 (instance private IP)
+         → FULL AUDIT TRAIL</code></pre></div>
+<hr>
+<h3>2 → HOW STS (SECURITY TOKEN SERVICE) WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────┐
+</span>│                 STS SERVICE (Global)                     │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │            AssumeRole Engine                    │    │
+│  │                                                 │    │
+│  │  Input:                                         │    │
+│  │    - RoleArn                                    │    │
+│  │    - RoleSessionName                            │    │
+│  │    - DurationSeconds (optional)                 │    │
+│  │    - Policy (optional session policy)           │    │
+│  │    - ExternalId (optional — Project 40)         │    │
+│  │                                                 │    │
+│  │  Validation:                                    │    │
+│  │    1. Role exists?                              │    │
+│  │    2. Trust policy allows caller?               │    │
+│  │    3. Conditions met?                           │    │
+│  │    4. SCP allows? (if in Organization)          │    │
+│  │                                                 │    │
+│  │  Output:                                        │    │
+│  │    - AccessKeyId (ASIA prefix)                  │    │
+│  │    - SecretAccessKey                            │    │
+│  │    - SessionToken                               │    │
+│  │    - Expiration                                 │    │
+│  │    - AssumedRoleUser (ARN + RoleId)             │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  Other STS Operations:                                  │
+│    - AssumeRoleWithSAML (corporate federation)          │
+│    - AssumeRoleWithWebIdentity (Google/Facebook/OIDC)   │
+│    - GetSessionToken (MFA-authenticated temp creds)     │
+│    - GetCallerIdentity (who am I?)                      │
+│    - DecodeAuthorizationMessage (decode error messages)  │
+│                                                         │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ STS is a GLOBAL service with regional endpoints<br>
+→ Best practice: Use regional STS endpoints for lower latency<br>
+→ EC2 automatically uses the regional endpoint for its AZ</p>
+<p><strong>Temporary Credential Characteristics:</strong></p>
+<table><thead><tr><th>Property</th><th>Value</th></tr></thead><tbody><tr><td>AccessKeyId prefix</td><td>ASIA (vs AKIA for permanent keys)</td></tr><tr><td>Credential components</td><td>AccessKeyId + SecretAccessKey + SessionToken (all three required)</td></tr><tr><td>Lifetime (EC2 Instance Profile)</td><td>~6 hours (auto-refreshed)</td></tr><tr><td>Lifetime (manual AssumeRole)</td><td>1-12 hours (configurable)</td></tr><tr><td>Lifetime (role chaining)</td><td>Maximum 1 hour</td></tr><tr><td>Can be revoked?</td><td>Yes — revoke session by modifying role policy or using IAM condition <code>aws:TokenIssueTime</code></td></tr><tr><td>Stored where (EC2)</td><td>Instance Metadata Service (IMDS)</td></tr><tr><td>Stored where (Lambda)</td><td>Lambda execution environment variables</td></tr><tr><td>Stored where (CLI)</td><td><code>~/.aws/cli/cache/</code> (auto-managed)</td></tr></tbody></table>
+<hr>
+<h3>3 → HOW EFFECTIVE PERMISSIONS ARE CALCULATED WITH ROLES</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application on EC2 tries: s3:PutObject to shopnow-bucket/orders/order-001.pdf
+</span>
+PERMISSION EVALUATION:
+
+Layer 1: SCP (Service Control Policy — if in Organization)
+  → Does the SCP allow s3:PutObject? → YES (or not restricted) → Continue
+
+Layer 2: Permission Boundary (if set on the role)
+  → Does the boundary allow s3:PutObject? → Not set → Continue
+
+Layer 3: Session Policy (if provided during AssumeRole)
+  → EC2 Instance Profile doesn't use session policies → Continue
+
+Layer 4: Identity-based Policy (role's permission policies)
+  → shopnow-web-server-policy Statement 2:
+    Allow s3:PutObject on arn:aws:s3:::shopnow-productimages-prod-aps1/orders/*
+  → order-001.pdf matches orders/* → ALLOW found
+
+Layer 5: Resource-based Policy (bucket policy — Project 10)
+  → Statement 1: Allow Principal shopnow-web-server-role s3:GetObject
+    → Action is PutObject, not GetObject → No match
+  → Statement 2: Deny without KMS encryption
+    → Is encryption header present with aws:kms? → YES → Deny doesn't apply
+  → No explicit deny found
+
+Layer 6: Bucket ACL (disabled — Project 10)
+  → Not applicable
+
+FINAL RESULT:
+  No explicit deny found ✓
+  Explicit allow found in role's permission policy ✓
+  (Same account — either IAM or bucket policy allow is sufficient)
+  → ACCESS GRANTED ✓</code></pre></div>
+<hr>
+<h3>4 → HOW EC2 INSTANCE IDENTITY WORKS IN CLOUDTRAIL</h3>
+<p><strong>CloudTrail Log Entry for S3 GetObject from EC2 Role:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "eventVersion": "1.08",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAQWERTYUIOP12345:i-0abc123def456",
+    "arn": "arn:aws:sts::123456789012:assumed-role/shopnow-web-server-role/i-0abc123def456",
+    "accountId": "123456789012",
+    "accessKeyId": "ASIAQWERTYUIOP12345",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "principalId": "AROAQWERTYUIOP12345",
+        "arn": "arn:aws:iam::123456789012:role/shopnow-web-server-role",
+        "accountId": "123456789012",
+        "userName": "shopnow-web-server-role"
+      },
+      "webIdFederationData": {},
+      "attributes": {
+        "creationDate": "2025-01-15T10:00:00Z",
+        "mfaAuthenticated": "false"
+      },
+      "ec2RoleDelivery": "2.0"
+    }
+  },
+  "eventTime": "2025-01-15T14:30:00Z",
+  "eventSource": "s3.amazonaws.com",
+  "eventName": "GetObject",
+  "sourceIPAddress": "10.0.1.50",
+  "requestParameters": {
+    "bucketName": "shopnow-productimages-prod-aps1",
+    "key": "products/images/shoe-001.jpg"
+  }
+}</code></pre></div>
+<p><strong>Key Fields for Auditing:</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th><th>What It Tells You</th></tr></thead><tbody><tr><td>userIdentity.type</td><td>AssumedRole</td><td>Temporary credentials from a role</td></tr><tr><td>userIdentity.arn</td><td>...assumed-role/shopnow-web-server-role/i-0abc123</td><td>WHICH role and WHICH instance</td></tr><tr><td>sourceIPAddress</td><td>10.0.1.50</td><td>Instance's private IP</td></tr><tr><td>eventName</td><td>GetObject</td><td>What action was performed</td></tr><tr><td>requestParameters.key</td><td>products/images/shoe-001.jpg</td><td>Exactly which object</td></tr><tr><td>sessionContext.ec2RoleDelivery</td><td>2.0</td><td>Credentials came via IMDSv2</td></tr></tbody></table>
+<p>→ This is COMPLETE auditability → answers: Who (role + instance), What (action + object), When (timestamp), Where (source IP)<br>
+→ This solves Problem 3 from the hypothetical: Every instance is identifiable in logs</p>
+<hr>
+<h3>5 → ROLE LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>Roles per account</td><td>1,000 (soft limit — can increase)</td></tr><tr><td>Policies per role</td><td>10 managed policies</td></tr><tr><td>Inline policy size per role</td><td>10,240 characters</td></tr><tr><td>Trust policy size</td><td>2,048 characters</td></tr><tr><td>Instance Profiles per account</td><td>1,000</td></tr><tr><td>Roles per Instance Profile</td><td>1</td></tr><tr><td>Instance Profiles per EC2 instance</td><td>1</td></tr><tr><td>Tags per role</td><td>50</td></tr><tr><td>Session duration (manual assume)</td><td>1-12 hours</td></tr><tr><td>Session duration (role chaining)</td><td>1 hour (hard limit)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Environment variables override Instance Profile</td><td>Application uses wrong credentials → wrong permissions</td><td>Never set AWS_ACCESS_KEY_ID on instances with IAM Roles</td></tr><tr><td>2</td><td>Trust policy doesn't include the service</td><td><code>sts:AssumeRole</code> fails → no credentials available</td><td>Verify trust policy has correct service principal</td></tr><tr><td>3</td><td>Permission policy too broad (<code>*:*</code>)</td><td>Compromised instance = compromised account</td><td>Always use least privilege with specific actions and resources</td></tr><tr><td>4</td><td>Forgot to attach Instance Profile</td><td>Application gets "Unable to locate credentials"</td><td>Verify IAM Role in EC2 console → Details tab</td></tr><tr><td>5</td><td>IMDSv1 enabled → SSRF steals credentials</td><td>Attacker reads role credentials via SSRF</td><td>Enforce IMDSv2 only (Project 3)</td></tr><tr><td>6</td><td>Role has S3 access but bucket policy denies role</td><td>"Access Denied" despite role policy allowing</td><td>Check bucket policy for explicit Deny matching the role</td></tr><tr><td>7</td><td>Multiple policies hit 10-policy limit</td><td>Cannot attach more permissions</td><td>Consolidate into fewer, broader policies</td></tr><tr><td>8</td><td>Instance Profile created via CLI without role</td><td>Instance Profile exists but empty → no credentials</td><td>Ensure role is added to the Instance Profile</td></tr><tr><td>9</td><td>Changed role policy but cached credentials still used</td><td>Old permissions active for minutes</td><td>SDK caches credentials — wait for refresh or restart application</td></tr><tr><td>10</td><td>Role used in production AND development</td><td>Dev application accidentally modifies prod resources</td><td>Create separate roles per environment with different resource scopes</td></tr><tr><td>11</td><td>Forgot KMS decrypt permission</td><td>"Access Denied" when reading KMS-encrypted S3 objects</td><td>Add kms:Decrypt to role policy (Project 36)</td></tr><tr><td>12</td><td>SQS queue encrypted with KMS but role lacks KMS access</td><td>Cannot send/receive SQS messages</td><td>Add kms:GenerateDataKey and kms:Decrypt for the SQS KMS key</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Role Reusability</strong></p>
+<ul>
+<li>ONE role can be used by HUNDREDS of EC2 instances</li>
+<li>All instances with the same Instance Profile share the same permissions</li>
+<li>Each instance gets its own unique temporary credentials (different AccessKeyId)</li>
+<li>Each instance has its own session name (instance ID) → distinguishable in logs</li>
+</ul>
+<p>→ <strong>Permission Management at Scale</strong></p>
+<ul>
+<li>Use AWS Managed Policies for common patterns (CloudWatchAgent, SSM)</li>
+<li>Use Customer Managed Policies for application-specific permissions</li>
+<li>Update the policy ONCE → ALL instances with that role get updated permissions</li>
+<li>No need to deploy to individual instances</li>
+</ul>
+<p>→ <strong>Role Per Tier Pattern</strong></p>
+<ul>
+<li>Web servers: <code>shopnow-web-server-role</code> (read S3, send SQS, publish SNS)</li>
+<li>Processors: <code>shopnow-order-processor-role</code> (read SQS, write RDS, publish SNS)</li>
+<li>Admin: <code>shopnow-admin-role</code> (broader access for maintenance tasks)</li>
+<li>Monitoring: <code>shopnow-monitoring-role</code> (read CloudWatch, write metrics)</li>
+<li>Each tier has EXACTLY the permissions it needs → blast radius is limited</li>
+</ul>
+<p>→ <strong>Auto Scaling Integration</strong></p>
+<ul>
+<li>Auto Scaling Launch Template includes Instance Profile</li>
+<li>Every new instance automatically gets the correct role</li>
+<li>No manual credential distribution → scales infinitely</li>
+<li>Terminated instances lose credentials immediately (IMDS is destroyed)</li>
+</ul>
+<p>→ <strong>Multi-Account Scalability</strong></p>
+<ul>
+<li>Cross-account roles (Project 40) enable centralized access patterns</li>
+<li>Roles in Account A can be assumed by identities in Account B</li>
+<li>No need to create IAM users in every account</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify the role is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Role exists with correct trust</td><td>IAM Console → Roles → Select role → Trust relationships tab</td></tr><tr><td>Correct policies attached</td><td>IAM Console → Roles → Select role → Permissions tab</td></tr><tr><td>Instance Profile attached to EC2</td><td>EC2 Console → Select instance → Details → IAM Role</td></tr><tr><td>Credentials available on instance</td><td>SSH → curl IMDS credential endpoint → JSON response with AccessKeyId</td></tr><tr><td>Caller identity correct</td><td>SSH → <code>aws sts get-caller-identity</code> → Shows assumed-role ARN</td></tr><tr><td>S3 access works</td><td>SSH → <code>aws s3 ls s3://bucket/prefix/</code> → Lists objects</td></tr><tr><td>Unauthorized action denied</td><td>SSH → <code>aws s3 rm s3://bucket/file</code> → "Access Denied"</td></tr><tr><td>CloudTrail shows correct identity</td><td>CloudTrail → Event history → Filter by username = role name</td></tr></tbody></table>
+<p>→ <strong>How to debug "Unable to locate credentials":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Is an Instance Profile attached?
+</span>        EC2 Console → Instance → Details → IAM Role
+        If blank → attach Instance Profile
+
+STEP 2: Is IMDS reachable?
+        From instance: curl -w "\n%{http_code}" http://169.254.169.254/latest/meta-data/
+        If timeout → check IMDS settings (httpPutResponseHopLimit, HttpTokens)
+
+STEP 3: Are credentials available in IMDS?
+        IMDSv2 token → then GET /latest/meta-data/iam/security-credentials/
+        Should return role name
+        Then GET /latest/meta-data/iam/security-credentials/{role-name}
+        Should return JSON with AccessKeyId
+
+STEP 4: Are environment variables overriding IMDS?
+        Check: env | grep AWS_
+        If AWS_ACCESS_KEY_ID is set → it overrides IMDS → unset it
+
+STEP 5: Is ~/.aws/credentials present?
+        Check: cat ~/.aws/credentials
+        If present with credentials → they override IMDS → remove or rename
+
+STEP 6: Is the SDK version too old?
+        Very old SDK versions may not support IMDSv2
+        Update to latest SDK version</code></pre></div>
+<p>→ <strong>How to debug "Access Denied" with correct role:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Confirm which credentials are being used
+</span>        aws sts get-caller-identity
+        → Is it the expected role? Or different credentials?
+
+STEP 2: Check the role's permission policies
+        IAM Console → Role → Permissions
+        Does ANY policy allow the specific action + resource?
+
+STEP 3: Check for explicit Deny in role policies
+        Look for any Deny statements that match
+
+STEP 4: Check the resource's policy (bucket policy, SQS policy, etc.)
+        Does it explicitly Deny the role?
+        For same-account: Either IAM or resource policy Allow is sufficient
+        For cross-account: BOTH must Allow
+
+STEP 5: Check Permission Boundary (if set on role)
+        Effective permissions = Role policy ∩ Boundary
+
+STEP 6: Check SCP (if in AWS Organization)
+        SCP might deny the action at the organization level
+
+STEP 7: Check KMS permissions
+        If the resource is encrypted with KMS
+        → Role needs kms:Decrypt (for reading) or kms:GenerateDataKey (for writing)
+
+STEP 8: Use IAM Policy Simulator
+        IAM Console → Policy Simulator → Select role → Test action + resource</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ IAM Roles are the ONLY correct way for AWS services to access other AWS services<br>
+→ Roles provide TEMPORARY credentials that AUTO-ROTATE — no keys to manage, steal, or leak<br>
+→ The Trust Policy defines WHO can assume the role (EC2, Lambda, Glue, another account)<br>
+→ The Permission Policy defines WHAT the role can do (which actions on which resources)<br>
+→ Instance Profiles are the bridge between IAM Roles and EC2 instances<br>
+→ AWS SDK automatically finds and uses IMDS credentials — zero application code needed<br>
+→ The credential chain has priorities — environment variables OVERRIDE Instance Profile<br>
+→ Each EC2 instance gets unique temporary credentials with the instance ID as session name<br>
+→ CloudTrail logs show exactly which role and which instance made each API call</p>
+<p>→ Connection to Project 2: IAM Roles use the SAME policy language as IAM Users</p>
+<ul>
+<li>Same actions, resources, conditions</li>
+<li>Different: Roles have Trust Policies, Users don't</li>
+<li>Different: Roles provide temporary credentials, Users have permanent keys</li>
+</ul>
+<p>→ Connection to Project 3: Credentials are delivered via IMDS (Instance Metadata)</p>
+<ul>
+<li>IMDSv2 protects credentials from SSRF attacks</li>
+<li>The metadata endpoint is the delivery mechanism for role credentials</li>
+</ul>
+<p>→ Connection to Project 10: Bucket policies reference the role as Principal</p>
+<ul>
+<li><code>"Principal": {"AWS": "arn:aws:iam::123456789012:role/shopnow-web-server-role"}</code></li>
+<li>The role's permission policy AND the bucket policy work together</li>
+</ul>
+<p>→ Connection to Projects 4, 5: The role grants API-level access; Security Groups grant network-level access</p>
+<ul>
+<li>Having an IAM Role doesn't bypass Security Groups</li>
+<li>Both must allow for the complete access path to work</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 17: Glue IAM Role (glue.amazonaws.com trust) for crawlers and ETL jobs</li>
+<li>Project 22: Redshift IAM Role (redshift.amazonaws.com trust) for COPY/UNLOAD</li>
+<li>Project 26: Lambda Execution Role (lambda.amazonaws.com trust)</li>
+<li>Project 30: S3 Replication Role (s3.amazonaws.com trust)</li>
+<li>Project 39: Cross-Account S3 Access via Role assumption</li>
+<li>Project 40: Cross-Account IAM Role Assumption (STS AssumeRole)</li>
+<li>Project 45: Lambda in VPC with IAM Role</li>
+<li>Every project from here on that involves AWS service-to-service access</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has IAM Roles for all EC2 instances — no hardcoded credentials<br>
+→ But the operations team raises a concern about S3 storage costs<br>
+→ The <code>shopnow-productimages-prod-aps1</code> bucket has grown to 2 TB<br>
+→ Analysis shows:</p>
+<ul>
+<li>500 GB are current product images (accessed daily)</li>
+<li>800 GB are old product images from discontinued products (accessed once a month)</li>
+<li>400 GB are archived marketing campaign images (accessed once a year)</li>
+<li>300 GB are accidentally overwritten images that nobody can recover<br>
+→ The CFO asks: "Why are we paying S3 Standard pricing for 1.5 TB of data that's rarely accessed?"<br>
+→ And the marketing team says: "We accidentally overwrote the Diwali campaign images — can we get the old version back?"</li>
+</ul>
+<p>→ <strong>This is exactly what Project 12 solves</strong><br>
+→ Project 12 introduces S3 Versioning and Lifecycle Policies<br>
+→ Versioning keeps every version of every object — accidental overwrites are recoverable<br>
+→ Lifecycle policies automatically move objects to cheaper storage classes based on age<br>
+→ It builds on S3 knowledge (Project 1) and bucket policies (Project 10)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 12: "The Storage Bill That Kept Growing — S3 Versioning &amp; Lifecycle Policies"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-10.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 11/60</span></div><a class="nav-btn next" href="project-12.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

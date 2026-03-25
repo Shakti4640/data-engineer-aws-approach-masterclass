@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 19: THE APPLICATION LOGS NOBODY COULD FIND — CloudWatch Logs from EC2 vi — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 19: THE APPLICATION LOGS NOBODY COULD FIND — CloudWatch Logs from EC2 via Unified Agent</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from previous projects) now runs a Java-based order processing application on an EC2 instance<br>
+→ The application writes logs to <code>/var/log/shopnow/application.log</code><br>
+→ The Nginx reverse proxy writes access logs to <code>/var/log/nginx/access.log</code> and error logs to <code>/var/log/nginx/error.log</code><br>
+→ The operating system writes critical messages to <code>/var/log/messages</code> and <code>/var/log/secure</code><br>
+→ Last week — the application threw 500 errors for 45 minutes during peak traffic<br>
+→ The on-call engineer SSH'd into the instance to check logs<br>
+→ Problem 1: The instance was part of an Auto Scaling group — the problematic instance had already been TERMINATED and replaced<br>
+→ Problem 2: The logs were gone forever — terminated instance = deleted EBS volume = deleted logs<br>
+→ Problem 3: Even on running instances, logs had rotated — only last 24 hours available<br>
+→ Problem 4: With 6 EC2 instances running, the engineer had to SSH into each one individually to grep logs<br>
+→ Problem 5: No way to search across all instances simultaneously<br>
+→ Problem 6: No way to set alarms on log content (e.g., alert when "OutOfMemoryError" appears)<br>
+→ The CTO demands: "I need ALL logs from ALL instances in ONE place, searchable, retained for 90 days, and alertable"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the core limitation<br>
+→ EC2 instance logs live on the LOCAL disk of that instance<br>
+→ If the instance terminates, scales down, or the disk fails — logs vanish permanently<br>
+→ SSH-based log access does NOT scale beyond 2–3 instances<br>
+→ You cannot search across multiple instances from a terminal</p>
+<p>→ The solution requires CENTRALIZING logs OFF the instance into a durable, searchable service<br>
+→ AWS CloudWatch Logs is that service</p>
+<p>→ But CloudWatch Logs doesn't magically pull logs from EC2<br>
+→ You need an AGENT running ON the EC2 instance that:</p>
+<ul>
+<li>Reads specified log files continuously</li>
+<li>Ships log lines to CloudWatch Logs service in real-time</li>
+<li>Handles batching, retry, and buffering</li>
+</ul>
+<p>→ That agent is the <strong>CloudWatch Unified Agent</strong></p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand CloudWatch Logs hierarchy (Log Group → Log Stream → Log Event)</li>
+<li>Step 2 — Create an IAM Role with CloudWatch Logs permissions (builds on Project 11)</li>
+<li>Step 3 — Attach role to EC2 instance</li>
+<li>Step 4 — Install the CloudWatch Unified Agent on EC2</li>
+<li>Step 5 — Configure the agent (which files to ship, where to send them)</li>
+<li>Step 6 — Start the agent and verify logs appear</li>
+<li>Step 7 — Set retention policy</li>
+<li>Step 8 — Create Metric Filters for log-based alarms</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND CLOUDWATCH LOGS HIERARCHY</h3>
+<p>→ CloudWatch Logs has a 3-level hierarchy — this is foundational</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CloudWatch Logs
+</span>  └── Log Group          (container — one per application/log type)
+        └── Log Stream    (one per source — typically one per instance)
+              └── Log Events   (individual log lines with timestamps)</code></pre></div>
+<p><strong>Log Group</strong><br>
+→ Think of it as a "folder" for a specific type of log<br>
+→ Example Log Groups:</p>
+<ul>
+<li><code>/shopnow/application</code></li>
+<li><code>/shopnow/nginx/access</code></li>
+<li><code>/shopnow/nginx/error</code></li>
+<li><code>/ec2/system/messages</code></li>
+<li><code>/ec2/system/secure</code><br>
+→ Retention policy is set at the Log Group level<br>
+→ Encryption is set at the Log Group level<br>
+→ Access control (IAM) can target specific Log Groups</li>
+</ul>
+<p><strong>Log Stream</strong><br>
+→ Think of it as "one source feeding into the group"<br>
+→ Typically — one Log Stream per EC2 instance per Log Group<br>
+→ Stream name is usually the instance ID: <code>i-0a1b2c3d4e5f67890</code><br>
+→ When that instance terminates — the stream remains (logs preserved!)<br>
+→ When a new instance launches — a new stream is created</p>
+<p><strong>Log Event</strong><br>
+→ A single log line with two components:</p>
+<ul>
+<li>Timestamp (millisecond precision)</li>
+<li>Raw message (the actual log line text)<br>
+→ Example: <code>2025-01-15T14:32:05.123Z ERROR OutOfMemoryError: Java heap space</code></li>
+</ul>
+<p>→ Why this hierarchy matters:</p>
+<ul>
+<li>You search within a Log Group (across ALL streams = across ALL instances simultaneously)</li>
+<li>You set retention on the Log Group (all streams inherit it)</li>
+<li>You create Metric Filters on the Log Group (pattern matching across all instances)</li>
+</ul>
+<hr>
+<h3>STEP 2 — CREATE IAM POLICY FOR CLOUDWATCH AGENT</h3>
+<p>→ The agent runs ON the EC2 instance<br>
+→ It needs permissions to WRITE logs to CloudWatch Logs<br>
+→ It also needs permissions to WRITE custom metrics (the Unified Agent also collects system metrics)<br>
+→ As learned in Project 11 — EC2 gets permissions via IAM Role + Instance Profile</p>
+<p><strong>Option A: Use AWS Managed Policy</strong><br>
+→ Navigate to IAM → Policies → Search for <code>CloudWatchAgentServerPolicy</code><br>
+→ This is an AWS-managed policy that grants:</p>
+<table><thead><tr><th>Permission</th><th>Purpose</th></tr></thead><tbody><tr><td><code>cloudwatch:PutMetricData</code></td><td>Push custom metrics (CPU, memory, disk)</td></tr><tr><td><code>logs:CreateLogGroup</code></td><td>Agent creates Log Groups if they don't exist</td></tr><tr><td><code>logs:CreateLogStream</code></td><td>Agent creates Log Streams (one per instance)</td></tr><tr><td><code>logs:PutLogEvents</code></td><td>Agent pushes actual log lines</td></tr><tr><td><code>logs:DescribeLogStreams</code></td><td>Agent checks existing streams</td></tr><tr><td><code>logs:DescribeLogGroups</code></td><td>Agent checks existing groups</td></tr><tr><td><code>ec2:DescribeTags</code></td><td>Agent reads instance tags (useful for dynamic naming)</td></tr><tr><td><code>ec2:DescribeVolumes</code></td><td>Agent reads volume info for disk metrics</td></tr><tr><td><code>ec2:DescribeInstances</code></td><td>Agent reads instance metadata</td></tr><tr><td><code>ssm:GetParameter</code></td><td>Agent can retrieve its config from SSM Parameter Store</td></tr></tbody></table>
+<p>→ This is the recommended approach for most use cases</p>
+<p><strong>Option B: Custom Policy (Least Privilege)</strong><br>
+→ If you want tighter control — restrict to specific Log Groups</p>
+<p>→ Custom policy structure:</p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>logs:CreateLogStream</code>, <code>logs:PutLogEvents</code></td></tr><tr><td>Resource</td><td><code>arn:aws:logs:ap-south-1:123456789012:log-group:/shopnow/*:*</code></td></tr></tbody></table>
+<p>→ This allows writing ONLY to Log Groups starting with <code>/shopnow/</code><br>
+→ The agent cannot create random Log Groups or write to others</p>
+<hr>
+<h3>STEP 3 — ATTACH ROLE TO EC2 INSTANCE</h3>
+<p>→ Two scenarios:</p>
+<p><strong>Scenario A: Instance already has a role (from Project 11)</strong><br>
+→ That role was for S3 access<br>
+→ Now ATTACH the <code>CloudWatchAgentServerPolicy</code> to that SAME role<br>
+→ Navigate to IAM → Roles → Select the role → Attach policies → Add <code>CloudWatchAgentServerPolicy</code><br>
+→ Instance Profile doesn't change — the role just gained additional permissions</p>
+<p><strong>Scenario B: Instance has no role</strong><br>
+→ Create new role (as per Project 11 process)<br>
+→ Trusted entity: EC2<br>
+→ Attach <code>CloudWatchAgentServerPolicy</code><br>
+→ Attach to instance: EC2 Console → Select instance → Actions → Security → Modify IAM Role</p>
+<p>→ Key reminder from Project 11: No instance restart needed — role attachment is immediate</p>
+<hr>
+<h3>STEP 4 — INSTALL THE CLOUDWATCH UNIFIED AGENT</h3>
+<p>→ The agent is NOT pre-installed on EC2 instances (except some Amazon Linux 2023 AMIs)<br>
+→ Installation method depends on the OS</p>
+<p><strong>Method 1: Via Systems Manager (SSM) — Recommended</strong><br>
+→ Navigate to AWS Systems Manager → Run Command<br>
+→ Choose document: <code>AWS-ConfigureAWSPackage</code><br>
+→ Parameters:</p>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td>Action</td><td>Install</td></tr><tr><td>Name</td><td>AmazonCloudWatchAgent</td></tr><tr><td>Version</td><td>Latest</td></tr></tbody></table>
+<p>→ Target: Select your EC2 instances (by tag, by instance ID, or by resource group)<br>
+→ Execute → Agent is installed remotely without SSH</p>
+<p>→ Prerequisite: EC2 instance must have SSM Agent running + IAM permissions for SSM<br>
+→ Amazon Linux 2/2023 and Ubuntu 18.04+ come with SSM Agent pre-installed</p>
+<p><strong>Method 2: Via SSH (Manual)</strong><br>
+→ SSH into the instance (as per Project 3)<br>
+→ Download the agent package from S3 (AWS hosts it)<br>
+→ Region-specific S3 URL pattern:<br>
+<code>https://s3.ap-south-1.amazonaws.com/amazoncloudwatch-agent-ap-south-1/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm</code><br>
+→ Install the downloaded package<br>
+→ Agent binary is installed to <code>/opt/aws/amazon-cloudwatch-agent/</code></p>
+<p><strong>Method 3: Via User Data at Launch (Automation)</strong><br>
+→ Add agent installation commands to EC2 User Data (Project 3)<br>
+→ Every new instance in the Auto Scaling group automatically gets the agent<br>
+→ Critical for the auto-scaling scenario in our problem statement</p>
+<hr>
+<h3>STEP 5 — CONFIGURE THE AGENT — THE MOST CRITICAL STEP</h3>
+<p>→ The agent needs a configuration file that tells it:</p>
+<ul>
+<li>WHICH log files to monitor</li>
+<li>WHERE to send them (which Log Group, which Log Stream)</li>
+<li>HOW to parse timestamps</li>
+<li>WHAT system metrics to collect</li>
+</ul>
+<p>→ Configuration is a JSON file stored at:<br>
+<code>/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json</code></p>
+<p>→ Two ways to create this configuration:</p>
+<hr>
+<p><strong>Method A: Interactive Wizard (Recommended for First Time)</strong><br>
+→ SSH into instance → Run the configuration wizard<br>
+→ The wizard asks questions interactively:</p>
+<table><thead><tr><th>Wizard Question</th><th>Our Answer</th><th>Why</th></tr></thead><tbody><tr><td>Are you on EC2 or on-premises?</td><td>EC2</td><td>Enables instance metadata usage</td></tr><tr><td>Which OS?</td><td>Linux</td><td>Auto-detected usually</td></tr><tr><td>Do you want to monitor CPU per core?</td><td>Yes</td><td>Identifies core-specific bottlenecks</td></tr><tr><td>Do you want to monitor memory?</td><td>Yes</td><td>EC2 default CloudWatch does NOT include memory (as noted in Project 8)</td></tr><tr><td>Do you want to monitor disk?</td><td>Yes</td><td>Monitor <code>/</code> and <code>/data</code> mount points</td></tr><tr><td>Metrics collection interval?</td><td>60 seconds</td><td>Balance between granularity and cost</td></tr><tr><td>Do you want to collect log files?</td><td>Yes</td><td>This is our primary goal</td></tr></tbody></table>
+<p>→ Then for EACH log file, the wizard asks:</p>
+<table><thead><tr><th>Question</th><th>Application Log</th><th>Nginx Access Log</th><th>System Messages</th></tr></thead><tbody><tr><td>Log file path</td><td><code>/var/log/shopnow/application.log</code></td><td><code>/var/log/nginx/access.log</code></td><td><code>/var/log/messages</code></td></tr><tr><td>Log Group name</td><td><code>/shopnow/application</code></td><td><code>/shopnow/nginx/access</code></td><td><code>/ec2/system/messages</code></td></tr><tr><td>Log Stream name</td><td><code>{instance_id}</code></td><td><code>{instance_id}</code></td><td><code>{instance_id}</code></td></tr><tr><td>Timestamp format</td><td><code>%Y-%m-%dT%H:%M:%S</code></td><td><code>%d/%b/%Y:%H:%M:%S</code></td><td><code>%b %d %H:%M:%S</code></td></tr><tr><td>Multi-line start pattern</td><td><code>^\d{4}-\d{2}-\d{2}</code></td><td>(none — single line)</td><td>(none — single line)</td></tr><tr><td>Timezone</td><td>UTC</td><td>UTC</td><td>UTC</td></tr></tbody></table>
+<p>→ The wizard generates the JSON configuration file automatically</p>
+<hr>
+<p><strong>Method B: Direct JSON Configuration (Production Approach)</strong></p>
+<p>→ The JSON file has three major sections:</p>
+<p><strong>Section 1: <code>agent</code> block</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>metrics_collection_interval</code></td><td>60</td><td>How often to collect system metrics (seconds)</td></tr><tr><td><code>region</code></td><td><code>ap-south-1</code></td><td>Which CloudWatch region to send data to</td></tr><tr><td><code>logfile</code></td><td><code>/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log</code></td><td>Agent's own log for troubleshooting</td></tr><tr><td><code>debug</code></td><td>false</td><td>Enable verbose agent logging (set true only for debugging)</td></tr></tbody></table>
+<p><strong>Section 2: <code>metrics</code> block</strong></p>
+<table><thead><tr><th>Setting</th><th>Purpose</th></tr></thead><tbody><tr><td><code>namespace</code></td><td>Custom namespace for metrics (default: <code>CWAgent</code>)</td></tr><tr><td><code>metrics_collected → cpu</code></td><td>CPU utilization, idle, iowait per core</td></tr><tr><td><code>metrics_collected → mem</code></td><td>Memory used %, available, total</td></tr><tr><td><code>metrics_collected → disk</code></td><td>Disk used %, free, total per mount point</td></tr><tr><td><code>metrics_collected → net</code></td><td>Network bytes in/out per interface</td></tr><tr><td><code>metrics_collected → swap</code></td><td>Swap used %, free</td></tr><tr><td><code>append_dimensions</code></td><td>Add <code>InstanceId</code>, <code>InstanceType</code>, <code>AutoScalingGroupName</code> as dimensions</td></tr></tbody></table>
+<p>→ Why <code>mem</code> matters: As established in Project 8, EC2 default CloudWatch metrics do NOT include memory utilization<br>
+→ The CloudWatch Agent is the ONLY way to get memory metrics into CloudWatch<br>
+→ This solves the Project 8 gap</p>
+<p><strong>Section 3: <code>logs</code> block — This is our focus</strong></p>
+<p>→ Under <code>logs → logs_collected → files → collect_list</code>, each entry defines one log file to monitor:</p>
+<p><strong>Entry 1: Application Log</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>file_path</code></td><td><code>/var/log/shopnow/application.log</code></td><td>Which file to tail</td></tr><tr><td><code>log_group_name</code></td><td><code>/shopnow/application</code></td><td>Target Log Group in CloudWatch</td></tr><tr><td><code>log_stream_name</code></td><td><code>{instance_id}</code></td><td>Dynamic — resolves to actual instance ID</td></tr><tr><td><code>timestamp_format</code></td><td><code>%Y-%m-%dT%H:%M:%S</code></td><td>How to parse timestamps from log lines</td></tr><tr><td><code>multi_line_start_pattern</code></td><td><code>^\d{4}-\d{2}-\d{2}</code></td><td>Lines starting with date = new log event; everything else = continuation (stack traces!)</td></tr><tr><td><code>timezone</code></td><td><code>UTC</code></td><td>Interpret timestamps as UTC</td></tr><tr><td><code>retention_in_days</code></td><td>90</td><td>Auto-set retention when agent creates the Log Group</td></tr><tr><td><code>encoding</code></td><td><code>utf-8</code></td><td>Character encoding of the log file</td></tr></tbody></table>
+<p><strong>Entry 2: Nginx Access Log</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>file_path</code></td><td><code>/var/log/nginx/access.log</code></td><td>Nginx access log location</td></tr><tr><td><code>log_group_name</code></td><td><code>/shopnow/nginx/access</code></td><td>Separate Log Group for access logs</td></tr><tr><td><code>log_stream_name</code></td><td><code>{instance_id}</code></td><td>Per-instance stream</td></tr><tr><td><code>timestamp_format</code></td><td><code>%d/%b/%Y:%H:%M:%S</code></td><td>Nginx default timestamp format</td></tr><tr><td><code>multi_line_start_pattern</code></td><td>(not set)</td><td>Each line is one event</td></tr></tbody></table>
+<p><strong>Entry 3: Nginx Error Log</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>file_path</code></td><td><code>/var/log/nginx/error.log</code></td><td>Nginx error log</td></tr><tr><td><code>log_group_name</code></td><td><code>/shopnow/nginx/error</code></td><td>Separate group for errors</td></tr><tr><td><code>log_stream_name</code></td><td><code>{instance_id}</code></td><td>Per-instance stream</td></tr></tbody></table>
+<p><strong>Entry 4: System Messages</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>file_path</code></td><td><code>/var/log/messages</code></td><td>OS-level system log</td></tr><tr><td><code>log_group_name</code></td><td><code>/ec2/system/messages</code></td><td>System log group</td></tr><tr><td><code>log_stream_name</code></td><td><code>{instance_id}</code></td><td>Per-instance stream</td></tr></tbody></table>
+<p><strong>Entry 5: SSH Authentication Log</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>file_path</code></td><td><code>/var/log/secure</code></td><td>SSH login attempts, sudo actions</td></tr><tr><td><code>log_group_name</code></td><td><code>/ec2/system/secure</code></td><td>Security-relevant logs</td></tr><tr><td><code>log_stream_name</code></td><td><code>{instance_id}</code></td><td>Per-instance stream</td></tr></tbody></table>
+<hr>
+<p><strong>Special Setting: <code>{instance_id}</code> Token</strong></p>
+<p>→ The agent supports dynamic tokens in Log Stream names:</p>
+<table><thead><tr><th>Token</th><th>Resolves To</th><th>Example</th></tr></thead><tbody><tr><td><code>{instance_id}</code></td><td>EC2 Instance ID</td><td><code>i-0a1b2c3d4e5f67890</code></td></tr><tr><td><code>{hostname}</code></td><td>OS hostname</td><td><code>ip-10-0-1-45</code></td></tr><tr><td><code>{ip_address}</code></td><td>Private IP</td><td><code>10.0.1.45</code></td></tr><tr><td><code>{local_hostname}</code></td><td>Local hostname</td><td><code>shopnow-web-01</code></td></tr></tbody></table>
+<p>→ <code>{instance_id}</code> is preferred because it's unique, immutable, and matches AWS console</p>
+<hr>
+<h3>STEP 6 — STORE CONFIGURATION IN SSM PARAMETER STORE (Best Practice)</h3>
+<p>→ Problem: If you have 6 EC2 instances (or 60), you don't want to manually copy the config file to each<br>
+→ Solution: Store the agent config in AWS Systems Manager Parameter Store</p>
+<p>→ Navigate to Systems Manager → Parameter Store → Create Parameter</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>AmazonCloudWatch-shopnow-config</code></td></tr><tr><td>Type</td><td>String</td></tr><tr><td>Data type</td><td>text</td></tr><tr><td>Value</td><td>(paste the entire JSON configuration)</td></tr></tbody></table>
+<p>→ Now every EC2 instance can FETCH this config from SSM at startup<br>
+→ Change the config in SSM → restart agents on instances → all pick up new config<br>
+→ This is how you manage agent config at scale across Auto Scaling groups</p>
+<hr>
+<h3>STEP 7 — START THE AGENT</h3>
+<p>→ After configuration is in place (locally or fetched from SSM):</p>
+<p><strong>Start agent with local config file:</strong><br>
+→ The agent reads <code>/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json</code><br>
+→ Agent starts tailing specified log files<br>
+→ Agent begins pushing log events to CloudWatch Logs</p>
+<p><strong>Start agent with SSM Parameter Store config:</strong><br>
+→ Agent fetches config from SSM parameter <code>AmazonCloudWatch-shopnow-config</code><br>
+→ Requires <code>ssm:GetParameter</code> permission (included in <code>CloudWatchAgentServerPolicy</code>)<br>
+→ Agent starts with the fetched configuration</p>
+<p><strong>Verify agent is running:</strong><br>
+→ Check agent status on the instance<br>
+→ Agent status should show: <code>running</code><br>
+→ Check agent's own log file at <code>/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log</code><br>
+→ Look for: <code>Successfully started</code> or errors like <code>AccessDeniedException</code> (IAM issue)</p>
+<hr>
+<h3>STEP 8 — VERIFY IN CLOUDWATCH CONSOLE</h3>
+<p>→ Navigate to CloudWatch → Logs → Log Groups<br>
+→ You should see:</p>
+<table><thead><tr><th>Log Group</th><th>Streams</th><th>Status</th></tr></thead><tbody><tr><td><code>/shopnow/application</code></td><td><code>i-0a1b2c3d...</code> (one per instance)</td><td>Active — events flowing</td></tr><tr><td><code>/shopnow/nginx/access</code></td><td><code>i-0a1b2c3d...</code></td><td>Active</td></tr><tr><td><code>/shopnow/nginx/error</code></td><td><code>i-0a1b2c3d...</code></td><td>Active</td></tr><tr><td><code>/ec2/system/messages</code></td><td><code>i-0a1b2c3d...</code></td><td>Active</td></tr><tr><td><code>/ec2/system/secure</code></td><td><code>i-0a1b2c3d...</code></td><td>Active</td></tr></tbody></table>
+<p>→ Click into a Log Group → Click a stream → You see actual log lines with timestamps<br>
+→ Logs from a TERMINATED instance? The stream still exists — logs are preserved!<br>
+→ This solves the original problem completely</p>
+<hr>
+<h3>STEP 9 — SET RETENTION POLICY</h3>
+<p>→ By default — CloudWatch Logs retains logs FOREVER (Never Expire)<br>
+→ This means ever-growing costs</p>
+<p>→ Navigate to CloudWatch → Log Groups → Select a Log Group → Actions → Edit Retention</p>
+<table><thead><tr><th>Log Group</th><th>Retention Setting</th><th>Rationale</th></tr></thead><tbody><tr><td><code>/shopnow/application</code></td><td>90 days</td><td>CTO's requirement — 90 day window</td></tr><tr><td><code>/shopnow/nginx/access</code></td><td>30 days</td><td>High volume, short-term debugging value</td></tr><tr><td><code>/shopnow/nginx/error</code></td><td>90 days</td><td>Error investigation needs longer window</td></tr><tr><td><code>/ec2/system/messages</code></td><td>60 days</td><td>System troubleshooting</td></tr><tr><td><code>/ec2/system/secure</code></td><td>365 days</td><td>Security audit compliance</td></tr></tbody></table>
+<p>→ Available retention options: 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653 days, or Never Expire</p>
+<p>→ After retention expires — log events are automatically deleted<br>
+→ If you need logs longer than retention → export to S3 first (covered in Step 11)</p>
+<hr>
+<h3>STEP 10 — SEARCH ACROSS ALL INSTANCES — LOG INSIGHTS</h3>
+<p>→ This is the power feature that solves "searching across 6 instances simultaneously"</p>
+<p>→ Navigate to CloudWatch → Logs → Logs Insights<br>
+→ Select Log Group: <code>/shopnow/application</code></p>
+<p>→ Logs Insights is a query language for CloudWatch Logs</p>
+<p><strong>Common Query Patterns (configuration-level understanding):</strong></p>
+<table><thead><tr><th>Query Purpose</th><th>What It Does</th></tr></thead><tbody><tr><td>Find all errors in last 1 hour</td><td>Filters events containing "ERROR" across ALL streams (all instances)</td></tr><tr><td>Count errors per instance</td><td>Groups by log stream (instance ID), counts ERROR occurrences</td></tr><tr><td>Find OutOfMemoryError</td><td>Filters for specific exception text</td></tr><tr><td>Find slowest API calls</td><td>Parses log line, extracts response time, sorts descending</td></tr><tr><td>Find 500 status codes in Nginx</td><td>Queries <code>/shopnow/nginx/access</code> group for status=500</td></tr></tbody></table>
+<p>→ Time range selector: Choose custom range or predefined (1h, 3h, 12h, 24h, 1w)<br>
+→ Multiple Log Groups can be queried simultaneously (select multiple)</p>
+<p>→ Key insight: You're querying ACROSS all streams (all instances) in one query<br>
+→ No more SSH-ing into 6 machines and running grep</p>
+<hr>
+<h3>STEP 11 — METRIC FILTERS — TURN LOG PATTERNS INTO ALARMS</h3>
+<p>→ This is where CloudWatch Logs connects back to CloudWatch Alarms (Project 8)</p>
+<p>→ Problem: "Alert me when OutOfMemoryError appears in any application log"<br>
+→ Solution: Metric Filter</p>
+<p>→ Navigate to CloudWatch → Log Groups → <code>/shopnow/application</code> → Metric Filters → Create</p>
+<p><strong>Metric Filter Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Filter Pattern</td><td><code>OutOfMemoryError</code></td><td>Text to match in log events</td></tr><tr><td>Filter Name</td><td><code>OOM-Error-Count</code></td><td>Human-readable identifier</td></tr><tr><td>Metric Namespace</td><td><code>ShopNow/Application</code></td><td>Custom namespace for this metric</td></tr><tr><td>Metric Name</td><td><code>OutOfMemoryErrors</code></td><td>Name of the CloudWatch metric</td></tr><tr><td>Metric Value</td><td><code>1</code></td><td>Each match increments metric by 1</td></tr><tr><td>Default Value</td><td><code>0</code></td><td>Value when no matches in a period</td></tr></tbody></table>
+<p>→ Now every time a log line contains "OutOfMemoryError" → CloudWatch metric <code>OutOfMemoryErrors</code> increments</p>
+<p>→ Create a CloudWatch Alarm on this metric (exactly as learned in Project 8):</p>
+<table><thead><tr><th>Alarm Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>ShopNow/Application</code> → <code>OutOfMemoryErrors</code></td></tr><tr><td>Statistic</td><td>Sum</td></tr><tr><td>Period</td><td>300 seconds (5 minutes)</td></tr><tr><td>Threshold</td><td>&gt;= 1</td></tr><tr><td>Alarm Action</td><td>SNS Topic (as configured in Project 6)</td></tr></tbody></table>
+<p>→ Result: Within 5 minutes of ANY OutOfMemoryError on ANY instance → email notification via SNS<br>
+→ This completes the full loop: Log file → Agent → CloudWatch Logs → Metric Filter → Alarm → SNS → Email</p>
+<p><strong>Advanced Filter Patterns:</strong></p>
+<table><thead><tr><th>Pattern</th><th>Matches</th></tr></thead><tbody><tr><td><code>ERROR</code></td><td>Any line containing "ERROR"</td></tr><tr><td><code>[ip, user, timestamp, request, status_code=5*, bytes]</code></td><td>Space-delimited logs where 5th field starts with 5 (500 errors)</td></tr><tr><td><code>{ $.status = 500 }</code></td><td>JSON-formatted logs where status field equals 500</td></tr><tr><td><code>?ERROR ?WARN</code></td><td>Lines containing ERROR OR WARN</td></tr><tr><td><code>ERROR -DEBUG</code></td><td>Lines containing ERROR but NOT DEBUG</td></tr></tbody></table>
+<hr>
+<h3>STEP 12 — EXPORT LOGS TO S3 (Long-Term Archive)</h3>
+<p>→ For logs that need retention beyond CloudWatch (compliance, cost savings):</p>
+<p>→ Navigate to CloudWatch → Log Groups → Select group → Actions → Export data to S3</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Destination S3 Bucket</td><td><code>shopnow-logs-archive-aps1</code> (from Project 1 knowledge)</td></tr><tr><td>Prefix</td><td><code>cloudwatch-exports/application/</code></td></tr><tr><td>Time range</td><td>Define start/end timestamps</td></tr></tbody></table>
+<p>→ Prerequisite: The S3 bucket needs a bucket policy allowing CloudWatch Logs to write<br>
+→ Principal: <code>logs.ap-south-1.amazonaws.com</code><br>
+→ Action: <code>s3:PutObject</code><br>
+→ Resource: <code>arn:aws:s3:::shopnow-logs-archive-aps1/cloudwatch-exports/*</code></p>
+<p>→ This is a ONE-TIME export — not continuous<br>
+→ For continuous export → Use CloudWatch Logs Subscription Filter to Kinesis Firehose → S3 (Project 52 concept)</p>
+<p>→ Exported logs in S3 can later be:</p>
+<ul>
+<li>Crawled by Glue (Project 17)</li>
+<li>Queried by Athena (Project 18)</li>
+<li>Loaded into Redshift (Project 22)</li>
+</ul>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use IAM Roles (Project 11) for agent permissions — never hardcode access keys on the instance<br>
+→ Always use <code>{instance_id}</code> as Log Stream name — guarantees uniqueness and traceability<br>
+→ Always set retention policies on every Log Group — "Never Expire" silently accumulates massive costs<br>
+→ Always configure <code>multi_line_start_pattern</code> for Java/Python logs — stack traces span multiple lines<br>
+→ Always store agent config in SSM Parameter Store — enables fleet-wide config management<br>
+→ Always separate log types into different Log Groups — application logs, access logs, error logs, system logs<br>
+→ Always use a naming convention for Log Groups</p>
+<table><thead><tr><th>Pattern</th><th>Example</th></tr></thead><tbody><tr><td><code>/{company}/{app}/{log-type}</code></td><td><code>/shopnow/orderservice/application</code></td></tr><tr><td><code>/{environment}/{app}/{log-type}</code></td><td><code>/prod/orderservice/error</code></td></tr></tbody></table>
+<p>→ Always create Metric Filters for critical error patterns on Day 1<br>
+→ Always verify agent is running after instance reboot — configure it as a system service that starts on boot<br>
+→ Always test with a deliberate log write — generate a test log line and verify it appears in CloudWatch within 30 seconds</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never leave retention as "Never Expire" without a conscious decision — 1 TB of logs/month at $0.03/GB = $30/month growing forever<br>
+→ Never use <code>{hostname}</code> as stream name in Auto Scaling groups — hostnames can be recycled<br>
+→ Never put ALL log types into one Log Group — makes searching, retention, and access control impossible to differentiate<br>
+→ Never install the OLD CloudWatch Logs Agent (<code>awslogs</code>) — it is deprecated; always use the UNIFIED Agent (<code>amazon-cloudwatch-agent</code>)<br>
+→ Never forget the timestamp format — wrong format = all events get ingestion time instead of actual event time → makes time-based searching useless<br>
+→ Never set collection interval below 10 seconds in production — excessive API calls, higher costs, potential throttling<br>
+→ Never skip multi-line configuration for Java apps — a single exception with stack trace becomes 30 separate log events instead of 1<br>
+→ Never grant <code>logs:*</code> in IAM — follow least privilege; agent only needs <code>PutLogEvents</code>, <code>CreateLogGroup</code>, <code>CreateLogStream</code>, <code>DescribeLogStreams</code><br>
+→ Never ignore the agent's own log file — if logs aren't appearing in CloudWatch, the answer is in <code>/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log</code><br>
+→ Never assume CloudWatch Agent is pre-installed — verify on your AMI or include installation in User Data / launch template</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE CLOUDWATCH LOGS</h2>
+<table><thead><tr><th>Scenario</th><th>Use CloudWatch Logs?</th><th>Why</th></tr></thead><tbody><tr><td>Centralize application logs from EC2 fleet</td><td>✅ Yes</td><td>Primary use case — agent-based collection</td></tr><tr><td>Search logs across multiple instances</td><td>✅ Yes</td><td>Logs Insights queries across all streams</td></tr><tr><td>Create alarms based on log content</td><td>✅ Yes</td><td>Metric Filters → Alarms → SNS</td></tr><tr><td>Retain logs beyond instance lifecycle</td><td>✅ Yes</td><td>Logs persist after instance termination</td></tr><tr><td>Store Lambda function execution logs</td><td>✅ Yes</td><td>Lambda writes to CloudWatch Logs natively (no agent needed)</td></tr><tr><td>Store API Gateway access logs</td><td>✅ Yes</td><td>Native integration</td></tr><tr><td>Store VPC Flow Logs</td><td>✅ Yes</td><td>One of the supported destinations</td></tr><tr><td>Store ECS/Fargate container logs</td><td>✅ Yes</td><td><code>awslogs</code> log driver sends directly</td></tr><tr><td>Long-term archive (years) at lowest cost</td><td>❌ No</td><td>Export to S3 → use S3 Glacier (Project 12)</td></tr><tr><td>Complex log analytics with joins/aggregations</td><td>❌ No</td><td>Export to S3 → query with Athena (Project 18) or load into Redshift (Project 16)</td></tr><tr><td>Real-time streaming log processing</td><td>❌ Partially</td><td>Use Subscription Filters → Kinesis (Project 52) for true streaming</td></tr><tr><td>Full-text search with complex faceting</td><td>❌ No</td><td>Use OpenSearch Service (Elasticsearch) for advanced search UX</td></tr><tr><td>Log volume &gt; 10 TB/day with complex pipelines</td><td>❌ No</td><td>Consider Kinesis → S3 → Athena for cost efficiency</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE CLOUDWATCH LOGS</h2>
+<p>→ When log volume is extremely high (&gt; 5 TB/day) and retention is long → Cost becomes prohibitive → Ship to S3 directly<br>
+→ When you need real-time dashboard with complex visualizations on logs → Use OpenSearch + Kibana<br>
+→ When you need to JOIN log data with business data in a warehouse → Export to S3 → Glue → Redshift<br>
+→ When you need sub-second log search across petabytes → OpenSearch is better suited<br>
+→ When compliance requires logs in S3 specifically (not CloudWatch) → Ship to S3 via Firehose</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → AGENT INTERNALS — HOW LOGS MOVE FROM FILE TO CLOUD</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[Log File on Disk]
+</span>       ↓
+ Agent TAILS the file (like Linux 'tail -f')
+       ↓
+ Agent reads new lines since last checkpoint
+       ↓
+ Agent parses timestamp using configured format
+       ↓
+ Agent batches multiple log events together
+       ↓
+ Agent calls PutLogEvents API
+       ↓
+ CloudWatch Logs service receives and indexes events
+       ↓
+ Events appear in Log Stream within the Log Group</code></pre></div>
+<p><strong>Checkpointing:</strong><br>
+→ The agent maintains a STATE FILE on disk<br>
+→ Location: <code>/opt/aws/amazon-cloudwatch-agent/logs/state/</code><br>
+→ This file records: "I have read up to byte offset 45678 of <code>/var/log/shopnow/application.log</code>"<br>
+→ If the agent restarts → it resumes from the checkpoint → no duplicate or missed logs<br>
+→ If the file rotates (logrotate) → agent detects the inode change → starts reading the new file</p>
+<p><strong>Batching:</strong><br>
+→ Agent does NOT send one API call per log line — that would be extremely expensive<br>
+→ Agent batches events and sends them in bulk<br>
+→ Batch constraints:</p>
+<table><thead><tr><th>Constraint</th><th>Limit</th></tr></thead><tbody><tr><td>Maximum batch size</td><td>1 MB</td></tr><tr><td>Maximum events per batch</td><td>10,000</td></tr><tr><td>Maximum event size</td><td>256 KB (single log event)</td></tr><tr><td>Flush interval</td><td>Configurable — default ~5 seconds</td></tr></tbody></table>
+<p>→ Agent accumulates log events in memory buffer<br>
+→ When buffer hits 1 MB OR 5 seconds elapse → flush to CloudWatch Logs API<br>
+→ This means typical log delivery latency: 5–15 seconds from file write to CloudWatch visibility</p>
+<p><strong>Retry Logic:</strong><br>
+→ If PutLogEvents fails (network issue, throttling) → agent retries with exponential backoff<br>
+→ Events are buffered in memory during retry<br>
+→ If agent crashes during retry → checkpointed events are safe, un-checkpointed events may be lost<br>
+→ Risk is minimal — window of potential loss is typically &lt; 5 seconds of logs</p>
+<hr>
+<h3>2 → CLOUDWATCH LOGS STORAGE INTERNALS</h3>
+<p><strong>Ingestion:</strong><br>
+→ PutLogEvents API receives batches<br>
+→ Events are validated (timestamps must be within 14 days past to 2 hours future)<br>
+→ Events are indexed by timestamp for time-range queries<br>
+→ Events are stored durably (replicated within the region)</p>
+<p><strong>Storage Tiers (as of 2024):</strong></p>
+<table><thead><tr><th>Tier</th><th>Name</th><th>Purpose</th><th>Cost</th></tr></thead><tbody><tr><td>Standard</td><td>Standard Class</td><td>Full features — Logs Insights, Metric Filters, alarms</td><td>Higher</td></tr><tr><td>Infrequent Access</td><td>IA Class</td><td>Reduced cost, supports Logs Insights, no Metric Filters</td><td>~50% cheaper ingestion</td></tr></tbody></table>
+<p>→ When creating a Log Group → choose the class:</p>
+<ul>
+<li>Application error logs (need Metric Filters + alarms) → Standard</li>
+<li>Verbose debug logs (rarely searched) → Infrequent Access</li>
+</ul>
+<p><strong>Sequence Token Mechanism:</strong><br>
+→ Each Log Stream has a <code>sequenceToken</code><br>
+→ Every PutLogEvents call must include the current sequence token<br>
+→ The response returns the NEXT sequence token<br>
+→ This ensures ordered, non-duplicate writes to a stream<br>
+→ The agent handles this automatically — you never interact with sequence tokens directly<br>
+→ If two agents write to the SAME stream simultaneously → one gets <code>InvalidSequenceTokenException</code><br>
+→ This is why: one stream per instance — never share streams</p>
+<hr>
+<h3>3 → METRIC FILTER INTERNALS</h3>
+<p>→ Metric Filters are NOT queries that run periodically<br>
+→ They are PATTERN MATCHERS applied to EVERY incoming log event in real-time</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Log Event arrives at Log Group
+</span>       ↓
+ CloudWatch checks ALL Metric Filters on that Log Group
+       ↓
+ For each filter — does the event match the pattern?
+       ↓
+ If YES → emit a CloudWatch metric data point
+       ↓
+ Metric data point flows into CloudWatch Metrics
+       ↓
+ Alarm evaluates the metric (as per Project 8 mechanics)</code></pre></div>
+<p>→ This is a PUSH model — not a pull/polling model<br>
+→ Every log event is evaluated against every Metric Filter on ingestion<br>
+→ Maximum Metric Filters per Log Group: 100<br>
+→ Metric Filters do NOT scan historical data — only events AFTER the filter is created<br>
+→ If you create a filter now — it won't count yesterday's errors</p>
+<hr>
+<h3>4 → LOGS INSIGHTS INTERNALS</h3>
+<p>→ Logs Insights is a query engine that scans log data<br>
+→ It is NOT a database — there is no pre-built index on your log content<br>
+→ When you run a query:</p>
+<ul>
+<li>CloudWatch identifies which log data falls in your time range</li>
+<li>It scans ALL events in that range across selected Log Groups</li>
+<li>Pattern matching and aggregation happen during scan</li>
+<li>Results are returned (up to 10,000 events for display, 20 per <code>limit</code> default)</li>
+</ul>
+<p>→ Pricing: Charged per GB of data scanned<br>
+→ Narrower time range = less data scanned = lower cost<br>
+→ This is exactly the same pricing model as Athena (Project 18) — scan-based billing</p>
+<p>→ Logs Insights automatically discovers fields in JSON-formatted logs<br>
+→ For non-JSON logs — use <code>parse</code> command to extract fields from text patterns</p>
+<hr>
+<h3>5 → DATA FLOW ARCHITECTURE (Complete Picture)</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EC2 Instance 1                    EC2 Instance 2                    EC2 Instance 3
+</span>  ┌──────────────┐                 ┌──────────────┐                 ┌──────────────┐
+  │ app.log      │                 │ app.log      │                 │ app.log      │
+  │ access.log   │                 │ access.log   │                 │ access.log   │
+  │ error.log    │                 │ error.log    │                 │ error.log    │
+  │ /var/log/msg │                 │ /var/log/msg │                 │ /var/log/msg │
+  └──────┬───────┘                 └──────┬───────┘                 └──────┬───────┘
+         │                                │                                │
+    CW Agent                         CW Agent                         CW Agent
+         │                                │                                │
+         └────────────────┬───────────────┴────────────────┬───────────────┘
+                          │         PutLogEvents API       │
+                          ▼                                ▼
+              ┌─────────────────────────────────────────────────┐
+              │              CloudWatch Logs Service             │
+              │                                                 │
+              │  Log Group: /shopnow/application                │
+              │    ├── Stream: i-0a1b... (Instance 1 logs)      │
+              │    ├── Stream: i-0c3d... (Instance 2 logs)      │
+              │    └── Stream: i-0e5f... (Instance 3 logs)      │
+              │                                                 │
+              │  Log Group: /shopnow/nginx/access               │
+              │    ├── Stream: i-0a1b...                        │
+              │    ├── Stream: i-0c3d...                        │
+              │    └── Stream: i-0e5f...                        │
+              │                                                 │
+              └────────┬──────────────────┬─────────────────────┘
+                       │                  │
+                Metric Filter         Logs Insights
+                       │               (Ad-hoc query)
+                       ▼
+              CloudWatch Metric
+              "OutOfMemoryErrors"
+                       │
+                       ▼
+              CloudWatch Alarm
+              (Project 8 pattern)
+                       │
+                       ▼
+                  SNS Topic
+              (Project 6 pattern)
+                       │
+                       ▼
+                 Email / SMS</code></pre></div>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>Agent installed but no logs in CloudWatch</td><td>Log Groups don't appear</td><td>IAM Role missing <code>logs:CreateLogGroup</code> or <code>logs:PutLogEvents</code></td><td>Attach <code>CloudWatchAgentServerPolicy</code> to instance role</td></tr><tr><td>2</td><td>Agent running but "AccessDeniedException" in agent log</td><td>Agent log shows permission error</td><td>IAM Role not attached to instance OR policy doesn't cover the target Log Group ARN</td><td>Verify role attachment (Project 11) and policy permissions</td></tr><tr><td>3</td><td>Logs appear but all timestamps show ingestion time</td><td>Events searchable but time is wrong</td><td>Incorrect <code>timestamp_format</code> in agent config → agent can't parse timestamps → uses current time</td><td>Fix the format string to match actual log timestamp pattern</td></tr><tr><td>4</td><td>Java stack traces split into 30 separate events</td><td>Each line of stack trace is a separate event</td><td>Missing <code>multi_line_start_pattern</code> configuration</td><td>Add pattern matching the START of each log entry (e.g., date pattern)</td></tr><tr><td>5</td><td>Logs stop appearing after logrotate</td><td>Agent was tailing old file descriptor</td><td>Agent version too old OR file rotation method incompatible</td><td>Upgrade to latest agent version → uses inode tracking to detect rotation</td></tr><tr><td>6</td><td>Log Group created in wrong region</td><td>Logs appear in <code>us-east-1</code> instead of <code>ap-south-1</code></td><td>Agent config <code>region</code> field missing → defaults to instance metadata region OR hardcoded wrong region</td><td>Explicitly set <code>region</code> in agent config</td></tr><tr><td>7</td><td>Massive CloudWatch Logs bill</td><td>$500+ monthly for logs</td><td>Verbose DEBUG-level logging enabled on all instances with "Never Expire" retention</td><td>Reduce log verbosity in application → set retention → consider IA log class</td></tr><tr><td>8</td><td><code>InvalidSequenceTokenException</code> errors</td><td>Some events rejected</td><td>Two processes writing to the same Log Stream</td><td>Ensure each instance writes to its own stream via <code>{instance_id}</code></td></tr><tr><td>9</td><td>Agent config works on one instance but not another</td><td>Some instances send logs, others don't</td><td>Different OS, different log file paths, or different permissions</td><td>Standardize AMI, log paths, and IAM roles across fleet</td></tr><tr><td>10</td><td>Metric Filter shows 0 despite errors in logs</td><td>Alarm never fires</td><td>Filter pattern is case-sensitive — <code>error</code> ≠ <code>ERROR</code></td><td>Match exact case used in application logs</td></tr><tr><td>11</td><td>Agent consumes high CPU</td><td>Instance performance degraded</td><td>Monitoring too many large log files OR collection interval too aggressive</td><td>Reduce monitored files → increase flush interval → monitor agent resource usage</td></tr><tr><td>12</td><td>Logs delivered with 5+ minute delay</td><td>Events appear late in CloudWatch</td><td>Network connectivity issues from private subnet → no NAT Gateway → no internet access for CloudWatch API</td><td>Ensure NAT Gateway exists (Project 5) OR use VPC Endpoint for CloudWatch Logs (Project 27 concept)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Instance Fleet Scaling</strong></p>
+<ul>
+<li>Agent runs independently on each instance</li>
+<li>Auto Scaling group launches new instance → User Data installs agent → agent fetches config from SSM → logs flow</li>
+<li>No central coordination needed</li>
+<li>6 instances or 600 instances — same architecture</li>
+</ul>
+<p>→ <strong>Log Volume Scaling</strong></p>
+<ul>
+<li>CloudWatch Logs can ingest up to 5,000 PutLogEvents requests per second per Log Group</li>
+<li>Each request can contain up to 10,000 events or 1 MB</li>
+<li>For higher throughput → split into multiple Log Groups (per microservice, per component)</li>
+</ul>
+<p>→ <strong>API Throttling</strong></p>
+<table><thead><tr><th>API</th><th>Default Limit</th><th>Scalable?</th></tr></thead><tbody><tr><td>PutLogEvents</td><td>800 TPS per account per region</td><td>Yes — request increase</td></tr><tr><td>CreateLogGroup</td><td>10 TPS</td><td>Rarely hit unless mass-deploying</td></tr><tr><td>DescribeLogGroups</td><td>10 TPS</td><td>Can be bottleneck in automation scripts</td></tr><tr><td>FilterLogEvents</td><td>25 TPS</td><td>Logs Insights is better for ad-hoc queries</td></tr><tr><td>GetLogEvents</td><td>25 TPS</td><td>Use Logs Insights instead</td></tr></tbody></table>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Component</th><th>Pricing Model</th></tr></thead><tbody><tr><td>Log Ingestion</td><td>$0.50 per GB ingested (Standard class)</td></tr><tr><td>Log Ingestion</td><td>$0.25 per GB ingested (Infrequent Access class)</td></tr><tr><td>Log Storage</td><td>$0.03 per GB per month</td></tr><tr><td>Logs Insights</td><td>$0.005 per GB of data scanned</td></tr></tbody></table>
+<p>→ Example: 100 GB/day ingestion × 30 days = 3,000 GB/month</p>
+<ul>
+<li>Ingestion: 3,000 × $0.50 = $1,500/month</li>
+<li>Storage (90-day retention): ~9,000 GB × $0.03 = $270/month</li>
+<li>Total: ~$1,770/month</li>
+</ul>
+<p>→ Cost optimization strategies:</p>
+<ul>
+<li>Reduce log verbosity (INFO not DEBUG in production)</li>
+<li>Use Infrequent Access class for verbose logs</li>
+<li>Set aggressive retention (30 days instead of 90 for access logs)</li>
+<li>Export to S3 for long-term retention (S3 storage: $0.023/GB vs CW $0.03/GB)</li>
+<li>Filter at the agent level — don't ship logs you'll never search</li>
+</ul>
+<p>→ <strong>Cross-Region Scaling</strong></p>
+<ul>
+<li>CloudWatch Logs is regional — logs stay in the region of the instance</li>
+<li>For multi-region deployments → each region has its own Log Groups</li>
+<li>Cross-region log aggregation → use Subscription Filters → Kinesis → S3 in central region</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify everything is working end-to-end:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>Where to Check</th><th>Expected Result</th></tr></thead><tbody><tr><td>Agent is running?</td><td>On EC2 instance — check agent status</td><td>Status: <code>running</code></td></tr><tr><td>Agent has errors?</td><td>Agent log file on instance</td><td>No <code>ERROR</code> or <code>AccessDenied</code> entries</td></tr><tr><td>Logs appearing?</td><td>CloudWatch → Log Groups</td><td>Log Group exists with recent events</td></tr><tr><td>All instances reporting?</td><td>CloudWatch → Log Group → Streams</td><td>One stream per running instance</td></tr><tr><td>Timestamps correct?</td><td>Click into events → check timestamp</td><td>Matches actual application log timestamps</td></tr><tr><td>Multi-line working?</td><td>Find a stack trace → verify it's ONE event</td><td>Entire stack trace in single event</td></tr><tr><td>Metric Filter working?</td><td>CloudWatch → Metrics → Custom Namespace</td><td>Data points appearing when pattern matches</td></tr><tr><td>Alarm working?</td><td>Trigger a test error → wait for alarm</td><td>Alarm state changes → SNS notification received</td></tr><tr><td>Retention set?</td><td>Log Group settings</td><td>Shows configured retention (not "Never Expire")</td></tr></tbody></table>
+<p>→ <strong>Troubleshooting Decision Tree:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Logs not appearing in CloudWatch?
+</span>  │
+  ├── Is agent installed? → Check with agent status command
+  │     └── No → Install via SSM or SSH
+  │
+  ├── Is agent running? → Check status
+  │     └── No → Check agent log for startup errors
+  │
+  ├── Does IAM Role exist on instance? → EC2 Console → Instance → Security → IAM Role
+  │     └── No → Attach role (Project 11)
+  │
+  ├── Does IAM Role have CloudWatch permissions? → IAM → Role → Policies
+  │     └── No → Attach CloudWatchAgentServerPolicy
+  │
+  ├── Can instance reach CloudWatch API? → Instance in private subnet?
+  │     ├── Yes → Is there NAT Gateway (Project 5) or VPC Endpoint (Project 27)?
+  │     │     └── No → Add NAT Gateway or VPC Endpoint for logs
+  │     └── No (public subnet) → Check Security Group outbound (Project 4)
+  │
+  ├── Is the log file path correct in config? → SSH → verify file exists at configured path
+  │     └── No → Fix file_path in agent config
+  │
+  └── Is the log file being written to? → Check file modification time
+        └── No → Application issue, not agent issue</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ CloudWatch Logs solves the fundamental problem of EPHEMERAL infrastructure<br>
+→ EC2 instances come and go (especially with Auto Scaling from Project 33) — logs must outlive them<br>
+→ The Unified Agent is the bridge between local disk and cloud-based log management<br>
+→ The architecture is: Agent → PutLogEvents API → Log Group → Log Stream → Log Events<br>
+→ Metric Filters transform UNSTRUCTURED log text into STRUCTURED CloudWatch metrics → enabling alarms (Project 8) → enabling notifications (Project 6)<br>
+→ SSM Parameter Store centralizes agent configuration across fleet<br>
+→ This connects to EVERY future project that generates operational data:</p>
+<table><thead><tr><th>Future Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 20 (DLQ)</td><td>Monitor DLQ depth + log failed message processing</td></tr><tr><td>Project 26 (Lambda + SQS)</td><td>Lambda writes to CloudWatch Logs NATIVELY — no agent needed</td></tr><tr><td>Project 33 (Auto Scaling)</td><td>New instances auto-register with CloudWatch via agent in launch template</td></tr><tr><td>Project 45 (Lambda in VPC)</td><td>Lambda in VPC still writes to CloudWatch Logs (via ENI → NAT → CloudWatch)</td></tr><tr><td>Project 57 (Security Audit)</td><td>CloudWatch Logs stores CloudTrail logs, VPC Flow Logs, GuardDuty findings</td></tr><tr><td>Project 60 (Data Mesh Observability)</td><td>Cross-account CloudWatch Logs for centralized observability</td></tr></tbody></table>
+<p>→ The exported logs in S3 become queryable data — connecting back to the Glue (Project 17) → Athena (Project 18) pipeline<br>
+→ Logs are not just for debugging — they are DATA that feeds analytics, compliance, and security</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ CloudWatch Logs now captures all application and system logs centrally<br>
+→ In Project 13, we built the SNS → SQS fan-out pattern for order processing<br>
+→ In Project 7, we learned about SQS message lifecycle and visibility timeout<br>
+→ But what happens when a message in SQS FAILS processing repeatedly?<br>
+→ The consumer tries 3 times → fails every time → message becomes visible again → fails again → infinite loop<br>
+→ Meanwhile — the failed message blocks the queue, wastes compute, and the error is never surfaced<br>
+→ The message eventually expires after the retention period → gone forever → no debugging possible</p>
+<p>→ <strong>This is exactly the problem Project 20 solves</strong><br>
+→ Project 20 introduces the Dead Letter Queue (DLQ) — a safety net for poison messages<br>
+→ You will learn how to configure a redrive policy so that after N failures, the message moves to a separate DLQ<br>
+→ Combined with CloudWatch Alarms (Project 8) and now CloudWatch Logs (this project), you'll have full observability over message failures</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 20: "The Failed Messages That Vanished Forever — SQS Dead Letter Queue Configuration"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-18.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 19/60</span></div><a class="nav-btn next" href="project-20.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

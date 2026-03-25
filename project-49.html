@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 49: THE COMPLEX PIPELINE — S3 Upload → EventBridge → Step Functions → Gl — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 49: THE COMPLEX PIPELINE — S3 Upload → EventBridge → Step Functions → Glue ETL → Redshift → SNS Alert</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's data platform has matured — individual services are configured and working<br>
+→ But the platform operates as DISCONNECTED ISLANDS:</p>
+<p><strong>Current State — Manual &amp; Fragmented:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Island 1: Partner uploads CSV to S3 landing zone
+</span>    → Nobody knows it arrived until someone checks manually
+
+Island 2: Data engineer manually triggers Glue ETL job
+    → Sometimes forgets → Data is 2 days stale
+    → Sometimes triggers twice → Duplicate processing
+
+Island 3: After Glue completes, engineer manually runs Redshift COPY
+    → Sometimes Glue failed but engineer doesn't know → COPY loads corrupt data
+    → Sometimes COPY fails → Nobody is notified for hours
+
+Island 4: After Redshift load, engineer manually sends Slack message
+    → "Data is ready" — but sometimes it isn't
+    → No audit trail of what happened, when, or why
+
+Island 5: When anything fails, the failure is discovered HOURS later
+    → By then, the fraud team has been making decisions on stale data
+    → No automatic retry — engineer must manually re-run failed steps</code></pre></div>
+<p><strong>The Business Impact:</strong></p>
+<table><thead><tr><th>Problem</th><th>Impact</th><th>Frequency</th></tr></thead><tbody><tr><td>File arrives but nobody processes it</td><td>Fraud detection delayed by 4-8 hours</td><td>3x per week</td></tr><tr><td>Glue job fails silently</td><td>Data lake has stale data</td><td>2x per week</td></tr><tr><td>Redshift COPY runs on incomplete data</td><td>Incorrect fraud scores in dashboard</td><td>1x per week</td></tr><tr><td>No failure notification</td><td>Team discovers issues hours later</td><td>Daily</td></tr><tr><td>Manual re-runs create duplicates</td><td>Duplicate transactions in analytics</td><td>2x per month</td></tr><tr><td>No audit trail</td><td>Compliance team cannot verify data lineage</td><td>Every audit</td></tr></tbody></table>
+<p><strong>The CTO's Requirement:</strong></p>
+<p>→ "Build ONE automated pipeline that does everything end-to-end"<br>
+→ "When a file lands in S3 → everything happens automatically"<br>
+→ "If anything fails → retry automatically → if retry fails → notify immediately"<br>
+→ "I want to see the entire pipeline status in one place"<br>
+→ "Zero human intervention for the happy path"</p>
+<p><strong>The Target Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Partner uploads CSV to S3
+</span>    |
+    ↓
+EventBridge detects S3 PutObject event
+    |
+    ↓
+Step Functions state machine starts
+    |
+    ├── Step 1: Validate file (check format, size, naming convention)
+    |       → FAIL → SNS: "Invalid file received"
+    |
+    ├── Step 2: Start Glue ETL Job (CSV → Parquet transformation)
+    |       → WAIT for completion (polling)
+    |       → FAIL → Retry 2x → SNS: "Glue ETL failed after retries"
+    |
+    ├── Step 3: Start Glue Crawler (update catalog with new partitions)
+    |       → WAIT for completion
+    |       → FAIL → SNS: "Crawler failed"
+    |
+    ├── Step 4: Execute Redshift COPY (load Parquet into warehouse)
+    |       → FAIL → Retry 1x → SNS: "Redshift load failed"
+    |
+    ├── Step 5: Run Redshift data quality check
+    |       → FAIL → SNS: "Data quality check failed — manual review needed"
+    |
+    └── Step 6: SNS: "Pipeline completed successfully — data ready"</code></pre></div>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the orchestration landscape</p>
+<table><thead><tr><th>Service</th><th>Role in Pipeline</th><th>Why THIS Service</th></tr></thead><tbody><tr><td>S3 (Project 1)</td><td>Data landing zone — trigger source</td><td>Files arrive here from partners</td></tr><tr><td>EventBridge (Project 38)</td><td>Event detection and routing</td><td>Detects S3 events, triggers Step Functions</td></tr><tr><td>Step Functions (Project 32)</td><td>Workflow orchestration</td><td>Sequences steps, handles errors, retries, branching</td></tr><tr><td>Glue ETL (Project 21, 46)</td><td>Data transformation</td><td>CSV → Parquet conversion with bookmarks</td></tr><tr><td>Glue Crawler (Project 17)</td><td>Catalog update</td><td>Updates Glue Data Catalog with new partitions</td></tr><tr><td>Redshift (Project 16, 22)</td><td>Data warehouse loading</td><td>Analytical queries on loaded data</td></tr><tr><td>SNS (Project 6)</td><td>Notifications</td><td>Success/failure alerts to team</td></tr></tbody></table>
+<p><strong>Why Step Functions and NOT Glue Workflow (Project 31)?</strong></p>
+<table><thead><tr><th>Capability</th><th>Glue Workflow (Project 31)</th><th>Step Functions</th></tr></thead><tbody><tr><td>Orchestrate Glue jobs/crawlers</td><td>✅ Yes</td><td>✅ Yes</td></tr><tr><td>Orchestrate non-Glue services (Redshift, Lambda, SNS)</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Conditional branching (if/else)</td><td>❌ Limited</td><td>✅ Full Choice state</td></tr><tr><td>Error handling with retry</td><td>❌ Basic</td><td>✅ Advanced (Retry + Catch)</td></tr><tr><td>Parallel execution</td><td>❌ No</td><td>✅ Parallel state</td></tr><tr><td>Wait for external completion</td><td>❌ No</td><td>✅ Wait + polling patterns</td></tr><tr><td>Visual workflow monitoring</td><td>❌ Basic graph</td><td>✅ Real-time visual execution</td></tr><tr><td>Integration with 200+ AWS services</td><td>❌ Glue only</td><td>✅ Yes — native integrations</td></tr></tbody></table>
+<p>→ Glue Workflow is sufficient for Glue-only pipelines (Project 31)<br>
+→ Step Functions is required when the pipeline spans MULTIPLE services</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Configure S3 event notification to EventBridge</li>
+<li>Step 2 — Create EventBridge rule to trigger Step Functions</li>
+<li>Step 3 — Design the Step Functions state machine</li>
+<li>Step 4 — Configure each state (Glue, Redshift, SNS integration)</li>
+<li>Step 5 — Configure error handling and retry logic</li>
+<li>Step 6 — Configure IAM role for Step Functions</li>
+<li>Step 7 — Test end-to-end pipeline</li>
+<li>Step 8 — Monitor and audit pipeline execution</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CONFIGURE S3 EVENT NOTIFICATION TO EVENTBRIDGE</h3>
+<p><strong>Why EventBridge and NOT S3 Event Notifications (from Project 15)?</strong></p>
+<table><thead><tr><th>Feature</th><th>S3 Event Notifications (Project 15)</th><th>EventBridge</th></tr></thead><tbody><tr><td>Targets</td><td>SNS, SQS, Lambda only</td><td>20+ targets including Step Functions</td></tr><tr><td>Filtering</td><td>Prefix + Suffix only</td><td>Advanced pattern matching (JSON-based)</td></tr><tr><td>Multiple targets from one event</td><td>❌ One destination per rule</td><td>✅ Multiple targets per rule</td></tr><tr><td>Event replay</td><td>❌ No</td><td>✅ Archive and replay</td></tr><tr><td>Cross-account routing</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>Content-based filtering</td><td>❌ No</td><td>✅ Yes (filter on file size, key pattern, etc.)</td></tr></tbody></table>
+<p>→ For this pipeline → EventBridge is required because the target is Step Functions (not supported by S3 Event Notifications directly)</p>
+<p><strong>Enable EventBridge on the S3 Bucket:</strong></p>
+<p>→ Navigate to S3 Console → Select bucket <code>payscale-landing</code> → Properties tab<br>
+→ Scroll to "Amazon EventBridge" section<br>
+→ Click "Edit" → Set to <strong>On</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Send notifications to Amazon EventBridge</td><td>On</td><td>S3 will publish ALL events to EventBridge for this bucket</td></tr></tbody></table>
+<p><strong>What This Does Internally:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE enabling:
+</span>    S3 PutObject → Event stays within S3 → Only S3 Event Notifications can use it
+
+AFTER enabling:
+    S3 PutObject → Event published to EventBridge default event bus
+    → EventBridge rules can match and route to ANY target
+    → S3 Event Notifications STILL work in parallel (both active)</code></pre></div>
+<p><strong>Event Structure Published to EventBridge:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "source": "aws.s3",
+    "detail-type": "Object Created",
+    "detail": {
+        "version": "0",
+        "bucket": {
+            "name": "payscale-landing"
+        },
+        "object": {
+            "key": "transactions/2025-01-15/partner-feed.csv",
+            "size": 15728640,
+            "etag": "abcdef1234567890"
+        },
+        "request-id": "xxx",
+        "requester": "123456789012",
+        "reason": "PutObject"
+    }
+}</code></pre></div>
+<p>→ EventBridge receives this event for EVERY object created in the bucket<br>
+→ We need a RULE to filter only the events we care about</p>
+<hr>
+<h3>STEP 2 — CREATE EVENTBRIDGE RULE TO TRIGGER STEP FUNCTIONS</h3>
+<p>→ Navigate to EventBridge Console → Rules → Create rule</p>
+<p><strong>Rule Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Name</td><td><code>rule-s3-landing-to-pipeline</code></td><td>Descriptive naming</td></tr><tr><td>Description</td><td>Triggers fraud data pipeline when CSV lands in S3 landing zone</td><td>Documentation</td></tr><tr><td>Event bus</td><td>default</td><td>S3 events go to default bus</td></tr><tr><td>Rule type</td><td>Rule with an event pattern</td><td>We want to match specific S3 events</td></tr></tbody></table>
+<p><strong>Event Pattern (Advanced Filtering):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "source": ["aws.s3"],
+    "detail-type": ["Object Created"],
+    "detail": {
+        "bucket": {
+            "name": ["payscale-landing"]
+        },
+        "object": {
+            "key": [{
+                "prefix": "transactions/"
+            }, {
+                "suffix": ".csv"
+            }]
+        }
+    }
+}</code></pre></div>
+<p><strong>What This Pattern Matches:</strong></p>
+<table><thead><tr><th>Event</th><th>Matches?</th><th>Why</th></tr></thead><tbody><tr><td>File: <code>transactions/2025-01-15/feed.csv</code> in <code>payscale-landing</code></td><td>✅ Yes</td><td>Prefix + suffix + bucket match</td></tr><tr><td>File: <code>transactions/2025-01-15/feed.parquet</code> in <code>payscale-landing</code></td><td>❌ No</td><td>Suffix is .parquet, not .csv</td></tr><tr><td>File: <code>customers/2025-01-15/feed.csv</code> in <code>payscale-landing</code></td><td>❌ No</td><td>Prefix is customers/, not transactions/</td></tr><tr><td>File: <code>transactions/2025-01-15/feed.csv</code> in <code>payscale-curated</code></td><td>❌ No</td><td>Wrong bucket</td></tr><tr><td>File: <code>transactions/readme.txt</code> in <code>payscale-landing</code></td><td>❌ No</td><td>Suffix is .txt, not .csv</td></tr></tbody></table>
+<p>→ Only CSV files in the transactions/ prefix of the landing bucket trigger the pipeline<br>
+→ This prevents accidental triggers from other file types or paths</p>
+<p><strong>Target Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Target type</td><td>AWS service</td><td>Step Functions is an AWS service</td></tr><tr><td>Target</td><td>Step Functions state machine</td><td>The orchestration engine</td></tr><tr><td>State machine</td><td><code>arn:aws:states:ap-south-1:222222222222:stateMachine:FraudDataPipeline</code></td><td>The specific state machine to trigger</td></tr><tr><td>Execution role</td><td><code>EventBridgeStepFunctionsRole</code></td><td>Allows EventBridge to start Step Functions execution</td></tr><tr><td>Input</td><td>Matched event (entire event passed to Step Functions)</td><td>Step Functions receives the S3 event details</td></tr></tbody></table>
+<p><strong>Configure Input Transformation (Optional but Recommended):</strong></p>
+<p>→ Instead of passing the ENTIRE EventBridge event → Transform to pass only needed fields</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Input transformer — Input path</td><td><code>{"bucket": "$.detail.bucket.name", "key": "$.detail.object.key", "size": "$.detail.object.size"}</code></td></tr><tr><td>Input transformer — Template</td><td><code>{"s3_bucket": "&lt;bucket&gt;", "s3_key": "&lt;key&gt;", "file_size": &lt;size&gt;}</code></td></tr></tbody></table>
+<p><strong>Result — Step Functions receives:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "s3_bucket": "payscale-landing",
+    "s3_key": "transactions/2025-01-15/partner-feed.csv",
+    "file_size": 15728640
+}</code></pre></div>
+<p>→ Clean, minimal input — Step Functions doesn't need to parse the full EventBridge envelope</p>
+<p><strong>EventBridge IAM Role:</strong></p>
+<p>→ Create IAM Role: <code>EventBridgeStepFunctionsRole</code></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>states:StartExecution</code></td><td><code>arn:aws:states:ap-south-1:222222222222:stateMachine:FraudDataPipeline</code></td><td>Start the specific state machine</td></tr></tbody></table>
+<table><thead><tr><th>Trust Policy</th><th></th></tr></thead><tbody><tr><td>Trusted entity</td><td><code>events.amazonaws.com</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 3 — DESIGN THE STEP FUNCTIONS STATE MACHINE</h3>
+<p>→ Navigate to Step Functions Console → State machines → Create state machine</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>Supports long-running workflows (Glue jobs can take minutes/hours)</td></tr><tr><td>Name</td><td><code>FraudDataPipeline</code></td><td>Descriptive</td></tr></tbody></table>
+<p><strong>Why Standard and NOT Express?</strong></p>
+<table><thead><tr><th>Feature</th><th>Standard</th><th>Express</th></tr></thead><tbody><tr><td>Max duration</td><td>1 year</td><td>5 minutes</td></tr><tr><td>Execution model</td><td>Exactly-once</td><td>At-least-once</td></tr><tr><td>Pricing</td><td>Per state transition</td><td>Per execution + duration</td></tr><tr><td>Use case</td><td>Long-running workflows</td><td>High-volume, short tasks</td></tr></tbody></table>
+<p>→ Glue ETL jobs can take 5-30 minutes → Standard is required</p>
+<p><strong>State Machine Architecture (Visual):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>START
+</span>  |
+  ↓
+[ValidateFile]          ← Lambda: Check file format, size, naming
+  |
+  ├── VALID → Continue
+  |
+  └── INVALID → [NotifyInvalidFile] → SNS → END (FAILED)
+  |
+  ↓
+[StartGlueETL]         ← Glue: StartJobRun API
+  |
+  ↓
+[WaitForGlueETL]       ← Glue: GetJobRun API (polling)
+  |
+  ├── SUCCEEDED → Continue
+  ├── RUNNING → Wait 30s → Poll again
+  └── FAILED → [RetryGlueETL] → Retry 2x → [NotifyGlueFailure] → SNS → END (FAILED)
+  |
+  ↓
+[StartGlueCrawler]      ← Glue: StartCrawler API
+  |
+  ↓
+[WaitForGlueCrawler]    ← Glue: GetCrawler API (polling)
+  |
+  ├── READY → Continue (crawler finished)
+  ├── RUNNING → Wait 30s → Poll again
+  └── FAILED → [NotifyCrawlerFailure] → SNS → END (FAILED)
+  |
+  ↓
+[ExecuteRedshiftCOPY]   ← Redshift Data API: ExecuteStatement
+  |
+  ↓
+[WaitForRedshiftCOPY]   ← Redshift Data API: DescribeStatement (polling)
+  |
+  ├── FINISHED → Continue
+  ├── STARTED/PICKED → Wait 15s → Poll again
+  └── FAILED → Retry 1x → [NotifyRedshiftFailure] → SNS → END (FAILED)
+  |
+  ↓
+[DataQualityCheck]      ← Redshift Data API: ExecuteStatement (validation query)
+  |
+  ↓
+[EvaluateQuality]       ← Choice state: Check row count &gt; 0, no nulls, etc.
+  |
+  ├── PASSED → [NotifySuccess] → SNS → END (SUCCESS)
+  └── FAILED → [NotifyQualityFailure] → SNS → END (FAILED)</code></pre></div>
+<hr>
+<h3>STEP 4 — CONFIGURE EACH STATE IN DETAIL</h3>
+<hr>
+<h4>STATE 1: ValidateFile (Lambda Task)</h4>
+<p><strong>Purpose:</strong> Verify the uploaded file meets expected format before processing</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>State type</td><td>Task</td><td>Invokes a Lambda function</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::lambda:invoke</code></td><td>Lambda integration</td></tr><tr><td>Function</td><td><code>arn:aws:lambda:ap-south-1:222222222222:function:ValidateCSVFile</code></td><td>Validation Lambda</td></tr><tr><td>Payload</td><td>Pass S3 bucket + key from state machine input</td><td>Lambda needs to know which file to validate</td></tr></tbody></table>
+<p><strong>What the Lambda Validates:</strong></p>
+<table><thead><tr><th>Check</th><th>Expected</th><th>Failure Reason</th></tr></thead><tbody><tr><td>File extension</td><td><code>.csv</code></td><td>Wrong file type uploaded</td></tr><tr><td>File size</td><td>&gt; 0 bytes, &lt; 5 GB</td><td>Empty file or too large</td></tr><tr><td>File name pattern</td><td><code>partner-feed-YYYY-MM-DD.csv</code></td><td>Incorrect naming convention</td></tr><tr><td>Header row</td><td>Contains expected columns</td><td>Schema mismatch</td></tr><tr><td>File not already processed</td><td>Check DynamoDB tracking table</td><td>Duplicate upload prevention</td></tr></tbody></table>
+<p><strong>Lambda Output:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Success: {"validation": "PASSED", "record_count": 15000, "file_date": "2025-01-15"}
+</span>Failure: {"validation": "FAILED", "reason": "Missing column: transaction_id"}</code></pre></div>
+<p><strong>Next State Logic (Choice State after Validation):</strong></p>
+<table><thead><tr><th>State type</th><th>Choice</th></tr></thead><tbody><tr><td>Condition</td><td>If <code>$.validation</code> equals <code>PASSED</code> → Go to StartGlueETL</td></tr><tr><td>Default</td><td>Go to NotifyInvalidFile</td></tr></tbody></table>
+<hr>
+<h4>STATE 2: NotifyInvalidFile (SNS Task — Failure Path)</h4>
+<p><strong>Purpose:</strong> Alert team about invalid file upload</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Task</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::sns:publish</code></td></tr><tr><td>Topic ARN</td><td><code>arn:aws:sns:ap-south-1:222222222222:FraudPipelineAlerts</code></td></tr><tr><td>Message construction</td><td>Dynamic — includes file name, failure reason, timestamp</td></tr></tbody></table>
+<p><strong>Message Template:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "TopicArn": "arn:aws:sns:ap-south-1:222222222222:FraudPipelineAlerts",
+    "Subject": "PIPELINE ALERT: Invalid File Received",
+    "Message": {
+        "pipeline": "FraudDataPipeline",
+        "status": "FAILED",
+        "stage": "File Validation",
+        "file": "&lt;s3_key from input&gt;",
+        "reason": "&lt;reason from Lambda output&gt;",
+        "timestamp": "&lt;current time&gt;",
+        "action_required": "Review file and re-upload with correct format"
+    }
+}</code></pre></div>
+<p>→ After publishing → State machine transitions to FAIL end state<br>
+→ The entire execution is marked as FAILED in Step Functions console</p>
+<hr>
+<h4>STATE 3: StartGlueETL (Glue Integration — Optimized)</h4>
+<p><strong>Purpose:</strong> Start the Glue ETL job that transforms CSV → Parquet</p>
+<p><strong>Step Functions provides TWO integration patterns for Glue:</strong></p>
+<table><thead><tr><th>Pattern</th><th>How It Works</th><th>Configuration</th></tr></thead><tbody><tr><td>Request-Response (fire and forget)</td><td>Starts Glue job → Immediately moves to next state (doesn't wait)</td><td>Resource: <code>arn:aws:states:::glue:startJobRun</code></td></tr><tr><td>Synchronous (.sync) — Run a Job</td><td>Starts Glue job → WAITS until job completes → Then moves to next state</td><td>Resource: <code>arn:aws:states:::glue:startJobRun.sync</code></td></tr></tbody></table>
+<p>→ Use <strong>.sync pattern</strong> — Step Functions automatically handles polling</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>State type</td><td>Task</td><td></td></tr><tr><td>Resource</td><td><code>arn:aws:states:::glue:startJobRun.sync</code></td><td>.sync = wait for completion</td></tr><tr><td>JobName</td><td><code>FraudTransactionETL</code></td><td>The Glue job name (from Project 21, 46)</td></tr><tr><td>Arguments</td><td><code>--s3_input_path</code>: dynamic from state input, <code>--s3_output_path</code>: constructed with date partition, <code>--job-bookmark-option</code>: <code>job-bookmark-enable</code></td><td>Pass file-specific parameters</td></tr></tbody></table>
+<p><strong>How .sync Works Internally:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step Functions calls: glue:StartJobRun
+</span>    |
+    ↓
+Glue Job starts running
+    |
+    ↓
+Step Functions AUTOMATICALLY polls: glue:GetJobRun every few seconds
+    |
+    ├── Status: RUNNING → Continue polling
+    ├── Status: SUCCEEDED → Move to next state ✅
+    ├── Status: FAILED → Trigger error handling
+    └── Status: TIMEOUT → Trigger error handling</code></pre></div>
+<p>→ You do NOT need to build polling logic manually<br>
+→ The <code>.sync</code> suffix tells Step Functions to handle the wait</p>
+<p><strong>Arguments Passed to Glue Job:</strong></p>
+<table><thead><tr><th>Argument</th><th>Value</th><th>Source</th></tr></thead><tbody><tr><td><code>--s3_input_path</code></td><td><code>s3://payscale-landing/transactions/2025-01-15/partner-feed.csv</code></td><td>From EventBridge input ($.s3_bucket + $.s3_key)</td></tr><tr><td><code>--s3_output_path</code></td><td><code>s3://payscale-curated/fraud-transactions/date=2025-01-15/</code></td><td>Constructed from file date</td></tr><tr><td><code>--job-bookmark-option</code></td><td><code>job-bookmark-enable</code></td><td>Enable incremental processing (from Project 46)</td></tr></tbody></table>
+<p><strong>Timeout Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>TimeoutSeconds</td><td>1800 (30 minutes)</td><td>Glue job should complete within 30 minutes — if not, something is wrong</td></tr><tr><td>HeartbeatSeconds</td><td>300 (5 minutes)</td><td>Step Functions expects progress signals every 5 minutes</td></tr></tbody></table>
+<hr>
+<h4>STATE 4: StartGlueCrawler (Glue Crawler Integration)</h4>
+<p><strong>Purpose:</strong> Update Glue Data Catalog with new partitions from ETL output</p>
+<p><strong>Challenge:</strong> Step Functions does NOT have a <code>.sync</code> integration for Glue Crawlers<br>
+→ Unlike Glue Jobs which support <code>.sync</code>, Crawlers require MANUAL polling</p>
+<p><strong>Solution: Polling Loop Pattern</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[StartCrawler]
+</span>    |
+    ↓
+[WaitForCrawler] (Wait state: 30 seconds)
+    |
+    ↓
+[CheckCrawlerStatus] (Task: glue:GetCrawler)
+    |
+    ├── State = "READY" → Crawler finished → Continue ✅
+    ├── State = "RUNNING" → Go back to [WaitForCrawler] ↩️
+    └── State = "STOPPING/FAILED" → Error handling</code></pre></div>
+<p><strong>State: StartCrawler</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Task</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::aws-sdk:glue:startCrawler</code></td></tr><tr><td>CrawlerName</td><td><code>fraud-transactions-crawler</code> (from Project 17)</td></tr></tbody></table>
+<p><strong>State: WaitForCrawler</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Wait</td></tr><tr><td>Seconds</td><td>30</td></tr></tbody></table>
+<p><strong>State: CheckCrawlerStatus</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Task</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::aws-sdk:glue:getCrawler</code></td></tr><tr><td>CrawlerName</td><td><code>fraud-transactions-crawler</code></td></tr><tr><td>ResultPath</td><td><code>$.crawlerResult</code></td></tr></tbody></table>
+<p><strong>State: EvaluateCrawlerStatus (Choice)</strong></p>
+<table><thead><tr><th>Condition</th><th>Next State</th></tr></thead><tbody><tr><td><code>$.crawlerResult.Crawler.State</code> equals <code>READY</code></td><td>Continue to Redshift step</td></tr><tr><td><code>$.crawlerResult.Crawler.State</code> equals <code>RUNNING</code></td><td>Go back to WaitForCrawler</td></tr><tr><td>Default</td><td>NotifyCrawlerFailure</td></tr></tbody></table>
+<p>→ This creates a polling loop that checks every 30 seconds<br>
+→ Most crawlers complete in 1-3 minutes for incremental updates</p>
+<hr>
+<h4>STATE 5: ExecuteRedshiftCOPY (Redshift Data API Integration)</h4>
+<p><strong>Purpose:</strong> Load the new Parquet data from S3 into Redshift</p>
+<p><strong>Why Redshift Data API and NOT Direct JDBC?</strong></p>
+<table><thead><tr><th>Method</th><th>How</th><th>Why Not for Step Functions</th></tr></thead><tbody><tr><td>Direct JDBC</td><td>Connect to Redshift via TCP 5439</td><td>Step Functions cannot make JDBC connections</td></tr><tr><td>Redshift Data API</td><td>HTTP API call — asynchronous</td><td>✅ Perfect for Step Functions — serverless, async</td></tr></tbody></table>
+<p><strong>Redshift Data API Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: ExecuteStatement (submit SQL) → Returns statement ID
+</span>Step 2: DescribeStatement (poll status) → Returns STARTED/PICKED/FINISHED/FAILED
+Step 3: GetStatementResult (get results) → Returns query output</code></pre></div>
+<p><strong>State: ExecuteRedshiftCOPY</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Task</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::aws-sdk:redshiftdata:executeStatement</code></td></tr><tr><td>ClusterIdentifier</td><td><code>payscale-redshift-cluster</code></td></tr><tr><td>Database</td><td><code>payscale_dw</code></td></tr><tr><td>DbUser</td><td><code>etl_user</code></td></tr><tr><td>Sql</td><td>COPY command (constructed dynamically)</td></tr><tr><td>ResultPath</td><td><code>$.redshiftResult</code></td></tr></tbody></table>
+<p><strong>SQL Statement (Dynamic):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COPY fraud_schema.transactions
+</span>FROM 's3://payscale-curated/fraud-transactions/date=2025-01-15/'
+IAM_ROLE 'arn:aws:iam::222222222222:role/RedshiftS3CopyRole'
+FORMAT AS PARQUET;</code></pre></div>
+<p>→ The date partition in the S3 path is constructed from the file date extracted during validation<br>
+→ COPY FROM Parquet is schema-aware — no delimiter or column mapping needed (from Project 22)</p>
+<p><strong>State: WaitForRedshiftCOPY</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Wait</td></tr><tr><td>Seconds</td><td>15</td></tr></tbody></table>
+<p><strong>State: CheckRedshiftStatus</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Task</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::aws-sdk:redshiftdata:describeStatement</code></td></tr><tr><td>Id</td><td><code>$.redshiftResult.Id</code> (statement ID from ExecuteStatement)</td></tr><tr><td>ResultPath</td><td><code>$.redshiftStatus</code></td></tr></tbody></table>
+<p><strong>State: EvaluateRedshiftStatus (Choice)</strong></p>
+<table><thead><tr><th>Condition</th><th>Next State</th></tr></thead><tbody><tr><td><code>$.redshiftStatus.Status</code> equals <code>FINISHED</code></td><td>Continue to DataQualityCheck</td></tr><tr><td><code>$.redshiftStatus.Status</code> in [<code>STARTED</code>, <code>PICKED</code>, <code>SUBMITTED</code>]</td><td>Go back to WaitForRedshiftCOPY</td></tr><tr><td><code>$.redshiftStatus.Status</code> equals <code>FAILED</code></td><td>Error handling (retry or notify)</td></tr></tbody></table>
+<hr>
+<h4>STATE 6: DataQualityCheck (Redshift Data API)</h4>
+<p><strong>Purpose:</strong> Validate the loaded data meets quality expectations</p>
+<p><strong>Quality Check SQL:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT 
+</span>    COUNT(*) as total_rows,
+    COUNT(CASE WHEN transaction_id IS NULL THEN 1 END) as null_ids,
+    COUNT(CASE WHEN amount &lt; 0 THEN 1 END) as negative_amounts,
+    MIN(created_at) as earliest_record,
+    MAX(created_at) as latest_record
+FROM fraud_schema.transactions
+WHERE load_date = '2025-01-15';</code></pre></div>
+<p>→ Submit via Redshift Data API (same ExecuteStatement → DescribeStatement → GetStatementResult pattern)</p>
+<p><strong>State: EvaluateQuality (Choice)</strong></p>
+<table><thead><tr><th>Condition</th><th>Next State</th><th>Why</th></tr></thead><tbody><tr><td>total_rows &gt; 0 AND null_ids = 0 AND negative_amounts = 0</td><td>NotifySuccess</td><td>Data quality passed</td></tr><tr><td>total_rows = 0</td><td>NotifyQualityFailure</td><td>No data loaded — something went wrong</td></tr><tr><td>null_ids &gt; 0</td><td>NotifyQualityFailure</td><td>NULL primary keys — data integrity issue</td></tr><tr><td>negative_amounts &gt; 0</td><td>NotifyQualityFailure</td><td>Invalid amounts — data quality issue</td></tr></tbody></table>
+<hr>
+<h4>STATE 7: NotifySuccess (SNS — Happy Path)</h4>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>State type</td><td>Task</td></tr><tr><td>Resource</td><td><code>arn:aws:states:::sns:publish</code></td></tr><tr><td>TopicArn</td><td><code>arn:aws:sns:ap-south-1:222222222222:FraudPipelineAlerts</code></td></tr><tr><td>Subject</td><td><code>PIPELINE SUCCESS: Fraud Data Pipeline Completed</code></td></tr></tbody></table>
+<p><strong>Message Template:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "pipeline": "FraudDataPipeline",
+    "status": "SUCCESS",
+    "file": "&lt;s3_key&gt;",
+    "records_loaded": "&lt;total_rows from quality check&gt;",
+    "date_partition": "2025-01-15",
+    "duration": "&lt;execution duration&gt;",
+    "redshift_table": "fraud_schema.transactions",
+    "timestamp": "&lt;completion time&gt;"
+}</code></pre></div>
+<p>→ After publishing → State machine transitions to SUCCEED end state ✅</p>
+<hr>
+<h3>STEP 5 — CONFIGURE ERROR HANDLING AND RETRY LOGIC</h3>
+<p><strong>This is where Step Functions truly differentiates from manual orchestration</strong></p>
+<hr>
+<h4>RETRY CONFIGURATION ON GLUE ETL STATE</h4>
+<p><strong>Retry Policy:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>ErrorEquals</td><td><code>States.ALL</code></td><td>Catch any error type</td></tr><tr><td>IntervalSeconds</td><td>60</td><td>Wait 1 minute before first retry</td></tr><tr><td>MaxAttempts</td><td>2</td><td>Try up to 2 additional times (3 total)</td></tr><tr><td>BackoffRate</td><td>2.0</td><td>Double the wait between retries (60s → 120s → 240s)</td></tr></tbody></table>
+<p><strong>How Retry Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Attempt 1: Glue ETL starts → FAILS (e.g., transient S3 error)
+</span>    → Wait 60 seconds
+Attempt 2: Glue ETL starts → FAILS (e.g., still transient)
+    → Wait 120 seconds (60 × 2.0 backoff)
+Attempt 3: Glue ETL starts → FAILS (persistent issue)
+    → MaxAttempts exhausted → Fall through to CATCH</code></pre></div>
+<p><strong>Catch Configuration (After Retries Exhausted):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>ErrorEquals</td><td><code>States.ALL</code></td><td>Catch any unhandled error</td></tr><tr><td>Next</td><td><code>NotifyGlueFailure</code></td><td>Route to SNS notification state</td></tr><tr><td>ResultPath</td><td><code>$.errorInfo</code></td><td>Preserve error details in state data</td></tr></tbody></table>
+<p><strong>Error Information Available in $.errorInfo:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>    "Error": "Glue.JobRunException",
+    "Cause": "Job run failed: OutOfMemoryError in Spark executor"
+}</code></pre></div>
+<p>→ This error detail is included in the SNS notification<br>
+→ The team knows exactly WHY the pipeline failed — not just THAT it failed</p>
+<hr>
+<h4>RETRY CONFIGURATION ON REDSHIFT COPY STATE</h4>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>ErrorEquals</td><td><code>States.ALL</code></td><td>Catch any error</td></tr><tr><td>IntervalSeconds</td><td>30</td><td>Redshift errors often resolve faster</td></tr><tr><td>MaxAttempts</td><td>1</td><td>Only 1 retry — Redshift failures are usually data-related, not transient</td></tr><tr><td>BackoffRate</td><td>1.0</td><td>No backoff — fixed 30-second wait</td></tr></tbody></table>
+<p><strong>Why fewer retries for Redshift?</strong><br>
+→ Glue failures are often transient (S3 throttling, temporary resource constraints)<br>
+→ Redshift COPY failures are usually persistent (wrong schema, missing files, permission errors)<br>
+→ Retrying a persistent error 3 times wastes time — better to notify immediately</p>
+<hr>
+<h4>GLOBAL TIMEOUT ON STATE MACHINE</h4>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>TimeoutSeconds</td><td>7200 (2 hours)</td><td>Entire pipeline should complete within 2 hours</td></tr></tbody></table>
+<p>→ If the pipeline runs for &gt; 2 hours → Something is fundamentally wrong<br>
+→ State machine is automatically aborted → Error notification sent</p>
+<hr>
+<h4>ERROR NOTIFICATION STATES (Failure Paths)</h4>
+<p><strong>Each failure state follows the same pattern:</strong></p>
+<table><thead><tr><th>Failure State</th><th>Triggered By</th><th>SNS Subject</th></tr></thead><tbody><tr><td>NotifyInvalidFile</td><td>File validation failed</td><td><code>ALERT: Invalid file — {filename}</code></td></tr><tr><td>NotifyGlueFailure</td><td>Glue ETL failed after retries</td><td><code>ALERT: Glue ETL failed — {error}</code></td></tr><tr><td>NotifyCrawlerFailure</td><td>Glue Crawler failed</td><td><code>ALERT: Crawler failed — {error}</code></td></tr><tr><td>NotifyRedshiftFailure</td><td>Redshift COPY failed after retry</td><td><code>ALERT: Redshift load failed — {error}</code></td></tr><tr><td>NotifyQualityFailure</td><td>Data quality check failed</td><td><code>ALERT: Data quality issue — {details}</code></td></tr></tbody></table>
+<p>→ Each notification includes:</p>
+<ul>
+<li>Pipeline name and execution ID</li>
+<li>Failed stage name</li>
+<li>Error message and cause</li>
+<li>S3 file that triggered the pipeline</li>
+<li>Timestamp of failure</li>
+<li>Link to Step Functions execution (for visual debugging)</li>
+</ul>
+<hr>
+<h3>STEP 6 — CONFIGURE IAM ROLE FOR STEP FUNCTIONS</h3>
+<p>→ Create IAM Role: <code>StepFunctionsPipelineRole</code></p>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity</td><td><code>states.amazonaws.com</code></td></tr></tbody></table>
+<p><strong>Permission Policies:</strong></p>
+<p><strong>Policy 1 — Lambda Invocation (for validation step):</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>lambda:InvokeFunction</code></td><td><code>arn:aws:lambda:ap-south-1:222222222222:function:ValidateCSVFile</code></td><td>Invoke validation Lambda</td></tr></tbody></table>
+<p><strong>Policy 2 — Glue Job and Crawler Management:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>glue:StartJobRun</code></td><td><code>arn:aws:glue:ap-south-1:222222222222:job/FraudTransactionETL</code></td><td>Start Glue ETL job</td></tr><tr><td><code>glue:GetJobRun</code></td><td>Same</td><td>Poll job status</td></tr><tr><td><code>glue:GetJobRuns</code></td><td>Same</td><td>List job runs</td></tr><tr><td><code>glue:StartCrawler</code></td><td><code>arn:aws:glue:ap-south-1:222222222222:crawler/fraud-transactions-crawler</code></td><td>Start crawler</td></tr><tr><td><code>glue:GetCrawler</code></td><td>Same</td><td>Poll crawler status</td></tr></tbody></table>
+<p><strong>Policy 3 — Redshift Data API:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>redshift-data:ExecuteStatement</code></td><td><code>arn:aws:redshift:ap-south-1:222222222222:cluster:payscale-redshift-cluster</code></td><td>Submit SQL statements</td></tr><tr><td><code>redshift-data:DescribeStatement</code></td><td><code>*</code></td><td>Poll statement status</td></tr><tr><td><code>redshift-data:GetStatementResult</code></td><td><code>*</code></td><td>Retrieve query results</td></tr><tr><td><code>redshift:GetClusterCredentials</code></td><td><code>arn:aws:redshift:ap-south-1:222222222222:dbuser:payscale-redshift-cluster/etl_user</code></td><td>Temporary DB credentials</td></tr></tbody></table>
+<p><strong>Policy 4 — SNS Publishing:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>sns:Publish</code></td><td><code>arn:aws:sns:ap-south-1:222222222222:FraudPipelineAlerts</code></td><td>Send notifications</td></tr></tbody></table>
+<p><strong>Policy 5 — CloudWatch Logs (for execution logging):</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>logs:CreateLogGroup</code></td><td><code>arn:aws:logs:ap-south-1:222222222222:*</code></td><td>Create log group</td></tr><tr><td><code>logs:CreateLogStream</code></td><td>Same</td><td>Create log stream</td></tr><tr><td><code>logs:PutLogEvents</code></td><td>Same</td><td>Write execution logs</td></tr></tbody></table>
+<p><strong>Policy 6 — X-Ray Tracing (optional but recommended):</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>xray:PutTraceSegments</code></td><td><code>*</code></td><td>Send trace data</td></tr><tr><td><code>xray:PutTelemetryRecords</code></td><td><code>*</code></td><td>Send telemetry</td></tr></tbody></table>
+<p>→ Every permission is SCOPED to specific resources — no wildcard <code>*</code> on actions<br>
+→ This follows the principle of least privilege (from Project 2)</p>
+<hr>
+<h3>STEP 7 — CONFIGURE STATE MACHINE SETTINGS</h3>
+<p>→ Navigate to Step Functions Console → State machine → Configuration</p>
+<p><strong>Logging Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Log level</td><td>ALL</td><td>Log every state transition for debugging</td></tr><tr><td>CloudWatch log group</td><td><code>/aws/stepfunctions/FraudDataPipeline</code></td><td>Dedicated log group</td></tr><tr><td>Include execution data</td><td>✅ Yes</td><td>Log input/output of each state (for debugging)</td></tr></tbody></table>
+<p><strong>Tracing Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>X-Ray tracing</td><td>✅ Enabled</td><td>Visual trace of entire pipeline — shows bottlenecks</td></tr></tbody></table>
+<p><strong>Execution Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Execution name prefix</td><td>Auto-generated (includes timestamp)</td><td>Unique per execution</td></tr></tbody></table>
+<hr>
+<h3>STEP 8 — PREVENT DUPLICATE PIPELINE EXECUTIONS</h3>
+<p><strong>Problem:</strong> What if the same file triggers the pipeline twice?<br>
+→ Partner re-uploads the same file (overwrite)<br>
+→ EventBridge fires again → Second execution starts<br>
+→ Both executions process the same file → Duplicate data in Redshift</p>
+<p><strong>Solution 1 — EventBridge Deduplication (Limited):</strong><br>
+→ EventBridge does NOT have built-in deduplication<br>
+→ Each S3 event triggers a new execution</p>
+<p><strong>Solution 2 — Step Functions Execution Name Deduplication:</strong></p>
+<p>→ Use the S3 object key as the execution name<br>
+→ Step Functions rejects duplicate execution names within 90 days</p>
+<table><thead><tr><th>Setting</th><th>Configuration</th></tr></thead><tbody><tr><td>Execution name</td><td>Derived from S3 key: <code>txn-2025-01-15-partner-feed</code></td></tr></tbody></table>
+<p>→ If the same file triggers again → Step Functions returns: "Execution already exists"<br>
+→ EventBridge receives the error but the duplicate execution is prevented</p>
+<p><strong>Solution 3 — DynamoDB Tracking Table (Most Robust):</strong></p>
+<p>→ The ValidateFile Lambda checks a DynamoDB table before proceeding</p>
+<table><thead><tr><th>DynamoDB Table</th><th>Schema</th></tr></thead><tbody><tr><td>Table name</td><td><code>pipeline-executions</code></td></tr><tr><td>Partition key</td><td><code>file_key</code> (String) — e.g., <code>transactions/2025-01-15/partner-feed.csv</code></td></tr><tr><td>Attributes</td><td><code>status</code>, <code>execution_id</code>, <code>started_at</code>, <code>completed_at</code></td></tr></tbody></table>
+<p><strong>Lambda Logic:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Check DynamoDB: Does file_key exist with status = "COMPLETED"?
+</span>    → YES → Return validation: "DUPLICATE" → Pipeline ends gracefully
+    → NO → Insert record with status = "PROCESSING" → Continue pipeline
+    
+At pipeline end (success): Update status to "COMPLETED"
+At pipeline end (failure): Update status to "FAILED" (allows re-processing)</code></pre></div>
+<hr>
+<h3>STEP 9 — CONFIGURE SNS TOPIC AND SUBSCRIPTIONS</h3>
+<p>→ From Project 6, SNS fundamentals are established<br>
+→ Create a dedicated topic for pipeline alerts</p>
+<p>→ Navigate to SNS Console → Topics → Create topic</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td><td>No ordering needed for alerts</td></tr><tr><td>Name</td><td><code>FraudPipelineAlerts</code></td><td>Descriptive</td></tr><tr><td>Display name</td><td><code>FraudPipeline</code></td><td>Shows in email "From" field</td></tr><tr><td>Encryption</td><td>SSE-SNS (or SSE-KMS from Project 36)</td><td>Encrypt alert messages at rest</td></tr></tbody></table>
+<p><strong>Subscriptions:</strong></p>
+<table><thead><tr><th>Protocol</th><th>Endpoint</th><th>Who Receives</th><th>Why</th></tr></thead><tbody><tr><td>Email</td><td><code>fraud-team@payscale.com</code></td><td>Fraud analysts</td><td>Aware of data freshness</td></tr><tr><td>Email</td><td><code>data-engineering@payscale.com</code></td><td>Data engineers</td><td>Responsible for pipeline health</td></tr><tr><td>HTTPS</td><td><code>https://hooks.slack.com/services/xxx</code></td><td>Slack #data-alerts channel</td><td>Real-time team visibility</td></tr><tr><td>SQS</td><td><code>arn:aws:sqs:...:pipeline-alerts-queue</code></td><td>Monitoring system</td><td>Automated alert processing</td></tr></tbody></table>
+<p>→ Fan-out pattern (from Project 13) — single SNS topic → multiple consumers<br>
+→ Each subscriber receives every notification — success AND failure</p>
+<p><strong>Message Filtering (Optional):</strong></p>
+<p>→ If the fraud team only wants SUCCESS notifications and data engineers want ALL:</p>
+<table><thead><tr><th>Subscription</th><th>Filter Policy</th></tr></thead><tbody><tr><td><a href="mailto:fraud-team@payscale.com">fraud-team@payscale.com</a></td><td><code>{"status": ["SUCCESS"]}</code></td></tr><tr><td><a href="mailto:data-engineering@payscale.com">data-engineering@payscale.com</a></td><td>No filter — receives everything</td></tr><tr><td>Slack webhook</td><td><code>{"status": ["FAILED"]}</code> — only failures</td></tr></tbody></table>
+<p>→ Filter policies are set on each subscription (from Project 13 concepts)<br>
+→ Requires message attributes to be set in the SNS Publish step</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use the <code>.sync</code> integration pattern for Glue Jobs — Step Functions handles polling automatically<br>
+→ Always build manual polling loops for services without <code>.sync</code> support (Crawlers, Redshift Data API)<br>
+→ Always configure Retry with exponential backoff — transient errors often resolve themselves<br>
+→ Always configure Catch as the final safety net — every error should produce a notification<br>
+→ Always set a global timeout on the state machine — prevents infinite runs<br>
+→ Always pass minimal, structured input between states — avoid passing entire event payloads<br>
+→ Always use Input Transformers in EventBridge — clean data before it reaches Step Functions<br>
+→ Always implement deduplication — S3 events can fire multiple times for the same file<br>
+→ Always include the execution ID and file name in every SNS notification — enables quick debugging<br>
+→ Always enable CloudWatch logging at ALL level during development — reduce to ERROR in production<br>
+→ Always enable X-Ray tracing — provides end-to-end visibility across all integrated services<br>
+→ Always scope IAM permissions to specific resources — never use <code>*</code> for actions<br>
+→ Always test each state independently before testing the full pipeline<br>
+→ Always use the Step Functions visual editor for initial design — switch to ASL JSON for version control</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use Express workflows for pipelines involving Glue or Redshift — 5-minute limit is too short<br>
+→ Never skip error handling — a state without Retry/Catch fails the ENTIRE execution silently<br>
+→ Never use fire-and-forget (.waitForTaskToken) for Glue jobs when .sync is available — unnecessary complexity<br>
+→ Never hardcode S3 paths, job names, or ARNs in the state machine — use parameters and input mapping<br>
+→ Never route ALL EventBridge events to Step Functions — use event patterns to filter precisely<br>
+→ Never forget the EventBridge IAM role — without it, EventBridge cannot start Step Functions<br>
+→ Never put sensitive data (credentials, PII) in state machine input/output — it's logged in CloudWatch<br>
+→ Never set retry MaxAttempts too high for persistent errors — wastes time and money<br>
+→ Never skip the data quality check — loading corrupt data is worse than loading no data<br>
+→ Never ignore the cost of Step Functions state transitions — optimize by combining states where possible<br>
+→ Never build complex logic inside Step Functions states — use Lambda for complex decisions<br>
+→ Never assume S3 events fire exactly once — design for at-least-once delivery</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE THIS PATTERN</h2>
+<table><thead><tr><th>Scenario</th><th>Use This Pattern?</th><th>Why</th></tr></thead><tbody><tr><td>File arrival triggers multi-service pipeline</td><td>✅ Yes</td><td>EventBridge + Step Functions = event-driven orchestration</td></tr><tr><td>Pipeline spans Glue + Redshift + notifications</td><td>✅ Yes</td><td>Step Functions integrates all natively</td></tr><tr><td>Need retry logic and error handling</td><td>✅ Yes</td><td>Step Functions has built-in Retry/Catch</td></tr><tr><td>Need visual monitoring of pipeline execution</td><td>✅ Yes</td><td>Step Functions console shows real-time execution graph</td></tr><tr><td>Pipeline is Glue-only (no Redshift, no Lambda)</td><td>❌ No</td><td>Use Glue Workflow (Project 31) — simpler</td></tr><tr><td>Pipeline runs in &lt; 5 minutes with high frequency</td><td>❌ Consider Express</td><td>Express workflows are cheaper for short, frequent runs</td></tr><tr><td>Pipeline has 100+ steps with complex branching</td><td>⚠️ Consider</td><td>Step Functions works but consider Apache Airflow (MWAA) for very complex DAGs</td></tr><tr><td>Real-time stream processing (not file-based)</td><td>❌ No</td><td>Use Kinesis (Project 52) for streaming</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE THIS PATTERN</h2>
+<p>→ When the pipeline is purely Glue (crawlers + jobs) → Glue Workflow (Project 31) is simpler and cheaper<br>
+→ When the trigger is time-based, not event-based → EventBridge Scheduler or Glue Triggers work better<br>
+→ When the pipeline needs sub-second latency → Step Functions Standard has seconds of overhead per state<br>
+→ When the pipeline has 50+ parallel branches → Consider AWS MWAA (Managed Apache Airflow)<br>
+→ When you need human approval mid-pipeline → Step Functions supports this with callbacks, but adds complexity<br>
+→ When cost is critical and the pipeline runs 10,000+ times/day → Express workflows or Lambda-based orchestration may be cheaper</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE EVENT FLOW (END-TO-END)</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TIME 0: Partner uploads CSV via AWS CLI / SDK / Console
+</span>    |
+    ↓
+TIME 0+ms: S3 PutObject completes
+    S3 generates internal event
+    |
+    ↓
+TIME ~1s: S3 publishes event to EventBridge (enabled in Step 1)
+    Event arrives on default event bus
+    |
+    ↓
+TIME ~1s: EventBridge evaluates ALL rules on default event bus
+    Rule "rule-s3-landing-to-pipeline" matches ✅
+    (source=aws.s3, detail-type=Object Created, prefix=transactions/, suffix=.csv)
+    |
+    ↓
+TIME ~1-2s: EventBridge invokes target: Step Functions StartExecution
+    Using EventBridgeStepFunctionsRole
+    Passes transformed input: {s3_bucket, s3_key, file_size}
+    |
+    ↓
+TIME ~2s: Step Functions creates new execution
+    Execution ID: auto-generated
+    State: ValidateFile
+    |
+    ↓
+TIME ~3-5s: Lambda ValidateCSVFile invoked
+    Reads S3 file header
+    Validates format
+    Returns: {validation: "PASSED", record_count: 15000}
+    |
+    ↓
+TIME ~5s: Choice state evaluates → PASSED → Next: StartGlueETL
+    |
+    ↓
+TIME ~6s: Step Functions calls glue:StartJobRun (.sync)
+    Glue job begins executing
+    |
+    ↓
+TIME ~6s to ~10min: Glue ETL processes CSV → Parquet
+    Step Functions automatically polls glue:GetJobRun
+    |
+    ↓
+TIME ~10min: Glue job SUCCEEDED
+    Step Functions detects completion → Next: StartCrawler
+    |
+    ↓
+TIME ~10min: Crawler starts
+    Polling loop: StartCrawler → Wait 30s → GetCrawler → Check status
+    |
+    ↓
+TIME ~12min: Crawler READY (completed)
+    → Next: ExecuteRedshiftCOPY
+    |
+    ↓
+TIME ~12min: Redshift Data API: ExecuteStatement (COPY command)
+    Polling loop: Wait 15s → DescribeStatement → Check status
+    |
+    ↓
+TIME ~14min: Redshift COPY FINISHED
+    → Next: DataQualityCheck
+    |
+    ↓
+TIME ~14min: Redshift Data API: ExecuteStatement (quality check SQL)
+    Polling loop: Wait 15s → DescribeStatement → GetStatementResult
+    |
+    ↓
+TIME ~15min: Quality check results evaluated
+    total_rows=15000, null_ids=0, negative_amounts=0 → PASSED ✅
+    → Next: NotifySuccess
+    |
+    ↓
+TIME ~15min: SNS Publish: "Pipeline completed successfully"
+    Email + Slack + SQS all receive notification
+    |
+    ↓
+TIME ~15min: State machine reaches SUCCEED end state ✅
+    Execution marked as SUCCEEDED in Step Functions console</code></pre></div>
+<p><strong>Total Pipeline Duration: ~15 minutes (automated, zero human intervention)</strong><br>
+<strong>Previous Manual Process: ~63 minutes + human coordination + error-prone</strong></p>
+<hr>
+<h3>2 → HOW .SYNC INTEGRATION WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step Functions calls glue:StartJobRun
+</span>    |
+    ↓
+Glue returns: {JobRunId: "jr_xxx"}
+    |
+    ↓
+Step Functions stores JobRunId internally
+    |
+    ↓
+Step Functions creates an INTERNAL polling schedule:
+    Every 10-30 seconds (adaptive):
+        Call glue:GetJobRun with JobRunId
+        Check JobRunState:
+            STARTING → Continue polling
+            RUNNING → Continue polling
+            SUCCEEDED → Transition to next state with job output
+            FAILED → Throw error (triggers Retry/Catch)
+            TIMEOUT → Throw error
+            STOPPED → Throw error
+    |
+    ↓
+Polling continues until terminal state reached
+    No Step Functions state transitions consumed during polling
+    (Polling is FREE — not charged as state transitions)</code></pre></div>
+<p>→ Key insight: The polling during <code>.sync</code> is NOT charged as state transitions<br>
+→ Only the initial StartJobRun and the final result processing count as transitions<br>
+→ This makes <code>.sync</code> cost-effective for long-running tasks</p>
+<hr>
+<h3>3 → HOW EVENTBRIDGE RULE EVALUATION WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 event arrives on default event bus
+</span>    |
+    ↓
+EventBridge evaluates ALL active rules (potentially hundreds):
+    Rule 1: source=aws.ec2 → NO MATCH (source is aws.s3)
+    Rule 2: source=aws.s3, detail-type=Object Deleted → NO MATCH (detail-type is Object Created)
+    Rule 3: source=aws.s3, detail-type=Object Created, bucket=other-bucket → NO MATCH
+    Rule 4: source=aws.s3, detail-type=Object Created, bucket=payscale-landing,
+            key prefix=transactions/, suffix=.csv → MATCH ✅
+    |
+    ↓
+For matched rule:
+    EventBridge applies Input Transformer
+    EventBridge assumes IAM role
+    EventBridge calls states:StartExecution on target state machine
+    |
+    ↓
+If target invocation fails:
+    EventBridge retries with exponential backoff (built-in)
+    Up to 24 hours of retries
+    Dead-letter queue receives permanently failed events (if configured)</code></pre></div>
+<p><strong>EventBridge Reliability:</strong><br>
+→ EventBridge guarantees at-least-once delivery to targets<br>
+→ In rare cases, the SAME event may trigger the target TWICE<br>
+→ This is why deduplication (Step 8) is important</p>
+<hr>
+<h3>4 → HOW REDSHIFT DATA API WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step Functions calls redshift-data:ExecuteStatement
+</span>    |
+    ↓
+Redshift Data API receives the request
+    Authenticates using IAM (redshift:GetClusterCredentials)
+    Generates temporary DB credentials for etl_user
+    Submits SQL statement to Redshift cluster asynchronously
+    Returns immediately: {Id: "stmt-xxx-yyy-zzz"}
+    |
+    ↓
+Redshift cluster processes the SQL in the background
+    Statement goes through WLM queue (from Project 16)
+    Executes COPY command
+    |
+    ↓
+Step Functions polls redshift-data:DescribeStatement
+    Status progression: SUBMITTED → PICKED → STARTED → FINISHED
+    |
+    ↓
+When FINISHED:
+    Step Functions calls redshift-data:GetStatementResult (for SELECT queries)
+    Returns column names + row data as JSON</code></pre></div>
+<p><strong>Key Properties of Redshift Data API:</strong></p>
+<table><thead><tr><th>Property</th><th>Value</th></tr></thead><tbody><tr><td>Maximum SQL statement size</td><td>100 KB</td></tr><tr><td>Maximum result set size (GetStatementResult)</td><td>100 MB</td></tr><tr><td>Statement timeout</td><td>24 hours</td></tr><tr><td>Concurrent active statements</td><td>200 per cluster</td></tr><tr><td>Authentication</td><td>IAM-based (no JDBC credentials needed)</td></tr></tbody></table>
+<p>→ Redshift Data API is SERVERLESS — no connection management<br>
+→ Unlike federated query (Project 48) which uses JDBC → Data API uses HTTP<br>
+→ No connection pool exhaustion risk</p>
+<hr>
+<h3>5 → STATE MACHINE EXECUTION DATA FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Input (from EventBridge):
+</span>{
+    "s3_bucket": "payscale-landing",
+    "s3_key": "transactions/2025-01-15/partner-feed.csv",
+    "file_size": 15728640
+}
+    |
+    ↓ ValidateFile Lambda
+    |
+    Output added to state:
+{
+    "s3_bucket": "payscale-landing",
+    "s3_key": "transactions/2025-01-15/partner-feed.csv",
+    "file_size": 15728640,
+    "validation": {
+        "status": "PASSED",
+        "record_count": 15000,
+        "file_date": "2025-01-15"
+    }
+}
+    |
+    ↓ StartGlueETL (.sync)
+    |
+    Output added:
+{
+    ... (previous data preserved) ...,
+    "glueResult": {
+        "JobRunId": "jr_xxx",
+        "JobRunState": "SUCCEEDED",
+        "ExecutionTime": 540
+    }
+}
+    |
+    ↓ Each subsequent state adds its output
+    |
+    ↓ Final state has complete execution history</code></pre></div>
+<p><strong>State Data Management:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Purpose</th><th>Example</th></tr></thead><tbody><tr><td>InputPath</td><td>Filter which part of state input is passed to the task</td><td><code>$.s3_key</code> — only pass the S3 key</td></tr><tr><td>ResultPath</td><td>WHERE to store the task output in the state data</td><td><code>$.glueResult</code> — store under this key</td></tr><tr><td>OutputPath</td><td>Filter which part of state data is passed to the NEXT state</td><td><code>$</code> — pass everything</td></tr><tr><td>Parameters</td><td>Construct the task input from state data</td><td>Map state data fields to API parameters</td></tr></tbody></table>
+<p>→ These four parameters control data flow between states<br>
+→ Incorrect configuration = data lost between states = pipeline fails with confusing errors<br>
+→ Always use ResultPath to APPEND results — never overwrite the entire state</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>EventBridge not enabled on S3 bucket</td><td>No pipeline triggers when file uploads</td><td>S3 EventBridge setting is Off</td><td>Enable EventBridge in S3 bucket Properties</td></tr><tr><td>2</td><td>EventBridge rule pattern too broad</td><td>Pipeline triggers for non-CSV files or wrong prefix</td><td>Missing prefix/suffix filter in event pattern</td><td>Add specific prefix and suffix conditions</td></tr><tr><td>3</td><td>EventBridge IAM role missing</td><td>"Access Denied" when EventBridge tries to start Step Functions</td><td>Role doesn't have states:StartExecution</td><td>Create/fix the IAM role with correct permission</td></tr><tr><td>4</td><td>Step Functions role missing Glue permissions</td><td>"AccessDeniedException" on glue:StartJobRun</td><td>IAM role doesn't include Glue permissions</td><td>Add glue:StartJobRun and glue:GetJobRun to role</td></tr><tr><td>5</td><td>.sync polling stuck forever</td><td>Execution hangs — Glue job completed but Step Functions doesn't detect</td><td>Rare service issue or missing GetJobRun permission</td><td>Add TimeoutSeconds on the state as safety net</td></tr><tr><td>6</td><td>Crawler polling loop infinite</td><td>Execution runs forever checking crawler status</td><td>Crawler stuck in RUNNING or Choice state conditions wrong</td><td>Add max iteration counter or timeout on the polling loop</td></tr><tr><td>7</td><td>Redshift Data API returns FAILED</td><td>COPY statement fails — bad SQL or missing permissions</td><td>SQL syntax error, missing IAM role on cluster, wrong table name</td><td>Check STL_LOAD_ERRORS in Redshift, verify SQL</td></tr><tr><td>8</td><td>State data overwritten between states</td><td>Next state receives empty or wrong input</td><td>ResultPath set to <code>$</code> (overwrites entire state) instead of <code>$.fieldName</code></td><td>Use specific ResultPath like <code>$.glueResult</code></td></tr><tr><td>9</td><td>Duplicate pipeline executions</td><td>Same file processed twice — duplicate data in Redshift</td><td>S3 event delivered twice by EventBridge (at-least-once)</td><td>Implement deduplication via execution name or DynamoDB</td></tr><tr><td>10</td><td>SNS notification not received</td><td>Pipeline completes but no email/Slack alert</td><td>SNS subscription not confirmed, or filter policy blocks message</td><td>Verify subscription confirmation + filter policies</td></tr><tr><td>11</td><td>Global timeout reached</td><td>Execution aborted mid-processing</td><td>Glue job took longer than expected</td><td>Increase TimeoutSeconds or optimize Glue job</td></tr><tr><td>12</td><td>Retry makes things worse</td><td>Failed Glue job retried 3x — each run costs $10</td><td>Error is persistent (not transient) — retrying wastes money</td><td>Differentiate transient vs persistent errors in Catch conditions</td></tr><tr><td>13</td><td>Step Functions Express used instead of Standard</td><td>Execution fails after 5 minutes</td><td>Express has 5-minute max duration — Glue jobs take longer</td><td>Use Standard workflow type</td></tr><tr><td>14</td><td>Missing X-Ray tracing makes debugging impossible</td><td>Cannot trace which step took how long or where latency is</td><td>X-Ray not enabled</td><td>Enable X-Ray tracing on state machine</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Execution Concurrency</strong></p>
+<table><thead><tr><th>Component</th><th>Default Limit</th><th>Scalability</th></tr></thead><tbody><tr><td>Step Functions concurrent executions</td><td>1,000,000 open executions per account</td><td>Virtually unlimited</td></tr><tr><td>Step Functions state transitions</td><td>1,500 per second per account</td><td>Requestable increase</td></tr><tr><td>EventBridge rule invocations</td><td>10,000 per second</td><td>Requestable increase</td></tr><tr><td>Glue concurrent job runs</td><td>200 per account (default)</td><td>Requestable increase</td></tr><tr><td>Redshift Data API concurrent statements</td><td>200 per cluster</td><td>Fixed</td></tr></tbody></table>
+<p>→ <strong>Bottleneck Analysis:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Bottleneck</th><th>Mitigation</th></tr></thead><tbody><tr><td>100 files uploaded simultaneously</td><td>Glue concurrent job limit (200)</td><td>Sufficient for 100 concurrent</td></tr><tr><td>500 files uploaded simultaneously</td><td>Glue concurrent job limit</td><td>Request limit increase or queue files</td></tr><tr><td>1000 files per hour</td><td>Step Functions transitions (1,500/s)</td><td>Well within limits</td></tr><tr><td>Large files (10 GB+)</td><td>Glue job duration + Redshift COPY duration</td><td>Increase DPU allocation for Glue</td></tr></tbody></table>
+<p>→ <strong>Cost Scalability:</strong></p>
+<table><thead><tr><th>Component</th><th>Pricing Model</th><th>100 Executions/Day</th><th>1,000 Executions/Day</th></tr></thead><tbody><tr><td>Step Functions (Standard)</td><td>$0.025 per 1,000 state transitions</td><td>~$0.20/day</td><td>~$2.00/day</td></tr><tr><td>EventBridge</td><td>$1.00 per million events</td><td>~$0.003/day</td><td>~$0.03/day</td></tr><tr><td>Glue ETL</td><td>$0.44 per DPU-hour</td><td>~$7.33/day (10 DPU-min each)</td><td>~$73.33/day</td></tr><tr><td>Redshift</td><td>Already running (cluster cost)</td><td>$0 incremental</td><td>$0 incremental</td></tr><tr><td>SNS</td><td>$0.50 per million notifications</td><td>~$0.00005/day</td><td>~$0.0005/day</td></tr><tr><td>Lambda (validation)</td><td>$0.20 per 1M requests</td><td>~$0.00002/day</td><td>~$0.0002/day</td></tr></tbody></table>
+<p>→ Glue ETL is the dominant cost — optimize DPU allocation and job duration<br>
+→ Step Functions cost is negligible compared to Glue<br>
+→ EventBridge and SNS costs are virtually zero</p>
+<p>→ <strong>Scaling Patterns:</strong></p>
+<p><strong>Pattern 1: Sequential (Current — One File at a Time)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>File 1 arrives → Pipeline runs → Completes
+</span>File 2 arrives → Pipeline runs → Completes</code></pre></div>
+<p>→ Simple but slow if many files arrive simultaneously</p>
+<p><strong>Pattern 2: Parallel (Multiple Files Simultaneously)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>File 1 arrives → Pipeline 1 runs ──────→ Completes
+</span>File 2 arrives → Pipeline 2 runs ──────→ Completes
+File 3 arrives → Pipeline 3 runs ──────→ Completes</code></pre></div>
+<p>→ Each file triggers its OWN state machine execution<br>
+→ All run in parallel — limited only by Glue concurrent job limit<br>
+→ This is the DEFAULT behavior — EventBridge triggers a new execution per event</p>
+<p><strong>Pattern 3: Batched (Collect Files, Process Together)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>File 1 arrives → SQS queue
+</span>File 2 arrives → SQS queue    → Lambda polls SQS every 5 min
+File 3 arrives → SQS queue       → Starts ONE pipeline with list of files
+                                   → Glue processes all files in one job</code></pre></div>
+<p>→ More efficient for high-volume scenarios (hundreds of small files)<br>
+→ Reduces Glue job overhead (fewer job starts)<br>
+→ Adds complexity (SQS + Lambda + batch logic)</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the pipeline is working:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th></tr></thead><tbody><tr><td>EventBridge rule active</td><td>EventBridge Console → Rules</td><td>Status: Enabled</td></tr><tr><td>EventBridge receiving S3 events</td><td>EventBridge Console → Monitoring → Matched events metric</td><td>Count &gt; 0 after file upload</td></tr><tr><td>Step Functions triggered</td><td>Step Functions Console → Executions</td><td>New execution appears after file upload</td></tr><tr><td>Each state succeeds</td><td>Step Functions Console → Click execution → Visual workflow</td><td>Green checkmarks on each state</td></tr><tr><td>Glue job ran</td><td>Glue Console → Job runs</td><td>New run with SUCCEEDED status</td></tr><tr><td>Crawler completed</td><td>Glue Console → Crawlers</td><td>Last run shows updated tables</td></tr><tr><td>Redshift data loaded</td><td>Redshift Query Editor → Query new data</td><td>Rows exist for the new date partition</td></tr><tr><td>SNS notification received</td><td>Email inbox / Slack channel</td><td>Success message with details</td></tr></tbody></table>
+<p>→ <strong>How to debug pipeline failures:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Open Step Functions Console → Executions → Click failed execution
+</span>    → Visual workflow shows RED on the failed state
+    → Click the failed state → See Input, Output, Error
+    |
+    ↓
+Step 2: Identify which state failed
+    |
+    ├── ValidateFile failed
+    |   → Check Lambda CloudWatch logs (from Project 19)
+    |   → Common: File format issue, missing columns
+    |
+    ├── StartGlueETL failed
+    |   → Check Glue Console → Job runs → Error log
+    |   → Common: S3 permission, data format, OOM error
+    |
+    ├── StartCrawler failed
+    |   → Check Glue Console → Crawlers → Last run log
+    |   → Common: IAM permission, S3 path doesn't exist
+    |
+    ├── ExecuteRedshiftCOPY failed
+    |   → Check Redshift STL_LOAD_ERRORS system table
+    |   → Common: Schema mismatch, missing IAM role, S3 path empty
+    |
+    └── DataQualityCheck failed
+        → Check quality check results in execution output
+        → Common: Zero rows loaded, NULL values, data type issues
+    |
+    ↓
+Step 3: Fix the issue → Re-run
+    Option A: Re-upload the file → EventBridge triggers new execution
+    Option B: Step Functions Console → Start new execution with same input</code></pre></div>
+<p>→ <strong>Monitoring Dashboard (CloudWatch):</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alarm Threshold</th></tr></thead><tbody><tr><td>ExecutionsStarted</td><td>Step Functions</td><td>Alert if 0 for 24 hours (no files processed)</td></tr><tr><td>ExecutionsFailed</td><td>Step Functions</td><td>Alert if &gt; 0 (any failure)</td></tr><tr><td>ExecutionTime</td><td>Step Functions</td><td>Alert if &gt; 30 minutes (abnormally slow)</td></tr><tr><td>MatchedEvents</td><td>EventBridge</td><td>Alert if 0 for 24 hours (EventBridge not receiving events)</td></tr><tr><td>FailedInvocations</td><td>EventBridge</td><td>Alert if &gt; 0 (EventBridge cannot trigger target)</td></tr><tr><td>Glue Job Duration</td><td>Glue CloudWatch</td><td>Alert if &gt; 2x normal duration</td></tr><tr><td>RedshiftCopyTime</td><td>Custom metric</td><td>Alert if COPY takes &gt; 10 minutes</td></tr></tbody></table>
+<p>→ <strong>Audit Trail:</strong></p>
+<table><thead><tr><th>Audit Need</th><th>Source</th><th>How</th></tr></thead><tbody><tr><td>Who uploaded the file?</td><td>CloudTrail → S3 PutObject event</td><td>Filter by bucket + key</td></tr><tr><td>When was pipeline triggered?</td><td>Step Functions → Execution start time</td><td>Execution list</td></tr><tr><td>What data was loaded?</td><td>Step Functions → Execution output (includes record counts)</td><td>Click execution → Output tab</td></tr><tr><td>Did quality checks pass?</td><td>Step Functions → DataQualityCheck state output</td><td>Quality metrics in state output</td></tr><tr><td>Who was notified?</td><td>SNS → Delivery logs + CloudTrail</td><td>SNS delivery status logs</td></tr><tr><td>Complete pipeline trace?</td><td>X-Ray → Trace map</td><td>Visual end-to-end trace</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ This pipeline represents the CULMINATION of all previous projects working together as ONE system<br>
+→ EventBridge replaces manual file detection — events trigger automatically within seconds<br>
+→ Step Functions replaces manual orchestration — sequences, waits, retries, and branches automatically<br>
+→ The <code>.sync</code> integration pattern eliminates custom polling code for Glue Jobs</p>
+→ Manual polling loops (Crawler, Redshift Data API) follow a consistent Wait → Check → Branch pattern<br>
+→ Retry with exponential backoff handles transient failures without human intervention<br>
+→ Catch with SNS notification ensures persistent failures are immediately visible<br>
+→ Data quality checks BEFORE declaring success prevent corrupt data from reaching analysts<br>
+→ Deduplication prevents the same file from being processed twice<br>
+→ The entire pipeline runs in ~15 minutes with ZERO human intervention vs ~63 minutes with manual steps<br>
+→ Every component traces back to a previous project:</p>
+<ul>
+<li>S3 landing zone (Project 1) — where files arrive</li>
+<li>IAM roles and policies (Project 2) — every service needs permissions</li>
+<li>EventBridge rules and patterns (Project 38) — event detection and routing</li>
+<li>Step Functions states and orchestration (Project 32) — workflow engine</li>
+<li>Glue ETL with bookmarks (Project 21, 46) — data transformation</li>
+<li>Glue Crawler and Catalog (Project 17) — metadata management</li>
+<li>Redshift COPY (Project 22) — warehouse loading</li>
+<li>Redshift Data API — serverless SQL execution (new in this project)</li>
+<li>SNS fan-out notifications (Project 6, 13) — alerting</li>
+<li>Secrets Manager (Project 37) — credential management for Redshift</li>
+<li>KMS encryption (Project 36) — encryption at rest for SNS, S3, Redshift<br>
+→ This is the pattern that enterprise data platforms are built on<br>
+→ Every additional data source, transformation, or destination follows the SAME orchestration pattern<br>
+→ Adding a new pipeline step = adding a new state in Step Functions — the framework scales</li>
+</ul>
+<hr>
+<hr>
+<h2>💰 COST ANALYSIS — MANUAL vs AUTOMATED</h2>
+<hr>
+<table><thead><tr><th>Cost Factor</th><th>Manual Process</th><th>Automated Pipeline</th></tr></thead><tbody><tr><td>Engineer time (monitoring, triggering, re-running)</td><td>~2 hours/day × $75/hour = $150/day</td><td>$0 — fully automated</td></tr><tr><td>Glue ETL compute</td><td>Same</td><td>Same</td></tr><tr><td>Redshift compute</td><td>Same (cluster always running)</td><td>Same</td></tr><tr><td>Step Functions</td><td>$0 (no orchestration)</td><td>~$0.20/day (state transitions)</td></tr><tr><td>EventBridge</td><td>$0 (no event routing)</td><td>~$0.003/day (events)</td></tr><tr><td>SNS</td><td>$0 (manual Slack messages)</td><td>~$0.001/day (notifications)</td></tr><tr><td>Lambda (validation)</td><td>$0 (no validation)</td><td>~$0.001/day</td></tr><tr><td><strong>Data quality issues (stale/corrupt data leading to wrong fraud decisions)</strong></td><td><strong>$5,000-$50,000/incident</strong></td><td><strong>$0 — prevented by automated quality checks</strong></td></tr><tr><td><strong>TOTAL</strong></td><td><strong>$150/day + incident risk</strong></td><td><strong>~$0.21/day + zero incident risk</strong></td></tr></tbody></table>
+<p>→ The automation cost is negligible<br>
+→ The REAL savings come from eliminating human error and preventing data quality incidents</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale now has a fully automated, event-driven, error-resilient data pipeline<br>
+→ But the infrastructure supporting it has grown complex:</p>
+<ul>
+<li>Account B has VPCs with multiple subnets, NAT Gateways, VPC Endpoints</li>
+<li>Account A and Account C are peered with Account B (from Project 44)</li>
+<li>All three accounts have their own VPCs, their own route tables, their own security groups</li>
+<li>The fraud team in Account B needs to reach MariaDB in Account A (via peering)</li>
+<li>The analytics team in Account C needs to reach Redshift in Account B (via peering)</li>
+<li>A new Account E (compliance) is being created — needs connectivity to ALL existing accounts</li>
+</ul>
+<p>→ The current networking architecture:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account A ←──pcx-1──→ Account B ←──pcx-2──→ Account C
+</span>                                              
+Account E needs connectivity to A, B, AND C
+    → Requires 3 NEW peering connections (E↔A, E↔B, E↔C)
+    → Total peering connections: 3 existing + 3 new = 6
+    → With 2 more accounts next quarter → Full mesh = 21 peering connections
+    → Non-transitive limitation means EVERY pair needs direct peering</code></pre></div>
+<p>→ The network architect says: "VPC Peering doesn't scale — we need a hub-and-spoke model where one central router connects all VPCs"<br>
+→ Adding a new account should require ONE connection to the hub — not N connections to every other account<br>
+→ They need transitive routing — Account A traffic to Account C should flow THROUGH the hub, not require a direct link</p>
+<p>→ <strong>This is the exact problem Project 50 solves</strong><br>
+→ Project 50 introduces AWS Transit Gateway — the central router for multi-VPC, multi-account networking<br>
+→ It replaces the mesh of peering connections with a single hub-and-spoke architecture<br>
+→ It supports transitive routing, centralized egress, cross-account sharing via RAM, and route propagation<br>
+→ Without Transit Gateway → Every new account adds N-1 peering connections → Exponential management complexity<br>
+→ With Transit Gateway → Every new account adds 1 attachment → Linear management complexity</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 50: "The Organization With 20 VPCs That Couldn't Scale Peering — Transit Gateway for Multi-VPC Multi-Account"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-48.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 49/60</span></div><a class="nav-btn next" href="project-50.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

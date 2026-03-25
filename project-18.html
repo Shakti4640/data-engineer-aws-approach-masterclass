@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 18: THE ANALYST WHO DIDN'T WANT TO SPIN UP A SERVER — Athena Querying S3 — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 18: THE ANALYST WHO DIDN'T WANT TO SPIN UP A SERVER — Athena Querying S3 via Glue Catalog</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-17) now has:</p>
+<ul>
+<li>S3 data lake with raw data from 5 sources (Project 17)</li>
+<li>Glue Data Catalog with 5 tables cataloged (Project 17)</li>
+<li>Redshift cluster for heavy analytical workloads (Project 16)</li>
+<li>RDS MariaDB for transactional operations (Projects 9, 14)</li>
+</ul>
+<p>→ The BI team has 5 analysts who need to answer ad-hoc questions QUICKLY:</p>
+<ul>
+<li>"How many orders were placed last Tuesday?"</li>
+<li>"What's the average clickstream session duration by device type?"</li>
+<li>"Which marketing campaign had the highest conversion rate?"</li>
+<li>"How many customers from Maharashtra ordered in January?"</li>
+</ul>
+<p>→ Problem 1: The Redshift cluster costs ~₹1,30,000/month ($1,598)<br>
+→ The BI team uses it for 8 hours a day → 16 hours idle → paying for unused compute<br>
+→ The CFO says: "Why are we paying for a warehouse 24/7 when analysts work 8 hours?"<br>
+→ For ad-hoc queries that run a few times per day → a full cluster is OVERKILL</p>
+<p>→ Problem 2: Loading data INTO Redshift takes time<br>
+→ Data arrives in S3 → must run COPY command (Project 22) → data loads into Redshift<br>
+→ This ETL pipeline introduces delay → analysts can't query FRESH S3 data immediately<br>
+→ They want to query the CSV/Parquet files in S3 DIRECTLY — the moment they land</p>
+<p>→ Problem 3: Some queries scan a FEW megabytes of data<br>
+→ "How many orders yesterday?" → scans 1 partition → ~5 MB of data<br>
+→ Running this on Redshift (2 RA3.xlplus nodes) is like driving a truck to the grocery store<br>
+→ They need a LIGHTWEIGHT query engine for simple ad-hoc analysis</p>
+<p>→ Problem 4: The data engineering team doesn't want to MANAGE another service<br>
+→ Redshift requires: Cluster sizing, WLM tuning, VACUUM, ANALYZE, monitoring<br>
+→ They want: "Write SQL → Get results → Pay per query → Zero management"</p>
+<p>→ Problem 5: Non-technical stakeholders (product managers, marketing leads) need self-service analytics<br>
+→ They can write basic SQL but can't manage infrastructure<br>
+→ They need a service where they just type SQL and get answers</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>Analysts must query S3 data WITHOUT loading it anywhere</li>
+<li>Pay ONLY for queries actually run — not for idle compute</li>
+<li>ZERO infrastructure to manage — no servers, no clusters, no scaling</li>
+<li>Use the Glue Data Catalog (Project 17) as the metadata source</li>
+<li>Queries must leverage partitioning for cost and performance optimization</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a SERVERLESS ANALYTICS problem<br>
+→ AWS Athena is a serverless, interactive query service that runs SQL on S3 data</p>
+<p><strong>Athena vs Redshift — When to Use Which:</strong></p>
+<table><thead><tr><th>Factor</th><th>Athena</th><th>Redshift (Project 16)</th></tr></thead><tbody><tr><td>Infrastructure</td><td>NONE — fully serverless</td><td>Cluster to manage (nodes, WLM, vacuuming)</td></tr><tr><td>Pricing model</td><td>Per query ($5/TB scanned)</td><td>Per hour (running cluster)</td></tr><tr><td>Best for</td><td>Ad-hoc queries, exploration, infrequent use</td><td>Recurring dashboards, heavy joins, consistent workloads</td></tr><tr><td>Startup time</td><td>Instant (no cluster to start)</td><td>Cluster must be running</td></tr><tr><td>Data loading</td><td>NONE — queries S3 directly</td><td>Must COPY data into Redshift</td></tr><tr><td>Concurrency</td><td>Limited (default 20-25 concurrent queries)</td><td>Higher (with WLM and concurrency scaling)</td></tr><tr><td>Data freshness</td><td>Instant — reads latest S3 data</td><td>Depends on ETL loading frequency</td></tr><tr><td>Performance</td><td>Seconds for small queries, minutes for large</td><td>Seconds for most queries (data is local)</td></tr><tr><td>Cost for 10 queries/day</td><td>~₹10-50/day (depends on data scanned)</td><td>~₹5,300/day (cluster running 24/7)</td></tr><tr><td>Cost for 1,000 queries/day</td><td>~₹5,000-25,000/day</td><td>~₹5,300/day (cluster running 24/7)</td></tr></tbody></table>
+<p>→ KEY INSIGHT: Athena is cheaper for LOW query volumes, Redshift is cheaper for HIGH query volumes<br>
+→ The crossover point depends on data size, query complexity, and frequency<br>
+→ Many organizations use BOTH: Athena for ad-hoc, Redshift for production dashboards</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ATHENA ARCHITECTURE:
+</span>
+Analyst writes SQL
+        │
+        ▼
+ATHENA SERVICE (Serverless)
+        │
+        ├── Step 1: Read table definition from GLUE DATA CATALOG (Project 17)
+        │   → Columns, data types, format, partitions, S3 location
+        │
+        ├── Step 2: Determine which S3 files to scan
+        │   → Use partition pruning (WHERE year='2024' → only scan 2024 data)
+        │   → Use columnar format optimization (Parquet → only read needed columns)
+        │
+        ├── Step 3: Scan S3 data using distributed Presto/Trino engine
+        │   → Multiple workers read S3 files in parallel
+        │   → Filter, aggregate, join as specified in SQL
+        │
+        ├── Step 4: Return results to analyst
+        │   → Results displayed in console
+        │   → Results also saved to S3 (query result location)
+        │
+        └── Step 5: Billing
+            → Charged: $5 per TB of data SCANNED (not returned)
+            → Minimum: 10 MB per query
+            → Cancelled queries: Charged for data already scanned</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Configure Athena workgroup and query result location</li>
+<li>Step 2 — Run first queries using the Glue Catalog</li>
+<li>Step 3 — Understand query result storage and format</li>
+<li>Step 4 — Optimize queries with partitioning and columnar format</li>
+<li>Step 5 — Understand Athena SQL capabilities and limitations</li>
+<li>Step 6 — Create views and saved queries</li>
+<li>Step 7 — Configure workgroups for team management and cost control</li>
+<li>Step 8 — Monitor query performance and costs</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CONFIGURE ATHENA WORKGROUP AND QUERY RESULT LOCATION</h3>
+<p>→ Before running any query → Athena needs a place to STORE query results<br>
+→ Every Athena query result is saved as a CSV file in S3</p>
+<p><strong>Create S3 Bucket for Query Results:</strong></p>
+<p>→ S3 Console → Create bucket: <code>shopnow-athena-results</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Bucket name</td><td><code>shopnow-athena-results</code></td></tr><tr><td>Region</td><td>ap-south-1 (same as data lake)</td></tr><tr><td>Versioning</td><td>Disable (results are ephemeral)</td></tr><tr><td>Encryption</td><td>SSE-S3</td></tr><tr><td>Block public access</td><td>All enabled</td></tr></tbody></table>
+<p><strong>Add Lifecycle Rule to Auto-Delete Old Results:</strong></p>
+<p>→ Bucket → Management → Lifecycle rule (Project 12 pattern)</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>expire-old-query-results</code></td></tr><tr><td>Scope</td><td>Entire bucket</td></tr><tr><td>Expiration</td><td>30 days</td></tr></tbody></table>
+<p>→ Query results older than 30 days are auto-deleted → prevents storage cost growth<br>
+→ If analysts need results longer → they export to a permanent location</p>
+<hr>
+<p><strong>Configure Athena Workgroup:</strong></p>
+<p>→ Athena Console → "Workgroups" → "Create workgroup"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Workgroup name</td><td><code>shopnow-analytics</code></td><td>Logical group for BI team queries</td></tr><tr><td>Description</td><td>"Primary workgroup for ShopNow BI analysts"</td><td></td></tr><tr><td>Query result location</td><td><code>s3://shopnow-athena-results/shopnow-analytics/</code></td><td>Where results are stored</td></tr><tr><td>Encrypt query results</td><td>Enable (SSE-S3)</td><td>Encrypt results at rest</td></tr><tr><td>Publish CloudWatch metrics</td><td>Enable</td><td>Monitor query performance and costs</td></tr><tr><td>Override client-side settings</td><td>Enable</td><td>Enforce workgroup settings — users can't change result location</td></tr></tbody></table>
+<p><strong>Cost Control Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Per-query data usage control</td><td>1 GB</td><td>Warn or cancel queries scanning &gt; 1 GB</td></tr><tr><td>Per-query action</td><td>Warn</td><td>Show warning but allow query to complete</td></tr><tr><td>Workgroup data usage control</td><td>100 GB per day</td><td>Total data scanned limit for the workgroup per day</td></tr><tr><td>Workgroup action</td><td>Cancel</td><td>Cancel queries if daily limit exceeded</td></tr></tbody></table>
+<p>→ Per-query limit of 1 GB → prevents accidentally scanning the entire data lake<br>
+→ Workgroup limit of 100 GB/day → caps daily cost at $0.50 (100 GB × $5/TB = $0.50)<br>
+→ These limits are CRITICAL for cost control — without them, a single bad query could cost hundreds of dollars</p>
+<p><strong>Why "Override Client-Side Settings":</strong></p>
+<p>→ When enabled → users CANNOT specify their own query result location<br>
+→ All results go to the workgroup's configured location<br>
+→ This prevents: Users saving results to unauthorized S3 buckets<br>
+→ Ensures: All query results are in one place, encrypted, with lifecycle policies</p>
+<p>→ Click "Create workgroup"</p>
+<hr>
+<p><strong>Set as Default Workgroup:</strong></p>
+<p>→ Athena Console → Workgroup selector (top of page) → Select <code>shopnow-analytics</code><br>
+→ All queries in this session use this workgroup's settings</p>
+<hr>
+<h3>STEP 2 — RUN FIRST QUERIES USING THE GLUE CATALOG</h3>
+<p>→ Athena Console → "Query editor"<br>
+→ Database selector → Choose <code>shopnow_raw</code> (the Glue Database from Project 17)<br>
+→ Tables appear in the left panel: orders, clickstream, products, campaigns, customers</p>
+<hr>
+<p><strong>Query 1: Simple SELECT — Verify Table Works</strong></p>
+<code>SELECT * FROM shopnow_raw.orders LIMIT 10;</code>
+<p>→ This reads 10 rows from the orders table<br>
+→ Athena → Glue Catalog → gets table definition → reads from S3 → returns 10 rows<br>
+→ Verify: Column names match, data looks correct, no errors</p>
+<p><strong>What Happens Behind the Scenes:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Athena receives query
+</span>Step 2: Athena calls Glue API: GetTable("shopnow_raw", "orders")
+        → Returns: 22 columns, CSV format, SerDe, S3 location, partition keys
+Step 3: Athena calls Glue API: GetPartitions (with LIMIT)
+        → Returns: partition locations
+Step 4: Athena reads sample S3 files (LIMIT 10 → reads one file)
+Step 5: Parses CSV using SerDe → returns 10 rows
+Step 6: Saves result to s3://shopnow-athena-results/shopnow-analytics/{query-id}.csv
+Step 7: Displays results in console
+Step 8: Records: Data scanned = ~5 MB, Query time = ~2 seconds</code></pre></div>
+<hr>
+<p><strong>Query 2: Aggregation with Partition Pruning</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT 
+</span>    order_status,
+    COUNT(*) as order_count,
+    SUM(total_amount) as total_revenue,
+    AVG(total_amount) as avg_order_value
+FROM shopnow_raw.orders
+WHERE year = '2024' AND month = '12'
+GROUP BY order_status
+ORDER BY total_revenue DESC;</code></pre></div>
+<p>→ This query scans ONLY December 2024 data (1 month out of 15+ months)<br>
+→ Partition pruning: <code>WHERE year = '2024' AND month = '12'</code> → Athena reads only 31 partitions<br>
+→ Without partition filter → Athena would scan ALL 380+ partitions → 12x more data → 12x more cost</p>
+<p><strong>Query Execution Stats (shown in Athena Console):</strong></p>
+<table><thead><tr><th>Stat</th><th>Value</th></tr></thead><tbody><tr><td>Run time</td><td>3.2 seconds</td></tr><tr><td>Data scanned</td><td>45 MB</td></tr><tr><td>Cost</td><td>$0.000225 (45 MB × $5/TB)</td></tr></tbody></table>
+<p>→ 45 MB scanned → cost is less than 1 paisa → incredibly cheap<br>
+→ Compare to Redshift: Same query runs in ~2 seconds but cluster costs ₹220/hour regardless</p>
+<hr>
+<p><strong>Query 3: JOIN Across Tables</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT 
+</span>    p.category,
+    COUNT(DISTINCT o.customer_id) as unique_customers,
+    SUM(o.total_amount) as total_revenue
+FROM shopnow_raw.orders o
+JOIN shopnow_raw.products p ON o.product_id = p.product_id
+WHERE o.year = '2025' AND o.month = '01'
+GROUP BY p.category
+ORDER BY total_revenue DESC;</code></pre></div>
+<p>→ Joins orders (partitioned, CSV) with products (non-partitioned, JSON)<br>
+→ Athena handles cross-format joins seamlessly — CSV JOIN JSON → works<br>
+→ Partition filter on orders → scans only January 2025 → fast</p>
+<hr>
+<p><strong>Query 4: Clickstream Analysis (Parquet — Columnar)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT 
+</span>    device_type,
+    COUNT(*) as page_views,
+    COUNT(DISTINCT session_id) as sessions,
+    AVG(time_on_page_seconds) as avg_time_on_page
+FROM shopnow_raw.clickstream
+WHERE year = '2025' AND month = '01' AND day = '15'
+GROUP BY device_type;</code></pre></div>
+<p>→ Clickstream is stored as Parquet (columnar format)<br>
+→ Athena reads ONLY the columns needed: device_type, session_id, time_on_page_seconds<br>
+→ Parquet files are compressed → even less data scanned → even cheaper</p>
+<p><strong>CSV vs Parquet Query Cost Comparison:</strong></p>
+<table><thead><tr><th>Format</th><th>Full Table Size</th><th>Columns Needed</th><th>Data Scanned</th><th>Cost</th></tr></thead><tbody><tr><td>CSV (orders)</td><td>15 GB</td><td>3 out of 22</td><td>15 GB (reads ALL columns)</td><td>$0.075</td></tr><tr><td>Parquet (clickstream)</td><td>500 GB</td><td>3 out of 35</td><td>~43 GB (reads ONLY 3 columns)</td><td>$0.215</td></tr></tbody></table>
+<p>→ Parquet scans only needed columns → massive cost savings for wide tables<br>
+→ CSV always scans all columns → more expensive for selective queries<br>
+→ This is why Project 21 (Glue ETL) will convert CSV to Parquet → cost optimization</p>
+<hr>
+<h3>STEP 3 — UNDERSTAND QUERY RESULT STORAGE</h3>
+<p>→ Every Athena query produces TWO files in S3:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-athena-results/shopnow-analytics/
+</span>    │
+    ├── {query-execution-id}.csv          ← Query results (CSV format)
+    │   Contains: Column headers + data rows
+    │   Size: Varies based on result set
+    │
+    └── {query-execution-id}.csv.metadata ← Query metadata
+        Contains: Column names, types, query text, execution stats</code></pre></div>
+<p><strong>Query Execution ID:</strong></p>
+<p>→ Every query gets a unique ID: <code>a1b2c3d4-5678-90ab-cdef-example11111</code><br>
+→ Used to: Retrieve results later, reference in API calls, audit queries</p>
+<p><strong>Result File Format:</strong></p>
+<p>→ Default: CSV with headers<br>
+→ Can be changed in workgroup settings:</p>
+<ul>
+<li>CSV (default)</li>
+<li>TSV (tab-separated)</li>
+<li>JSON (one JSON object per line)</li>
+<li>Parquet (columnar — best for downstream processing)</li>
+</ul>
+<p><strong>Changing Result Format:</strong></p>
+<p>→ Athena Console → Workgroups → Select workgroup → Edit → Additional settings<br>
+→ "Query result format" → Select Parquet</p>
+<p>→ Parquet results are useful when: Downstream tools (Glue, Spark) process Athena results<br>
+→ CSV results are useful when: Humans open results in Excel</p>
+<p><strong>Accessing Previous Results:</strong></p>
+<p>→ Athena Console → "Recent queries" tab<br>
+→ Shows: Query text, status, runtime, data scanned, result location<br>
+→ Click on any query → "Download results" → downloads the CSV</p>
+<p>→ Alternatively → browse S3 directly:<br>
+<code>s3://shopnow-athena-results/shopnow-analytics/</code> → find the query ID → download</p>
+<hr>
+<h3>STEP 4 — OPTIMIZE QUERIES WITH PARTITIONING AND COLUMNAR FORMAT</h3>
+<p>→ This is the MOST important section for cost and performance optimization<br>
+→ Athena charges per TB SCANNED → reducing data scanned = reducing cost</p>
+<p><strong>Optimization 1: Partition Pruning (ALWAYS Use Partition Filters)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BAD (Full table scan — expensive):
+</span>  SELECT COUNT(*) FROM shopnow_raw.orders;
+  → Scans: ALL 380+ partitions → ALL 15 GB → Cost: $0.075
+
+GOOD (Partition pruned — cheap):
+  SELECT COUNT(*) FROM shopnow_raw.orders WHERE year = '2025' AND month = '01';
+  → Scans: 31 partitions → ~1.3 GB → Cost: $0.0065
+
+SAVINGS: 91% cost reduction</code></pre></div>
+<p>→ ALWAYS include partition columns in WHERE clauses<br>
+→ Athena can only prune partitions that are referenced in WHERE<br>
+→ Even <code>WHERE year IS NOT NULL</code> doesn't help → must use equality or range</p>
+<p><strong>Effective Partition Filters:</strong></p>
+<table><thead><tr><th>Filter</th><th>Pruning?</th><th>Why</th></tr></thead><tbody><tr><td><code>WHERE year = '2024'</code></td><td>✅ YES</td><td>Equality on partition key</td></tr><tr><td><code>WHERE year = '2024' AND month = '01'</code></td><td>✅ YES</td><td>Multiple partition keys</td></tr><tr><td><code>WHERE year &gt;= '2024'</code></td><td>✅ YES</td><td>Range on partition key</td></tr><tr><td><code>WHERE year IN ('2024', '2025')</code></td><td>✅ YES</td><td>IN list on partition key</td></tr><tr><td><code>WHERE order_date = '2024-01-15'</code></td><td>❌ NO</td><td>order_date is a COLUMN, not a partition key</td></tr><tr><td><code>WHERE year IS NOT NULL</code></td><td>❌ NO</td><td>IS NOT NULL doesn't prune</td></tr><tr><td>No WHERE clause</td><td>❌ NO</td><td>Full scan of all partitions</td></tr></tbody></table>
+<hr>
+<p><strong>Optimization 2: Use Columnar Format (Parquet/ORC)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CSV file: 100 columns, query needs 3 columns
+</span>  → Athena reads ALL 100 columns → scans 100% of data
+
+Parquet file: 100 columns, query needs 3 columns
+  → Athena reads ONLY 3 column chunks → scans ~3% of data
+
+Cost impact for 10 GB table:
+  CSV: 10 GB scanned × $5/TB = $0.05
+  Parquet: 0.3 GB scanned × $5/TB = $0.0015
+
+SAVINGS: 97% cost reduction</code></pre></div>
+<p>→ Converting CSV to Parquet is done by Glue ETL (Project 21)<br>
+→ This is one of the MOST impactful optimizations in the data lake</p>
+<p><strong>Columnar Format Comparison:</strong></p>
+<table><thead><tr><th>Format</th><th>Compression</th><th>Column Pruning</th><th>Predicate Pushdown</th><th>Athena Support</th></tr></thead><tbody><tr><td>CSV</td><td>None (unless gzipped)</td><td>❌ NO</td><td>❌ NO</td><td>✅ Full</td></tr><tr><td>JSON</td><td>None (unless gzipped)</td><td>❌ NO</td><td>❌ NO</td><td>✅ Full</td></tr><tr><td>Parquet</td><td>Built-in (Snappy/GZIP/ZSTD)</td><td>✅ YES</td><td>✅ YES</td><td>✅ Full</td></tr><tr><td>ORC</td><td>Built-in (ZLIB/Snappy)</td><td>✅ YES</td><td>✅ YES</td><td>✅ Full</td></tr><tr><td>Avro</td><td>Built-in (Deflate/Snappy)</td><td>❌ NO (row-based)</td><td>❌ NO</td><td>✅ Full</td></tr></tbody></table>
+<p>→ Parquet and ORC are the BEST formats for Athena<br>
+→ Parquet is more widely used → preferred choice</p>
+<p><strong>Predicate Pushdown:</strong></p>
+<p>→ With Parquet → Athena can push WHERE filters INTO the file reader<br>
+→ Each Parquet file has min/max statistics per column per row group<br>
+→ If WHERE amount &gt; 1000 and a row group's max(amount) = 500 → skip entire row group</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Parquet file row group statistics:
+</span>  Row Group 1: amount min=10, max=500     → WHERE amount &gt; 1000 → SKIP
+  Row Group 2: amount min=200, max=5000   → WHERE amount &gt; 1000 → READ (may contain matches)
+  Row Group 3: amount min=50, max=800     → WHERE amount &gt; 1000 → SKIP
+
+Result: Only 1 out of 3 row groups read → 67% less I/O</code></pre></div>
+<hr>
+<p><strong>Optimization 3: Compress CSV Files</strong></p>
+<p>→ If you MUST use CSV → compress with GZIP</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Uncompressed CSV: 10 GB → Athena scans 10 GB → $0.05
+</span>GZIP compressed CSV: 2 GB → Athena scans 2 GB → $0.01
+
+SAVINGS: 80% cost reduction</code></pre></div>
+<p>→ Athena natively reads: GZIP, BZIP2, LZ4, ZSTD, Snappy compressed files<br>
+→ No configuration needed → just upload compressed files → Athena auto-detects<br>
+→ Glue Crawler (Project 17) also auto-detects compression</p>
+<p>→ BUT: GZIP CSV still reads ALL columns (no column pruning) → Parquet is still better</p>
+<hr>
+<p><strong>Optimization 4: Optimal File Sizing</strong></p>
+<p>→ Athena performs best with files between 128 MB and 512 MB<br>
+→ Too many small files → excessive S3 LIST operations → slow<br>
+→ Too few large files → limited parallelism → slow</p>
+<table><thead><tr><th>File Size</th><th>Problem</th><th>Solution</th></tr></thead><tbody><tr><td>&lt; 10 MB (many small files)</td><td>Overhead per file exceeds read time</td><td>Combine into larger files</td></tr><tr><td>10-128 MB</td><td>Acceptable but not optimal</td><td>Consider combining</td></tr><tr><td>128-512 MB</td><td>OPTIMAL</td><td>Best balance of parallelism and overhead</td></tr><tr><td>&gt; 512 MB</td><td>Limited parallelism within single file</td><td>Split into smaller files</td></tr></tbody></table>
+<p>→ Glue ETL (Project 21) can coalesce small files into optimal sizes during transformation</p>
+<hr>
+<p><strong>Optimization 5: CTAS (Create Table As Select) for Materialized Results</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>-- Create a new optimized table from a complex query
+</span>CREATE TABLE shopnow_curated.monthly_revenue
+WITH (
+    format = 'PARQUET',
+    partitioned_by = ARRAY['year', 'month'],
+    external_location = 's3://shopnow-data-lake/curated/monthly_revenue/'
+) AS
+SELECT 
+    category,
+    SUM(total_amount) as revenue,
+    COUNT(*) as order_count,
+    year,
+    month
+FROM shopnow_raw.orders
+GROUP BY category, year, month;</code></pre></div>
+<p>→ CTAS creates a NEW table with query results stored in S3 as Parquet<br>
+→ The new table is registered in the Glue Catalog automatically<br>
+→ Subsequent queries on <code>monthly_revenue</code> are MUCH faster (pre-aggregated, Parquet, partitioned)<br>
+→ This is Athena's version of a "materialized view"</p>
+<hr>
+<p><strong>Cost Optimization Summary:</strong></p>
+<table><thead><tr><th>Optimization</th><th>Savings</th><th>Effort</th></tr></thead><tbody><tr><td>Partition pruning (WHERE on partition keys)</td><td>70-95%</td><td>Low (just add WHERE clause)</td></tr><tr><td>Parquet instead of CSV</td><td>80-97%</td><td>Medium (ETL conversion — Project 21)</td></tr><tr><td>GZIP compression on CSV</td><td>60-80%</td><td>Low (compress during upload)</td></tr><tr><td>Optimal file sizing (128-512 MB)</td><td>20-40%</td><td>Medium (ETL coalescing)</td></tr><tr><td>CTAS for repeated queries</td><td>90%+ for subsequent runs</td><td>Low (one-time CTAS query)</td></tr><tr><td>All combined</td><td>95-99%</td><td>Medium</td></tr></tbody></table>
+<p>→ A query that costs $5 on raw CSV can cost $0.05 on optimized Parquet → 100x cheaper</p>
+<hr>
+<h3>STEP 5 — ATHENA SQL CAPABILITIES AND LIMITATIONS</h3>
+<p><strong>Athena SQL Engine:</strong></p>
+<p>→ Athena uses Trino (formerly PrestoSQL) as its SQL engine<br>
+→ Supports ANSI SQL with extensions for complex analytics</p>
+<p><strong>Supported Operations:</strong></p>
+<table><thead><tr><th>Category</th><th>Examples</th></tr></thead><tbody><tr><td>Basic SELECT</td><td>SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, HAVING</td></tr><tr><td>JOINs</td><td>INNER, LEFT, RIGHT, FULL OUTER, CROSS, SEMI, ANTI</td></tr><tr><td>Subqueries</td><td>Correlated and non-correlated subqueries</td></tr><tr><td>Window functions</td><td>ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM OVER, AVG OVER</td></tr><tr><td>Aggregations</td><td>COUNT, SUM, AVG, MIN, MAX, STDDEV, VARIANCE, APPROX_DISTINCT</td></tr><tr><td>String functions</td><td>CONCAT, SUBSTR, TRIM, UPPER, LOWER, REGEXP_LIKE, REGEXP_EXTRACT</td></tr><tr><td>Date functions</td><td>DATE_PARSE, DATE_FORMAT, DATE_ADD, DATE_DIFF, CURRENT_DATE</td></tr><tr><td>JSON functions</td><td>JSON_EXTRACT, JSON_EXTRACT_SCALAR, JSON_PARSE</td></tr><tr><td>Array functions</td><td>UNNEST, ARRAY_AGG, CARDINALITY, CONTAINS, ELEMENT_AT</td></tr><tr><td>Type casting</td><td>CAST, TRY_CAST (returns NULL on failure instead of error)</td></tr><tr><td>CTEs</td><td>WITH clause (Common Table Expressions)</td></tr><tr><td>UNION</td><td>UNION ALL, UNION (with deduplication)</td></tr><tr><td>CTAS</td><td>CREATE TABLE AS SELECT</td></tr><tr><td>INSERT INTO</td><td>Insert results into existing table</td></tr><tr><td>Views</td><td>CREATE VIEW, CREATE OR REPLACE VIEW</td></tr></tbody></table>
+<p><strong>NOT Supported (Limitations):</strong></p>
+<table><thead><tr><th>Operation</th><th>Status</th><th>Alternative</th></tr></thead><tbody><tr><td>UPDATE</td><td>❌ Not supported</td><td>Create new table with corrected data (CTAS)</td></tr><tr><td>DELETE</td><td>❌ Not supported</td><td>Create new table excluding deleted rows (CTAS)</td></tr><tr><td>ALTER TABLE (add column)</td><td>⚠️ Limited</td><td>Update in Glue Catalog directly</td></tr><tr><td>Stored procedures</td><td>❌ Not supported</td><td>Use Step Functions + Lambda for orchestration</td></tr><tr><td>Triggers</td><td>❌ Not supported</td><td>Use S3 events + Lambda (Project 15)</td></tr><tr><td>Transactions (BEGIN/COMMIT)</td><td>❌ Not supported</td><td>Athena is read-mostly; use Athena ACID tables for limited writes</td></tr><tr><td>Indexes</td><td>❌ Not supported</td><td>Use partitioning and columnar format instead</td></tr><tr><td>Real-time queries</td><td>❌ Not designed for</td><td>Use Redshift (Project 16) or Kinesis Analytics</td></tr></tbody></table>
+<p>→ Athena is primarily a READ engine → writes via CTAS and INSERT INTO<br>
+→ For data modification → use Glue ETL (Project 21) or process outside Athena</p>
+<hr>
+<h3>STEP 6 — CREATE VIEWS AND SAVED QUERIES</h3>
+<p><strong>Views — Virtual Tables for Common Queries:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CREATE OR REPLACE VIEW shopnow_raw.v_recent_orders AS
+</span>SELECT 
+    o.order_id,
+    o.customer_id,
+    o.order_date,
+    o.total_amount,
+    o.order_status,
+    p.name as product_name,
+    p.category,
+    o.year,
+    o.month,
+    o.day
+FROM shopnow_raw.orders o
+LEFT JOIN shopnow_raw.products p ON o.product_id = p.product_id
+WHERE o.year &gt;= '2025';</code></pre></div>
+<p>→ View is stored in the Glue Catalog as a virtual table<br>
+→ Analysts query: <code>SELECT * FROM shopnow_raw.v_recent_orders WHERE category = 'Shoes'</code><br>
+→ No data duplication → view executes the underlying query each time<br>
+→ Simplifies complex JOINs for non-technical users</p>
+<p><strong>View Considerations:</strong></p>
+<table><thead><tr><th>Feature</th><th>Behavior</th></tr></thead><tbody><tr><td>Storage cost</td><td>ZERO — views don't store data</td></tr><tr><td>Query cost</td><td>Charged based on data scanned by the underlying query</td></tr><tr><td>Performance</td><td>Same as running the underlying query (no caching)</td></tr><tr><td>Schema changes</td><td>If underlying table changes → view may break → re-create</td></tr><tr><td>Sharing</td><td>Views are in Glue Catalog → visible to all users with access</td></tr><tr><td>Partitioning</td><td>Views can include partition filters → analysts get pre-filtered data</td></tr></tbody></table>
+<hr>
+<p><strong>Named Queries (Saved Queries):</strong></p>
+<p>→ Athena Console → "Saved queries" → "Create"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td>Daily Revenue Report</td></tr><tr><td>Description</td><td>Shows revenue by category for the current month</td></tr><tr><td>Database</td><td>shopnow_raw</td></tr><tr><td>Workgroup</td><td>shopnow-analytics</td></tr><tr><td>Query</td><td><code>SELECT category, SUM(total_amount) ... WHERE year = '2025' AND month = '01' ...</code></td></tr></tbody></table>
+<p>→ Saved queries are reusable templates<br>
+→ Analysts select from a list → modify parameters → run<br>
+→ Ensures consistency across the team → everyone uses the same query logic</p>
+<hr>
+<h3>STEP 7 — CONFIGURE WORKGROUPS FOR TEAM MANAGEMENT</h3>
+<p>→ Different teams have different needs → separate workgroups provide isolation</p>
+<p><strong>Create Additional Workgroups:</strong></p>
+<p><strong>Workgroup: <code>shopnow-data-engineering</code></strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-data-engineering</code></td></tr><tr><td>Result location</td><td><code>s3://shopnow-athena-results/data-engineering/</code></td></tr><tr><td>Per-query limit</td><td>10 GB (engineers run larger queries)</td></tr><tr><td>Workgroup daily limit</td><td>500 GB</td></tr><tr><td>Result format</td><td>Parquet (for downstream processing)</td></tr></tbody></table>
+<p><strong>Workgroup: <code>shopnow-executive</code></strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-executive</code></td></tr><tr><td>Result location</td><td><code>s3://shopnow-athena-results/executive/</code></td></tr><tr><td>Per-query limit</td><td>500 MB (executives run simple queries)</td></tr><tr><td>Workgroup daily limit</td><td>10 GB</td></tr><tr><td>Result format</td><td>CSV</td></tr></tbody></table>
+<p><strong>Workgroup Benefits:</strong></p>
+<table><thead><tr><th>Feature</th><th>How Workgroups Help</th></tr></thead><tbody><tr><td>Cost isolation</td><td>Each workgroup tracks its own data scanned → cost attribution per team</td></tr><tr><td>Cost control</td><td>Per-workgroup daily limits → prevent runaway costs</td></tr><tr><td>Query settings</td><td>Different result formats, locations, encryption per team</td></tr><tr><td>IAM integration</td><td>IAM policies can restrict users to specific workgroups</td></tr><tr><td>Metrics</td><td>CloudWatch metrics per workgroup → monitor each team's usage</td></tr></tbody></table>
+<p><strong>IAM Policy for Workgroup Access:</strong></p>
+<p>→ Restrict analysts to their workgroup:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowOnlyAnalyticsWorkgroup
+  Effect: Allow
+  Action:
+    - athena:StartQueryExecution
+    - athena:GetQueryExecution
+    - athena:GetQueryResults
+    - athena:StopQueryExecution
+    - athena:ListQueryExecutions
+  Resource:
+    - arn:aws:athena:ap-south-1:123456789012:workgroup/shopnow-analytics
+
+Statement:
+  Sid: DenyOtherWorkgroups
+  Effect: Deny
+  Action: athena:StartQueryExecution
+  Resource:
+    - arn:aws:athena:ap-south-1:123456789012:workgroup/shopnow-data-engineering</code></pre></div>
+<p>→ Analysts can only run queries in their workgroup → cost isolation enforced</p>
+<hr>
+<h3>STEP 8 — MONITOR QUERY PERFORMANCE AND COSTS</h3>
+<p><strong>CloudWatch Metrics for Athena (Enabled per Workgroup):</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Measures</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>TotalExecutionTime</td><td>Query duration in milliseconds</td><td>&gt; 300,000 ms (5 min) for dashboard queries</td></tr><tr><td>ProcessedBytes</td><td>Data scanned per query</td><td>&gt; 1 GB (per-query cost control)</td></tr><tr><td>DataScannedInBytes</td><td>Same as ProcessedBytes (aggregated)</td><td>Workgroup daily total &gt; 80% of limit</td></tr><tr><td>QueryPlanningTime</td><td>Time spent planning (reading catalog)</td><td>&gt; 10,000 ms (catalog issues)</td></tr><tr><td>QueryQueueTime</td><td>Time spent waiting in queue</td><td>&gt; 30,000 ms (concurrency limit hit)</td></tr><tr><td>EngineExecutionTime</td><td>Actual query processing time</td><td>Majority of TotalExecutionTime</td></tr><tr><td>ServiceProcessingTime</td><td>Athena overhead (result writing)</td><td>Usually small</td></tr></tbody></table>
+<p><strong>CloudWatch Alarms for Athena:</strong></p>
+<p><strong>Alarm: Workgroup Approaching Daily Limit</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>DataScannedInBytes (SUM over 24 hours)</td></tr><tr><td>Workgroup dimension</td><td>shopnow-analytics</td></tr><tr><td>Threshold</td><td>&gt; 85,899,345,920 (80 GB — 80% of 100 GB limit)</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td><code>shopnow-athena-daily-scan-high</code></td></tr></tbody></table>
+<p>→ Alert at 80% of daily limit → team can slow down or optimize queries before hitting the cap</p>
+<p><strong>Alarm: Slow Queries</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>TotalExecutionTime (p90)</td></tr><tr><td>Workgroup dimension</td><td>shopnow-analytics</td></tr><tr><td>Threshold</td><td>&gt; 60,000 ms (1 minute)</td></tr><tr><td>Datapoints</td><td>3 out of 5</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td><code>shopnow-athena-slow-queries</code></td></tr></tbody></table>
+<p>→ If 90th percentile query time &gt; 1 minute → investigate: missing partitions? CSV instead of Parquet? Huge result sets?</p>
+<hr>
+<p><strong>Query History and Cost Analysis:</strong></p>
+<p>→ Athena Console → "Recent queries" tab<br>
+→ Shows: Every query with execution time, data scanned, status</p>
+<table><thead><tr><th>Query</th><th>Data Scanned</th><th>Time</th><th>Cost</th></tr></thead><tbody><tr><td>SELECT * FROM orders WHERE year='2025'</td><td>1.3 GB</td><td>4.2s</td><td>$0.0065</td></tr><tr><td>SELECT COUNT(*) FROM clickstream</td><td>500 GB</td><td>45s</td><td>$2.50</td></tr><tr><td>SELECT * FROM orders LIMIT 10</td><td>5 MB</td><td>1.2s</td><td>$0.00005</td></tr></tbody></table>
+<p>→ The clickstream query (500 GB) is expensive → needs partition filter<br>
+→ Without <code>WHERE year=... AND month=...</code> → scans entire clickstream table</p>
+<p>→ Teach analysts: "Always include partition filters in WHERE clause — it saves money AND time"</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always include partition columns in WHERE clauses — partition pruning is the #1 cost optimization<br>
+→ Always use Parquet or ORC format for frequently queried data — column pruning saves 80-97%<br>
+→ Always configure workgroup data limits — prevents accidental full-table scans from costing hundreds<br>
+→ Always set query result location with lifecycle rules — auto-delete old results<br>
+→ Always enable CloudWatch metrics on workgroups — monitor cost and performance<br>
+→ Always compress CSV files with GZIP if Parquet conversion isn't possible yet<br>
+→ Always use CTAS for repeated complex queries — pre-compute and store as optimized Parquet<br>
+→ Always create views for common JOIN patterns — simplifies analyst workflow<br>
+→ Always use specific column names in SELECT — avoid <code>SELECT *</code> (reads all columns)<br>
+→ Always use <code>TRY_CAST</code> instead of <code>CAST</code> for unreliable data — prevents query failures<br>
+→ Always use saved queries for standard reports — consistency across team<br>
+→ Always configure separate workgroups per team — cost isolation and control</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never run <code>SELECT *</code> on large unpartitioned tables — scans everything → expensive<br>
+→ Never skip partition filters on partitioned tables — full scan is 10-100x more expensive<br>
+→ Never use Athena for frequent (hundreds/day) recurring dashboard queries — Redshift is cheaper at scale<br>
+→ Never store query results indefinitely — add lifecycle rules to auto-expire<br>
+→ Never use CSV for analytical tables when Parquet is possible — CSV reads all columns always<br>
+→ Never let all users share one workgroup — no cost isolation or control<br>
+→ Never run queries without understanding the data size — check table properties first<br>
+→ Never use <code>LIKE '%pattern%'</code> on non-partitioned string columns — forces full scan<br>
+→ Never assume query results persist forever — they're in S3 with lifecycle rules<br>
+→ Never create tables directly in Athena when Glue Crawler can automate it<br>
+→ Never ignore QueryQueueTime metrics — growing queue time means concurrency limits are being hit<br>
+→ Never use Athena for UPDATE/DELETE operations — it's a read-mostly engine</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>Ad-hoc exploration of S3 data</td><td>Athena (this project)</td></tr><tr><td>Recurring production dashboards on large data</td><td>Redshift (Project 16)</td></tr><tr><td>Query data without any loading/ETL</td><td>Athena</td></tr><tr><td>Query with sub-second response time</td><td>Redshift (data is local)</td></tr><tr><td>Zero infrastructure management</td><td>Athena (serverless)</td></tr><tr><td>Heavy JOINs across many tables</td><td>Redshift (optimized for complex JOINs)</td></tr><tr><td>5-10 queries per day</td><td>Athena (pay per query — cheapest)</td></tr><tr><td>500+ queries per day</td><td>Redshift (fixed cost — cheaper at scale)</td></tr><tr><td>Query streaming/real-time data</td><td>Kinesis Analytics or Redshift Streaming</td></tr><tr><td>Query RDS data from Athena</td><td>Athena Federated Query (Project 35)</td></tr><tr><td>Transform and write data</td><td>Glue ETL (Project 21) or Athena CTAS</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Athena for OLTP workloads (INSERT/UPDATE/DELETE per row) → Use RDS (Project 9)<br>
+→ Do NOT use Athena for sub-second dashboard queries → Use Redshift or ElastiCache<br>
+→ Do NOT use Athena for high-concurrency workloads (100+ simultaneous queries) → Use Redshift with concurrency scaling<br>
+→ Do NOT use Athena for real-time streaming analysis → Use Kinesis Analytics<br>
+→ Do NOT use Athena as a data transformation tool → Use Glue ETL (Project 21) for large-scale transforms<br>
+→ Do NOT use Athena when the same query runs hundreds of times daily → Redshift is more cost-effective</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → HOW ATHENA EXECUTES A QUERY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Analyst submits: SELECT category, SUM(amount) FROM orders WHERE year='2024' GROUP BY category
+</span>        │
+        ▼
+Step 1: QUERY SUBMISSION
+        Athena receives the SQL text
+        Validates syntax
+        Checks IAM permissions: athena:StartQueryExecution, glue:GetTable, s3:GetObject
+        │
+        ▼
+Step 2: QUERY PLANNING
+        │
+        ├── Athena calls Glue Catalog:
+        │   GetTable("shopnow_raw", "orders")
+        │   → Returns: columns, types, format (CSV), SerDe, location, partition keys
+        │
+        ├── Athena calls Glue Catalog:
+        │   GetPartitions(filter: year='2024')
+        │   → Returns: 365 partition locations (all days in 2024)
+        │
+        ├── Athena creates execution plan:
+        │   → Scan 365 S3 files
+        │   → Parse CSV using LazySimpleSerDe
+        │   → Project only: category, amount (but CSV reads all columns)
+        │   → Filter: (partition pruning already applied)
+        │   → Aggregate: GROUP BY category, SUM(amount)
+        │   → Sort: ORDER BY (if specified)
+        │
+        └── Plan distributed across Athena workers
+        │
+        ▼
+Step 3: QUERY EXECUTION (Distributed)
+        │
+        ├── Athena allocates WORKERS from a shared pool
+        │   (You don't control the number — Athena auto-scales)
+        │
+        ├── Worker 1: Reads S3 files for partitions day=01 to day=73
+        │   → Parses CSV → Extracts category + amount → Partial aggregation
+        │   → Sends partial result: {Shoes: 5M, Electronics: 8M, ...}
+        │
+        ├── Worker 2: Reads S3 files for partitions day=74 to day=146
+        │   → Same process → partial result
+        │
+        ├── Worker 3-5: Similar parallel processing
+        │
+        └── All workers process SIMULTANEOUSLY
+        │
+        ▼
+Step 4: RESULT AGGREGATION
+        Coordinator worker receives all partial results
+        Merges: {Shoes: 5M+4.8M+5.2M+..., Electronics: ...}
+        Applies final ORDER BY
+        │
+        ▼
+Step 5: RESULT STORAGE
+        Writes result to: s3://shopnow-athena-results/shopnow-analytics/{query-id}.csv
+        Writes metadata to: s3://.../{query-id}.csv.metadata
+        │
+        ▼
+Step 6: RESULT DELIVERY
+        Returns result to console/API
+        Records metrics: data scanned, execution time, cost
+        │
+        ▼
+Step 7: BILLING
+        Data scanned: 4.5 GB (365 days × ~12 MB average per day)
+        Cost: 4.5 GB × $5/TB = $0.0225
+        Minimum charge: 10 MB per query</code></pre></div>
+<hr>
+<h3>2 → HOW PARTITION PRUNING WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TABLE: orders
+</span>  Partition keys: year (string), month (string), day (string)
+  Total partitions: 380
+
+QUERY: WHERE year = '2024' AND month = '12'
+
+Step 1: Athena calls GetPartitions with filter expression
+        Filter: year = '2024' AND month = '12'
+        │
+        ▼
+Step 2: Glue Catalog evaluates filter against partition index
+        │
+        ├── Total partitions: 380
+        ├── Matching: year='2024' AND month='12' → 31 partitions (Dec 1-31)
+        └── Returns: 31 partition locations
+        │
+        ▼
+Step 3: Athena generates S3 file list from 31 partition locations
+        Each partition → 1 S3 file → 31 files total
+        │
+        ▼
+Step 4: Athena scans ONLY these 31 files
+        Ignores: 349 other partitions (92% of data skipped)
+
+WITHOUT partition filter:
+  Athena calls GetPartitions without filter → ALL 380 partitions → ALL files scanned
+  12x more data → 12x more cost → 12x slower</code></pre></div>
+<hr>
+<h3>3 → HOW ATHENA READS DIFFERENT FORMATS</h3>
+<p><strong>CSV Reading:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 File: orders-20240115.csv
+</span>  order_id,customer_id,order_date,category,amount,...
+  1,5678,2024-01-15,Shoes,999,...
+  2,9012,2024-01-15,Electronics,2499,...
+
+Athena process:
+  1. Read entire file (cannot skip columns in CSV)
+  2. Parse using LazySimpleSerDe with comma delimiter
+  3. Cast each value to catalog-defined type
+  4. Project only needed columns (discard unused AFTER reading)
+  5. Apply remaining filters (WHERE, HAVING)
+
+Data scanned: ENTIRE file size (all columns)</code></pre></div>
+<p><strong>Parquet Reading:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 File: click-20240115-00.parquet
+</span>  Column chunks: session_id, user_id, page_url, device_type, timestamp, ...
+
+Athena process:
+  1. Read Parquet footer (metadata: column locations, statistics)
+  2. Identify needed columns: device_type, session_id, time_on_page
+  3. Read ONLY those column chunks (skip all other columns)
+  4. For each row group: check min/max statistics
+     → If predicate pushdown can eliminate row group → skip
+  5. Decompress read column chunks
+  6. Apply remaining filters
+
+Data scanned: ONLY the bytes of needed columns
+  → 3 columns out of 35 → ~8.5% of file size</code></pre></div>
+<p><strong>JSON Reading:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 File: products-snapshot-202501.json
+</span>  {"product_id": 1, "name": "Running Shoes", "category": "Shoes", "price": 999}
+  {"product_id": 2, "name": "Laptop Pro", "category": "Electronics", "price": 45999}
+
+Athena process:
+  1. Read entire file (JSON is row-based — cannot skip fields efficiently)
+  2. Parse each line as JSON using JsonSerDe
+  3. Extract fields matching catalog columns
+  4. Apply filters
+
+Data scanned: ENTIRE file size (similar to CSV — row-based format)</code></pre></div>
+<p>→ Parquet/ORC = columnar → reads only needed columns → CHEAP<br>
+→ CSV/JSON = row-based → reads everything → EXPENSIVE<br>
+→ This is why converting to Parquet (Project 21) is so important</p>
+<hr>
+<h3>4 → ATHENA PRICING DEEP DIVE</h3>
+<table><thead><tr><th>Component</th><th>Cost</th></tr></thead><tbody><tr><td>Data scanned per query</td><td>$5.00 per TB</td></tr><tr><td>Minimum charge per query</td><td>10 MB ($0.00005)</td></tr><tr><td>Cancelled queries</td><td>Charged for data already scanned before cancellation</td></tr><tr><td>Failed queries</td><td>Charged for data scanned before failure</td></tr><tr><td>DDL queries (CREATE TABLE, DROP TABLE)</td><td>FREE</td></tr><tr><td>Queries that scan no data (e.g., SHOW TABLES)</td><td>FREE</td></tr><tr><td>CTAS and INSERT INTO</td><td>$5.00 per TB of source data scanned</td></tr><tr><td>Query result storage</td><td>Standard S3 storage rates</td></tr></tbody></table>
+<p><strong>Cost Reduction Levers:</strong></p>
+<table><thead><tr><th>Lever</th><th>Reduction</th><th>How</th></tr></thead><tbody><tr><td>Partition pruning</td><td>70-95%</td><td>WHERE on partition columns</td></tr><tr><td>Columnar format (Parquet)</td><td>80-97%</td><td>ETL conversion (Project 21)</td></tr><tr><td>Compression</td><td>60-80%</td><td>GZIP CSV or Parquet compression</td></tr><tr><td>Column selection</td><td>20-50%</td><td>SELECT specific columns, not <code>*</code></td></tr><tr><td>CTAS materialization</td><td>90%+ on repeat queries</td><td>Pre-compute and store results</td></tr><tr><td>All combined</td><td>95-99.5%</td><td>Full optimization stack</td></tr></tbody></table>
+<p><strong>ShopNow Monthly Cost Estimate (Optimized):</strong></p>
+<table><thead><tr><th>Workgroup</th><th>Queries/Day</th><th>Avg Data/Query</th><th>Monthly Data Scanned</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>shopnow-analytics</td><td>50</td><td>200 MB</td><td>300 GB</td><td>$1.50</td></tr><tr><td>shopnow-data-engineering</td><td>20</td><td>2 GB</td><td>1.2 TB</td><td>$6.00</td></tr><tr><td>shopnow-executive</td><td>10</td><td>50 MB</td><td>15 GB</td><td>$0.075</td></tr><tr><td><strong>Total</strong></td><td></td><td></td><td><strong>~1.5 TB</strong></td><td><strong>~$7.58/month</strong></td></tr></tbody></table>
+<p>→ Compare to Redshift: ~₹1,30,000/month vs Athena: ~₹630/month<br>
+→ For ShopNow's current query volume → Athena is 200x cheaper<br>
+→ As query volume grows → Redshift becomes more cost-effective</p>
+<hr>
+<h3>5 → ATHENA LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>Concurrent queries per account</td><td>25 (DML) + 20 (DDL)</td></tr><tr><td>Query timeout</td><td>30 minutes</td></tr><tr><td>Query string length</td><td>262,144 bytes (256 KB)</td></tr><tr><td>Query result size</td><td>No hard limit (stored in S3)</td></tr><tr><td>Databases per catalog</td><td>10,000 (Glue Catalog limit)</td></tr><tr><td>Tables per database</td><td>1,000,000 (Glue Catalog limit)</td></tr><tr><td>Partitions per table</td><td>10,000,000 (Glue Catalog limit)</td></tr><tr><td>Columns per table</td><td>100 (Athena limit — lower than Glue's 400)</td></tr><tr><td>Workgroups per account</td><td>1,000</td></tr><tr><td>Saved queries per account</td><td>1,000</td></tr><tr><td>Query history retention</td><td>45 days</td></tr><tr><td>CTAS result partitions</td><td>100 per query</td></tr></tbody></table>
+<p>→ 25 concurrent DML queries is the most common limit hit<br>
+→ Request increase via Service Quotas if needed<br>
+→ Workgroups don't increase the total — they share the account limit</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>SELECT * on unpartitioned table</td><td>Scans entire table → expensive, slow</td><td>Always SELECT specific columns, always use partition filters</td></tr><tr><td>2</td><td>No partition filter on partitioned table</td><td>Scans all partitions → 10-100x more expensive</td><td>Always include partition keys in WHERE clause</td></tr><tr><td>3</td><td>Using CSV when Parquet is possible</td><td>Reads all columns → 10-30x more data scanned</td><td>Convert to Parquet via Glue ETL (Project 21)</td></tr><tr><td>4</td><td>No workgroup data limits</td><td>Single bad query scans 10 TB → $50 charge</td><td>Set per-query and per-workgroup data limits</td></tr><tr><td>5</td><td>Query results accumulating in S3</td><td>Storage costs grow over months</td><td>Add lifecycle rule to auto-delete old results</td></tr><tr><td>6</td><td>Athena columns don't match Glue Catalog</td><td>"HIVE_BAD_DATA" error → query fails</td><td>Verify Glue Catalog schema matches actual data</td></tr><tr><td>7</td><td>Date columns inferred as strings by crawler</td><td>Can't use date functions (DATE_ADD, DATE_DIFF)</td><td>CAST to DATE in queries or fix Glue Catalog column type</td></tr><tr><td>8</td><td>Many small files (&lt; 10 MB each)</td><td>Slow queries due to S3 LIST overhead</td><td>Coalesce small files via Glue ETL (Project 21)</td></tr><tr><td>9</td><td>Concurrent query limit hit</td><td>Queries queued → analysts wait → frustration</td><td>Request limit increase or stagger query schedules</td></tr><tr><td>10</td><td>Partition values as strings vs integers</td><td>WHERE month = 1 doesn't match partition month = '01'</td><td>Use string comparison: WHERE month = '01'</td></tr><tr><td>11</td><td>Missing new partitions in catalog</td><td>Query returns no data for recent dates → analysts think data is missing</td><td>Run crawler or MSCK REPAIR TABLE (Project 17)</td></tr><tr><td>12</td><td>Using CAST instead of TRY_CAST</td><td>Malformed data → entire query fails</td><td>Use TRY_CAST → returns NULL instead of failing</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Query Scalability</strong></p>
+<ul>
+<li>Athena auto-scales workers per query → larger data = more workers</li>
+<li>No provisioning needed → handles 1 MB or 1 TB transparently</li>
+<li>Concurrent query limit (25) is the bottleneck → request increase for heavy usage</li>
+<li>Workgroup isolation doesn't increase total concurrency</li>
+</ul>
+<p>→ <strong>Data Volume Scalability</strong></p>
+<ul>
+<li>Athena can query petabytes of data in S3</li>
+<li>Performance scales with: partitioning, columnar format, compression</li>
+<li>No data loading required → query new data immediately after it lands in S3</li>
+<li>Catalog supports millions of tables and billions of partitions</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Cost scales linearly with data scanned (not data stored)</li>
+<li>Optimization reduces cost sub-linearly → more data but smarter queries</li>
+<li>At very high query volumes → Redshift becomes more cost-effective</li>
+<li>Hybrid: Use Athena for ad-hoc, Redshift for production dashboards</li>
+</ul>
+<p>→ <strong>Team Scalability</strong></p>
+<ul>
+<li>Workgroups isolate teams → add workgroups as teams grow</li>
+<li>IAM controls who can query which databases/tables</li>
+<li>Views simplify access for non-technical users</li>
+<li>Saved queries ensure consistency across the team</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify Athena is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Workgroup configured</td><td>Athena Console → Workgroups → Verify settings</td></tr><tr><td>Query result location set</td><td>Workgroup settings → Result location → S3 path exists</td></tr><tr><td>Glue Catalog tables visible</td><td>Athena Console → Database selector → Tables listed</td></tr><tr><td>Simple query works</td><td>Run <code>SELECT 1</code> → returns 1</td></tr><tr><td>Table query works</td><td>Run <code>SELECT * FROM table LIMIT 10</code> → returns data</td></tr><tr><td>Partitions recognized</td><td>Run query with partition filter → data scanned is reduced</td></tr><tr><td>Cost tracking works</td><td>CloudWatch → Athena metrics → DataScannedInBytes &gt; 0</td></tr></tbody></table>
+<p>→ <strong>How to debug "query failed":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Read the error message
+</span>        Athena Console → Recent queries → Click failed query → Error details
+        Common errors:
+          - "HIVE_METASTORE_ERROR" → Glue Catalog issue (table/partition missing)
+          - "HIVE_BAD_DATA" → Data doesn't match catalog schema
+          - "HIVE_CANNOT_OPEN_SPLIT" → S3 access denied or file not found
+          - "GENERIC_USER_ERROR" → SQL syntax error
+          - "EXCEEDED_MEMORY_LIMIT" → Query too complex for available memory
+
+STEP 2: For "HIVE_BAD_DATA"
+        Data format doesn't match SerDe definition
+        → Check if files are actually CSV/Parquet/JSON as catalog says
+        → Check delimiter: is it comma, tab, or pipe?
+        → Re-run crawler to refresh schema
+
+STEP 3: For "HIVE_CANNOT_OPEN_SPLIT"
+        → S3 files missing at the cataloged location
+        → IAM role doesn't have s3:GetObject permission
+        → KMS encryption without proper decrypt permissions
+        → Check: Does the S3 path still contain data?
+
+STEP 4: For "EXCEEDED_MEMORY_LIMIT"
+        → Query is too complex (too many JOINs, too large GROUP BY)
+        → Break into smaller queries using CTAS (materialize intermediate results)
+        → Add more restrictive WHERE clauses to reduce data
+
+STEP 5: For access denied
+        → Check IAM permissions: athena:StartQueryExecution
+        → Check S3 permissions: s3:GetObject on data location
+        → Check S3 permissions: s3:PutObject on result location
+        → Check Glue permissions: glue:GetTable, glue:GetPartitions
+        → Check workgroup access: correct workgroup selected
+
+STEP 6: For missing data (query returns empty)
+        → Are partitions registered for the date you're querying?
+        → Run MSCK REPAIR TABLE or check Glue Catalog partitions
+        → Is the partition filter correct? (string '01' vs integer 1)</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Athena is SERVERLESS SQL on S3 — zero infrastructure, pay per query, instant availability<br>
+→ It reads table definitions from the Glue Data Catalog (Project 17) — the catalog is the bridge<br>
+→ PARTITION PRUNING is the #1 cost optimization — always include partition columns in WHERE<br>
+→ COLUMNAR FORMAT (Parquet) is the #2 optimization — reads only needed columns → 80-97% savings<br>
+→ Workgroups provide team isolation, cost control, and monitoring<br>
+→ Athena is cheapest for LOW query volumes — Redshift is cheaper at HIGH volumes<br>
+→ CTAS creates materialized results as optimized Parquet — accelerates repeated queries<br>
+→ Athena is primarily a READ engine — writes via CTAS and INSERT INTO only<br>
+→ Query results are stored in S3 — add lifecycle rules to manage storage</p>
+<p>→ Connection to Project 17: Glue Data Catalog provides ALL metadata for Athena</p>
+<ul>
+<li>Without the catalog → Athena has no table definitions → can't query anything</li>
+<li>Crawlers (Project 17) auto-discover schemas → Athena auto-sees new tables</li>
+<li>Partition management (Project 17) directly affects Athena query cost and performance</li>
+</ul>
+<p>→ Connection to Project 1: S3 is the actual data store — Athena reads FROM S3</p>
+<ul>
+<li>S3 durability (11 9s) protects the data</li>
+<li>S3 storage classes (Project 12) don't affect Athena queries (reads from any class except Deep Archive)</li>
+</ul>
+<p>→ Connection to Project 16: Athena complements Redshift</p>
+<ul>
+<li>Athena: Ad-hoc, low-volume, serverless</li>
+<li>Redshift: Production dashboards, high-volume, managed cluster</li>
+<li>Both use the same Glue Catalog → same table definitions</li>
+</ul>
+<p>→ Connection to Project 11: IAM permissions control Athena access</p>
+<ul>
+<li><code>athena:StartQueryExecution</code> — run queries</li>
+<li><code>glue:GetTable</code>, <code>glue:GetPartitions</code> — read catalog</li>
+<li><code>s3:GetObject</code> — read data files</li>
+<li><code>s3:PutObject</code> — write query results</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 21: Glue ETL converts CSV to Parquet → Athena queries become 10-100x cheaper</li>
+<li>Project 25: End-to-end pipeline: S3 → Crawler → Catalog → Athena</li>
+<li>Project 28: Redshift Spectrum also uses Glue Catalog (same metadata)</li>
+<li>Project 35: Athena Federated Query to RDS MariaDB (query databases from Athena)</li>
+<li>Project 51: Enterprise Data Lake with Athena as the primary query engine</li>
+<li>Project 52: Kinesis → S3 → Athena for near-real-time analytics</li>
+<li>Project 59: API Gateway → Lambda → Athena → QuickSight for full analytics platform</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has Athena for serverless SQL queries on S3 data<br>
+→ But the operations team says: "The web server EC2 instances are generating application logs"<br>
+→ These logs contain: error messages, request traces, performance metrics<br>
+→ Currently → logs are on the EC2 local disk → when the instance is terminated → logs are LOST<br>
+→ And CloudWatch basic monitoring (Project 8) doesn't show: memory utilization, disk usage, custom application metrics</p>
+<p>→ The team needs:</p>
+<ol>
+<li>Application logs shipped from EC2 to a CENTRALIZED location (CloudWatch Logs)</li>
+<li>Memory and disk metrics published to CloudWatch (not available by default — Project 8 limitation)</li>
+<li>Custom application metrics (request count, error rate) visible in dashboards</li>
+</ol>
+<p>→ <strong>This is exactly what Project 19 solves</strong><br>
+→ Project 19 introduces CloudWatch Logs and the CloudWatch Agent<br>
+→ The agent runs INSIDE the EC2 instance (unlike hypervisor-level basic monitoring)<br>
+→ It collects: logs, memory, disk, custom metrics → publishes to CloudWatch<br>
+→ It uses the IAM Role (Project 11) for authentication → no credentials on the instance<br>
+→ Logs can be analyzed with CloudWatch Logs Insights or exported to S3 → queried with Athena (this project)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 19: "The Application Logs Nobody Could Find — CloudWatch Logs from EC2 via Agent"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-17.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 18/60</span></div><a class="nav-btn next" href="project-19.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

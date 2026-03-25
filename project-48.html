@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 48: THE REDSHIFT CLUSTER THAT NEEDED LIVE OPERATIONAL DATA — Redshift Fe — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 48: THE REDSHIFT CLUSTER THAT NEEDED LIVE OPERATIONAL DATA — Redshift Federated Query to RDS MariaDB</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's data architecture now has two major data stores:</p>
+<p><strong>Store 1 — Redshift Data Warehouse (Account B)</strong><br>
+→ Set up in Project 16, loaded via COPY in Project 22<br>
+→ Contains 3 years of historical transaction data (1+ billion rows)<br>
+→ Optimized for analytical queries — aggregations, trend analysis, pattern detection<br>
+→ Data is loaded nightly via Glue ETL (Project 24, 46)<br>
+→ Latest data is always 24 hours old (yesterday's transactions)</p>
+<p><strong>Store 2 — MariaDB Operational Database (Account B)</strong><br>
+→ Set up in Project 9, connected to EC2 in Project 14<br>
+→ Contains LIVE transaction data — updated in real-time as payments happen<br>
+→ Optimized for transactional queries — INSERT, UPDATE, SELECT by primary key<br>
+→ Contains current transaction STATUS (pending, processing, completed, failed, reversed)</p>
+<p><strong>The Current Data Flow:</strong></p>
+<code>Live Transaction → MariaDB (real-time) → Glue ETL (nightly) → S3 → COPY → Redshift (24h delay)</code>
+<p><strong>The Business Problem:</strong></p>
+<p>→ The fraud team runs a critical query every hour:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>"For each customer who had a high-risk transaction in the LAST 3 YEARS (Redshift),
+</span> show me their CURRENT pending transactions and LIVE status (MariaDB)"</code></pre></div>
+<p>→ This requires JOINING:</p>
+<ul>
+<li>Redshift <code>historical_risk_scores</code> table (3 years, 1B rows) — only in Redshift</li>
+<li>MariaDB <code>transactions</code> table (live status) — only in MariaDB</li>
+</ul>
+<p><strong>Current Workaround:</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Time</th><th>Problem</th></tr></thead><tbody><tr><td>1</td><td>Export MariaDB transactions to S3 via Glue</td><td>45 minutes</td><td>Data is stale by the time export completes</td></tr><tr><td>2</td><td>COPY S3 data into Redshift staging table</td><td>15 minutes</td><td>Additional storage cost in Redshift</td></tr><tr><td>3</td><td>Run JOIN query in Redshift</td><td>2 minutes</td><td>Query runs on 1-hour-old data, not live</td></tr><tr><td>4</td><td>Drop staging table</td><td>1 minute</td><td>Cleanup overhead</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~63 minutes</strong></td><td><strong>Data is 1+ hour stale by the time results are available</strong></td></tr></tbody></table>
+<p>→ The fraud team says: "We need this in REAL-TIME — a single query that joins Redshift history with MariaDB LIVE data"<br>
+→ They cannot wait 63 minutes — fraud decisions must happen within seconds<br>
+→ They don't want to replicate all MariaDB data into Redshift — it's constantly changing</p>
+<p>→ The data architect says: "We need Redshift to reach INTO MariaDB and query it directly — without moving data"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the options for querying external data from Redshift</p>
+<table><thead><tr><th>Option</th><th>What It Does</th><th>Data Movement</th><th>Latency</th><th>Best For</th></tr></thead><tbody><tr><td>COPY from S3 (Project 22)</td><td>Loads data INTO Redshift</td><td>Full copy — data moves</td><td>High (batch)</td><td>Bulk historical loads</td></tr><tr><td>Redshift Spectrum (Project 28)</td><td>Queries S3 data without loading</td><td>No movement — reads S3 in place</td><td>Medium</td><td>Data lake queries</td></tr><tr><td>Redshift Federated Query</td><td>Queries RDS/Aurora directly from Redshift</td><td>No movement — live query</td><td>Low (real-time)</td><td>Live operational data joins</td></tr><tr><td>Glue ETL (Project 24, 46)</td><td>Extracts data from MariaDB to S3/Redshift</td><td>Full or incremental copy</td><td>High (batch)</td><td>Scheduled ETL pipelines</td></tr></tbody></table>
+<p>→ Redshift Federated Query is the ONLY option that provides LIVE access to MariaDB without data movement<br>
+→ It allows Redshift to execute a query that JOINs local Redshift tables with remote MariaDB tables in a SINGLE SQL statement</p>
+<p><strong>How Federated Query Works (Conceptual):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift Cluster                              RDS MariaDB
+</span>    |                                              |
+    | SELECT r.customer_id, r.risk_score,          |
+    |        m.status, m.amount                    |
+    | FROM redshift_schema.historical_risk r       |
+    | JOIN mariadb_schema.transactions m            |
+    |   ON r.customer_id = m.customer_id           |
+    | WHERE r.risk_score &gt; 0.8                     |
+    |   AND m.status = 'pending'                   |
+    |                                              |
+    ↓                                              |
+    Redshift processes local table scan             |
+    (historical_risk — 1B rows, filtered to        |
+    high-risk customers)                           |
+    |                                              |
+    ↓                                              |
+    Redshift sends filtered query to ──────────→   MariaDB
+    MariaDB (only for matching customer_ids)       |
+    |                                              |
+    |  ←──────────────────────────────────────────  MariaDB returns
+    |                                              matching rows
+    ↓                                              
+    Redshift joins results locally                 
+    Returns final result set                       </code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Store MariaDB credentials in Secrets Manager</li>
+<li>Step 2 — Create an IAM Role for Redshift Federated Query</li>
+<li>Step 3 — Configure network connectivity (Redshift → MariaDB)</li>
+<li>Step 4 — Create External Schema in Redshift pointing to MariaDB</li>
+<li>Step 5 — Query MariaDB tables from Redshift</li>
+<li>Step 6 — Execute cross-database JOINs</li>
+<li>Step 7 — Understand query pushdown optimization</li>
+<li>Step 8 — Monitor and optimize federated query performance</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — STORE MARIADB CREDENTIALS IN SECRETS MANAGER</h3>
+<p>→ From Project 37, Secrets Manager stores database credentials securely<br>
+→ Redshift Federated Query requires credentials stored in Secrets Manager — it CANNOT use hardcoded credentials</p>
+<p>→ Navigate to Secrets Manager Console → Store a new secret</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Secret type</td><td>Credentials for Amazon RDS database</td><td>Pre-built template for RDS credentials</td></tr><tr><td>Username</td><td><code>redshift_reader</code></td><td>Dedicated read-only MariaDB user for Redshift</td></tr><tr><td>Password</td><td>(strong generated password)</td><td>Auto-generated by Secrets Manager</td></tr><tr><td>Encryption key</td><td>aws/secretsmanager (default) or custom KMS key (from Project 36)</td><td>Encryption at rest</td></tr><tr><td>Database</td><td>Select the RDS MariaDB instance</td><td>Associates secret with specific RDS instance</td></tr></tbody></table>
+<p>→ Secret name: <code>payscale/redshift/mariadb-federated-creds</code><br>
+→ ARN: <code>arn:aws:secretsmanager:ap-south-1:222222222222:secret:payscale/redshift/mariadb-federated-creds-AbCdEf</code></p>
+<p><strong>Why a Dedicated Read-Only MariaDB User?</strong></p>
+<p>→ The Redshift federated query user should have MINIMAL permissions on MariaDB<br>
+→ It should NEVER have INSERT, UPDATE, DELETE permissions<br>
+→ This prevents Redshift from accidentally modifying operational data</p>
+<p><strong>MariaDB User Configuration (DBA performs this on MariaDB):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Username</td><td><code>redshift_reader</code></td><td>Descriptive name indicating purpose</td></tr><tr><td>Host</td><td><code>10.1.%</code> (Account B VPC CIDR range)</td><td>Restrict connections to VPC only</td></tr><tr><td>Privileges</td><td>SELECT only on specific tables</td><td>Read-only access</td></tr><tr><td>Database access</td><td><code>payscale_prod.transactions</code>, <code>payscale_prod.customers</code></td><td>Only tables Redshift needs</td></tr></tbody></table>
+<p>→ The principle of least privilege applies to database users too<br>
+→ Never use the MariaDB root/admin user for federated queries</p>
+<hr>
+<h3>STEP 2 — CREATE IAM ROLE FOR REDSHIFT FEDERATED QUERY</h3>
+<p>→ Redshift needs an IAM role with TWO sets of permissions:</p>
+<ol>
+<li>Access to Secrets Manager to retrieve MariaDB credentials</li>
+<li>Network access (handled by VPC/SG, not IAM — but the role must be associated with Redshift)</li>
+</ol>
+<p>→ Navigate to IAM Console → Roles → Create Role</p>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity type</td><td>AWS service</td></tr><tr><td>Service</td><td>Redshift</td></tr><tr><td>Use case</td><td>Redshift - Customizable</td></tr></tbody></table>
+<p>→ This allows the Redshift SERVICE to assume this role</p>
+<p><strong>Permission Policy 1 — Secrets Manager Access:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td><code>arn:aws:secretsmanager:ap-south-1:222222222222:secret:payscale/redshift/mariadb-federated-creds-*</code></td><td>Retrieve DB credentials</td></tr><tr><td><code>secretsmanager:DescribeSecret</code></td><td>Same ARN</td><td>Describe secret metadata</td></tr></tbody></table>
+<p><strong>Permission Policy 2 — S3 Access (if the role also needs Spectrum — from Project 28):</strong></p>
+<p>→ If this role is ALSO used for Redshift Spectrum → include S3 permissions<br>
+→ If separate roles are used → keep this role focused on Secrets Manager only</p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::payscale-curated/*</code></td><td>Only if also used for Spectrum</td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::payscale-curated</code></td><td>Only if also used for Spectrum</td></tr></tbody></table>
+<p><strong>Permission Policy 3 — Glue Catalog Access (if using Spectrum):</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>glue:GetTable</code></td><td><code>arn:aws:glue:ap-south-1:222222222222:*</code></td><td>Only if also used for Spectrum</td></tr><tr><td><code>glue:GetDatabase</code></td><td>Same</td><td>Only if also used for Spectrum</td></tr></tbody></table>
+<p>→ Role name: <code>RedshiftFederatedQueryRole</code><br>
+→ ARN: <code>arn:aws:iam::222222222222:role/RedshiftFederatedQueryRole</code></p>
+<p><strong>Associate Role with Redshift Cluster:</strong></p>
+<p>→ Navigate to Redshift Console → Clusters → Select cluster → Actions → Manage IAM roles<br>
+→ Add <code>RedshiftFederatedQueryRole</code> to the cluster's associated IAM roles<br>
+→ Click "Save changes"</p>
+<p><strong>Why the role must be associated with the cluster:</strong><br>
+→ Redshift can only assume roles that are explicitly associated with it<br>
+→ Even if the role's trust policy allows Redshift → the cluster won't use it unless associated<br>
+→ This is a safety mechanism — prevents one cluster from using another cluster's roles</p>
+<p><strong>Multiple Roles on One Cluster:</strong></p>
+<table><thead><tr><th>Role</th><th>Purpose</th><th>Already Associated?</th></tr></thead><tbody><tr><td><code>RedshiftS3CopyRole</code> (from Project 22)</td><td>COPY/UNLOAD to S3</td><td>✅ Yes</td></tr><tr><td><code>RedshiftSpectrumRole</code> (from Project 28)</td><td>Query S3 via Spectrum</td><td>✅ Yes</td></tr><tr><td><code>RedshiftFederatedQueryRole</code> (this project)</td><td>Query MariaDB via federation</td><td>✅ Now associated</td></tr></tbody></table>
+<p>→ A Redshift cluster can have up to 50 associated IAM roles<br>
+→ Each external schema specifies WHICH role to use</p>
+<hr>
+<h3>STEP 3 — CONFIGURE NETWORK CONNECTIVITY (REDSHIFT → MARIADB)</h3>
+<p><strong>Network Requirement:</strong><br>
+→ Redshift cluster must be able to reach MariaDB on TCP port 3306<br>
+→ Both are in Account B's VPC (10.1.0.0/16) — from Project 5, 16, 9</p>
+<p><strong>Subnet Layout (from previous projects):</strong></p>
+<table><thead><tr><th>Resource</th><th>Subnet</th><th>CIDR</th></tr></thead><tbody><tr><td>Redshift Cluster</td><td>subnet-private-1a, subnet-private-1b</td><td>10.1.2.0/24, 10.1.3.0/24</td></tr><tr><td>RDS MariaDB</td><td>subnet-db-1a, subnet-db-1b</td><td>10.1.4.0/24, 10.1.5.0/24</td></tr></tbody></table>
+<p>→ Both are in the SAME VPC → Routing is automatic via the "local" route (from Project 5)<br>
+→ No NAT Gateway or VPC Peering needed (both same VPC, same account)</p>
+<p><strong>Security Group Configuration:</strong></p>
+<p><strong>Redshift Security Group (sg-redshift):</strong></p>
+<table><thead><tr><th>Rule</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Purpose</th></tr></thead><tbody><tr><td>Outbound (existing)</td><td>TCP</td><td>443</td><td>0.0.0.0/0</td><td>S3 access via VPC Endpoint (from Project 27)</td></tr><tr><td><strong>Outbound (NEW)</strong></td><td><strong>TCP</strong></td><td><strong>3306</strong></td><td><strong>sg-rds-mariadb</strong></td><td><strong>Redshift → MariaDB for federated query</strong></td></tr></tbody></table>
+<p><strong>RDS MariaDB Security Group (sg-rds-mariadb):</strong></p>
+<table><thead><tr><th>Rule</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>Inbound (existing from Project 14)</td><td>TCP</td><td>3306</td><td>sg-application-servers</td><td>EC2 apps → MariaDB</td></tr><tr><td>Inbound (existing from Project 45)</td><td>TCP</td><td>3306</td><td>sg-lambda-fraud-scoring</td><td>Lambda → MariaDB</td></tr><tr><td><strong>Inbound (NEW)</strong></td><td><strong>TCP</strong></td><td><strong>3306</strong></td><td><strong>sg-redshift</strong></td><td><strong>Redshift → MariaDB for federated query</strong></td></tr></tbody></table>
+<p>→ Both security groups are in the same VPC → Security group ID referencing works (unlike cross-account from Project 44)</p>
+<p><strong>If Redshift and MariaDB Were in Different VPCs:</strong><br>
+→ VPC Peering required (from Project 44)<br>
+→ Route tables on both sides must include peer CIDR<br>
+→ Security group rules must use CIDR blocks (not SG IDs)</p>
+<p><strong>If Redshift and MariaDB Were in Different Accounts:</strong><br>
+→ VPC Peering (Project 44) OR Transit Gateway (Project 50) required<br>
+→ Cross-account security group referencing NOT possible — use CIDR blocks<br>
+→ Secrets Manager secret must be in the SAME account as Redshift (or use cross-account Secrets Manager access via resource policy)</p>
+<hr>
+<h3>STEP 4 — ENABLE ENHANCED VPC ROUTING ON REDSHIFT</h3>
+<p>→ Navigate to Redshift Console → Clusters → Select cluster → Properties → Network and security</p>
+<table><thead><tr><th>Setting</th><th>Required Value</th><th>Why</th></tr></thead><tbody><tr><td>Enhanced VPC routing</td><td>✅ Enabled</td><td>Forces ALL Redshift traffic (including federated queries) through VPC — not over internet</td></tr></tbody></table>
+<p><strong>Why Enhanced VPC Routing Matters for Federation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT Enhanced VPC Routing:
+</span>    Redshift → AWS managed network → Internet → MariaDB
+    Problem: MariaDB is in a PRIVATE subnet — unreachable via internet
+    Result: Federated query FAILS
+
+WITH Enhanced VPC Routing:
+    Redshift → VPC network → Direct private route → MariaDB
+    Problem: None — both in same VPC
+    Result: Federated query SUCCEEDS ✅</code></pre></div>
+<p>→ Enhanced VPC routing was likely already enabled (from Project 22 for S3 access)<br>
+→ Verify it's ON — without it, federated queries to private RDS instances WILL FAIL</p>
+<hr>
+<h3>STEP 5 — CREATE EXTERNAL SCHEMA IN REDSHIFT POINTING TO MARIADB</h3>
+<p><strong>This is the core configuration step — it creates the "bridge" between Redshift and MariaDB</strong></p>
+<p>→ Connect to Redshift using Redshift Query Editor v2 (Console) or SQL client</p>
+<p><strong>External Schema Creation Configuration:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Schema name</td><td><code>mariadb_live</code></td><td>Name used in Redshift SQL to reference MariaDB tables</td></tr><tr><td>Data source type</td><td><code>MYSQL</code></td><td>Tells Redshift the external database engine type</td></tr><tr><td>Database name</td><td><code>payscale_prod</code></td><td>The MariaDB database name to connect to</td></tr><tr><td>URI</td><td><code>endpoint:port/database</code> format</td><td>Redshift endpoint for MariaDB connection</td></tr><tr><td>IAM Role</td><td><code>RedshiftFederatedQueryRole</code> ARN</td><td>Role Redshift assumes to get credentials</td></tr><tr><td>Secret ARN</td><td><code>arn:aws:secretsmanager:...mariadb-federated-creds-...</code></td><td>Where credentials are stored</td></tr></tbody></table>
+<p><strong>URI Format:</strong></p>
+<code>mariadb-instance.xxxxxxxxxxxx.ap-south-1.rds.amazonaws.com:3306/payscale_prod</code>
+<p>→ This is the RDS endpoint (from Project 9) + port + database name<br>
+→ Use the RDS endpoint DNS name — NOT the IP address (IPs change during failover, from Project 29)</p>
+<p><strong>What Happens When External Schema is Created:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift receives CREATE EXTERNAL SCHEMA command
+</span>    |
+    ↓
+Redshift assumes RedshiftFederatedQueryRole
+    |
+    ↓
+Redshift calls Secrets Manager:
+    secretsmanager:GetSecretValue on the secret ARN
+    |
+    ↓
+Secrets Manager returns: {username: "redshift_reader", password[REDACTED:PASSWORD]xxx"}
+    |
+    ↓
+Redshift connects to MariaDB using the credentials
+    |
+    ↓
+Redshift introspects MariaDB's payscale_prod database:
+    - Lists all tables
+    - Lists all columns per table
+    - Maps MariaDB types to Redshift types
+    |
+    ↓
+External schema "mariadb_live" created in Redshift
+    - Contains virtual table references to all MariaDB tables
+    - No data is copied — only metadata is stored</code></pre></div>
+<p>→ After creation → You can see MariaDB tables in Redshift:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift: SELECT * FROM svv_external_tables WHERE schemaname = 'mariadb_live';
+</span>
+Result:
+    schemaname    | tablename      | columns
+    mariadb_live  | transactions   | transaction_id, customer_id, amount, status, ...
+    mariadb_live  | customers      | customer_id, full_name, email, ...</code></pre></div>
+<hr>
+<h3>STEP 6 — QUERY MARIADB TABLES FROM REDSHIFT</h3>
+<p><strong>Simple Query — Read MariaDB Data from Redshift:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift SQL:
+</span>    SELECT transaction_id, customer_id, amount, status
+    FROM mariadb_live.transactions
+    WHERE status = 'pending'
+    LIMIT 100;</code></pre></div>
+<p><strong>What Happens Internally:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift Query Planner
+</span>    |
+    ↓
+Detects: mariadb_live.transactions is an EXTERNAL table (federated)
+    |
+    ↓
+Redshift generates a remote query for MariaDB:
+    SELECT transaction_id, customer_id, amount, status
+    FROM payscale_prod.transactions
+    WHERE status = 'pending'
+    LIMIT 100
+    |
+    ↓
+Sends query to MariaDB over JDBC (TCP 3306)
+    |
+    ↓
+MariaDB executes query using its own indexes/optimizer
+    |
+    ↓
+MariaDB returns result set to Redshift
+    |
+    ↓
+Redshift formats results and returns to user</code></pre></div>
+<p>→ The query is PUSHED DOWN to MariaDB — Redshift doesn't pull all data and filter locally<br>
+→ This is critical for performance — only matching rows cross the network</p>
+<hr>
+<h3>STEP 7 — EXECUTE CROSS-DATABASE JOINS (THE REAL POWER)</h3>
+<p><strong>The Query the Fraud Team Needs:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Redshift SQL:
+</span>    SELECT 
+        r.customer_id,
+        r.avg_risk_score,
+        r.total_flagged_transactions,
+        m.transaction_id AS live_txn_id,
+        m.amount AS live_amount,
+        m.status AS live_status,
+        m.created_at AS live_created_at
+    FROM public.historical_risk_summary r          -- LOCAL Redshift table (3 years, aggregated)
+    JOIN mariadb_live.transactions m                -- REMOTE MariaDB table (live)
+        ON r.customer_id = m.customer_id
+    WHERE r.avg_risk_score &gt; 0.8                   -- High-risk customers (Redshift filters locally)
+        AND m.status = 'pending'                   -- Only pending transactions (pushed to MariaDB)
+    ORDER BY r.avg_risk_score DESC
+    LIMIT 50;</code></pre></div>
+<p><strong>How Redshift Executes This JOIN:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Redshift scans LOCAL table: public.historical_risk_summary
+</span>        WHERE avg_risk_score &gt; 0.8
+        Result: ~5,000 high-risk customer_ids (out of 500K total)
+        
+Step 2: Redshift generates REMOTE query for MariaDB:
+        SELECT transaction_id, customer_id, amount, status, created_at
+        FROM payscale_prod.transactions
+        WHERE status = 'pending'
+        AND customer_id IN (list of 5,000 customer_ids)
+        
+        → This is PUSHDOWN — Redshift pushes the filter to MariaDB
+        → MariaDB uses its customer_id index to efficiently find matching rows
+        
+Step 3: MariaDB returns ~200 matching pending transactions
+        (only 200 out of potentially millions — highly filtered)
+        
+Step 4: Redshift JOINs the 5,000 local rows with 200 remote rows
+        Result: ~200 joined rows
+        
+Step 5: Redshift sorts by avg_risk_score DESC, applies LIMIT 50
+        Returns final 50 rows to user
+        
+Total time: ~3-5 seconds (vs 63 minutes with the old ETL approach)</code></pre></div>
+<p><strong>The Key Insight:</strong><br>
+→ Redshift processes the LOCAL table first (large historical data — this is what Redshift is good at)<br>
+→ Then sends a TARGETED query to MariaDB (small filtered result set)<br>
+→ MariaDB only processes a small, indexed query<br>
+→ The JOIN happens in Redshift's memory — minimal data crosses the network</p>
+<hr>
+<h3>STEP 8 — UNDERSTAND QUERY PUSHDOWN OPTIMIZATION</h3>
+<p><strong>What Gets Pushed Down to MariaDB:</strong></p>
+<table><thead><tr><th>SQL Element</th><th>Pushed Down?</th><th>Example</th></tr></thead><tbody><tr><td>WHERE clause filters</td><td>✅ Yes</td><td><code>WHERE status = 'pending'</code> → Executed on MariaDB</td></tr><tr><td>Column projection</td><td>✅ Yes</td><td><code>SELECT col1, col2</code> → Only requested columns fetched</td></tr><tr><td>LIMIT</td><td>✅ Yes</td><td><code>LIMIT 100</code> → MariaDB returns only 100 rows</td></tr><tr><td>Aggregations (COUNT, SUM, AVG)</td><td>✅ Yes</td><td><code>SELECT COUNT(*) FROM table</code> → Computed on MariaDB</td></tr><tr><td>ORDER BY</td><td>⚠️ Partial</td><td>Simple ORDER BY may be pushed; complex may not</td></tr><tr><td>JOINs between two remote tables</td><td>❌ No</td><td>JOIN of two MariaDB tables → Both fetched to Redshift, joined locally</td></tr><tr><td>Subqueries</td><td>⚠️ Partial</td><td>Simple subqueries may be pushed</td></tr><tr><td>Window functions</td><td>❌ No</td><td>ROW_NUMBER(), RANK() → Computed in Redshift</td></tr><tr><td>UDFs (User-Defined Functions)</td><td>❌ No</td><td>Redshift UDFs don't exist on MariaDB</td></tr></tbody></table>
+<p><strong>How to Verify Pushdown:</strong></p>
+<p>→ Use Redshift's EXPLAIN command to see the query plan:</p>
+<code>EXPLAIN SELECT * FROM mariadb_live.transactions WHERE status = 'pending';</code>
+<p>→ Look for: <code>XN Foreign Scan</code> → Indicates federated query<br>
+→ Look for: Filter conditions listed under the Foreign Scan → Indicates pushdown</p>
+<p><strong>Optimizing for Pushdown:</strong></p>
+<table><thead><tr><th>Do This</th><th>Why</th></tr></thead><tbody><tr><td>Put WHERE filters on remote table columns</td><td>Gets pushed to MariaDB — reduces data transfer</td></tr><tr><td>Select only needed columns</td><td>Column projection reduces data transfer</td></tr><tr><td>Use LIMIT on remote-only queries</td><td>Prevents pulling entire remote table</td></tr><tr><td>Filter local table FIRST, then join remote</td><td>Reduces the customer_id IN (...) list sent to MariaDB</td></tr><tr><td>Ensure MariaDB has indexes on filtered columns</td><td>Pushdown filters are only fast if MariaDB can use indexes</td></tr></tbody></table>
+<table><thead><tr><th>Avoid This</th><th>Why</th></tr></thead><tbody><tr><td>SELECT * FROM remote table without WHERE</td><td>Pulls ENTIRE table over network — very slow</td></tr><tr><td>Joining two large remote tables</td><td>Both tables fetched entirely to Redshift — defeats purpose</td></tr><tr><td>Complex functions on remote columns in WHERE</td><td>May prevent pushdown — filter applied locally after full fetch</td></tr><tr><td>DISTINCT on remote table without filters</td><td>Fetches all rows, deduplicates locally</td></tr></tbody></table>
+<hr>
+<h3>STEP 9 — MARIADB INDEX OPTIMIZATION FOR FEDERATED QUERIES</h3>
+<p><strong>Why MariaDB Indexes Matter:</strong></p>
+<p>→ Redshift pushes WHERE clauses to MariaDB<br>
+→ If MariaDB doesn't have indexes on the filtered columns → Full table scan on MariaDB<br>
+→ Full table scan on MariaDB = slow response = slow federated query = defeats the purpose</p>
+<p><strong>Recommended MariaDB Indexes for Federated Query Patterns:</strong></p>
+<table><thead><tr><th>Query Pattern from Redshift</th><th>MariaDB Index Needed</th><th>Type</th></tr></thead><tbody><tr><td><code>WHERE status = 'pending'</code></td><td>Index on <code>status</code></td><td>Single column</td></tr><tr><td><code>WHERE customer_id IN (...)</code></td><td>Index on <code>customer_id</code></td><td>Single column (likely PK or FK)</td></tr><tr><td><code>WHERE status = 'pending' AND customer_id IN (...)</code></td><td>Composite index on <code>(status, customer_id)</code></td><td>Multi-column</td></tr><tr><td><code>WHERE created_at &gt; '2025-01-15'</code></td><td>Index on <code>created_at</code></td><td>Single column</td></tr><tr><td><code>WHERE status = 'pending' AND created_at &gt; '2025-01-15'</code></td><td>Composite index on <code>(status, created_at)</code></td><td>Multi-column</td></tr></tbody></table>
+<p>→ Work with the DBA to create appropriate indexes<br>
+→ Monitor MariaDB's slow query log during federated queries<br>
+→ If a federated query takes &gt; 10 seconds → likely missing index on MariaDB side</p>
+<hr>
+<h3>STEP 10 — CROSS-DATABASE QUERY PATTERNS</h3>
+<p><strong>Pattern 1 — Local Redshift + Remote MariaDB JOIN (Most Common)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT r.*, m.status
+</span>FROM public.redshift_table r
+JOIN mariadb_live.mariadb_table m ON r.id = m.id
+WHERE r.local_filter = 'value'
+    AND m.remote_filter = 'value';</code></pre></div>
+<p>→ Best performance — Redshift filters locally first, then queries MariaDB for matching subset</p>
+<p><strong>Pattern 2 — Remote MariaDB + Redshift Spectrum (S3) JOIN</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT m.transaction_id, m.status, s.risk_model_output
+</span>FROM mariadb_live.transactions m
+JOIN spectrum_schema.model_scores s ON m.transaction_id = s.transaction_id
+WHERE m.status = 'pending';</code></pre></div>
+<p>→ Joins LIVE MariaDB data with S3 data lake (via Spectrum from Project 28)<br>
+→ Three data sources accessible from single Redshift query: Local + MariaDB + S3</p>
+<p><strong>Pattern 3 — Three-Way JOIN (Local + MariaDB + Spectrum)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SELECT 
+</span>    r.customer_id,
+    r.lifetime_value,                        -- From Redshift local table
+    m.current_balance,                       -- From MariaDB (live)
+    s.latest_risk_score                      -- From S3 via Spectrum
+FROM public.customer_summary r               -- LOCAL
+JOIN mariadb_live.customer_accounts m        -- REMOTE (MariaDB)
+    ON r.customer_id = m.customer_id
+JOIN spectrum_schema.risk_scores s           -- REMOTE (S3)
+    ON r.customer_id = s.customer_id
+WHERE r.lifetime_value &gt; 100000
+    AND s.latest_risk_score &gt; 0.7;</code></pre></div>
+<p>→ This is the ULTIMATE power of Redshift — querying three different data stores in one SQL statement<br>
+→ No data movement, no ETL, no staging tables</p>
+<p><strong>Pattern 4 — Materialized View on Federated Query (Caching)</strong></p>
+<p>→ If the same federated query runs frequently → Create a materialized view</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Materialized view name</td><td><code>mv_high_risk_pending</code></td><td>Cached result of federated join</td></tr><tr><td>Auto-refresh</td><td>Enabled (schedule-based)</td><td>Refresh every 15 minutes</td></tr></tbody></table>
+<p>→ First query hits MariaDB → Result cached in materialized view<br>
+→ Subsequent queries read from materialized view → No MariaDB hit<br>
+→ Trade-off: Data freshness (up to 15 min stale) vs query performance</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always store MariaDB credentials in Secrets Manager — never hardcode in external schema definition<br>
+→ Always create a dedicated read-only MariaDB user for Redshift federation — never use admin/root<br>
+→ Always verify Enhanced VPC Routing is enabled on the Redshift cluster<br>
+→ Always ensure security groups allow Redshift → MariaDB on port 3306<br>
+→ Always use the RDS DNS endpoint in the URI — never use IP addresses (IPs change during failover from Project 29)<br>
+→ Always push filters to the remote side by placing WHERE conditions on remote table columns<br>
+→ Always select only the columns you need from remote tables — minimize data transfer<br>
+→ Always filter the LOCAL Redshift table FIRST in JOINs — reduce the dataset before hitting MariaDB<br>
+→ Always create appropriate indexes on MariaDB for columns used in federated query WHERE clauses<br>
+→ Always monitor MariaDB connection count during federated queries — each query opens connections<br>
+→ Always test federated queries during low-traffic MariaDB periods first — measure impact on operational workload<br>
+→ Always use EXPLAIN to verify query pushdown behavior<br>
+→ Always consider materialized views for frequently-run federated queries</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never run <code>SELECT * FROM mariadb_live.large_table</code> without WHERE — pulls entire table over network<br>
+→ Never join two large remote MariaDB tables — both are fetched entirely to Redshift before joining<br>
+→ Never use the MariaDB root/admin credentials — use a dedicated read-only user<br>
+→ Never forget to update security groups — federated query silently times out without clear error<br>
+→ Never assume federated query performance equals local Redshift query performance — network latency exists<br>
+→ Never use federated queries for bulk historical analysis — use COPY/Glue ETL for that (Project 22, 24)<br>
+→ Never run hundreds of concurrent federated queries — each opens MariaDB connections (connection limit from Project 45)<br>
+→ Never use federated queries as a replacement for proper ETL — federation is for LIVE lookups, not bulk processing<br>
+→ Never skip Enhanced VPC Routing — without it, Redshift cannot reach private RDS instances<br>
+→ Never hardcode MariaDB IPs in URI — Multi-AZ failover (from Project 29) changes the IP<br>
+→ Never ignore the impact on MariaDB — federated queries add read load to your operational database<br>
+→ Never use federated query for data that doesn't change frequently — COPY it into Redshift instead (cheaper, faster)</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE REDSHIFT FEDERATED QUERY</h2>
+<table><thead><tr><th>Scenario</th><th>Use Federated Query?</th><th>Why</th></tr></thead><tbody><tr><td>Join Redshift history with LIVE MariaDB status</td><td>✅ Yes</td><td>Real-time data needed, small result set</td></tr><tr><td>Lookup current customer details from operational DB</td><td>✅ Yes</td><td>Point lookup — small data, live</td></tr><tr><td>Ad-hoc investigation: "What's this customer's live balance?"</td><td>✅ Yes</td><td>One-off query, no ETL needed</td></tr><tr><td>Enrich Redshift analytics with live operational metrics</td><td>✅ Yes</td><td>Complement historical data with live status</td></tr><tr><td>Bulk load millions of MariaDB records into Redshift</td><td>❌ No</td><td>Use COPY from S3 (Project 22) or Glue ETL (Project 24)</td></tr><tr><td>Replace nightly ETL entirely</td><td>❌ No</td><td>Federation is for supplements, not replacements</td></tr><tr><td>Query MariaDB from Redshift across accounts</td><td>✅ Yes (with VPC Peering from Project 44)</td><td>Network connectivity is the only additional requirement</td></tr><tr><td>Join with S3 data lake simultaneously</td><td>✅ Yes (with Spectrum from Project 28)</td><td>Three-way local + MariaDB + S3 join</td></tr><tr><td>High-concurrency dashboard with 100+ simultaneous users</td><td>❌ No</td><td>Each query hits MariaDB — use materialized views or ETL instead</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE REDSHIFT FEDERATED QUERY</h2>
+<p>→ When you need to scan millions of rows from MariaDB → Network transfer becomes the bottleneck → Use ETL<br>
+→ When the same query runs hundreds of times per hour → MariaDB connection overload → Use materialized views or cache<br>
+→ When data freshness of 1 hour is acceptable → Nightly/hourly ETL is simpler and cheaper<br>
+→ When MariaDB is already under heavy write load → Federated queries add read pressure → Risk to operational stability<br>
+→ When complex aggregations are needed on remote data → Pushdown may not apply → Full table fetched → Slow<br>
+→ When you need to join two large remote tables → Both fully fetched → Worse than local join<br>
+→ When Redshift Serverless is used with very small RPU allocation → Federated query overhead may be disproportionate</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE FEDERATED QUERY EXECUTION ENGINE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User submits SQL to Redshift
+</span>    |
+    ↓
+Redshift Query Parser
+    |
+    ├── Identifies LOCAL tables (public schema, local schemas)
+    ├── Identifies EXTERNAL tables (mariadb_live schema)
+    └── Identifies SPECTRUM tables (spectrum schemas)
+    |
+    ↓
+Redshift Query Optimizer
+    |
+    ├── Determines optimal join order
+    ├── Decides what to push down to remote sources
+    ├── Creates execution plan with:
+    |   ├── Local scan nodes (for Redshift tables)
+    |   ├── Foreign scan nodes (for MariaDB tables)
+    |   └── Spectrum scan nodes (for S3 tables)
+    |
+    ↓
+Execution Engine
+    |
+    ├── LOCAL scan: Executed on Redshift compute nodes
+    |   → Uses columnar storage, zone maps, sort keys
+    |   → Highly optimized — this is Redshift's strength
+    |
+    ├── FOREIGN scan: Executed via JDBC to MariaDB
+    |   → Redshift leader node establishes JDBC connection
+    |   → Sends pushed-down SQL to MariaDB
+    |   → Receives result set over network
+    |   → Result materialized in Redshift memory
+    |
+    └── SPECTRUM scan: Executed via Spectrum layer on S3
+        → Uses Redshift Spectrum compute (from Project 28)
+        → Reads Parquet/ORC from S3
+        → Returns filtered results to Redshift
+    |
+    ↓
+JOIN execution (all results now in Redshift memory)
+    |
+    ↓
+Final result returned to user</code></pre></div>
+<hr>
+<h3>2 → CONNECTION MANAGEMENT</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Federated Query Execution:
+</span>    |
+    ↓
+Redshift Leader Node
+    |
+    ├── Assumes RedshiftFederatedQueryRole (IAM)
+    |
+    ├── Calls Secrets Manager: GetSecretValue
+    |   → Retrieves: {username: "redshift_reader", passwo[REDACTED:PASSWORD] "xxx"}
+    |
+    ├── Establishes JDBC connection to MariaDB
+    |   → TCP connection: Redshift Leader → RDS MariaDB:3306
+    |   → Authenticates with retrieved credentials
+    |
+    ├── Sends pushed-down SQL query
+    |
+    ├── Receives result set
+    |
+    └── Closes JDBC connection (or returns to connection pool)</code></pre></div>
+<p><strong>Connection Pooling Behavior:</strong><br>
+→ Redshift maintains a CONNECTION POOL for federated queries<br>
+→ Connections are reused across queries to the same external schema<br>
+→ Pool size is managed by Redshift internally — not configurable<br>
+→ However — during high concurrency → multiple connections opened simultaneously<br>
+→ This impacts MariaDB's <code>max_connections</code> limit (from Project 45)</p>
+<p><strong>MariaDB Connection Impact:</strong></p>
+<table><thead><tr><th>Redshift Concurrent Queries</th><th>MariaDB Connections Used</th><th>MariaDB db.t3.medium max_connections (~150)</th></tr></thead><tbody><tr><td>5</td><td>~5-10</td><td>✅ Safe</td></tr><tr><td>20</td><td>~20-40</td><td>⚠️ Approaching limit if other apps also connect</td></tr><tr><td>50</td><td>~50-100</td><td>❌ Risk of connection exhaustion</td></tr></tbody></table>
+<p>→ Use Redshift WLM (Workload Management from Project 16) to limit concurrent federated queries<br>
+→ Or use RDS Proxy (from Project 45 scalability section) to pool MariaDB connections</p>
+<hr>
+<h3>3 → DATA TYPE MAPPING (MARIADB → REDSHIFT)</h3>
+<p><strong>Redshift automatically maps MariaDB types:</strong></p>
+<table><thead><tr><th>MariaDB Type</th><th>Redshift Type</th><th>Notes</th></tr></thead><tbody><tr><td>TINYINT</td><td>SMALLINT</td><td>Upcasted</td></tr><tr><td>SMALLINT</td><td>SMALLINT</td><td>Direct map</td></tr><tr><td>INT</td><td>INTEGER</td><td>Direct map</td></tr><tr><td>BIGINT</td><td>BIGINT</td><td>Direct map</td></tr><tr><td>FLOAT</td><td>REAL</td><td>Direct map</td></tr><tr><td>DOUBLE</td><td>DOUBLE PRECISION</td><td>Direct map</td></tr><tr><td>DECIMAL(p,s)</td><td>DECIMAL(p,s)</td><td>Direct map</td></tr><tr><td>CHAR(n)</td><td>CHAR(n)</td><td>Direct map</td></tr><tr><td>VARCHAR(n)</td><td>VARCHAR(n)</td><td>Direct map — max 65535 in Redshift</td></tr><tr><td>TEXT</td><td>VARCHAR(65535)</td><td>Mapped to max VARCHAR</td></tr><tr><td>DATE</td><td>DATE</td><td>Direct map</td></tr><tr><td>DATETIME</td><td>TIMESTAMP</td><td>Direct map</td></tr><tr><td>TIMESTAMP</td><td>TIMESTAMP</td><td>Direct map</td></tr><tr><td>ENUM</td><td>VARCHAR</td><td>Converted to string</td></tr><tr><td>JSON</td><td>VARCHAR(65535)</td><td>Stored as string — no JSON parsing</td></tr><tr><td>BLOB</td><td>Not supported</td><td>Binary data cannot be federated</td></tr></tbody></table>
+<p><strong>Potential Issues:</strong></p>
+<table><thead><tr><th>Issue</th><th>MariaDB</th><th>Redshift</th><th>Impact</th></tr></thead><tbody><tr><td>VARCHAR length mismatch</td><td>VARCHAR(16383) in UTF8MB4 = 65535 bytes</td><td>VARCHAR(65535) characters</td><td>May truncate</td></tr><tr><td>Timezone handling</td><td>TIMESTAMP stores in server timezone</td><td>TIMESTAMP is timezone-naive</td><td>Ensure both use UTC</td></tr><tr><td>NULL handling</td><td>NULL values</td><td>NULL values</td><td>Compatible</td></tr><tr><td>Boolean</td><td>TINYINT(1)</td><td>BOOLEAN</td><td>May need casting</td></tr></tbody></table>
+<hr>
+<h3>4 → QUERY PUSHDOWN MECHANICS IN DETAIL</h3>
+<p><strong>How Redshift Decides What to Push Down:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Original Query:
+</span>    SELECT t.transaction_id, t.amount
+    FROM mariadb_live.transactions t
+    WHERE t.status = 'pending'
+        AND t.amount &gt; 1000
+        AND UPPER(t.merchant) = 'AMAZON'
+
+Pushdown Analysis:
+    ├── t.status = 'pending'          → Simple equality → PUSHED DOWN ✅
+    ├── t.amount &gt; 1000               → Simple comparison → PUSHED DOWN ✅
+    └── UPPER(t.merchant) = 'AMAZON'  → Function on column → DEPENDS
+        → UPPER() is a standard SQL function → MariaDB supports it → PUSHED DOWN ✅
+        → If it were a Redshift-specific function → NOT pushed down ❌
+
+Query sent to MariaDB:
+    SELECT transaction_id, amount
+    FROM payscale_prod.transactions
+    WHERE status = 'pending'
+        AND amount &gt; 1000
+        AND UPPER(merchant) = 'AMAZON'</code></pre></div>
+<p><strong>Functions That ARE Pushed Down (standard SQL):</strong></p>
+<table><thead><tr><th>Function</th><th>Example</th></tr></thead><tbody><tr><td>UPPER, LOWER</td><td><code>WHERE UPPER(name) = 'X'</code></td></tr><tr><td>TRIM, LTRIM, RTRIM</td><td><code>WHERE TRIM(status) = 'active'</code></td></tr><tr><td>CAST</td><td><code>WHERE CAST(amount AS INTEGER) &gt; 100</code></td></tr><tr><td>COALESCE</td><td><code>WHERE COALESCE(status, 'unknown') = 'pending'</code></td></tr><tr><td>Mathematical (+, -, *, /)</td><td><code>WHERE amount * 1.1 &gt; 1000</code></td></tr><tr><td>Comparison (=, &gt;, &lt;, &gt;=, &lt;=, &lt;&gt;)</td><td>All standard comparisons</td></tr><tr><td>IN, BETWEEN, LIKE</td><td>Standard predicates</td></tr><tr><td>IS NULL, IS NOT NULL</td><td>NULL checks</td></tr></tbody></table>
+<p><strong>Functions That Are NOT Pushed Down (Redshift-specific):</strong></p>
+<table><thead><tr><th>Function</th><th>Why Not</th></tr></thead><tbody><tr><td>GETDATE()</td><td>Redshift-specific function</td></tr><tr><td>DATEADD, DATEDIFF</td><td>Redshift syntax differs from MariaDB</td></tr><tr><td>REGEXP_REPLACE</td><td>Different regex implementations</td></tr><tr><td>Custom UDFs</td><td>Only exist in Redshift</td></tr><tr><td>Window functions (ROW_NUMBER, RANK)</td><td>Complex — processed locally</td></tr></tbody></table>
+<p>→ When a function cannot be pushed down:</p>
+<ul>
+<li>Redshift fetches ALL rows from MariaDB (or rows matching other pushable filters)</li>
+<li>Applies the non-pushable function LOCALLY on the fetched data</li>
+<li>This can dramatically increase data transfer and slow down the query</li>
+</ul>
+<hr>
+<h3>5 → SECURITY FLOW (END-TO-END)</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User submits query
+</span>    |
+    ↓
+Redshift validates: User has SELECT on external schema mariadb_live? 
+    (Redshift GRANT system — separate from Lake Formation)
+    → NO → Access Denied
+    → YES → Continue
+    |
+    ↓
+Redshift assumes RedshiftFederatedQueryRole
+    |
+    ↓
+IAM validates: Does this role have secretsmanager:GetSecretValue?
+    → NO → Access Denied
+    → YES → Continue
+    |
+    ↓
+Secrets Manager returns credentials (encrypted with KMS from Project 36)
+    |
+    ↓
+Redshift connects to MariaDB using credentials
+    |
+    ↓
+MariaDB validates: Does redshift_reader have SELECT on this table?
+    → NO → Access Denied
+    → YES → Continue
+    |
+    ↓
+MariaDB executes query and returns results
+    |
+    ↓
+Data flows: MariaDB → VPC network → Redshift (encrypted in transit via TLS)
+    |
+    ↓
+Results returned to user</code></pre></div>
+<p>→ Three layers of authorization:</p>
+<ol>
+<li>Redshift schema permissions (who can query the external schema)</li>
+<li>IAM role permissions (what the role can access)</li>
+<li>MariaDB user permissions (what the DB user can SELECT)</li>
+</ol>
+<p>→ All three must allow the request — any denial stops the query</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Enhanced VPC Routing not enabled</td><td>Federated query times out</td><td>Redshift cannot reach private RDS without VPC routing</td><td>Enable Enhanced VPC Routing on cluster</td></tr><tr><td>2</td><td>Security group missing inbound rule on RDS</td><td>Connection timeout to MariaDB:3306</td><td>RDS SG doesn't allow Redshift SG</td><td>Add inbound TCP 3306 from sg-redshift to sg-rds-mariadb</td></tr><tr><td>3</td><td>Secrets Manager secret has wrong credentials</td><td>Authentication failure on MariaDB</td><td>Password changed in MariaDB but not in Secrets Manager</td><td>Update secret in Secrets Manager (rotation from Project 37)</td></tr><tr><td>4</td><td>IAM role missing Secrets Manager permission</td><td>"Unable to retrieve credentials" error</td><td>Role cannot call GetSecretValue</td><td>Add secretsmanager:GetSecretValue to role policy</td></tr><tr><td>5</td><td>IAM role not associated with Redshift cluster</td><td>"Role not found" error</td><td>Role exists but not attached to cluster</td><td>Associate role via Redshift Console → Manage IAM roles</td></tr><tr><td>6</td><td>SELECT * on large remote table</td><td>Query takes 30+ minutes, times out</td><td>Entire table pulled over network — no pushdown filters</td><td>Add WHERE clause to limit data transfer</td></tr><tr><td>7</td><td>MariaDB connection limit exhausted</td><td>"Too many connections" error from MariaDB</td><td>Multiple concurrent federated queries each open connections</td><td>Limit concurrency via Redshift WLM OR use RDS Proxy</td></tr><tr><td>8</td><td>MariaDB performance degraded during federated queries</td><td>Operational application slows down</td><td>Federated queries add read load to production MariaDB</td><td>Use read replica for federated queries (from Project 29)</td></tr><tr><td>9</td><td>Data type mismatch in JOIN condition</td><td>Unexpected JOIN results or errors</td><td>MariaDB column type doesn't match Redshift column type</td><td>Explicitly CAST columns to matching types in JOIN</td></tr><tr><td>10</td><td>Using IP address in URI instead of DNS endpoint</td><td>Federated query fails after RDS failover</td><td>IP changed during Multi-AZ failover</td><td>Always use RDS DNS endpoint</td></tr><tr><td>11</td><td>Redshift-specific function prevents pushdown</td><td>Query slow — full table fetched from MariaDB</td><td>Non-pushable function causes local processing</td><td>Rewrite query using standard SQL functions</td></tr><tr><td>12</td><td>Secret rotation breaks federated queries</td><td>"Authentication failed" intermittently</td><td>Secrets Manager rotated password but MariaDB password not synced</td><td>Use Secrets Manager automatic rotation with RDS integration (from Project 37)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Query Performance Scalability</strong></p>
+<table><thead><tr><th>Factor</th><th>Impact</th><th>Mitigation</th></tr></thead><tbody><tr><td>Remote table size</td><td>Larger table = more data to potentially transfer</td><td>Always push down filters — never scan full remote table</td></tr><tr><td>Network bandwidth</td><td>VPC bandwidth between Redshift and RDS</td><td>Both in same AZ = best performance; cross-AZ adds ~1ms</td></tr><tr><td>MariaDB query performance</td><td>Slow MariaDB = slow federated query</td><td>Create appropriate indexes on MariaDB filtered columns</td></tr><tr><td>Number of columns selected</td><td>More columns = more data transferred</td><td>Select only needed columns</td></tr><tr><td>Concurrent federated queries</td><td>Each opens MariaDB connections</td><td>Limit via WLM; use RDS Proxy for connection pooling</td></tr></tbody></table>
+<p>→ <strong>Connection Scalability</strong></p>
+<table><thead><tr><th>Redshift Cluster Size</th><th>Approximate Concurrent Federated Queries</th><th>MariaDB Impact</th></tr></thead><tbody><tr><td>dc2.large (2 nodes)</td><td>5-10 comfortable</td><td>Low — ~10 connections</td></tr><tr><td>ra3.xlplus (4 nodes)</td><td>10-20 comfortable</td><td>Medium — ~20-40 connections</td></tr><tr><td>ra3.4xlarge (8 nodes)</td><td>20-50 comfortable</td><td>High — ~50-100 connections</td></tr></tbody></table>
+<p>→ Use RDS Proxy to decouple Redshift concurrency from MariaDB connection limits<br>
+→ Use Read Replicas (from Project 29) to offload federated query read load from primary MariaDB</p>
+<p><strong>Using Read Replica for Federation:</strong><br>
+→ Create external schema pointing to READ REPLICA endpoint instead of primary<br>
+→ Read Replica endpoint: <code>mariadb-replica.xxxxxxxxxxxx.ap-south-1.rds.amazonaws.com</code><br>
+→ Benefits:</p>
+<ul>
+<li>Zero impact on primary MariaDB (operational workload unaffected)</li>
+<li>Read Replica can be a larger instance class optimized for read queries</li>
+<li>Replication lag is typically &lt; 1 second (acceptable for most fraud detection use cases)</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<table><thead><tr><th>Cost Component</th><th>Driver</th><th>Optimization</th></tr></thead><tbody><tr><td>Redshift compute</td><td>DPU-hours for query processing</td><td>Federated queries are generally lightweight on Redshift side</td></tr><tr><td>Data transfer</td><td>Data flowing from RDS to Redshift (same VPC = free, cross-AZ = minimal)</td><td>Push down filters to minimize transfer</td></tr><tr><td>RDS read load</td><td>Additional read queries on MariaDB</td><td>Use Read Replica</td></tr><tr><td>Secrets Manager</td><td>$0.40/secret/month + $0.05/10,000 API calls</td><td>Negligible</td></tr><tr><td>Network</td><td>Same-region, same-VPC = free</td><td>No optimization needed</td></tr></tbody></table>
+<p>→ <strong>When to Stop Using Federation and Switch to ETL</strong></p>
+<table><thead><tr><th>Indicator</th><th>Federation Still Appropriate</th><th>Switch to ETL</th></tr></thead><tbody><tr><td>Data freshness needed</td><td>Real-time (&lt; 1 minute)</td><td>Hourly or daily acceptable</td></tr><tr><td>Result set size</td><td>&lt; 100,000 rows per query</td><td>&gt; 1,000,000 rows per query</td></tr><tr><td>Query frequency</td><td>&lt; 100 queries/hour</td><td>&gt; 1,000 queries/hour</td></tr><tr><td>MariaDB impact</td><td>&lt; 10% additional read load</td><td>&gt; 30% additional read load</td></tr><tr><td>Network transfer per query</td><td>&lt; 100 MB</td><td>&gt; 1 GB</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify federated query is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th><th>Expected Result</th></tr></thead><tbody><tr><td>External schema created</td><td>Query <code>SVV_EXTERNAL_SCHEMAS</code> system view</td><td><code>mariadb_live</code> schema appears</td></tr><tr><td>Remote tables visible</td><td>Query <code>SVV_EXTERNAL_TABLES</code> system view</td><td>MariaDB tables listed</td></tr><tr><td>Remote columns visible</td><td>Query <code>SVV_EXTERNAL_COLUMNS</code> system view</td><td>Column names and types listed</td></tr><tr><td>Simple query works</td><td><code>SELECT 1 FROM mariadb_live.transactions LIMIT 1</code></td><td>Returns 1 row</td></tr><tr><td>Pushdown working</td><td><code>EXPLAIN SELECT ... WHERE status='pending'</code></td><td>Filter appears in Foreign Scan node</td></tr><tr><td>JOIN works</td><td>Run cross-database JOIN query</td><td>Results returned combining local and remote data</td></tr></tbody></table>
+<p>→ <strong>How to monitor federated query performance:</strong></p>
+<table><thead><tr><th>Metric</th><th>Where to Find</th><th>What to Look For</th></tr></thead><tbody><tr><td>Query duration</td><td>Redshift Console → Queries → Query history</td><td>Federated queries should complete in seconds, not minutes</td></tr><tr><td>Data scanned from remote</td><td><code>STL_QUERY</code> system table → bytes column</td><td>Should be proportional to result set, not full table</td></tr><tr><td>MariaDB connections</td><td>RDS Console → CloudWatch → DatabaseConnections</td><td>Spikes during federated query windows</td></tr><tr><td>MariaDB CPU</td><td>RDS Console → CloudWatch → CPUUtilization</td><td>Increases during federated queries</td></tr><tr><td>MariaDB slow queries</td><td>RDS Console → CloudWatch → SlowQueryCount</td><td>Federated queries appearing as slow queries</td></tr><tr><td>Network throughput</td><td>VPC Flow Logs (from Project 44)</td><td>Data volume between Redshift and RDS</td></tr></tbody></table>
+<p>→ <strong>How to debug federated query failures:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Can Redshift reach MariaDB?
+</span>    → Check Enhanced VPC Routing: Enabled?
+    → Check Security Groups: Redshift SG → RDS SG on port 3306?
+    → Check NACLs: Both allow TCP 3306?
+    |
+    ↓
+Step 2: Can Redshift authenticate?
+    → Check Secrets Manager: Secret exists and contains correct credentials?
+    → Check IAM Role: Has secretsmanager:GetSecretValue?
+    → Check IAM Role: Associated with Redshift cluster?
+    → Check MariaDB: User exists with SELECT permission?
+    |
+    ↓
+Step 3: Is the query correct?
+    → Check external schema name matches
+    → Check table name matches MariaDB table name
+    → Check column names match (case-sensitive in some contexts)
+    |
+    ↓
+Step 4: Is the query slow?
+    → Run EXPLAIN to check pushdown
+    → Check MariaDB indexes for filtered columns
+    → Check result set size — too large = too slow
+    → Check MariaDB performance during query
+    |
+    ↓
+Step 5: Check Redshift system tables
+    → STL_ERROR for error messages
+    → STL_QUERY for query execution details
+    → SVL_FEDERATED_QUERY for federated query specifics</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Redshift Federated Query eliminates the "data movement tax" for live operational data lookups<br>
+→ It creates a BRIDGE between the analytical world (Redshift) and the operational world (MariaDB) without ETL<br>
+→ The external schema is a VIRTUAL mapping — no data is copied, only metadata<br>
+→ Query pushdown is the KEY to performance — filters pushed to MariaDB = minimal data transfer<br>
+→ Three authorization layers must all permit: Redshift schema grants + IAM role + MariaDB user permissions<br>
+→ Secrets Manager integration (from Project 37) provides secure, rotatable credential management<br>
+→ Enhanced VPC Routing (must be enabled) ensures Redshift reaches private RDS instances<br>
+→ Federation complements ETL — it does NOT replace it</p>
+<ul>
+<li>Use federation for: Real-time lookups, live status checks, small result sets</li>
+<li>Use ETL for: Bulk historical loads, aggregation pipelines, large data movement<br>
+→ Combined with Spectrum (from Project 28), Redshift can query THREE data stores in one SQL:</li>
+<li>Local Redshift tables (columnar, optimized)</li>
+<li>S3 data lake (via Spectrum)</li>
+<li>Live MariaDB (via Federation)<br>
+→ Connection to previous projects:</li>
+<li>Redshift cluster setup (Project 16) — the cluster running federated queries</li>
+<li>Secrets Manager (Project 37) — credential storage for MariaDB authentication</li>
+<li>Redshift Spectrum (Project 28) — complementary external query capability</li>
+<li>VPC networking (Project 5) + Security Groups (Project 4) — network connectivity foundation</li>
+<li>RDS MariaDB (Project 9) + Read Replicas (Project 29) — the federated data source</li>
+<li>Enhanced VPC Routing + VPC Endpoints (Project 27) — network path configuration<br>
+→ Connection to next projects:</li>
+<li>The multi-service orchestrated pipeline (Project 49) will combine federated query results with EventBridge triggers and Step Functions</li>
+<li>The complete enterprise data lake (Project 51) leverages federation as one of many data access patterns</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale now has a comprehensive data platform:</p>
+<ul>
+<li>S3 data lake with governance (Projects 1, 17, 18, 25, 47)</li>
+<li>Redshift warehouse with Spectrum and Federation (Projects 16, 22, 28, this project)</li>
+<li>MariaDB operational database (Projects 9, 14)</li>
+<li>Glue ETL with incremental processing (Projects 21, 24, 46)</li>
+<li>Cross-account networking (Projects 44, 45)</li>
+<li>Event-driven patterns (Projects 13, 26, 38)</li>
+</ul>
+<p>→ But each piece runs INDEPENDENTLY — there's no single orchestrated pipeline<br>
+→ The CTO says: "When a new data file lands in S3, I want EVERYTHING to happen automatically:</p>
+<ol>
+<li>EventBridge detects the S3 upload</li>
+<li>Step Functions orchestrates the workflow</li>
+<li>Glue ETL transforms the data</li>
+<li>Redshift loads the transformed data</li>
+<li>SNS sends a success/failure notification</li>
+<li>If any step fails → automatic retry with error notification"</li>
+</ol>
+<p>→ Today → Each step is manually triggered or loosely scheduled<br>
+→ They need a SINGLE orchestrated pipeline with error handling, retry logic, and notifications</p>
+<p>→ <strong>This is the exact problem Project 49 solves</strong><br>
+→ Project 49: "The Complex Pipeline — S3 Upload → EventBridge → Step Functions → Glue ETL → Redshift → SNS Alert"<br>
+→ It combines EventBridge (from Project 38), Step Functions (from Project 32), Glue (from Project 21), Redshift (from Project 22), and SNS (from Project 6) into one cohesive, automated, error-resilient pipeline</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 49: "The Complex Pipeline — S3 Upload → EventBridge → Step Functions → Glue ETL → Redshift → SNS Alert"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-47.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 48/60</span></div><a class="nav-btn next" href="project-49.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

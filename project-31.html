@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 31: THE ETL THAT HAD 5 STEPS IN SEQUENCE — Glue Workflow Orchestration — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 31: THE ETL THAT HAD 5 STEPS IN SEQUENCE — Glue Workflow Orchestration</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Project 1) has grown significantly<br>
+→ Their data engineering team has built multiple individual Glue components over time:</p>
+<ul>
+<li>A Crawler that catalogs raw CSV files landing in S3 (built in Project 17)</li>
+<li>A Glue ETL Job that converts CSV to Parquet (built in Project 21)</li>
+<li>Another Crawler that catalogs the newly created Parquet files</li>
+<li>A second Glue ETL Job that enriches Parquet data by joining with MariaDB product master (built in Project 24)</li>
+<li>A final Crawler that catalogs the enriched dataset for Athena consumption (Project 18 pattern)</li>
+</ul>
+<p>→ Currently — a data engineer manually runs each step one after another<br>
+→ He runs Crawler 1 → waits → checks if succeeded → runs Job 1 → waits → checks → runs Crawler 2 → waits → runs Job 2 → waits → runs Crawler 3<br>
+→ This takes 45 minutes of babysitting every single morning</p>
+<p>→ Problems compounding:</p>
+<ul>
+<li>The engineer went on vacation — nobody knew the sequence — pipeline didn't run for 5 days</li>
+<li>One day Job 1 failed silently — Job 2 ran on stale data — wrong reports reached the CEO</li>
+<li>On weekends nobody triggers the pipeline — Monday analytics are always 2 days behind</li>
+<li>The team tried running steps in parallel where possible but couldn't coordinate dependencies</li>
+<li>No visibility into which step failed, when, or why — they check each component's logs individually</li>
+</ul>
+<p>→ The Head of Data asks: "Can we define the entire 5-step pipeline as ONE unit that runs automatically, handles failures, and shows me the full picture in one place?"</p>
+<p>→ This is EXACTLY what AWS Glue Workflows solve</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what orchestration means in the ETL context<br>
+→ Individual Glue Crawlers and Jobs (from Projects 17, 21, 24) are like individual musicians<br>
+→ A Workflow is the conductor — it decides WHO plays WHEN and WHAT happens if someone misses a note</p>
+<p>→ The mental model:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WORKFLOW = A directed acyclic graph (DAG) of:
+</span>    TRIGGERS → that start
+    ACTIONS → which are Crawlers or Jobs
+    CONDITIONS → that determine if next step should fire</code></pre></div>
+<p>→ Three core components inside a Glue Workflow:</p>
+<table><thead><tr><th>Component</th><th>Role</th><th>Analogy</th></tr></thead><tbody><tr><td>Workflow</td><td>The container that holds everything</td><td>The orchestra performance</td></tr><tr><td>Trigger</td><td>The signal that starts one or more actions</td><td>The conductor's baton signal</td></tr><tr><td>Action</td><td>The Crawler or Job that executes</td><td>The musician playing their part</td></tr></tbody></table>
+<p>→ Triggers come in 3 types — this is the KEY decision point:</p>
+<table><thead><tr><th>Trigger Type</th><th>When It Fires</th><th>Use Case</th></tr></thead><tbody><tr><td>On-Demand</td><td>Manually or via API call</td><td>Testing, ad-hoc runs</td></tr><tr><td>Scheduled</td><td>At a cron/rate expression</td><td>Daily/hourly automated runs</td></tr><tr><td>Conditional</td><td>When previous action(s) succeed/fail/complete</td><td>Chaining steps in sequence</td></tr></tbody></table>
+<p>→ The approach for ShopNow's 5-step pipeline:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[Scheduled Trigger - 6 AM daily]
+</span>        │
+        ▼
+   [Crawler 1: Catalog raw CSV]
+        │
+        ▼ (Conditional Trigger: fires when Crawler 1 SUCCEEDS)
+   [Job 1: CSV → Parquet conversion]
+        │
+        ▼ (Conditional Trigger: fires when Job 1 SUCCEEDS)
+   [Crawler 2: Catalog Parquet files]
+        │
+        ▼ (Conditional Trigger: fires when Crawler 2 SUCCEEDS)
+   [Job 2: Parquet + MariaDB enrichment]
+        │
+        ▼ (Conditional Trigger: fires when Job 2 SUCCEEDS)
+   [Crawler 3: Catalog enriched dataset]</code></pre></div>
+<p>→ If ANY step fails → subsequent steps DO NOT fire → workflow status shows FAILED → team gets visibility</p>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>PREREQUISITE VERIFICATION</h3>
+<p>→ Before building the Workflow, confirm these already exist (from previous projects):</p>
+<table><thead><tr><th>Component</th><th>Created In</th><th>What It Does</th></tr></thead><tbody><tr><td>S3 bucket with raw CSV landing zone</td><td>Project 1</td><td><code>s3://shopnow-data-lake/raw/orders/</code></td></tr><tr><td>S3 bucket path for Parquet output</td><td>Project 21</td><td><code>s3://shopnow-data-lake/processed/orders/</code></td></tr><tr><td>S3 bucket path for enriched output</td><td>Project 24</td><td><code>s3://shopnow-data-lake/enriched/orders/</code></td></tr><tr><td>Glue Crawler 1 (raw CSV cataloging)</td><td>Project 17</td><td>Crawls <code>raw/orders/</code> → creates table in Glue Catalog</td></tr><tr><td>Glue Job 1 (CSV to Parquet)</td><td>Project 21</td><td>Reads raw table → writes Parquet to <code>processed/</code></td></tr><tr><td>Glue JDBC Connection to MariaDB</td><td>Project 24</td><td>Connects to RDS MariaDB for product master data</td></tr><tr><td>Glue Job 2 (Parquet + MariaDB enrichment)</td><td>Project 24</td><td>Joins Parquet with MariaDB → writes to <code>enriched/</code></td></tr><tr><td>IAM Role for Glue</td><td>Project 17</td><td><code>AWSGlueServiceRole-ShopNow</code> with S3, Catalog, JDBC permissions</td></tr></tbody></table>
+<p>→ We need to CREATE two additional Crawlers (Crawler 2 and Crawler 3) plus the Workflow itself</p>
+<hr>
+<h3>STEP 1 — CREATE CRAWLER 2 (Catalog Parquet Output)</h3>
+<p>→ Navigate to AWS Glue Console → Crawlers → Create Crawler</p>
+<p><strong>Setting: Crawler Name</strong><br>
+→ <code>shopnow-crawler-processed-orders</code></p>
+<p><strong>Setting: Data Source</strong><br>
+→ S3 path: <code>s3://shopnow-data-lake/processed/orders/</code><br>
+→ Crawl all sub-folders: Yes<br>
+→ Subsequent crawl behavior: Crawl new folders only (for incremental — ties to Project 46)</p>
+<p><strong>Setting: IAM Role</strong><br>
+→ Same role from Project 17: <code>AWSGlueServiceRole-ShopNow</code><br>
+→ This role already has S3 read access and Glue Catalog write access (configured in Project 17)</p>
+<p><strong>Setting: Target Database</strong><br>
+→ Glue Catalog Database: <code>shopnow_processed_db</code><br>
+→ Table prefix: <code>proc_</code></p>
+<p><strong>Setting: Schedule</strong><br>
+→ Set to "On demand" — we do NOT want this crawler running on its own schedule<br>
+→ The WORKFLOW will control when it runs<br>
+→ This is critical — if you set a schedule here AND in the workflow, it runs twice</p>
+<p><strong>Setting: Schema Change Policy</strong><br>
+→ Update the table definition in the data catalog: Yes<br>
+→ Add new columns only: Yes (safe default)<br>
+→ Delete columns detected as missing: No (prevents accidental schema loss)</p>
+<p>→ Create Crawler</p>
+<hr>
+<h3>STEP 2 — CREATE CRAWLER 3 (Catalog Enriched Output)</h3>
+<p>→ Same process as Step 1 with different values:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-crawler-enriched-orders</code></td></tr><tr><td>S3 Path</td><td><code>s3://shopnow-data-lake/enriched/orders/</code></td></tr><tr><td>IAM Role</td><td><code>AWSGlueServiceRole-ShopNow</code></td></tr><tr><td>Target Database</td><td><code>shopnow_enriched_db</code></td></tr><tr><td>Table Prefix</td><td><code>enr_</code></td></tr><tr><td>Schedule</td><td>On demand (workflow-controlled)</td></tr></tbody></table>
+<p>→ Create Crawler</p>
+<hr>
+<h3>STEP 3 — CREATE THE GLUE WORKFLOW</h3>
+<p>→ Navigate to AWS Glue Console → Left menu → ETL → Workflows → Create Workflow</p>
+<p><strong>Setting: Workflow Name</strong><br>
+→ <code>shopnow-daily-orders-pipeline</code></p>
+<p><strong>Setting: Description</strong><br>
+→ "Daily pipeline: Raw CSV → Catalog → Parquet → Catalog → Enrichment → Catalog"</p>
+<p><strong>Setting: Default Run Properties (Key-Value Pairs)</strong></p>
+<table><thead><tr><th>Key</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>--source_database</code></td><td><code>shopnow_raw_db</code></td><td>Passed to all jobs/crawlers as context</td></tr><tr><td><code>--target_database</code></td><td><code>shopnow_enriched_db</code></td><td>Jobs can read these at runtime</td></tr><tr><td><code>--processing_date</code></td><td><code>2025-01-15</code></td><td>Can be overridden per run</td></tr><tr><td><code>--environment</code></td><td><code>production</code></td><td>Helps jobs behave differently per environment</td></tr></tbody></table>
+<p>→ These run properties are accessible by every Job within the workflow at runtime<br>
+→ They act as shared configuration — change once, affects all steps<br>
+→ Jobs access them through the <code>--workflow_name</code> and <code>--workflow_run_id</code> parameters passed automatically by Glue</p>
+<p><strong>Setting: Max Concurrent Runs</strong><br>
+→ Set to 1<br>
+→ This prevents overlapping runs — if yesterday's run is still going at 6 AM, today's run won't start<br>
+→ Critical for data consistency — you don't want two runs writing to the same S3 paths simultaneously</p>
+<p>→ Click "Create"</p>
+<hr>
+<h3>STEP 4 — ADD THE STARTING TRIGGER (Scheduled)</h3>
+<p>→ Inside the workflow → Click "Add trigger"</p>
+<p><strong>Setting: Trigger Type</strong><br>
+→ Schedule</p>
+<p><strong>Setting: Trigger Name</strong><br>
+→ <code>trigger-start-daily-6am</code></p>
+<p><strong>Setting: Schedule</strong><br>
+→ Frequency: Daily<br>
+→ Start time: 06:00 UTC<br>
+→ Cron expression equivalent: <code>cron(0 6 * * ? *)</code></p>
+<p>→ Understanding cron in Glue:</p>
+<table><thead><tr><th>Field</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Minutes</td><td>0</td><td>At minute 0</td></tr><tr><td>Hours</td><td>6</td><td>At 6 AM</td></tr><tr><td>Day of month</td><td>*</td><td>Every day</td></tr><tr><td>Month</td><td>*</td><td>Every month</td></tr><tr><td>Day of week</td><td>?</td><td>Any day (required when day-of-month is specified)</td></tr><tr><td>Year</td><td>*</td><td>Every year</td></tr></tbody></table>
+<p><strong>Setting: Actions for this trigger</strong><br>
+→ Add: Crawler → <code>shopnow-crawler-raw-orders</code> (the Crawler from Project 17)<br>
+→ This is the FIRST step — the entry point of the workflow</p>
+<p><strong>Setting: Start on creation</strong><br>
+→ No — we want to test first before enabling<br>
+→ After testing → set to Yes OR manually activate the trigger</p>
+<p>→ Save trigger</p>
+<p>→ At this point the workflow graph shows:</p>
+<code>[trigger-start-daily-6am] ──► [shopnow-crawler-raw-orders]</code>
+<hr>
+<h3>STEP 5 — ADD CONDITIONAL TRIGGER 1 (After Crawler 1 → Start Job 1)</h3>
+<p>→ Inside the workflow → Click "Add trigger"</p>
+<p><strong>Setting: Trigger Type</strong><br>
+→ Conditional</p>
+<p><strong>Setting: Trigger Name</strong><br>
+→ <code>trigger-after-crawler1-start-job1</code></p>
+<p><strong>Setting: Trigger Logic</strong><br>
+→ "Start after ALL watched events"</p>
+<p><strong>Setting: Watched Events</strong><br>
+→ Crawler: <code>shopnow-crawler-raw-orders</code><br>
+→ Condition: <code>SUCCEEDED</code></p>
+<p>→ This is where the power lies — the trigger ONLY fires when the specific crawler completes successfully<br>
+→ If the crawler fails → this trigger does NOT fire → the entire downstream chain stops</p>
+<p><strong>Understanding Trigger Conditions:</strong></p>
+<table><thead><tr><th>Condition</th><th>Meaning</th></tr></thead><tbody><tr><td>SUCCEEDED</td><td>The crawler/job completed without errors</td></tr><tr><td>FAILED</td><td>The crawler/job encountered an error and stopped</td></tr><tr><td>STOPPED</td><td>The crawler/job was manually stopped</td></tr><tr><td>TIMEOUT</td><td>The crawler/job exceeded its timeout setting</td></tr></tbody></table>
+<p>→ You can also set "Start after ANY watched event" for parallel-to-sequential transitions (covered later in this project)</p>
+<p><strong>Setting: Actions for this trigger</strong><br>
+→ Add: Job → <code>shopnow-csv-to-parquet-job</code> (the Job from Project 21)</p>
+<p>→ Save trigger</p>
+<p>→ Workflow graph now shows:</p>
+<code>[trigger-start-daily-6am] ──► [Crawler 1] ──► [trigger-after-crawler1] ──► [Job 1]</code>
+<hr>
+<h3>STEP 6 — ADD CONDITIONAL TRIGGER 2 (After Job 1 → Start Crawler 2)</h3>
+<p>→ Same pattern:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trigger Type</td><td>Conditional</td></tr><tr><td>Trigger Name</td><td><code>trigger-after-job1-start-crawler2</code></td></tr><tr><td>Watched Event</td><td>Job: <code>shopnow-csv-to-parquet-job</code> → SUCCEEDED</td></tr><tr><td>Action</td><td>Crawler: <code>shopnow-crawler-processed-orders</code></td></tr></tbody></table>
+<p>→ Workflow graph:</p>
+<code>[6AM Trigger] ──► [Crawler 1] ──► [Trigger] ──► [Job 1] ──► [Trigger] ──► [Crawler 2]</code>
+<hr>
+<h3>STEP 7 — ADD CONDITIONAL TRIGGER 3 (After Crawler 2 → Start Job 2)</h3>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trigger Type</td><td>Conditional</td></tr><tr><td>Trigger Name</td><td><code>trigger-after-crawler2-start-job2</code></td></tr><tr><td>Watched Event</td><td>Crawler: <code>shopnow-crawler-processed-orders</code> → SUCCEEDED</td></tr><tr><td>Action</td><td>Job: <code>shopnow-mariadb-enrichment-job</code> (from Project 24)</td></tr></tbody></table>
+<hr>
+<h3>STEP 8 — ADD CONDITIONAL TRIGGER 4 (After Job 2 → Start Crawler 3)</h3>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trigger Type</td><td>Conditional</td></tr><tr><td>Trigger Name</td><td><code>trigger-after-job2-start-crawler3</code></td></tr><tr><td>Watched Event</td><td>Job: <code>shopnow-mariadb-enrichment-job</code> → SUCCEEDED</td></tr><tr><td>Action</td><td>Crawler: <code>shopnow-crawler-enriched-orders</code></td></tr></tbody></table>
+<hr>
+<h3>COMPLETE WORKFLOW GRAPH</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>[Scheduled Trigger: 6 AM Daily]
+</span>        │
+        ▼
+[Crawler 1: shopnow-crawler-raw-orders]
+        │ (on SUCCEEDED)
+        ▼
+[Conditional Trigger 1]
+        │
+        ▼
+[Job 1: shopnow-csv-to-parquet-job]
+        │ (on SUCCEEDED)
+        ▼
+[Conditional Trigger 2]
+        │
+        ▼
+[Crawler 2: shopnow-crawler-processed-orders]
+        │ (on SUCCEEDED)
+        ▼
+[Conditional Trigger 3]
+        │
+        ▼
+[Job 2: shopnow-mariadb-enrichment-job]
+        │ (on SUCCEEDED)
+        ▼
+[Conditional Trigger 4]
+        │
+        ▼
+[Crawler 3: shopnow-crawler-enriched-orders]</code></pre></div>
+<p>→ 5 actions in sequence<br>
+→ 5 triggers (1 scheduled + 4 conditional)<br>
+→ If ANY step fails → everything downstream stops<br>
+→ The entire pipeline is visible as ONE entity in the Glue console</p>
+<hr>
+<h3>STEP 9 — ACTIVATE THE WORKFLOW</h3>
+<p>→ Select the workflow → Actions → Activate<br>
+→ This specifically activates the STARTING trigger (scheduled trigger)<br>
+→ Conditional triggers are always "listening" — they don't need separate activation<br>
+→ They only fire when their watched event condition is met</p>
+<p>→ Alternatively for testing:<br>
+→ Select the workflow → Actions → Run<br>
+→ This triggers an immediate on-demand run without waiting for the 6 AM schedule<br>
+→ Use this to validate the entire chain before going live</p>
+<hr>
+<h3>STEP 10 — MONITOR THE WORKFLOW RUN</h3>
+<p>→ After a run starts → Click on the workflow → "History" tab</p>
+<p><strong>What you see per run:</strong></p>
+<table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody><tr><td>Workflow Run ID</td><td>Unique identifier for this specific execution</td></tr><tr><td>Status</td><td>RUNNING / COMPLETED / STOPPED / ERROR</td></tr><tr><td>Started On</td><td>Timestamp when the scheduled trigger fired</td></tr><tr><td>Completed On</td><td>Timestamp when the last action finished</td></tr><tr><td>Run Properties</td><td>The key-value pairs available to all steps</td></tr></tbody></table>
+<p>→ Click on a specific Run ID → You see the VISUAL GRAPH with color-coded status:</p>
+<table><thead><tr><th>Color</th><th>Meaning</th></tr></thead><tbody><tr><td>Green</td><td>Succeeded</td></tr><tr><td>Red</td><td>Failed</td></tr><tr><td>Blue</td><td>Currently running</td></tr><tr><td>Gray</td><td>Not yet started (waiting for upstream)</td></tr></tbody></table>
+<p>→ This is the "single pane of glass" the Head of Data requested<br>
+→ At a glance — you see the ENTIRE pipeline status without checking 5 separate components</p>
+<p><strong>Checking individual step details within the run:</strong><br>
+→ Click on any node (Crawler or Job) in the graph<br>
+→ Shows: Start time, end time, duration, status, error message (if failed)<br>
+→ For Jobs: Links to CloudWatch Logs for detailed execution logs<br>
+→ For Crawlers: Shows tables created/updated, rows scanned</p>
+<hr>
+<h3>STEP 11 — CONFIGURE WORKFLOW RUN PROPERTIES OVERRIDE</h3>
+<p>→ When triggering a run manually (via console or API), you can OVERRIDE default run properties</p>
+<table><thead><tr><th>Default Property</th><th>Override for this Run</th><th>Use Case</th></tr></thead><tbody><tr><td><code>--processing_date: 2025-01-15</code></td><td><code>--processing_date: 2025-01-10</code></td><td>Backfill — reprocess a specific historical date</td></tr><tr><td><code>--environment: production</code></td><td><code>--environment: staging</code></td><td>Test the workflow against staging data</td></tr></tbody></table>
+<p>→ This makes the same workflow reusable across dates and environments<br>
+→ Jobs within the workflow read these properties and behave accordingly</p>
+<hr>
+<h3>STEP 12 — ADDING PARALLEL BRANCHES (Advanced Pattern)</h3>
+<p>→ ShopNow's pipeline is purely sequential — each step depends on the previous<br>
+→ But what if Job 1 produces TWO outputs and you need TWO crawlers to run simultaneously?</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                [Job 1]
+</span>               /       \
+              ▼         ▼
+        [Crawler 2A] [Crawler 2B]    ← PARALLEL
+              \       /
+               ▼     ▼
+          [Conditional Trigger: ALL SUCCEEDED]
+                  │
+                  ▼
+               [Job 2]</code></pre></div>
+<p>→ Configuration for parallel execution:</p>
+<p><strong>Trigger for parallel start:</strong><br>
+→ Single conditional trigger watching Job 1 → SUCCEEDED<br>
+→ But with TWO actions: Crawler 2A AND Crawler 2B<br>
+→ Both crawlers start simultaneously when Job 1 succeeds</p>
+<p><strong>Trigger for convergence (fan-in):</strong><br>
+→ Single conditional trigger with:</p>
+<ul>
+<li>Trigger Logic: "Start after ALL watched events"</li>
+<li>Watched Event 1: Crawler 2A → SUCCEEDED</li>
+<li>Watched Event 2: Crawler 2B → SUCCEEDED<br>
+→ This trigger fires ONLY when BOTH crawlers have succeeded<br>
+→ Then it starts Job 2</li>
+</ul>
+<p><strong>"ALL" vs "ANY" logic:</strong></p>
+<table><thead><tr><th>Logic</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>ALL</td><td>Fires when every watched event has completed with specified condition</td><td>Fan-in — wait for all parallel branches</td></tr><tr><td>ANY</td><td>Fires when at least one watched event has completed with specified condition</td><td>First-responder pattern — proceed as soon as any branch finishes</td></tr></tbody></table>
+<p>→ ShopNow doesn't need parallel branches yet — but this pattern is critical for complex pipelines</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always name workflows, triggers, and actions with consistent naming conventions</p>
+<ul>
+<li>Pattern: <code>{project}-{pipeline}-{component-type}-{step-description}</code></li>
+<li>Example: <code>shopnow-daily-orders-trigger-after-crawler1</code></li>
+</ul>
+<p>→ Always set Max Concurrent Runs to 1 for pipelines that write to same output paths<br>
+→ Always use conditional triggers with SUCCEEDED condition — never assume previous step worked</p>
+<p>→ Always set workflow default run properties for shared configuration</p>
+<ul>
+<li>Processing dates</li>
+<li>Environment identifiers</li>
+<li>Source/target paths</li>
+<li>Any value that multiple steps need</li>
+</ul>
+<p>→ Always test with an on-demand run before activating the schedule<br>
+→ Always verify each individual Crawler and Job works standalone BEFORE adding them to a workflow<br>
+→ Always check that individual Crawlers and Jobs do NOT have their own independent schedules</p>
+<ul>
+<li>If Crawler 1 has its own schedule AND is in a workflow → it runs twice (once independently, once via workflow)</li>
+</ul>
+<p>→ Always monitor workflow runs — set up CloudWatch Alarms on workflow failure (ties to Project 8)<br>
+→ Always tag workflows with Department, Project, Environment for cost tracking and governance</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never create a workflow with more than 100 triggers — Glue has a soft limit<br>
+→ Never put ALL your company's ETL into ONE workflow — separate by domain/pipeline<br>
+→ Never assume conditional triggers fire instantly — there's a small polling interval (seconds)<br>
+→ Never set Crawler schedules AND include them in a workflow — duplicate execution<br>
+→ Never chain more than 10-15 sequential steps in a single workflow without evaluating Step Functions (Project 32) as alternative<br>
+→ Never use workflow run properties for sensitive data (credentials, API keys) — use Secrets Manager (Project 37)<br>
+→ Never skip the testing phase — a misconfigured trigger condition can silently skip steps<br>
+→ Never forget that if the starting trigger is not activated, nothing runs — activation is a separate step from creation<br>
+→ Never use "ANY" logic when you mean "ALL" for convergence triggers — one failed branch could let the pipeline continue with incomplete data<br>
+→ Never hardcode S3 paths inside Jobs when you can pass them via workflow run properties — makes the workflow inflexible</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE GLUE WORKFLOWS</h2>
+<table><thead><tr><th>Scenario</th><th>Use Glue Workflow?</th></tr></thead><tbody><tr><td>Chain 2-15 Glue Crawlers and Jobs in sequence</td><td>✅ Yes — ideal use case</td></tr><tr><td>Parallel Glue Crawlers/Jobs with fan-in convergence</td><td>✅ Yes — supports parallel branches</td></tr><tr><td>All-Glue pipeline (only Crawlers and Jobs)</td><td>✅ Yes — native integration</td></tr><tr><td>Need shared run properties across all steps</td><td>✅ Yes — built-in feature</td></tr><tr><td>Need visual DAG monitoring</td><td>✅ Yes — console provides run graph</td></tr><tr><td>Simple daily/hourly ETL scheduling</td><td>✅ Yes — scheduled trigger handles this</td></tr><tr><td>Need to orchestrate non-Glue services (Lambda, Redshift, ECS, SNS)</td><td>❌ No — Use Step Functions (Project 32)</td></tr><tr><td>Need human approval gates in the pipeline</td><td>❌ No — Use Step Functions (Project 32)</td></tr><tr><td>Need complex branching logic (if-else, loops, retries with backoff)</td><td>❌ No — Use Step Functions (Project 32)</td></tr><tr><td>Need to call external APIs as part of the pipeline</td><td>❌ No — Use Step Functions + Lambda</td></tr><tr><td>Need cross-account orchestration</td><td>❌ No — Use Step Functions or EventBridge (Project 38)</td></tr><tr><td>Pipeline has 50+ steps with complex dependencies</td><td>⚠️ Evaluate — Glue Workflows can get unwieldy; consider Step Functions or Apache Airflow (MWAA)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE GLUE WORKFLOWS</h2>
+<p>→ When your pipeline includes non-Glue steps</p>
+<ul>
+<li>Need to trigger a Lambda after ETL? → Step Functions (Project 32)</li>
+<li>Need to send SNS notification on completion? → Step Functions or EventBridge (Project 38)</li>
+<li>Need to run a Redshift COPY command? → Step Functions with Redshift Data API</li>
+</ul>
+<p>→ When you need dynamic runtime decisions</p>
+<ul>
+<li>"If data volume &gt; 1M rows, use Job A; else use Job B" → Step Functions Choice State</li>
+<li>Glue Workflows have static DAGs — the graph is fixed at design time</li>
+</ul>
+<p>→ When you need retry with exponential backoff per step</p>
+<ul>
+<li>Glue Workflows do not have built-in retry on trigger level</li>
+<li>Jobs have their own retry config (max retries setting on the Job itself)</li>
+<li>For sophisticated retry patterns → Step Functions Retry/Catch</li>
+</ul>
+<p>→ When you need cross-account pipeline coordination</p>
+<ul>
+<li>Workflow runs within a single AWS account</li>
+<li>For cross-account patterns → EventBridge (Project 38) + Step Functions (Project 32)</li>
+</ul>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — WORKFLOW EXECUTION ENGINE</h3>
+<p>→ When the scheduled trigger fires at 6 AM:</p>
+<ol>
+<li>Glue Workflow Engine creates a new "Workflow Run" with a unique Run ID</li>
+<li>The starting trigger evaluates and fires its actions (Crawler 1)</li>
+<li>Crawler 1 transitions to RUNNING state</li>
+<li>The Workflow Engine polls the status of Crawler 1 periodically</li>
+<li>When Crawler 1 completes → the engine checks all conditional triggers watching Crawler 1</li>
+<li>Trigger condition is evaluated: "Did Crawler 1 SUCCEED?"</li>
+<li>If YES → the trigger fires its action (Job 1)</li>
+<li>If NO (FAILED/STOPPED/TIMEOUT) → the trigger does NOT fire → downstream chain stops</li>
+<li>This cascading evaluation continues through every trigger-action pair</li>
+</ol>
+<p>→ The polling interval is internal to AWS — typically seconds, not configurable<br>
+→ There is no SLA on exact trigger evaluation latency — expect 5-30 seconds between step completion and next step starting</p>
+<hr>
+<h3>MECHANIC 2 — TRIGGER STATE MACHINE</h3>
+<p>→ Each trigger in a workflow has its own lifecycle:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CREATED → ACTIVATED → FIRING → SUCCEEDED/FAILED
+</span>              ↑                      │
+              └──────────────────────┘
+              (re-arms for next run)</code></pre></div>
+<table><thead><tr><th>State</th><th>Meaning</th></tr></thead><tbody><tr><td>CREATED</td><td>Trigger exists but is not active</td></tr><tr><td>ACTIVATED</td><td>Trigger is listening for its condition</td></tr><tr><td>FIRING</td><td>Condition met — starting its actions</td></tr><tr><td>SUCCEEDED</td><td>Actions started successfully</td></tr><tr><td>FAILED</td><td>Could not start actions (e.g., action doesn't exist)</td></tr></tbody></table>
+<p>→ Scheduled triggers re-arm after each firing — they fire again at the next scheduled time<br>
+→ Conditional triggers re-arm for the next workflow run — they fire once per run</p>
+<hr>
+<h3>MECHANIC 3 — RUN PROPERTIES PROPAGATION</h3>
+<p>→ When a workflow run starts:</p>
+<ol>
+<li>Default run properties (defined at workflow creation) are loaded</li>
+<li>If overrides were provided (via API/console), they replace defaults</li>
+<li>Every Job in the workflow receives additional system arguments:
+<ul>
+<li><code>--workflow_name</code>: Name of the workflow</li>
+<li><code>--workflow_run_id</code>: Unique ID of this specific run</li>
+</ul>
+</li>
+<li>Inside the Job → these two parameters are used to FETCH the run properties via Glue API</li>
+<li>The Job calls <code>glue.get_workflow_run_properties(Name, RunId)</code> → gets the key-value pairs</li>
+<li>The Job uses these properties to determine paths, dates, configurations</li>
+</ol>
+<p>→ This is NOT automatic injection into job arguments<br>
+→ The Job must EXPLICITLY fetch run properties using the workflow name and run ID<br>
+→ If the Job runs OUTSIDE the workflow (standalone), these parameters won't exist → Job should handle this gracefully</p>
+<hr>
+<h3>MECHANIC 4 — WORKFLOW RUN STATUS DETERMINATION</h3>
+<p>→ The overall workflow run status is determined by the collective status of ALL actions:</p>
+<table><thead><tr><th>Scenario</th><th>Workflow Run Status</th></tr></thead><tbody><tr><td>All actions completed successfully</td><td>COMPLETED</td></tr><tr><td>Any action failed AND downstream triggers didn't fire</td><td>ERROR</td></tr><tr><td>Workflow was manually stopped</td><td>STOPPED</td></tr><tr><td>Some actions completed, pipeline stopped due to failure</td><td>ERROR</td></tr><tr><td>Workflow is still executing</td><td>RUNNING</td></tr></tbody></table>
+<p>→ Important: Glue Workflow does NOT have a native "FAILED" notification mechanism<br>
+→ To get notified on failure → you must:</p>
+<ul>
+<li>Set up a CloudWatch Events rule (EventBridge) watching for Glue Workflow run state changes</li>
+<li>Route to SNS for email notification (Project 6, 38 patterns)</li>
+<li>OR use a separate monitoring Lambda that polls workflow run status</li>
+</ul>
+<hr>
+<h3>MECHANIC 5 — HOW THE VISUAL GRAPH IS BUILT</h3>
+<p>→ The Glue console renders the workflow graph by:</p>
+<ol>
+<li>Reading all triggers associated with the workflow</li>
+<li>For each trigger → mapping its watched events (upstream) and actions (downstream)</li>
+<li>Building a DAG (Directed Acyclic Graph) from these relationships</li>
+<li>Color-coding nodes based on the current/last run status</li>
+</ol>
+<p>→ The graph is READ-ONLY during execution — you cannot modify a running workflow<br>
+→ To modify → stop the workflow → edit triggers/actions → reactivate</p>
+<hr>
+<h3>MECHANIC 6 — TRIGGER EVALUATION FOR PARALLEL FAN-IN</h3>
+<p>→ When a conditional trigger watches MULTIPLE events with "ALL" logic:</p>
+<code>Trigger watches: [Crawler 2A: SUCCEEDED] AND [Crawler 2B: SUCCEEDED]</code>
+<p>→ Internal behavior:</p>
+<ol>
+<li>Crawler 2A finishes → engine checks trigger → Crawler 2B not done yet → trigger does NOT fire</li>
+<li>Crawler 2B finishes → engine checks trigger → both conditions met → trigger FIRES</li>
+<li>If Crawler 2A SUCCEEDED but Crawler 2B FAILED → trigger NEVER fires</li>
+</ol>
+<p>→ The trigger maintains internal state tracking which watched events have been satisfied<br>
+→ This state resets at the beginning of each workflow run</p>
+<hr>
+<h3>MECHANIC 7 — INTERACTION WITH INDIVIDUAL JOB/CRAWLER SETTINGS</h3>
+<p>→ Glue Jobs and Crawlers have their own configurations (timeout, retries, DPU allocation)<br>
+→ The Workflow does NOT override these settings<br>
+→ It simply starts them — the Job/Crawler runs with its own defined configuration</p>
+<table><thead><tr><th>Setting</th><th>Controlled By</th><th>NOT By</th></tr></thead><tbody><tr><td>Job timeout</td><td>Job definition</td><td>Workflow</td></tr><tr><td>Job max retries</td><td>Job definition</td><td>Workflow</td></tr><tr><td>Job DPU/worker count</td><td>Job definition</td><td>Workflow</td></tr><tr><td>Crawler timeout</td><td>Crawler definition</td><td>Workflow</td></tr><tr><td>Execution sequence</td><td>Workflow triggers</td><td>Job/Crawler definition</td></tr><tr><td>Shared parameters</td><td>Workflow run properties</td><td>Job definition</td></tr></tbody></table>
+<p>→ If a Job has <code>Max Retries: 2</code> → and it fails → Glue retries the job 2 times<br>
+→ The conditional trigger watching this Job waits until ALL retries are exhausted<br>
+→ Only after the final retry fails does the trigger see the FAILED condition</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Forgot to ACTIVATE the workflow after creation</td><td>Scheduled trigger never fires — pipeline never runs</td><td>Always activate after testing — check workflow status shows "ACTIVE"</td></tr><tr><td>2</td><td>Individual Crawler has its own schedule + is in workflow</td><td>Crawler runs twice — once independently, once via workflow — catalog updates may conflict</td><td>Remove individual schedules when adding to workflow</td></tr><tr><td>3</td><td>Conditional trigger watches wrong action name</td><td>Trigger never fires because it's watching a non-existent or renamed action</td><td>Verify trigger watched events match exact Crawler/Job names</td></tr><tr><td>4</td><td>Job doesn't fetch workflow run properties</td><td>Job runs with hardcoded defaults instead of workflow-provided parameters</td><td>Always implement run property fetching in Job logic</td></tr><tr><td>5</td><td>Max Concurrent Runs not set to 1</td><td>Two workflow runs overlap — both write to same S3 paths — corrupted data</td><td>Set Max Concurrent Runs = 1 for pipelines with shared output paths</td></tr><tr><td>6</td><td>Using "ANY" instead of "ALL" for fan-in trigger</td><td>Pipeline proceeds when only ONE parallel branch finishes — incomplete data</td><td>Double-check trigger logic when using parallel patterns</td></tr><tr><td>7</td><td>Workflow has circular dependency</td><td>Creation fails or infinite loop risk</td><td>Glue prevents this at creation time — but verify your DAG is acyclic</td></tr><tr><td>8</td><td>Starting trigger fires but first Crawler is already running (from manual start)</td><td>Crawler returns error or queues — depends on Crawler's own concurrency setting</td><td>Ensure no manual runs overlap with scheduled workflow runs</td></tr><tr><td>9</td><td>No alerting on workflow failure</td><td>Pipeline fails silently for days</td><td>Set up EventBridge rule → SNS notification on workflow state change (Project 38 pattern)</td></tr><tr><td>10</td><td>Modifying a workflow while a run is in progress</td><td>Unpredictable behavior — running instance uses old graph, new runs use new graph</td><td>Always stop active runs before modifying workflow structure</td></tr><tr><td>11</td><td>Deleting a Crawler/Job that's part of a workflow</td><td>Workflow run fails at that step — trigger fires but action doesn't exist</td><td>Remove from workflow first → then delete the Crawler/Job</td></tr><tr><td>12</td><td>Workflow graph becomes too complex (20+ steps)</td><td>Console graph becomes unreadable — debugging is painful</td><td>Split into multiple smaller workflows or evaluate Step Functions</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Number of Steps per Workflow</strong></p>
+<ul>
+<li>Soft limit: 100 triggers per workflow</li>
+<li>Practical limit: 15-20 steps before the visual graph becomes hard to manage</li>
+<li>Beyond 20 steps → consider splitting into sub-workflows or using Step Functions</li>
+</ul>
+<p>→ <strong>Number of Workflows per Account</strong></p>
+<ul>
+<li>Soft limit: 25 workflows per account (can request increase)</li>
+<li>For organizations with many pipelines → request limit increase to 100+</li>
+</ul>
+<p>→ <strong>Concurrent Workflow Runs</strong></p>
+<ul>
+<li>Configurable via Max Concurrent Runs</li>
+<li>Each run consumes resources for every Job/Crawler it triggers</li>
+<li>10 workflows each running 5 Jobs = 50 concurrent Glue Jobs → check your account's Glue Job concurrency limit</li>
+</ul>
+<p>→ <strong>Execution Duration</strong></p>
+<ul>
+<li>No timeout on the workflow itself — it runs until all steps complete or fail</li>
+<li>Individual Jobs and Crawlers have their own timeouts</li>
+<li>A workflow with 5 sequential steps, each taking 30 minutes = 2.5 hours total</li>
+<li>Plan scheduling accordingly — don't schedule next run before previous can finish</li>
+</ul>
+<p>→ <strong>Cross-Region Limitation</strong></p>
+<ul>
+<li>Workflows are regional — they can only orchestrate Crawlers and Jobs in the same AWS region</li>
+<li>For cross-region ETL → use Step Functions or EventBridge cross-region patterns</li>
+</ul>
+<p>→ <strong>Run History Retention</strong></p>
+<ul>
+<li>Glue retains workflow run history for 90 days</li>
+<li>After 90 days → run details are purged</li>
+<li>For long-term audit → export run metadata to S3 via API</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<ul>
+<li>The Workflow itself has NO cost — it's a free orchestration layer</li>
+<li>You pay ONLY for the Crawlers and Jobs that execute within it</li>
+<li>Crawlers: Billed per DPU-hour</li>
+<li>Jobs: Billed per DPU-hour (or per DPU-second for Glue 2.0+)</li>
+<li>More steps = more DPU consumption = higher cost</li>
+<li>Optimize individual Job DPU allocation to control costs</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the workflow is correctly configured:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th></tr></thead><tbody><tr><td>Workflow exists and is active</td><td>Glue Console → Workflows → Status column</td><td>"ACTIVE"</td></tr><tr><td>Graph shows correct sequence</td><td>Workflow → Graph tab</td><td>All 5 actions connected via 5 triggers in correct order</td></tr><tr><td>Starting trigger has correct schedule</td><td>Click on starting trigger → Schedule</td><td><code>cron(0 6 * * ? *)</code></td></tr><tr><td>Conditional triggers watch correct events</td><td>Click each conditional trigger → Watched events</td><td>Correct Crawler/Job name + SUCCEEDED condition</td></tr><tr><td>Run properties are set</td><td>Workflow → Run properties tab</td><td>All expected key-value pairs present</td></tr><tr><td>Max concurrent runs is 1</td><td>Workflow → Properties</td><td>Max concurrent runs: 1</td></tr><tr><td>Individual Crawlers have NO independent schedule</td><td>Glue → Crawlers → Schedule column</td><td>"On demand" for all workflow-managed crawlers</td></tr></tbody></table>
+<p>→ <strong>How to validate a run worked correctly:</strong></p>
+<table><thead><tr><th>Validation Step</th><th>Method</th></tr></thead><tbody><tr><td>All 5 steps show green</td><td>Workflow → History → Click Run ID → Visual graph</td></tr><tr><td>Crawler 1 updated the raw table</td><td>Glue Catalog → shopnow_raw_db → Check table schema and row count</td></tr><tr><td>Job 1 created Parquet files</td><td>S3 Console → <code>processed/orders/</code> → Verify <code>.parquet</code> files exist</td></tr><tr><td>Crawler 2 updated the processed table</td><td>Glue Catalog → shopnow_processed_db → Check table</td></tr><tr><td>Job 2 created enriched files</td><td>S3 Console → <code>enriched/orders/</code> → Verify files exist</td></tr><tr><td>Crawler 3 updated the enriched table</td><td>Glue Catalog → shopnow_enriched_db → Check table</td></tr><tr><td>Athena can query enriched data</td><td>Athena Console → Query <code>SELECT * FROM shopnow_enriched_db.enr_orders LIMIT 10</code></td></tr></tbody></table>
+<p>→ <strong>How to debug a failed run:</strong></p>
+<table><thead><tr><th>Failure Point</th><th>Debug Steps</th></tr></thead><tbody><tr><td>Crawler failed</td><td>Workflow graph → Click failed crawler → View CloudWatch Logs → Check IAM permissions, S3 path existence, classifier issues</td></tr><tr><td>Job failed</td><td>Workflow graph → Click failed job → View CloudWatch Logs → Check error output, DPU allocation, data format issues</td></tr><tr><td>Trigger didn't fire</td><td>Verify trigger is watching the CORRECT action name → Verify condition (SUCCEEDED vs FAILED) → Check if previous action actually completed</td></tr><tr><td>Workflow shows ERROR but no step is red</td><td>Check if the starting trigger failed to fire → Possible IAM permission issue on the Glue service role</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Glue Workflow is the NATIVE orchestrator for Glue-only pipelines<br>
+→ It turns individual Crawlers and Jobs (from Projects 17, 21, 24) into a single managed pipeline<br>
+→ The three pillars: Triggers (when) → Actions (what) → Conditions (if)<br>
+→ Sequential chains use conditional triggers with SUCCEEDED condition<br>
+→ Parallel branches use one trigger with multiple actions + fan-in trigger with ALL logic<br>
+→ Run properties provide shared configuration across all steps<br>
+→ The workflow itself is FREE — you only pay for Crawler/Job execution<br>
+→ Max Concurrent Runs = 1 is essential for data consistency<br>
+→ Monitoring is through the visual run graph — green/red/blue/gray status<br>
+→ Alerting requires external setup (EventBridge → SNS) — not built into workflows natively</p>
+<p>→ <strong>Connection to Previous Projects:</strong></p>
+<ul>
+<li>Project 17 → The Crawlers being orchestrated were created here</li>
+<li>Project 21 → The CSV-to-Parquet Job being orchestrated was created here</li>
+<li>Project 24 → The MariaDB enrichment Job being orchestrated was created here</li>
+<li>All three were standalone — this project CHAINS them into an automated pipeline</li>
+</ul>
+<p>→ <strong>Limitation realized:</strong></p>
+<ul>
+<li>What if ShopNow needs to send an SNS notification when the pipeline completes?</li>
+<li>What if they need to call a Lambda to trigger a Redshift COPY after enrichment?</li>
+<li>What if they need a human approval step before production data refresh?</li>
+<li>Glue Workflow CANNOT do any of these — it only orchestrates Glue components</li>
+</ul>
+<p>→ <strong>This is EXACTLY what Project 32 solves</strong></p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow's daily pipeline now runs automatically via Glue Workflow<br>
+→ But the Head of Data has new requirements:</p>
+<ul>
+<li>After the pipeline completes → load the enriched data into Redshift (non-Glue action)</li>
+<li>Before Redshift load → get approval from the Data Quality team (human gate)</li>
+<li>If any step fails → send an SNS alert to the on-call engineer</li>
+<li>Some steps should retry 3 times with exponential backoff before declaring failure</li>
+<li>The pipeline should branch: if data volume &gt; threshold → use large Glue Job config; else → use small config</li>
+</ul>
+<p>→ Glue Workflow cannot handle ANY of these requirements<br>
+→ AWS Step Functions is the general-purpose orchestrator that can coordinate ANY AWS service<br>
+→ It supports branching, loops, retries, human approval, error handling, and cross-service integration</p>
+<p>→ <strong>Project 32 introduces Step Functions — the orchestrator that orchestrates everything, not just Glue</strong></p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 32: "The Pipeline That Needed Human Approval — Step Functions Multi-Service Orchestration"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-30.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 31/60</span></div><a class="nav-btn next" href="project-32.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

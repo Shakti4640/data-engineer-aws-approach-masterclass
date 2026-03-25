@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 60: THE ENTERPRISE DATA MESH — Multi-Account Producer-Consumer Pattern w — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 60: THE ENTERPRISE DATA MESH — Multi-Account Producer-Consumer Pattern with Full Governance &amp; Observability</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ DataPulse Corp has grown dramatically over the past 18 months:</p>
+<ul>
+<li>Acquired InsightWorks (Project 58) and integrated their data</li>
+<li>Built a complete serverless analytics platform (Project 59)</li>
+<li>Hardened security across 5 accounts (Project 57)</li>
+<li>Optimized costs to save 54% (Project 56)</li>
+<li>Implemented cross-account governance via Organizations (Project 54)</li>
+</ul>
+<p>→ But the organization has hit a SCALING WALL — not technical, but ORGANIZATIONAL:</p>
+<p><strong>The Central Data Team Bottleneck:</strong></p>
+<table><thead><tr><th>Team</th><th>Data Request</th><th>Wait Time</th><th>Current Status</th></tr></thead><tbody><tr><td>Marketing</td><td>Campaign attribution dataset with hourly refresh</td><td>3 weeks in backlog</td><td>Pending — data team overloaded</td></tr><tr><td>Finance</td><td>Quarterly reconciliation dataset joining 4 sources</td><td>5 weeks in backlog</td><td>Not started</td></tr><tr><td>InsightWorks Integration</td><td>Regional sales normalization</td><td>2 weeks in backlog</td><td>In progress</td></tr><tr><td>Product</td><td>User behavior analytics from clickstream</td><td>6 weeks in backlog</td><td>Not prioritized</td></tr><tr><td>Customer Success</td><td>Churn prediction feature dataset</td><td>4 weeks in backlog</td><td>Pending</td></tr><tr><td>Partner Integration</td><td>Partner-facing aggregated API datasets</td><td>8 weeks in backlog</td><td>Blocked by security review</td></tr></tbody></table>
+<p>→ The central data team has 6 engineers<br>
+→ They maintain 47 Glue ETL jobs, 23 Crawlers, 15 Redshift schemas, 12 Athena workgroups<br>
+→ Every new dataset request flows through them<br>
+→ Average time from request to production: 4-8 weeks<br>
+→ Business teams are frustrated — they know their domain data better than the central team</p>
+<p><strong>The Ownership Problem:</strong><br>
+→ Marketing team understands campaign data better than anyone<br>
+→ But they cannot create their own Glue jobs, Athena tables, or Redshift schemas<br>
+→ They must explain their domain to the central team → central team builds it → marketing validates → iterations take weeks<br>
+→ The central team becomes a translation layer between domain experts and infrastructure</p>
+<p><strong>The Governance Problem:</strong><br>
+→ 5 AWS accounts with data spread across them<br>
+→ No clear ownership of datasets — "who is responsible for data quality of the customer table?"<br>
+→ No data contracts — downstream consumers break when upstream schemas change<br>
+→ No data discoverability — teams don't know what data exists in other accounts<br>
+→ Lake Formation permissions (Project 47) exist but are managed ad-hoc</p>
+<p><strong>The Observability Problem:</strong><br>
+→ CloudWatch metrics are per-account — no cross-account unified view<br>
+→ When a Glue job fails in Account 3 → Account 1's dashboard doesn't update → users see stale data for hours<br>
+→ No end-to-end pipeline observability from ingestion to consumption<br>
+→ SLA monitoring doesn't exist — nobody knows if data freshness commitments are met</p>
+<p><strong>The CTO's Vision:</strong><br>
+→ "Each domain team should OWN their data end-to-end"<br>
+→ "They should PUBLISH data products that other teams can discover and consume"<br>
+→ "A central governance team should provide guardrails — not gatekeeping"<br>
+→ "We need to see the health of the ENTIRE data platform from one dashboard"<br>
+→ "This must work across all our AWS accounts with proper security"</p>
+<p>→ This is the <strong>Data Mesh</strong> architecture pattern<br>
+→ Coined by Zhamak Dehghani — it applies product thinking and domain ownership to data</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ Data Mesh has 4 foundational principles:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────┐
+</span>│                    DATA MESH PRINCIPLES                            │
+│                                                                    │
+│  ┌─────────────────────┐    ┌─────────────────────┐              │
+│  │  1. DOMAIN           │    │  2. DATA AS A        │              │
+│  │     OWNERSHIP        │    │     PRODUCT          │              │
+│  │                      │    │                      │              │
+│  │  Each business       │    │  Data is treated     │              │
+│  │  domain owns their   │    │  like a product:     │              │
+│  │  data end-to-end     │    │  discoverable,       │              │
+│  │  (ingestion →        │    │  addressable,        │              │
+│  │   transformation →   │    │  trustworthy,        │              │
+│  │   serving)           │    │  self-describing,    │              │
+│  │                      │    │  interoperable       │              │
+│  └─────────────────────┘    └─────────────────────┘              │
+│                                                                    │
+│  ┌─────────────────────┐    ┌─────────────────────┐              │
+│  │  3. SELF-SERVE       │    │  4. FEDERATED        │              │
+│  │     DATA PLATFORM    │    │     COMPUTATIONAL    │              │
+│  │                      │    │     GOVERNANCE       │              │
+│  │  Platform provides   │    │                      │              │
+│  │  infrastructure      │    │  Central policies    │              │
+│  │  that domain teams   │    │  + domain autonomy   │              │
+│  │  can use             │    │  Governance is       │              │
+│  │  independently       │    │  automated, not      │              │
+│  │  without central     │    │  manual gatekeeping  │              │
+│  │  team dependency     │    │                      │              │
+│  └─────────────────────┘    └─────────────────────┘              │
+└──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Translating these principles to AWS:</p>
+<table><thead><tr><th>Principle</th><th>AWS Implementation</th></tr></thead><tbody><tr><td>Domain Ownership</td><td>Separate AWS account per domain (or per team)</td></tr><tr><td>Data as a Product</td><td>Curated datasets in S3 with Glue Catalog metadata, SLA commitments, documentation</td></tr><tr><td>Self-Serve Platform</td><td>Standardized account templates, shared Glue/Athena/Lake Formation infrastructure</td></tr><tr><td>Federated Governance</td><td>Central governance account with Lake Formation, Organizations SCPs, shared policies</td></tr></tbody></table>
+<p>→ Approach:</p>
+<ol>
+<li>Design the multi-account architecture (account structure)</li>
+<li>Set up the Central Governance Account (Lake Formation, catalog, policies)</li>
+<li>Set up Domain Producer Accounts (each domain owns their pipeline)</li>
+<li>Configure cross-account data sharing (Lake Formation + Glue Catalog)</li>
+<li>Set up the Consumer Layer (Athena, QuickSight, API from Project 59)</li>
+<li>Implement data product contracts and SLAs</li>
+<li>Build cross-account observability</li>
+<li>Establish federated governance processes</li>
+</ol>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>SECTION A — MULTI-ACCOUNT ARCHITECTURE DESIGN</h3>
+<hr>
+<p><strong>Step A1 — Define Account Structure</strong></p>
+<p>→ Builds on Project 54 (Organizations + SCPs)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────┐
+</span>│                    AWS ORGANIZATION                                │
+│                    (Management Account)                            │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  INFRASTRUCTURE OU                                        │    │
+│  │                                                            │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │    │
+│  │  │ Security     │  │ Log Archive  │  │ Shared       │   │    │
+│  │  │ Account      │  │ Account      │  │ Services     │   │    │
+│  │  │              │  │              │  │ Account      │   │    │
+│  │  │ • GuardDuty  │  │ • CloudTrail │  │ • Transit GW │   │    │
+│  │  │ • Sec Hub    │  │ • Config Logs│  │ • VPC Endpts │   │    │
+│  │  │ • Config Agg │  │ • Flow Logs  │  │ • DNS        │   │    │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘   │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  GOVERNANCE OU                                            │    │
+│  │                                                            │    │
+│  │  ┌──────────────────────────────────────────────────┐    │    │
+│  │  │ Central Governance Account                        │    │    │
+│  │  │                                                    │    │    │
+│  │  │ • Lake Formation (Central Admin)                  │    │    │
+│  │  │ • Central Glue Data Catalog                       │    │    │
+│  │  │ • Data Product Registry (DynamoDB)                │    │    │
+│  │  │ • Cross-Account Observability Dashboard           │    │    │
+│  │  │ • Data Quality Rules (Central)                    │    │    │
+│  │  │ • SNS Topics for Data Platform Alerts             │    │    │
+│  │  └──────────────────────────────────────────────────┘    │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  DATA DOMAINS OU                                          │    │
+│  │                                                            │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │    │
+│  │  │ Marketing    │  │ Finance      │  │ Product      │   │    │
+│  │  │ Domain       │  │ Domain       │  │ Domain       │   │    │
+│  │  │ Account      │  │ Account      │  │ Account      │   │    │
+│  │  │              │  │              │  │              │   │    │
+│  │  │ • S3 (own)   │  │ • S3 (own)   │  │ • S3 (own)   │   │    │
+│  │  │ • Glue (own) │  │ • Glue (own) │  │ • Glue (own) │   │    │
+│  │  │ • Athena     │  │ • Athena     │  │ • Athena     │   │    │
+│  │  │ • Redshift   │  │ • RDS        │  │ • Redshift   │   │    │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘   │    │
+│  │                                                            │    │
+│  │  ┌──────────────┐  ┌──────────────┐                      │    │
+│  │  │ Customer     │  │ InsightWorks │                      │    │
+│  │  │ Success      │  │ (Acquired)   │                      │    │
+│  │  │ Domain       │  │ Domain       │                      │    │
+│  │  │ Account      │  │ Account      │                      │    │
+│  │  └──────────────┘  └──────────────┘                      │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  CONSUMPTION OU                                           │    │
+│  │                                                            │    │
+│  │  ┌──────────────────────────────────────────────────┐    │    │
+│  │  │ Analytics Consumption Account                     │    │    │
+│  │  │                                                    │    │    │
+│  │  │ • QuickSight (from Project 59)                    │    │    │
+│  │  │ • API Gateway + Lambda (from Project 59)          │    │    │
+│  │  │ • Athena (federated queries across domains)       │    │    │
+│  │  │ • Cross-domain dashboards                         │    │    │
+│  │  └──────────────────────────────────────────────────┘    │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Total accounts: 10</p>
+<ul>
+<li>1 Management Account (Organizations)</li>
+<li>3 Infrastructure Accounts (Security, Log Archive, Shared Services)</li>
+<li>1 Central Governance Account</li>
+<li>5 Domain Producer Accounts (Marketing, Finance, Product, Customer Success, InsightWorks)</li>
+<li>1 Analytics Consumption Account</li>
+</ul>
+<p><strong>Step A2 — Create Organizational Units</strong></p>
+<p>→ Organizations Console → Create OU Structure</p>
+<table><thead><tr><th>OU Name</th><th>Purpose</th><th>Accounts</th></tr></thead><tbody><tr><td>Infrastructure</td><td>Shared platform services</td><td>Security, Log Archive, Shared Services</td></tr><tr><td>Governance</td><td>Central data governance</td><td>Central Governance</td></tr><tr><td>DataDomains</td><td>Domain producer accounts</td><td>Marketing, Finance, Product, Customer Success, InsightWorks</td></tr><tr><td>Consumption</td><td>Data consumption services</td><td>Analytics Consumption</td></tr></tbody></table>
+<p><strong>Step A3 — Apply SCPs per OU</strong></p>
+<p>→ Builds on Project 54 (SCPs)</p>
+<p><strong>SCP for DataDomains OU:</strong></p>
+<table><thead><tr><th>SCP</th><th>Effect</th><th>Purpose</th></tr></thead><tbody><tr><td>Deny disabling CloudTrail</td><td>Deny <code>cloudtrail:StopLogging</code></td><td>Audit trail cannot be disabled by domain teams</td></tr><tr><td>Deny disabling Config</td><td>Deny <code>config:StopConfigurationRecorder</code></td><td>Compliance monitoring always on</td></tr><tr><td>Deny public S3</td><td>Deny <code>s3:PutBucketPolicy</code> with public principal</td><td>Domain teams cannot make data public</td></tr><tr><td>Deny creating IAM users</td><td>Deny <code>iam:CreateUser</code></td><td>Force SSO/role-based access only</td></tr><tr><td>Deny deleting Lake Formation permissions</td><td>Deny <code>lakeformation:RevokePermissions</code> without governance role</td><td>Prevent accidental permission removal</td></tr><tr><td>Allow only approved regions</td><td>Deny all actions outside ap-south-1 and us-east-1</td><td>Data residency compliance</td></tr></tbody></table>
+<p><strong>SCP for Consumption OU:</strong></p>
+<table><thead><tr><th>SCP</th><th>Effect</th><th>Purpose</th></tr></thead><tbody><tr><td>Deny creating data sources</td><td>Deny <code>glue:CreateDatabase</code>, <code>glue:CreateCrawler</code></td><td>Consumers read only — don't produce</td></tr><tr><td>Deny writing to domain S3</td><td>Deny <code>s3:PutObject</code> on domain account buckets</td><td>Consumers cannot modify producer data</td></tr><tr><td>Allow QuickSight and Athena</td><td>Allow full QuickSight and Athena access</td><td>Core consumption tools</td></tr></tbody></table>
+<p><strong>Step A4 — Network Architecture</strong></p>
+<p>→ Builds on Project 50 (Transit Gateway)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────┐
+</span>│                   TRANSIT GATEWAY                          │
+│                   (Shared Services Account)                │
+│                                                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
+│  │ Governance│  │ Marketing│  │ Finance  │               │
+│  │ VPC       │  │ VPC      │  │ VPC      │  ... more     │
+│  │ 10.1.0/16│  │ 10.2.0/16│  │ 10.3.0/16│               │
+│  └─────┬────┘  └─────┬────┘  └─────┬────┘               │
+│        │             │             │                      │
+│        └─────────────┴─────────────┘                      │
+│                      │                                     │
+│              ┌───────▼───────┐                             │
+│              │ Shared VPC    │                             │
+│              │ Endpoints     │                             │
+│              │ (S3, Glue,    │                             │
+│              │  KMS, Logs)   │                             │
+│              │ 10.0.0.0/16  │                             │
+│              └───────────────┘                             │
+└──────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Each domain account has its own VPC<br>
+→ All VPCs connect through Transit Gateway (Project 50)<br>
+→ Shared Services VPC hosts centralized VPC Endpoints (Project 27, 57)<br>
+→ Domain VPCs route to shared endpoints through Transit Gateway<br>
+→ Non-overlapping CIDR blocks required across all VPCs</p>
+<hr>
+<h3>SECTION B — CENTRAL GOVERNANCE ACCOUNT SETUP</h3>
+<hr>
+<p><strong>Step B1 — Configure Lake Formation as Central Admin</strong></p>
+<p>→ Builds on Project 42 (Cross-Account Glue Catalog) and Project 47 (Lake Formation Permissions)<br>
+→ In the Central Governance Account:<br>
+→ Lake Formation Console → Administrative Roles and Tasks</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Data Lake Administrators</td><td><code>DataGovernanceAdminRole</code> (IAM role in governance account)</td></tr><tr><td>Database Creators</td><td>None (databases created by domain accounts, not governance)</td></tr></tbody></table>
+<p>→ Lake Formation Settings → Data Catalog Settings:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Use only IAM access control for new databases</td><td>❌ Unchecked</td></tr><tr><td>Use only IAM access control for new tables</td><td>❌ Unchecked</td></tr></tbody></table>
+<p>→ This enables Lake Formation permission model (not just IAM) — required for cross-account sharing</p>
+<p><strong>Step B2 — Create Central Glue Data Catalog Structure</strong></p>
+<p>→ The Central Governance Account maintains a REGISTRY of all data products<br>
+→ It does NOT store the data — data stays in domain accounts<br>
+→ It stores RESOURCE LINKS that point to domain account catalogs</p>
+<p>→ Glue Console → Databases → Create</p>
+<table><thead><tr><th>Database Name</th><th>Purpose</th><th>Contains</th></tr></thead><tbody><tr><td><code>dp_marketing</code></td><td>Resource links to Marketing domain tables</td><td>Resource links (not actual tables)</td></tr><tr><td><code>dp_finance</code></td><td>Resource links to Finance domain tables</td><td>Resource links</td></tr><tr><td><code>dp_product</code></td><td>Resource links to Product domain tables</td><td>Resource links</td></tr><tr><td><code>dp_customer_success</code></td><td>Resource links to Customer Success tables</td><td>Resource links</td></tr><tr><td><code>dp_insightworks</code></td><td>Resource links to InsightWorks tables</td><td>Resource links</td></tr><tr><td><code>dp_cross_domain</code></td><td>Cross-domain views and aggregations</td><td>Actual tables (materialized cross-domain data)</td></tr></tbody></table>
+<p><strong>Step B3 — Create Data Product Registry (DynamoDB)</strong></p>
+<p>→ DynamoDB Console → Create Table</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Table Name</td><td><code>DataProductRegistry</code></td></tr><tr><td>Partition Key</td><td><code>domain_name</code> (String)</td></tr><tr><td>Sort Key</td><td><code>product_name</code> (String)</td></tr></tbody></table>
+<p>→ This is the CENTRAL CATALOG of all data products across all domains<br>
+→ Each entry represents a published data product:</p>
+<table><thead><tr><th>Attribute</th><th>Type</th><th>Example</th></tr></thead><tbody><tr><td>domain_name</td><td>String</td><td>"marketing"</td></tr><tr><td>product_name</td><td>String</td><td>"campaign_attribution"</td></tr><tr><td>description</td><td>String</td><td>"Daily campaign attribution with channel breakdown"</td></tr><tr><td>owner_team</td><td>String</td><td>"Marketing Analytics"</td></tr><tr><td>owner_email</td><td>String</td><td>"<a href="mailto:marketing-data@datapulse.com">marketing-data@datapulse.com</a>"</td></tr><tr><td>source_account_id</td><td>String</td><td>"222233334444"</td></tr><tr><td>glue_database</td><td>String</td><td>"marketing_refined"</td></tr><tr><td>glue_table</td><td>String</td><td>"campaign_attribution_daily"</td></tr><tr><td>s3_location</td><td>String</td><td>"s3://marketing-domain-data/refined/campaign_attribution/"</td></tr><tr><td>format</td><td>String</td><td>"Parquet"</td></tr><tr><td>partitions</td><td>String</td><td>"year, month, day"</td></tr><tr><td>freshness_sla</td><td>String</td><td>"Daily by 7 AM IST"</td></tr><tr><td>quality_score</td><td>Number</td><td>98.5</td></tr><tr><td>last_updated</td><td>String</td><td>"2025-01-15T07:00:00Z"</td></tr><tr><td>schema_version</td><td>String</td><td>"v3.2"</td></tr><tr><td>classification</td><td>String</td><td>"INTERNAL — No PII"</td></tr><tr><td>consumers</td><td>List</td><td>["finance", "product", "executive-dashboard"]</td></tr><tr><td>status</td><td>String</td><td>"ACTIVE"</td></tr><tr><td>documentation_url</td><td>String</td><td>"<a href="https://wiki.datapulse.com/data-products/campaign-attribution">https://wiki.datapulse.com/data-products/campaign-attribution</a>"</td></tr></tbody></table>
+<p>→ This registry is queryable by all teams to DISCOVER available data products<br>
+→ Lambda function (in governance account) provides API for browsing the registry<br>
+→ Teams can search: "What data products does the marketing domain publish?"</p>
+<p><strong>Step B4 — Define Data Product Standards</strong></p>
+<p>→ Every data product MUST meet these standards before publication:</p>
+<table><thead><tr><th>Standard</th><th>Requirement</th><th>How Enforced</th></tr></thead><tbody><tr><td>Schema Documentation</td><td>Every column must have description in Glue Catalog</td><td>Config rule checks Glue table metadata</td></tr><tr><td>Data Classification</td><td>Must be tagged: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED</td><td>SCP requires classification tag</td></tr><tr><td>Freshness SLA</td><td>Must declare update frequency and SLA</td><td>Registered in Data Product Registry</td></tr><tr><td>Quality Metrics</td><td>Must publish data quality scores</td><td>Glue Data Quality (or custom Lambda)</td></tr><tr><td>Ownership</td><td>Must have declared owner team and email</td><td>Registered in Data Product Registry</td></tr><tr><td>Format</td><td>Must be Parquet or ORC (no CSV in refined zone)</td><td>Config rule checks S3 object metadata</td></tr><tr><td>Partitioning</td><td>Must be partitioned by time dimension minimum</td><td>Glue Crawler validates partition structure</td></tr><tr><td>Encryption</td><td>Must be encrypted with KMS CMK</td><td>Config rule: s3-bucket-server-side-encryption</td></tr><tr><td>Access Control</td><td>Must have Lake Formation permissions defined</td><td>Lake Formation audit</td></tr><tr><td>Versioning</td><td>Schema changes must increment version</td><td>Glue Schema Registry</td></tr></tbody></table>
+<p><strong>Step B5 — Configure Glue Schema Registry</strong></p>
+<p>→ Glue Console → Schema Registries → Create Registry</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Registry Name</td><td><code>datapulse-data-products</code></td></tr><tr><td>Description</td><td>Central schema registry for all data products</td></tr></tbody></table>
+<p>→ Each data product registers its schema:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Schema Name</td><td><code>marketing.campaign_attribution</code></td></tr><tr><td>Data Format</td><td>Avro (or JSON Schema)</td></tr><tr><td>Compatibility Mode</td><td>BACKWARD (new schema must be readable by old consumers)</td></tr></tbody></table>
+<p>→ Compatibility modes:</p>
+<table><thead><tr><th>Mode</th><th>Meaning</th><th>When to Use</th></tr></thead><tbody><tr><td>BACKWARD</td><td>New schema can read old data</td><td>Default — safest for consumers</td></tr><tr><td>FORWARD</td><td>Old schema can read new data</td><td>When producers need flexibility</td></tr><tr><td>FULL</td><td>Both backward and forward compatible</td><td>Strictest — both producer and consumer safe</td></tr><tr><td>NONE</td><td>No compatibility checks</td><td>Only for development</td></tr></tbody></table>
+<p>→ When a domain team updates their schema:</p>
+<ul>
+<li>They register new schema version in Glue Schema Registry</li>
+<li>Registry checks compatibility against previous version</li>
+<li>If INCOMPATIBLE → registration rejected → forces domain team to make backward-compatible change</li>
+<li>If COMPATIBLE → new version registered → consumers notified via EventBridge</li>
+</ul>
+<hr>
+<h3>SECTION C — DOMAIN PRODUCER ACCOUNT SETUP (Marketing Domain Example)</h3>
+<hr>
+<p><strong>Step C1 — Marketing Domain Account Structure</strong></p>
+<p>→ Each domain account follows the SAME standardized structure<br>
+→ Marketing Domain Account (Account I[REDACTED:BANK_ACCOUNT_NUMBER]444):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────┐
+</span>│              MARKETING DOMAIN ACCOUNT                         │
+│                                                                │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  S3 DATA LAKE (Domain-Owned)                           │  │
+│  │                                                          │  │
+│  │  s3://marketing-domain-data/                            │  │
+│  │  ├── raw/           ← Raw ingested data                 │  │
+│  │  │   ├── ad_platforms/   (Google Ads, Facebook, etc.)   │  │
+│  │  │   ├── email_campaigns/                               │  │
+│  │  │   └── web_analytics/                                 │  │
+│  │  ├── curated/       ← Cleaned, typed, deduplicated      │  │
+│  │  │   ├── campaign_events/                               │  │
+│  │  │   ├── channel_performance/                           │  │
+│  │  │   └── customer_touchpoints/                          │  │
+│  │  └── refined/       ← Published Data Products           │  │
+│  │      ├── campaign_attribution/  ← DATA PRODUCT 1        │  │
+│  │      ├── channel_roi/           ← DATA PRODUCT 2        │  │
+│  │      └── audience_segments/     ← DATA PRODUCT 3        │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  GLUE DATA CATALOG (Domain-Owned)                      │  │
+│  │                                                          │  │
+│  │  Database: marketing_raw                                │  │
+│  │  Database: marketing_curated                            │  │
+│  │  Database: marketing_refined  ← Shared via Lake Formation│  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  GLUE ETL JOBS (Domain-Owned)                          │  │
+│  │                                                          │  │
+│  │  • raw-to-curated-campaign-events                       │  │
+│  │  • raw-to-curated-channel-performance                   │  │
+│  │  • curated-to-refined-campaign-attribution              │  │
+│  │  • curated-to-refined-channel-roi                       │  │
+│  │  • curated-to-refined-audience-segments                 │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  GLUE WORKFLOW (Domain-Owned)                          │  │
+│  │                                                          │  │
+│  │  Trigger: Daily 5 AM                                    │  │
+│  │  Step 1: Crawl raw zone                                 │  │
+│  │  Step 2: ETL raw → curated (parallel jobs)              │  │
+│  │  Step 3: ETL curated → refined (parallel jobs)          │  │
+│  │  Step 4: Crawl refined zone                             │  │
+│  │  Step 5: Data quality validation                        │  │
+│  │  Step 6: Publish notification (EventBridge)             │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  ATHENA (Domain-Owned — for domain team's own queries) │  │
+│  │                                                          │  │
+│  │  Workgroup: marketing-team                              │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>Step C2 — Configure Domain S3 Bucket</strong></p>
+<p>→ S3 Console (in Marketing Account) → Create Bucket</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Bucket Name</td><td><code>marketing-domain-data-222233334444</code></td></tr><tr><td>Region</td><td>ap-south-1</td></tr><tr><td>Block Public Access</td><td>✅ All blocked (enforced by SCP)</td></tr><tr><td>Versioning</td><td>✅ Enabled</td></tr><tr><td>Default Encryption</td><td>SSE-KMS with domain-specific CMK</td></tr><tr><td>Tags</td><td>Domain=Marketing, Environment=Production, DataClassification=INTERNAL</td></tr></tbody></table>
+<p>→ Lifecycle Rules (builds on Project 12):</p>
+<table><thead><tr><th>Rule</th><th>Scope</th><th>Action</th></tr></thead><tbody><tr><td>Raw zone aging</td><td>Prefix: <code>raw/</code></td><td>Transition to S3-IA after 90 days → Glacier after 365 days</td></tr><tr><td>Curated zone aging</td><td>Prefix: <code>curated/</code></td><td>Transition to Intelligent-Tiering after 30 days</td></tr><tr><td>Refined zone — keep current</td><td>Prefix: <code>refined/</code></td><td>S3 Standard (actively queried by consumers)</td></tr><tr><td>Abort incomplete multipart</td><td>All</td><td>Delete after 7 days</td></tr><tr><td>Noncurrent version expiry</td><td>All</td><td>Delete noncurrent versions after 30 days</td></tr></tbody></table>
+<p><strong>Step C3 — Configure Domain Glue Catalog</strong></p>
+<p>→ Glue Console (in Marketing Account) → Create Databases</p>
+<table><thead><tr><th>Database</th><th>Purpose</th></tr></thead><tbody><tr><td><code>marketing_raw</code></td><td>Raw ingested data tables</td></tr><tr><td><code>marketing_curated</code></td><td>Cleaned and typed tables</td></tr><tr><td><code>marketing_refined</code></td><td>Published data products — SHARED with other accounts</td></tr></tbody></table>
+<p>→ Create Crawlers for each zone (builds on Project 17):</p>
+<table><thead><tr><th>Crawler</th><th>Source</th><th>Target Database</th><th>Schedule</th></tr></thead><tbody><tr><td><code>marketing-raw-crawler</code></td><td><code>s3://marketing-domain-data/raw/</code></td><td><code>marketing_raw</code></td><td>Daily 4:30 AM</td></tr><tr><td><code>marketing-curated-crawler</code></td><td><code>s3://marketing-domain-data/curated/</code></td><td><code>marketing_curated</code></td><td>Triggered after ETL</td></tr><tr><td><code>marketing-refined-crawler</code></td><td><code>s3://marketing-domain-data/refined/</code></td><td><code>marketing_refined</code></td><td>Triggered after ETL</td></tr></tbody></table>
+<p><strong>Step C4 — Configure Domain Glue ETL Pipeline</strong></p>
+<p>→ Builds on Projects 21, 31, 46</p>
+<p>→ Create Glue Workflow:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Workflow Name</td><td><code>marketing-daily-pipeline</code></td></tr><tr><td>Description</td><td>Daily marketing domain data pipeline</td></tr></tbody></table>
+<p>→ Workflow Steps:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Trigger: Scheduled (Daily 5 AM)
+</span>    │
+    ▼
+Step 1: Crawler — marketing-raw-crawler
+    │ (On success)
+    ▼
+Step 2: Parallel ETL Jobs
+    ├── Job: raw-to-curated-campaign-events
+    ├── Job: raw-to-curated-channel-performance
+    └── Job: raw-to-curated-customer-touchpoints
+    │ (All succeed)
+    ▼
+Step 3: Crawler — marketing-curated-crawler
+    │ (On success)
+    ▼
+Step 4: Parallel ETL Jobs (Refined — Data Products)
+    ├── Job: curated-to-refined-campaign-attribution
+    │   (Job Bookmark enabled — Project 46)
+    ├── Job: curated-to-refined-channel-roi
+    └── Job: curated-to-refined-audience-segments
+    │ (All succeed)
+    ▼
+Step 5: Crawler — marketing-refined-crawler
+    │ (On success)
+    ▼
+Step 6: Lambda — Data Quality Validation
+    │ (Quality score &gt; threshold)
+    ▼
+Step 7: Lambda — Publish Notification
+    │ (EventBridge event to governance account)
+    ▼
+COMPLETE</code></pre></div>
+<p><strong>Step C5 — Implement Data Quality Validation</strong></p>
+<p>→ Each data product has quality checks that run after ETL:</p>
+<p><strong>Glue Data Quality Rules for <code>campaign_attribution</code>:</strong></p>
+<table><thead><tr><th>Rule</th><th>Check</th><th>Threshold</th></tr></thead><tbody><tr><td>Completeness</td><td><code>Completeness "campaign_id" &gt;= 0.99</code></td><td>99% of rows have campaign_id</td></tr><tr><td>Uniqueness</td><td><code>Uniqueness "attribution_id" &gt;= 1.0</code></td><td>100% unique attribution IDs</td></tr><tr><td>Freshness</td><td><code>Freshness "event_date" &lt;= 2 days</code></td><td>Most recent data within 2 days</td></tr><tr><td>Referential Integrity</td><td><code>ReferentialIntegrity "campaign_id" "campaigns.id" &gt;= 0.98</code></td><td>98% of campaign_ids exist in campaigns table</td></tr><tr><td>Row Count</td><td><code>RowCount &gt;= 10000</code></td><td>At least 10K rows (prevents empty table publication)</td></tr><tr><td>Column Type</td><td><code>ColumnDataType "revenue" = Double</code></td><td>Revenue column is numeric</td></tr></tbody></table>
+<p>→ Quality validation Lambda:</p>
+<ol>
+<li>Runs Glue Data Quality checks</li>
+<li>Calculates composite quality score (weighted average of all rules)</li>
+<li>If score ≥ 95% → data product is "HEALTHY" → publish notification</li>
+<li>If score 80-95% → data product is "DEGRADED" → publish warning</li>
+<li>If score &lt; 80% → data product is "UNHEALTHY" → publish alert → block consumption update</li>
+</ol>
+<p>→ Quality score is updated in the Data Product Registry (DynamoDB in governance account)</p>
+<p><strong>Step C6 — Publish Data Product Notification</strong></p>
+<p>→ After successful pipeline completion + quality validation:<br>
+→ Lambda function publishes EventBridge event to the DEFAULT event bus</p>
+<p>→ EventBridge event structure:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Source</td><td><code>datapulse.marketing.data-product</code></td></tr><tr><td>Detail-Type</td><td><code>DataProductUpdated</code></td></tr><tr><td>Detail</td><td><code>{ "domain": "marketing", "product": "campaign_attribution", "version": "v3.2", "quality_score": 98.5, "row_count": 1250000, "timestamp": "2025-01-15T07:00:00Z", "status": "HEALTHY" }</code></td></tr></tbody></table>
+<p>→ This event is forwarded to:</p>
+<ol>
+<li>Central Governance Account (via cross-account EventBridge — see Section E)</li>
+<li>Consumer Account (triggers SPICE refresh in QuickSight)</li>
+<li>SNS Topic (alerts subscribers that new data is available)</li>
+</ol>
+<hr>
+<h3>SECTION D — CROSS-ACCOUNT DATA SHARING VIA LAKE FORMATION</h3>
+<hr>
+<p><strong>Step D1 — Grant Cross-Account Permissions from Producer to Governance</strong></p>
+<p>→ Builds on Project 42 (Cross-Account Glue Catalog Sharing)<br>
+→ In Marketing Domain Account:<br>
+→ Lake Formation Console → Permissions → Grant</p>
+<p><strong>Grant 1: Share Refined Database with Governance Account</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td>External Account: Governance Account ID (333344445555)</td></tr><tr><td>Resource Type</td><td>Database</td></tr><tr><td>Database</td><td><code>marketing_refined</code></td></tr><tr><td>Permissions</td><td>Describe</td></tr><tr><td>Grantable Permissions</td><td>Describe (allows governance to re-share)</td></tr></tbody></table>
+<p><strong>Grant 2: Share Refined Tables with Governance Account</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td>External Account: 333344445555</td></tr><tr><td>Resource Type</td><td>Table</td></tr><tr><td>Database</td><td><code>marketing_refined</code></td></tr><tr><td>Tables</td><td>All tables (or specific data product tables)</td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr><tr><td>Grantable Permissions</td><td>Select, Describe (allows governance to grant to consumers)</td></tr></tbody></table>
+<p>→ Important: "Grantable Permissions" is what enables the GOVERNANCE account to re-share with CONSUMER accounts<br>
+→ Without grantable permissions → governance can see the data but cannot share it further</p>
+<p><strong>Step D2 — Accept Share in Governance Account</strong></p>
+<p>→ In Central Governance Account:<br>
+→ Lake Formation Console → Pending Permissions → Accept</p>
+<p>→ After accepting, the shared database appears in Governance account's Glue Catalog<br>
+→ But it appears as a "shared" database — to make it accessible, create a RESOURCE LINK</p>
+<p><strong>Step D3 — Create Resource Links in Governance Account</strong></p>
+<p>→ Glue Console (in Governance Account) → Databases → <code>dp_marketing</code> → Create Resource Link</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Resource Link Name</td><td><code>campaign_attribution</code></td></tr><tr><td>Shared Database</td><td><code>marketing_refined</code> (from account 222233334444)</td></tr><tr><td>Shared Table</td><td><code>campaign_attribution_daily</code></td></tr></tbody></table>
+<p>→ Repeat for each data product table from each domain:</p>
+<table><thead><tr><th>Governance Database</th><th>Resource Link Name</th><th>Source Account</th><th>Source Table</th></tr></thead><tbody><tr><td><code>dp_marketing</code></td><td><code>campaign_attribution</code></td><td>Marketing (222233334444)</td><td><code>marketing_refined.campaign_attribution_daily</code></td></tr><tr><td><code>dp_marketing</code></td><td><code>channel_roi</code></td><td>Marketing (222233334444)</td><td><code>marketing_refined.channel_roi_monthly</code></td></tr><tr><td><code>dp_finance</code></td><td><code>revenue_reconciliation</code></td><td>Finance (333344445555)</td><td><code>finance_refined.revenue_reconciliation_quarterly</code></td></tr><tr><td><code>dp_finance</code></td><td><code>cost_allocation</code></td><td>Finance (333344445555)</td><td><code>finance_refined.cost_allocation_monthly</code></td></tr><tr><td><code>dp_product</code></td><td><code>user_behavior</code></td><td>Product (444455556666)</td><td><code>product_refined.user_behavior_daily</code></td></tr><tr><td><code>dp_insightworks</code></td><td><code>regional_sales</code></td><td>InsightWorks (555566667777)</td><td><code>insightworks_refined.regional_sales_daily</code></td></tr></tbody></table>
+<p>→ Resource Links are POINTERS — they don't copy data<br>
+→ When a consumer queries through a resource link → the query reads from the PRODUCER's S3 bucket<br>
+→ Data never moves — only metadata is shared</p>
+<p><strong>Step D4 — Grant Consumer Access via Governance Account</strong></p>
+<p>→ The Governance Account acts as the CENTRAL PERMISSION BROKER<br>
+→ It grants access to Consumer accounts (and individual consumer roles) using Lake Formation</p>
+<p>→ Lake Formation Console (in Governance Account) → Permissions → Grant</p>
+<p><strong>Grant to Analytics Consumption Account:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td>External Account: Analytics Consumption Account ID</td></tr><tr><td>Resource Type</td><td>Table</td></tr><tr><td>Database</td><td><code>dp_marketing</code></td></tr><tr><td>Tables</td><td><code>campaign_attribution</code>, <code>channel_roi</code></td></tr><tr><td>Permissions</td><td>Select, Describe</td></tr><tr><td>Grantable Permissions</td><td>None (consumers cannot re-share)</td></tr></tbody></table>
+<p>→ Repeat for each consumer account that needs access to each data product</p>
+<p><strong>Grant with Column-Level Security:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal</td><td>External Account: Partner Account (if applicable)</td></tr><tr><td>Resource Type</td><td>Table</td></tr><tr><td>Database</td><td><code>dp_marketing</code></td></tr><tr><td>Table</td><td><code>campaign_attribution</code></td></tr><tr><td>Column Filter</td><td>Include: campaign_name, channel, date, impressions, clicks, conversions</td></tr><tr><td>Excluded Columns</td><td>cost, internal_score, customer_id (PII/sensitive)</td></tr><tr><td>Permissions</td><td>Select</td></tr></tbody></table>
+<p>→ Partners see only non-sensitive columns — enforced at Lake Formation level<br>
+→ Even if they write SQL <code>SELECT *</code> → excluded columns are not returned</p>
+<p><strong>Step D5 — Tag-Based Access Control (TBAC)</strong></p>
+<p>→ For organizations with many data products and many consumers:<br>
+→ Individual grants become unmanageable<br>
+→ TBAC uses TAGS to automate permission assignment</p>
+<p>→ Lake Formation Console → LF-Tags → Add LF-Tag</p>
+<table><thead><tr><th>Tag Key</th><th>Allowed Values</th></tr></thead><tbody><tr><td><code>domain</code></td><td>marketing, finance, product, customer_success, insightworks</td></tr><tr><td><code>classification</code></td><td>public, internal, confidential, restricted</td></tr><tr><td><code>data_product_tier</code></td><td>gold (highest quality), silver (good quality), bronze (raw)</td></tr></tbody></table>
+<p>→ Assign tags to resources:</p>
+<table><thead><tr><th>Resource</th><th>Tag</th><th>Value</th></tr></thead><tbody><tr><td><code>dp_marketing.campaign_attribution</code></td><td>domain</td><td>marketing</td></tr><tr><td><code>dp_marketing.campaign_attribution</code></td><td>classification</td><td>internal</td></tr><tr><td><code>dp_marketing.campaign_attribution</code></td><td>data_product_tier</td><td>gold</td></tr><tr><td><code>dp_finance.revenue_reconciliation</code></td><td>domain</td><td>finance</td></tr><tr><td><code>dp_finance.revenue_reconciliation</code></td><td>classification</td><td>confidential</td></tr><tr><td><code>dp_finance.revenue_reconciliation</code></td><td>data_product_tier</td><td>gold</td></tr></tbody></table>
+<p>→ Assign tags to principals:</p>
+<table><thead><tr><th>Principal</th><th>Tag</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Analytics Consumption Account</td><td>classification</td><td>internal, public</td><td>Can access internal and public data</td></tr><tr><td>Finance Team Role</td><td>classification</td><td>internal, confidential</td><td>Can access up to confidential</td></tr><tr><td>Executive Role</td><td>classification</td><td>internal, confidential, restricted</td><td>Can access everything</td></tr><tr><td>Partner Account</td><td>classification</td><td>public</td><td>Can access only public data</td></tr></tbody></table>
+<p>→ Lake Formation AUTOMATICALLY grants access based on tag matching:</p>
+<ul>
+<li>If principal's <code>classification</code> tag includes the resource's <code>classification</code> tag → access granted</li>
+<li>No individual grants needed per table per consumer</li>
+<li>Adding a new data product with tag <code>classification=internal</code> → automatically accessible to all principals with <code>internal</code> tag</li>
+<li>Adding a new consumer with tag <code>classification=internal</code> → automatically gets access to all <code>internal</code> data products</li>
+</ul>
+<p>→ TBAC dramatically reduces governance overhead at scale</p>
+<hr>
+<h3>SECTION E — CROSS-ACCOUNT EVENT BUS FOR DATA PRODUCT NOTIFICATIONS</h3>
+<hr>
+<p><strong>Step E1 — Create Central Event Bus in Governance Account</strong></p>
+<p>→ EventBridge Console (in Governance Account) → Event Buses → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event Bus Name</td><td><code>datapulse-data-mesh-bus</code></td></tr></tbody></table>
+<p>→ Event Bus Resource Policy — Allow domain accounts to send events:</p>
+<table><thead><tr><th>Policy Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Principal</td><td><code>arn:aws:iam::222233334444:root</code> (Marketing), <code>arn:aws:iam::333344445555:root</code> (Finance), ...</td></tr><tr><td>Action</td><td><code>events:PutEvents</code></td></tr><tr><td>Resource</td><td><code>arn:aws:events:ap-south-1:GOVERNANCE_ACCOUNT:event-bus/datapulse-data-mesh-bus</code></td></tr><tr><td>Condition</td><td><code>aws:PrincipalOrgID</code> = Organization ID (allows all org accounts)</td></tr></tbody></table>
+<p><strong>Step E2 — Configure Domain Accounts to Send Events</strong></p>
+<p>→ In each Domain Account (e.g., Marketing):<br>
+→ The "Publish Notification" Lambda (Step C6) sends events to the governance account's event bus:</p>
+<p>→ Lambda needs IAM permission:</p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>events:PutEvents</code></td><td><code>arn:aws:events:ap-south-1:GOVERNANCE_ACCOUNT:event-bus/datapulse-data-mesh-bus</code></td></tr></tbody></table>
+<p>→ Lambda publishes event with:</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>EventBusName</td><td><code>arn:aws:events:ap-south-1:GOVERNANCE_ACCOUNT:event-bus/datapulse-data-mesh-bus</code></td></tr><tr><td>Source</td><td><code>datapulse.{domain}.data-product</code></td></tr><tr><td>DetailType</td><td><code>DataProductUpdated</code> or <code>DataProductQualityAlert</code> or <code>DataProductSchemaChanged</code></td></tr></tbody></table>
+<p><strong>Step E3 — Create EventBridge Rules in Governance Account</strong></p>
+<p><strong>Rule 1: Update Data Product Registry</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event Bus</td><td><code>datapulse-data-mesh-bus</code></td></tr><tr><td>Event Pattern</td><td>Source: <code>datapulse.*.data-product</code>, DetailType: <code>DataProductUpdated</code></td></tr><tr><td>Target</td><td>Lambda → Updates DynamoDB Data Product Registry with new timestamp, quality score, row count</td></tr></tbody></table>
+<p><strong>Rule 2: Alert on Quality Degradation</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event Bus</td><td><code>datapulse-data-mesh-bus</code></td></tr><tr><td>Event Pattern</td><td>Source: <code>datapulse.*.data-product</code>, DetailType: <code>DataProductQualityAlert</code></td></tr><tr><td>Target 1</td><td>SNS → Data Governance team alert</td></tr><tr><td>Target 2</td><td>Lambda → Updates Data Product Registry status to "DEGRADED"</td></tr></tbody></table>
+<p><strong>Rule 3: Notify Consumers of Data Freshness</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event Bus</td><td><code>datapulse-data-mesh-bus</code></td></tr><tr><td>Event Pattern</td><td>Source: <code>datapulse.*.data-product</code>, DetailType: <code>DataProductUpdated</code></td></tr><tr><td>Target</td><td>EventBridge → Forward to Consumer Account's event bus</td></tr></tbody></table>
+<p><strong>Rule 4: Schema Change Notification</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event Bus</td><td><code>datapulse-data-mesh-bus</code></td></tr><tr><td>Event Pattern</td><td>Source: <code>datapulse.*.data-product</code>, DetailType: <code>DataProductSchemaChanged</code></td></tr><tr><td>Target 1</td><td>SNS → All registered consumers of this data product</td></tr><tr><td>Target 2</td><td>Lambda → Validate backward compatibility via Glue Schema Registry</td></tr></tbody></table>
+<p><strong>Step E4 — Configure Consumer Account to Receive Events</strong></p>
+<p>→ In Analytics Consumption Account:<br>
+→ EventBridge Console → Create Rule on default event bus</p>
+<p>→ First: Create cross-account event bus target from Governance to Consumer<br>
+→ In Governance Account → EventBridge Rule → Target → Cross-account event bus</p>
+<p>→ In Consumer Account → EventBridge Rule:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule Name</td><td><code>trigger-spice-refresh-on-data-update</code></td></tr><tr><td>Event Pattern</td><td>Source: <code>datapulse.*.data-product</code>, DetailType: <code>DataProductUpdated</code></td></tr><tr><td>Target</td><td>Lambda → Triggers QuickSight SPICE refresh for the updated dataset</td></tr></tbody></table>
+<p>→ Flow:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Marketing Domain: ETL Complete
+</span>         │
+         ▼
+Marketing Lambda: Publish DataProductUpdated event
+         │
+         ▼
+Governance Event Bus: Receives event
+         │
+         ├── Rule 1: Update DynamoDB registry
+         │
+         ├── Rule 3: Forward to Consumer Account
+         │         │
+         │         ▼
+         │   Consumer Event Bus: Receives event
+         │         │
+         │         ▼
+         │   Lambda: Trigger SPICE refresh for campaign_attribution dataset
+         │         │
+         │         ▼
+         │   QuickSight: SPICE refresh starts
+         │         │
+         │         ▼
+         │   Dashboard shows fresh data within minutes of ETL completion
+         │
+         └── Rule 2: (Only if quality degraded) → Alert governance team</code></pre></div>
+<hr>
+<h3>SECTION F — CONSUMER LAYER SETUP</h3>
+<hr>
+<p><strong>Step F1 — Configure Athena in Consumer Account for Federated Queries</strong></p>
+<p>→ Builds on Project 35 (Athena Federated Query) and Project 59 (Serverless Analytics)<br>
+→ In Analytics Consumption Account:</p>
+<p>→ After accepting Lake Formation shares from Governance Account:<br>
+→ Resource links become available in the Consumer Account's Glue Catalog</p>
+<p>→ Athena Console → Query Editor:<br>
+→ Consumers can now query across ALL domains:</p>
+<table><thead><tr><th>Query Pattern</th><th>What It Does</th></tr></thead><tbody><tr><td><code>SELECT * FROM dp_marketing.campaign_attribution WHERE year='2025'</code></td><td>Query Marketing's data product</td></tr><tr><td><code>SELECT * FROM dp_finance.revenue_reconciliation WHERE quarter='Q1'</code></td><td>Query Finance's data product</td></tr><tr><td><code>SELECT m.campaign_name, f.revenue FROM dp_marketing.campaign_attribution m JOIN dp_finance.revenue_reconciliation f ON m.date = f.date</code></td><td>Cross-domain JOIN</td></tr></tbody></table>
+<p>→ The consumer queries data that PHYSICALLY resides in each domain's S3 bucket<br>
+→ No data copying → always fresh → governed by Lake Formation permissions</p>
+<p><strong>Step F2 — Configure QuickSight for Cross-Domain Dashboards</strong></p>
+<p>→ Builds on Project 59 (QuickSight setup)<br>
+→ In Analytics Consumption Account:</p>
+<p>→ QuickSight Console → Datasets → New Dataset → Athena</p>
+<table><thead><tr><th>Dataset</th><th>Source</th><th>SPICE Refresh</th></tr></thead><tbody><tr><td>Marketing Campaign Attribution</td><td><code>dp_marketing.campaign_attribution</code></td><td>Triggered by EventBridge (Step E4)</td></tr><tr><td>Finance Revenue</td><td><code>dp_finance.revenue_reconciliation</code></td><td>Triggered by EventBridge</td></tr><tr><td>Product User Behavior</td><td><code>dp_product.user_behavior</code></td><td>Triggered by EventBridge</td></tr><tr><td>Cross-Domain Executive Summary</td><td>Athena query joining all domains</td><td>Daily scheduled</td></tr></tbody></table>
+<p>→ Cross-Domain Dashboard includes visuals from ALL domains:</p>
+<table><thead><tr><th>Dashboard Sheet</th><th>Data Sources</th><th>Audience</th></tr></thead><tbody><tr><td>Revenue Overview</td><td>Finance + Marketing + InsightWorks</td><td>CEO, CFO</td></tr><tr><td>Marketing Performance</td><td>Marketing domain only</td><td>VP Marketing</td></tr><tr><td>Product Analytics</td><td>Product domain only</td><td>VP Product</td></tr><tr><td>Unified Customer View</td><td>Customer Success + Marketing + Product</td><td>Customer Success team</td></tr><tr><td>Regional Performance</td><td>InsightWorks + Finance</td><td>Regional managers</td></tr></tbody></table>
+<p>→ RLS applied (from Project 59):</p>
+<ul>
+<li>Regional managers see only their region across ALL domain datasets</li>
+<li>Domain teams see only their domain's detailed data</li>
+<li>Executives see everything</li>
+</ul>
+<p><strong>Step F3 — Configure API Gateway for Cross-Domain API Access</strong></p>
+<p>→ Builds on Project 59 (API Gateway + Lambda + Athena)<br>
+→ The existing API endpoints now query cross-domain data:</p>
+<table><thead><tr><th>API Endpoint</th><th>Athena Query Source</th><th>Consumers</th></tr></thead><tbody><tr><td><code>GET /v1/revenue</code></td><td><code>dp_finance.revenue_reconciliation</code> + <code>dp_marketing.channel_roi</code></td><td>Mobile app, partners</td></tr><tr><td><code>GET /v1/campaigns</code></td><td><code>dp_marketing.campaign_attribution</code></td><td>Marketing tools</td></tr><tr><td><code>GET /v1/products</code></td><td><code>dp_product.user_behavior</code></td><td>Product analytics</td></tr><tr><td><code>GET /v1/unified-customer</code></td><td>Cross-domain JOIN</td><td>Customer success tools</td></tr></tbody></table>
+<p>→ Lambda functions query through Athena → Athena reads from domain S3 buckets via Lake Formation permissions<br>
+→ All governed — consumers cannot access data products they're not authorized for</p>
+<hr>
+<h3>SECTION G — CROSS-ACCOUNT OBSERVABILITY</h3>
+<hr>
+<p><strong>Step G1 — CloudWatch Cross-Account Observability Setup</strong></p>
+<p>→ CloudWatch Console (in Central Governance Account) → Settings → Cross-Account Observability</p>
+<p><strong>Configure Monitoring Account:</strong></p>
+<p>→ In Governance Account:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role</td><td>Monitoring Account</td></tr><tr><td>Source Accounts</td><td>All domain accounts + consumption account</td></tr></tbody></table>
+<p><strong>Configure Source Accounts:</strong></p>
+<p>→ In each Domain Account:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role</td><td>Source Account</td></tr><tr><td>Monitoring Account</td><td>Governance Account ID</td></tr><tr><td>Data Shared</td><td>Metrics, Logs, Traces</td></tr></tbody></table>
+<p>→ After configuration:</p>
+<ul>
+<li>Governance Account can view CloudWatch metrics from ALL accounts in one console</li>
+<li>No log copying — metrics are queried cross-account in real-time</li>
+<li>CloudWatch dashboards in governance account show data from all domains</li>
+</ul>
+<p><strong>Step G2 — Create Cross-Account Observability Dashboard</strong></p>
+<p>→ CloudWatch Console (in Governance Account) → Dashboards → Create</p>
+<p><strong>Dashboard: Data Mesh Health</strong></p>
+<p><strong>Widget 1: Pipeline Status Matrix</strong></p>
+<table><thead><tr><th>Domain</th><th>Last ETL Run</th><th>Status</th><th>Quality Score</th><th>Freshness SLA</th></tr></thead><tbody><tr><td>Marketing</td><td>2025-01-15 07:00</td><td>✅ HEALTHY</td><td>98.5%</td><td>✅ Met (by 7 AM)</td></tr><tr><td>Finance</td><td>2025-01-15 06:45</td><td>✅ HEALTHY</td><td>97.2%</td><td>✅ Met (by 7 AM)</td></tr><tr><td>Product</td><td>2025-01-15 07:30</td><td>⚠️ DEGRADED</td><td>82.1%</td><td>✅ Met (by 8 AM)</td></tr><tr><td>Customer Success</td><td>2025-01-15 08:15</td><td>✅ HEALTHY</td><td>96.8%</td><td>❌ Missed (SLA: 8 AM)</td></tr><tr><td>InsightWorks</td><td>2025-01-15 06:30</td><td>✅ HEALTHY</td><td>99.1%</td><td>✅ Met (by 7 AM)</td></tr></tbody></table>
+<p>→ Source: DynamoDB Data Product Registry (queried by Lambda → published as CloudWatch custom metric)</p>
+<p><strong>Widget 2: Glue Job Success/Failure Rate per Domain</strong></p>
+<table><thead><tr><th>Metric</th><th>Source Account</th><th>Namespace</th></tr></thead><tbody><tr><td>Glue Job Runs (Success)</td><td>Marketing Account</td><td>AWS/Glue</td></tr><tr><td>Glue Job Runs (Failed)</td><td>Marketing Account</td><td>AWS/Glue</td></tr><tr><td>Glue Job Runs (Success)</td><td>Finance Account</td><td>AWS/Glue</td></tr><tr><td>Glue Job Duration</td><td>All accounts</td><td>AWS/Glue</td></tr></tbody></table>
+<p>→ Cross-account metric widgets reference metrics from source accounts</p>
+<p><strong>Widget 3: Data Product Consumption Metrics</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th></tr></thead><tbody><tr><td>Athena queries per data product</td><td>Athena CloudWatch (Consumer Account)</td></tr><tr><td>API requests per endpoint</td><td>API Gateway CloudWatch (Consumer Account)</td></tr><tr><td>QuickSight dashboard views</td><td>QuickSight CloudWatch (Consumer Account)</td></tr><tr><td>SPICE refresh latency</td><td>QuickSight CloudWatch (Consumer Account)</td></tr></tbody></table>
+<p><strong>Widget 4: Data Freshness Timeline</strong></p>
+<p>→ Custom metric published by each domain's notification Lambda:</p>
+<table><thead><tr><th>Metric Name</th><th>Dimensions</th><th>Value</th></tr></thead><tbody><tr><td><code>DataProductFreshness</code></td><td>Domain, ProductName</td><td>Minutes since last update</td></tr></tbody></table>
+<p>→ CloudWatch Alarm:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>DataProductFreshness</td></tr><tr><td>Threshold</td><td>&gt; 120 minutes (2 hours past SLA)</td></tr><tr><td>Action</td><td>SNS → Data Governance team + Domain team</td></tr></tbody></table>
+<p><strong>Widget 5: Cross-Account Cost per Domain</strong></p>
+<p>→ Source: Cost Explorer API (queried by Lambda daily)</p>
+<table><thead><tr><th>Domain</th><th>Monthly Data Cost</th><th>Glue Cost</th><th>Storage Cost</th><th>Trend</th></tr></thead><tbody><tr><td>Marketing</td><td>$2,340</td><td>$890</td><td>$1,450</td><td>↓ 5%</td></tr><tr><td>Finance</td><td>$1,870</td><td>$520</td><td>$1,350</td><td>→ Flat</td></tr><tr><td>Product</td><td>$3,210</td><td>$1,400</td><td>$1,810</td><td>↑ 12%</td></tr></tbody></table>
+<p><strong>Step G3 — Configure Cross-Account Alarms</strong></p>
+<p>→ CloudWatch Console (in Governance Account) → Alarms</p>
+<p><strong>Alarm 1: Domain Pipeline Failure</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric Source</td><td>Domain Account (cross-account)</td></tr><tr><td>Metric</td><td>AWS/Glue → <code>glue.driver.aggregate.numFailedTasks</code></td></tr><tr><td>Threshold</td><td>&gt; 0 for any domain</td></tr><tr><td>Action</td><td>SNS → Domain team + Governance team</td></tr></tbody></table>
+<p><strong>Alarm 2: Data Product SLA Breach</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>Custom: <code>DataProductFreshness</code></td></tr><tr><td>Dimensions</td><td>Domain=<em>, ProductName=</em></td></tr><tr><td>Threshold</td><td>&gt; SLA minutes (varies per product)</td></tr><tr><td>Action</td><td>SNS → Domain team owner</td></tr></tbody></table>
+<p><strong>Alarm 3: Cross-Domain Query Failures</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric Source</td><td>Consumer Account</td></tr><tr><td>Metric</td><td>Athena query failures</td></tr><tr><td>Threshold</td><td>&gt; 5 failures in 15 minutes</td></tr><tr><td>Action</td><td>SNS → Governance team</td></tr></tbody></table>
+<p><strong>Alarm 4: Lake Formation Permission Denied</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric Source</td><td>CloudTrail (all accounts)</td></tr><tr><td>Pattern</td><td><code>AccessDeniedException</code> on Lake Formation operations</td></tr><tr><td>Threshold</td><td>&gt; 10 in 5 minutes</td></tr><tr><td>Action</td><td>SNS → Governance team (possible misconfiguration or unauthorized access attempt)</td></tr></tbody></table>
+<p><strong>Step G4 — End-to-End Pipeline Tracing with X-Ray</strong></p>
+<p>→ Enable X-Ray tracing across the entire data flow:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Producer (Marketing Account):
+</span>  Glue ETL Job → X-Ray segment: "marketing-etl-campaign-attribution"
+       │
+       ▼
+  Lambda (Quality Check) → X-Ray segment: "marketing-quality-validation"
+       │
+       ▼
+  Lambda (Publish Event) → X-Ray segment: "marketing-publish-notification"
+       │
+       ▼
+Governance Account:
+  EventBridge → X-Ray segment: "governance-event-processing"
+       │
+       ▼
+  Lambda (Registry Update) → X-Ray segment: "governance-registry-update"
+       │
+       ▼
+Consumer Account:
+  Lambda (SPICE Trigger) → X-Ray segment: "consumer-spice-refresh"
+       │
+       ▼
+  API Gateway → Lambda → Athena → X-Ray trace: "consumer-api-query"</code></pre></div>
+<p>→ X-Ray Service Map shows the ENTIRE flow across all accounts<br>
+→ Governance team can trace a data product from ingestion to consumption<br>
+→ Identify bottlenecks: "The marketing ETL takes 45 minutes but the quality check takes 30 minutes — optimize quality check"</p>
+<hr>
+<h3>SECTION H — FEDERATED GOVERNANCE PROCESSES</h3>
+<hr>
+<p><strong>Step H1 — Data Product Lifecycle Management</strong></p>
+<table><thead><tr><th>Phase</th><th>Owner</th><th>Governance Role</th><th>Process</th></tr></thead><tbody><tr><td>Proposal</td><td>Domain Team</td><td>Review standards compliance</td><td>Domain submits data product proposal → Governance validates against standards</td></tr><tr><td>Development</td><td>Domain Team</td><td>Provide templates and tooling</td><td>Domain builds ETL, creates tables, implements quality checks</td></tr><tr><td>Publication</td><td>Domain Team</td><td>Register in catalog</td><td>Domain registers in Data Product Registry → Governance creates resource links</td></tr><tr><td>Consumption</td><td>Consumer Team</td><td>Grant access via Lake Formation</td><td>Consumer requests access → Governance grants via TBAC or individual grant</td></tr><tr><td>Maintenance</td><td>Domain Team</td><td>Monitor quality and freshness</td><td>Domain monitors quality scores → Governance monitors SLA compliance</td></tr><tr><td>Deprecation</td><td>Domain Team</td><td>Notify consumers</td><td>Domain announces deprecation → 90-day notice → Governance removes resource links</td></tr></tbody></table>
+<p><strong>Step H2 — Data Stewardship Model</strong></p>
+<table><thead><tr><th>Role</th><th>Scope</th><th>Responsibilities</th></tr></thead><tbody><tr><td>Data Mesh Lead</td><td>Organization-wide</td><td>Define standards, resolve cross-domain conflicts, budget allocation</td></tr><tr><td>Domain Data Owner</td><td>Per domain</td><td>Define domain data products, quality SLAs, access policies</td></tr><tr><td>Domain Data Engineer</td><td>Per domain</td><td>Build and maintain ETL pipelines, implement quality checks</td></tr><tr><td>Data Governance Admin</td><td>Central</td><td>Manage Lake Formation permissions, maintain registry, monitor compliance</td></tr><tr><td>Data Consumer Lead</td><td>Per consumer team</td><td>Request access, report quality issues, provide feedback</td></tr></tbody></table>
+<p><strong>Step H3 — Automated Governance Enforcement</strong></p>
+<p>→ AWS Config Rules (in each Domain Account) — builds on Project 57:</p>
+<table><thead><tr><th>Rule</th><th>What It Checks</th><th>Auto-Remediation</th></tr></thead><tbody><tr><td><code>s3-bucket-server-side-encryption-enabled</code></td><td>All domain S3 buckets encrypted</td><td>✅ Enable SSE-KMS</td></tr><tr><td><code>glue-table-has-description</code> (custom)</td><td>All Glue tables have descriptions</td><td>❌ Alert domain team</td></tr><tr><td><code>data-product-has-quality-check</code> (custom)</td><td>All refined tables have quality rules</td><td>❌ Alert domain team</td></tr><tr><td><code>data-product-registered</code> (custom)</td><td>All refined tables are in Data Product Registry</td><td>❌ Alert governance</td></tr><tr><td><code>s3-bucket-tagged</code></td><td>All buckets have Domain and Classification tags</td><td>✅ Apply default tags</td></tr></tbody></table>
+<p>→ Config Aggregator (in Governance Account) provides organization-wide compliance view</p>
+<p><strong>Step H4 — Data Product SLA Dashboard</strong></p>
+<p>→ Governance team maintains SLA tracking:</p>
+<table><thead><tr><th>Data Product</th><th>SLA</th><th>Current Status</th><th>30-Day Compliance</th></tr></thead><tbody><tr><td>Marketing: Campaign Attribution</td><td>Daily by 7 AM</td><td>✅ Met</td><td>97% (29/30 days)</td></tr><tr><td>Marketing: Channel ROI</td><td>Monthly by 3rd business day</td><td>✅ Met</td><td>100%</td></tr><tr><td>Finance: Revenue Reconciliation</td><td>Quarterly by 5th business day</td><td>✅ Met</td><td>100%</td></tr><tr><td>Product: User Behavior</td><td>Daily by 8 AM</td><td>⚠️ Late</td><td>85% (missed 4.5 days)</td></tr><tr><td>InsightWorks: Regional Sales</td><td>Daily by 7 AM</td><td>✅ Met</td><td>100%</td></tr></tbody></table>
+<p>→ SLA breaches trigger:</p>
+<ol>
+<li>Automatic notification to domain team owner</li>
+<li>Escalation to Data Mesh Lead if breach persists &gt; 24 hours</li>
+<li>Monthly SLA report to CTO</li>
+</ol>
+<p><strong>Step H5 — Data Product Discovery Portal</strong></p>
+<p>→ Build a simple discovery interface using the Data Product Registry:</p>
+<p>→ API Gateway (in Governance Account) + Lambda + DynamoDB:</p>
+<table><thead><tr><th>Endpoint</th><th>Function</th></tr></thead><tbody><tr><td><code>GET /data-products</code></td><td>List all data products (filterable by domain, classification, status)</td></tr><tr><td><code>GET /data-products/{domain}/{product}</code></td><td>Get details of specific data product</td></tr><tr><td><code>GET /data-products/search?q=campaign</code></td><td>Search data products by keyword</td></tr><tr><td><code>POST /data-products/{domain}/{product}/request-access</code></td><td>Submit access request</td></tr></tbody></table>
+<p>→ Frontend: Simple static website hosted on S3 + CloudFront<br>
+→ Or: Integrate into existing internal portal</p>
+<p>→ Discovery portal shows:</p>
+<ul>
+<li>All available data products across all domains</li>
+<li>Schema documentation (from Glue Catalog)</li>
+<li>Quality scores and freshness status</li>
+<li>Owner and contact information</li>
+<li>How to request access</li>
+<li>Sample queries</li>
+</ul>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always assign clear domain ownership — every data product has ONE owner team<br>
+→ Always define data product standards BEFORE teams start publishing<br>
+→ Always use Lake Formation TBAC for scalable permission management<br>
+→ Always require schema registration in Glue Schema Registry — backward compatibility prevents consumer breakage<br>
+→ Always implement data quality checks in every domain pipeline — quality is the producer's responsibility<br>
+→ Always publish data product events via EventBridge — enables event-driven consumption<br>
+→ Always maintain a central Data Product Registry — discoverability is critical<br>
+→ Always use resource links (not data copying) for cross-account access — keeps data in producer's control<br>
+→ Always implement cross-account CloudWatch observability — single pane of glass for platform health<br>
+→ Always enforce SLAs with automated monitoring and alerting — trust comes from reliability<br>
+→ Always provide self-serve tooling for domain teams — reduce dependency on central platform team<br>
+→ Always version schemas — breaking changes must be communicated and managed<br>
+→ Always separate governance (rules + standards) from gatekeeping (approval bottleneck)<br>
+→ Always start with 2-3 domain teams as pilots — don't transform all teams simultaneously<br>
+→ Always tag resources with Domain and Classification — foundation for TBAC and cost allocation</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never allow domains to publish directly to consumers without governance registration — creates shadow data products<br>
+→ Never copy data between accounts when Lake Formation sharing works — duplication causes inconsistency<br>
+→ Never let the central team own domain-specific ETL — they become a bottleneck<br>
+→ Never skip data quality checks because "the data is obviously correct" — quality degrades silently<br>
+→ Never use IAM-only access control for cross-account data sharing — Lake Formation provides finer granularity<br>
+→ Never create one giant account for all domains — defeats the purpose of domain ownership<br>
+→ Never implement all 4 Data Mesh principles at once — start with domain ownership, then add incrementally<br>
+→ Never force ALL data into the mesh — some shared infrastructure data (IAM, networking) stays centralized<br>
+→ Never let domains define their own standards independently — federated means SHARED standards, not NO standards<br>
+→ Never skip the discovery portal — if teams can't find data products, they'll build their own (duplication)<br>
+→ Never grant blanket access to all data products — least privilege applies even in a data mesh<br>
+→ Never ignore cross-domain dependencies — if Finance depends on Marketing's data, that's a contractual relationship<br>
+→ Never let domain teams skip EventBridge notifications — consumers need to know when data is fresh<br>
+→ Never use cross-account S3 bucket policies alone for data sharing — Lake Formation provides audit trail and column-level security<br>
+→ Never implement data mesh without executive sponsorship — organizational change requires leadership alignment</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Right Tool</th></tr></thead><tbody><tr><td>Domain team needs to own their pipeline end-to-end</td><td>Separate AWS account per domain</td></tr><tr><td>Cross-account data sharing with fine-grained permissions</td><td>Lake Formation + Resource Links</td></tr><tr><td>Scalable permission management across many products and consumers</td><td>Lake Formation TBAC (Tag-Based Access Control)</td></tr><tr><td>Schema compatibility enforcement</td><td>Glue Schema Registry</td></tr><tr><td>Data product discoverability</td><td>DynamoDB Data Product Registry + Discovery API</td></tr><tr><td>Event-driven consumption (trigger refresh when data is updated)</td><td>EventBridge cross-account event bus</td></tr><tr><td>Cross-account observability</td><td>CloudWatch Cross-Account Observability</td></tr><tr><td>Organization-wide policy enforcement</td><td>SCPs via Organizations</td></tr><tr><td>Domain-level compliance monitoring</td><td>AWS Config Rules + Aggregator</td></tr><tr><td>Data quality validation in domain pipelines</td><td>Glue Data Quality Rules</td></tr><tr><td>Cross-domain analytical queries</td><td>Athena querying through Lake Formation resource links</td></tr><tr><td>Self-serve dashboards for business users</td><td>QuickSight with SPICE + RLS (Project 59)</td></tr><tr><td>Programmatic cross-domain data access</td><td>API Gateway + Lambda + Athena (Project 59)</td></tr><tr><td>Network connectivity between domain accounts</td><td>Transit Gateway (Project 50)</td></tr><tr><td>Centralized VPC Endpoints for cost efficiency</td><td>Shared Services Account (Project 57)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Data Mesh when you have &lt; 3 domain teams — overhead exceeds benefit<br>
+→ Do NOT use Data Mesh when a single central team can handle all data needs efficiently<br>
+→ Do NOT use separate accounts per domain when teams are very small (&lt; 3 people) — use separate databases in one account instead<br>
+→ Do NOT use Lake Formation TBAC when you have &lt; 10 data products — individual grants are simpler<br>
+→ Do NOT use Glue Schema Registry when all consumers are internal and schema changes are rare — overhead not justified<br>
+→ Do NOT use cross-account EventBridge when all domains are in one account — use default event bus with rules<br>
+→ Do NOT use Data Mesh for real-time streaming data — Data Mesh is primarily for analytical/batch data products; use Kinesis (Project 52) for streaming<br>
+→ Do NOT use CloudWatch Cross-Account Observability when you have only 1-2 accounts — standard CloudWatch dashboards suffice<br>
+→ Do NOT use DynamoDB Data Product Registry when you have &lt; 5 data products — a simple spreadsheet or Confluence page works<br>
+→ Do NOT use Transit Gateway for domain account networking when domains don't need private connectivity between each other — they may only need S3 + Glue + Lake Formation access<br>
+→ Do NOT use separate Redshift clusters per domain when data volumes are small — shared Redshift with schema-level isolation is more cost-effective<br>
+→ Do NOT use Data Mesh as an excuse to eliminate the central platform team — the platform team's role SHIFTS from building pipelines to building self-serve infrastructure<br>
+→ Do NOT use Data Mesh when your organization lacks data engineering skills in domain teams — domains must be capable of owning their pipelines</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>LAKE FORMATION CROSS-ACCOUNT SHARING MECHANICS</h3>
+<p><strong>1 → Permission Grant Flow</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PRODUCER ACCOUNT (Marketing)
+</span>           │
+           │ Step 1: Lake Formation Grant
+           │ (Share marketing_refined database + tables
+           │  with Governance Account)
+           │
+           ▼
+┌─────────────────────────────────────────────┐
+│  AWS RAM (Resource Access Manager)           │
+│                                               │
+│  Lake Formation uses RAM under the hood      │
+│  to share Glue Catalog resources             │
+│  across accounts                             │
+│                                               │
+│  RAM creates a "Resource Share":             │
+│  • Resource: Glue Database + Tables          │
+│  • Principal: Governance Account ID          │
+│  • Permission: SELECT, DESCRIBE              │
+│                                               │
+│  RAM invitation sent to Governance Account   │
+└──────────────────────┬──────────────────────┘
+                       │
+                       ▼
+GOVERNANCE ACCOUNT
+           │
+           │ Step 2: Accept RAM invitation
+           │ (Shared resources appear in local Glue Catalog)
+           │
+           │ Step 3: Create Resource Link
+           │ (Pointer from local catalog to shared table)
+           │
+           │ Step 4: Grant to Consumer Account
+           │ (Lake Formation grant with grantable=false)
+           │
+           ▼
+┌─────────────────────────────────────────────┐
+│  AWS RAM (Second Share)                       │
+│                                               │
+│  Governance Account shares Resource Link     │
+│  with Consumer Account via RAM               │
+│                                               │
+│  Consumer can now query through the          │
+│  Resource Link → which resolves to           │
+│  Producer's actual table → which reads       │
+│  from Producer's S3 bucket                   │
+└──────────────────────┬──────────────────────┘
+                       │
+                       ▼
+CONSUMER ACCOUNT (Analytics)
+           │
+           │ Step 5: Accept RAM invitation
+           │ Step 6: Query via Athena using Resource Link
+           │
+           ▼
+┌─────────────────────────────────────────────┐
+│  Athena Query Execution:                      │
+│                                               │
+│  SELECT * FROM dp_marketing.campaign_attr... │
+│           │                                   │
+│           ▼                                   │
+│  Glue Catalog resolves Resource Link         │
+│  → Points to marketing_refined.campaign_...  │
+│  → In Marketing Account's Glue Catalog       │
+│           │                                   │
+│           ▼                                   │
+│  Lake Formation checks permissions:          │
+│  • Consumer Account has SELECT on this table?│
+│  • Column-level restrictions?                │
+│  • Row-level filter (if configured)?         │
+│           │                                   │
+│           ▼ (If authorized)                   │
+│                                               │
+│  Athena reads from Marketing Account's S3    │
+│  s3://marketing-domain-data/refined/...      │
+│  (Using cross-account S3 access granted      │
+│   automatically by Lake Formation)           │
+│                                               │
+│  Data NEVER copied — read directly from      │
+│  producer's storage                          │
+└─────────────────────────────────────────────┘</code></pre></div>
+<p><strong>2 → How Lake Formation Grants S3 Access Automatically</strong></p>
+<p>→ When Lake Formation grants cross-account SELECT permission:</p>
+<ul>
+<li>Lake Formation AUTOMATICALLY creates temporary S3 credentials</li>
+<li>These credentials allow the consumer's Athena to read from the producer's S3 bucket</li>
+<li>The producer does NOT need to modify their S3 bucket policy</li>
+<li>The producer does NOT need to create cross-account IAM roles for each consumer</li>
+<li>Lake Formation manages all of this transparently</li>
+</ul>
+<p>→ Internal mechanism:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer Athena submits query
+</span>           │
+           ▼
+Athena calls Lake Formation: GetTemporaryGluePartitionCredentials
+           │
+           ▼
+Lake Formation checks:
+  1. Does this principal have SELECT on this table? (LF permission)
+  2. Are there column restrictions? (Filter columns)
+  3. Are there row-level filters? (Apply filter expression)
+           │
+           ▼ (If authorized)
+Lake Formation returns:
+  • Temporary S3 credentials (scoped to specific S3 prefixes)
+  • Column filter (if CLS configured)
+  • Row filter expression (if row-level security configured)
+           │
+           ▼
+Athena uses temporary credentials to read S3 objects
+  • Credentials are short-lived (expire in minutes)
+  • Credentials are scoped to ONLY the specific S3 paths for this table
+  • Even if consumer tries to access other S3 paths → ACCESS DENIED</code></pre></div>
+<p>→ This is fundamentally different from cross-account S3 bucket policies (Project 39):</p>
+<ul>
+<li>Bucket policies grant broad access to entire buckets or prefixes</li>
+<li>Lake Formation grants narrow access to specific table data only</li>
+<li>Lake Formation adds column and row filtering on top</li>
+<li>Lake Formation provides centralized audit trail</li>
+</ul>
+<p><strong>3 → Tag-Based Access Control (TBAC) Evaluation</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer queries: SELECT * FROM dp_marketing.campaign_attribution
+</span>           │
+           ▼
+Lake Formation evaluates TBAC:
+           │
+           ├── Resource Tags:
+           │   campaign_attribution has tags:
+           │   • classification = "internal"
+           │   • domain = "marketing"
+           │   • tier = "gold"
+           │
+           ├── Principal Tags:
+           │   Consumer role has tags:
+           │   • classification = ["internal", "public"]
+           │   • domain = ["marketing", "finance", "product"]
+           │
+           ├── Tag Expression Evaluation:
+           │   For each tag key:
+           │     Resource tag value ∈ Principal tag values?
+           │
+           │   classification: "internal" ∈ ["internal", "public"] → ✅ MATCH
+           │   domain: "marketing" ∈ ["marketing", "finance", "product"] → ✅ MATCH
+           │
+           └── ALL tag keys match → ACCESS GRANTED
+           
+If even ONE tag key doesn't match → ACCESS DENIED
+
+Example: Consumer tries to query dp_finance.cost_data
+  Resource tags: classification = "confidential"
+  Principal tags: classification = ["internal", "public"]
+  "confidential" ∈ ["internal", "public"] → ❌ NO MATCH → ACCESS DENIED</code></pre></div>
+<p>→ TBAC evaluation happens at QUERY TIME — not at grant time<br>
+→ Adding a new tag to a principal IMMEDIATELY changes their access<br>
+→ Adding a new tag to a resource IMMEDIATELY changes who can access it<br>
+→ No need to modify individual grants — tags drive everything</p>
+<p><strong>4 → Resource Link Mechanics</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────┐
+</span>│  GOVERNANCE ACCOUNT — Glue Catalog                       │
+│                                                           │
+│  Database: dp_marketing                                  │
+│    │                                                      │
+│    ├── Table: campaign_attribution (RESOURCE LINK)        │
+│    │   │                                                  │
+│    │   ├── Type: Resource Link                           │
+│    │   ├── Target Database: marketing_refined            │
+│    │   ├── Target Table: campaign_attribution_daily      │
+│    │   ├── Target Account:[REDACTED:BANK_ACCOUNT_NUMBER]4                  │
+│    │   │                                                  │
+│    │   └── When queried:                                 │
+│    │       1. Glue resolves link → finds target table    │
+│    │       2. Target table's schema is used              │
+│    │       3. Target table's S3 location is used         │
+│    │       4. Lake Formation permissions checked         │
+│    │       5. Data read from target account's S3         │
+│    │                                                      │
+│    ├── Table: channel_roi (RESOURCE LINK)                │
+│    │   └── Points to: 222233334444.marketing_refined     │
+│    │                   .channel_roi_monthly               │
+│    │                                                      │
+│    └── Table: audience_segments (RESOURCE LINK)          │
+│        └── Points to: 222233334444.marketing_refined     │
+│                        .audience_segments_weekly          │
+│                                                           │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Resource Links are METADATA ONLY — zero bytes of data<br>
+→ They are pointers in the Glue Catalog — like symbolic links in a file system<br>
+→ Schema is inherited from the target table — no schema duplication<br>
+→ If producer updates their schema → resource link automatically reflects the change<br>
+→ If producer adds partitions → resource link automatically sees new partitions</p>
+<hr>
+<h3>EVENTBRIDGE CROSS-ACCOUNT MECHANICS</h3>
+<p><strong>1 → Cross-Account Event Flow</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MARKETING ACCOUNT                    GOVERNANCE ACCOUNT
+</span>                                     
+Lambda publishes event               Event Bus: datapulse-data-mesh-bus
+     │                                    │
+     │  PutEvents API call               │  Event arrives
+     │  (to governance event bus ARN)    │
+     │                                    │
+     │  IAM Role must have:              │  Event Bus Policy allows:
+     │  events:PutEvents on              │  PutEvents from
+     │  governance bus ARN               │  Organization accounts
+     │                                    │
+     └──────────────────────────────────▶│
+                                          │
+                                          ├── Rule 1: Update Registry
+                                          │   Target: Lambda
+                                          │
+                                          ├── Rule 2: Quality Alert
+                                          │   Target: SNS
+                                          │
+                                          └── Rule 3: Forward to Consumer
+                                              Target: Consumer Event Bus
+                                                   │
+                                                   ▼
+                                     CONSUMER ACCOUNT
+                                     
+                                     Default Event Bus receives event
+                                          │
+                                          └── Rule: Trigger SPICE Refresh
+                                              Target: Lambda</code></pre></div>
+<p><strong>2 → Event Delivery Guarantees</strong></p>
+<p>→ EventBridge provides AT-LEAST-ONCE delivery<br>
+→ In rare cases, an event may be delivered twice<br>
+→ Consumer Lambda functions should be IDEMPOTENT:</p>
+<ul>
+<li>Triggering SPICE refresh twice is safe (second refresh overwrites first)</li>
+<li>Updating DynamoDB registry twice with same data is safe (idempotent write)</li>
+<li>Sending duplicate SNS notification is acceptable (human can ignore duplicate)</li>
+</ul>
+<p><strong>3 → Cross-Account Event Bus Authorization</strong></p>
+<p>→ Two authorization checks for cross-account events:</p>
+<table><thead><tr><th>Check</th><th>Where</th><th>What</th></tr></thead><tbody><tr><td>Sender Authorization</td><td>Sender account's IAM</td><td>Sender role must have <code>events:PutEvents</code> on target bus ARN</td></tr><tr><td>Receiver Authorization</td><td>Target event bus resource policy</td><td>Bus policy must allow sender's account/organization</td></tr></tbody></table>
+<p>→ Both must ALLOW — if either denies, event is rejected<br>
+→ Using Organization ID condition in bus policy:</p>
+<ul>
+<li>Any account in the Organization can send events</li>
+<li>Accounts OUTSIDE the Organization cannot</li>
+<li>New member accounts automatically authorized</li>
+</ul>
+<hr>
+<h3>CLOUDWATCH CROSS-ACCOUNT OBSERVABILITY MECHANICS</h3>
+<p><strong>1 → How Cross-Account Metrics Work</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MONITORING ACCOUNT (Governance)
+</span>           │
+           │ CloudWatch Console → Metrics → All Metrics
+           │
+           │ Displays metrics from:
+           │ ├── Local account (governance)
+           │ ├── Marketing Account (cross-account)
+           │ ├── Finance Account (cross-account)
+           │ ├── Product Account (cross-account)
+           │ └── Consumer Account (cross-account)
+           │
+           │ HOW:
+           │
+           ▼
+┌─────────────────────────────────────────────────┐
+│  SOURCE ACCOUNTS                                  │
+│                                                    │
+│  Each source account creates an IAM role:         │
+│  CloudWatch-CrossAccountSharingRole               │
+│                                                    │
+│  Trust Policy: Allow Monitoring Account to assume │
+│  Permissions: CloudWatch read-only                │
+│                                                    │
+│  When Monitoring Account requests metrics:        │
+│  1. Monitoring Account assumes role in source     │
+│  2. Reads CloudWatch metrics from source          │
+│  3. Displays in Monitoring Account's console      │
+│                                                    │
+│  Data is NOT copied — it's queried in real-time   │
+│  from source accounts                             │
+└─────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>2 → Cross-Account Log Queries</strong></p>
+<p>→ CloudWatch Logs Insights can query logs across accounts:</p>
+<table><thead><tr><th>Query Scope</th><th>How It Works</th></tr></thead><tbody><tr><td>Single account</td><td>Standard CloudWatch Logs Insights query</td></tr><tr><td>Cross-account</td><td>Select source account → query their log groups remotely</td></tr></tbody></table>
+<p>→ Governance team can query Glue job logs from any domain account without switching accounts<br>
+→ Useful for debugging pipeline failures across domains</p>
+<p><strong>3 → Cross-Account Dashboard Widgets</strong></p>
+<p>→ Each CloudWatch dashboard widget can specify a source account:</p>
+<table><thead><tr><th>Widget</th><th>Source Account</th><th>Metric</th></tr></thead><tbody><tr><td>Marketing Glue Jobs</td><td>Marketing Account ID</td><td>AWS/Glue metrics</td></tr><tr><td>Finance Glue Jobs</td><td>Finance Account ID</td><td>AWS/Glue metrics</td></tr><tr><td>Consumer API Latency</td><td>Consumer Account ID</td><td>API Gateway metrics</td></tr><tr><td>Consumer Athena Queries</td><td>Consumer Account ID</td><td>AWS/Athena metrics</td></tr></tbody></table>
+<p>→ All displayed on ONE dashboard in the Governance Account<br>
+→ No need to switch between accounts to monitor the data mesh</p>
+<hr>
+<h3>GLUE SCHEMA REGISTRY INTERNAL MECHANICS</h3>
+<p><strong>1 → Schema Version Management</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Schema: marketing.campaign_attribution
+</span>           │
+           ├── Version 1 (Initial — Jan 2025)
+           │   Columns: campaign_id, channel, date, impressions, clicks
+           │
+           ├── Version 2 (Added column — Feb 2025)
+           │   Columns: campaign_id, channel, date, impressions, clicks, conversions
+           │   Compatibility check: BACKWARD ✅ 
+           │   (New column with default — old consumers can still read)
+           │
+           ├── Version 3 (Added column — Mar 2025)
+           │   Columns: campaign_id, channel, date, impressions, clicks, conversions, cost
+           │   Compatibility check: BACKWARD ✅
+           │
+           └── Version 4 (REJECTED — removed column)
+               Columns: campaign_id, channel, date, clicks, conversions, cost
+               Compatibility check: BACKWARD ❌
+               (Removed "impressions" — old consumers expecting this column will break)
+               REGISTRATION REJECTED</code></pre></div>
+<p><strong>2 → Compatibility Check Algorithm</strong></p>
+<table><thead><tr><th>Change Type</th><th>BACKWARD Compatible?</th><th>FORWARD Compatible?</th><th>FULL Compatible?</th></tr></thead><tbody><tr><td>Add optional column</td><td>✅ Yes</td><td>❌ No</td><td>❌ No</td></tr><tr><td>Add required column (with default)</td><td>✅ Yes</td><td>❌ No</td><td>❌ No</td></tr><tr><td>Remove column</td><td>❌ No</td><td>✅ Yes</td><td>❌ No</td></tr><tr><td>Rename column</td><td>❌ No</td><td>❌ No</td><td>❌ No</td></tr><tr><td>Change column type (widening: INT→LONG)</td><td>✅ Yes</td><td>❌ No</td><td>❌ No</td></tr><tr><td>Change column type (narrowing: LONG→INT)</td><td>❌ No</td><td>✅ Yes</td><td>❌ No</td></tr><tr><td>Add new enum value</td><td>✅ Yes</td><td>❌ No</td><td>❌ No</td></tr><tr><td>Remove enum value</td><td>❌ No</td><td>✅ Yes</td><td>❌ No</td></tr></tbody></table>
+<p>→ BACKWARD is recommended for Data Mesh:</p>
+<ul>
+<li>Producers can ADD columns freely (new features)</li>
+<li>Producers CANNOT remove or rename columns (breaks existing consumers)</li>
+<li>Forces producers to think about consumer impact before schema changes</li>
+<li>If a column must be removed → deprecate first (add <code>_deprecated</code> suffix) → remove after all consumers migrate</li>
+</ul>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Impact</th><th>Prevention</th></tr></thead><tbody><tr><td>1</td><td>Treating Data Mesh as a technology project only</td><td>Organizational resistance, domains refuse ownership</td><td>Start with executive sponsorship → pilot with willing domains → demonstrate value before expanding</td></tr><tr><td>2</td><td>Domain teams lack data engineering skills</td><td>Domains cannot build or maintain pipelines → fall back to central team dependency</td><td>Invest in training → provide templates and accelerators → central platform team provides tooling not gatekeeping</td></tr><tr><td>3</td><td>No data product standards defined before domains start publishing</td><td>Inconsistent formats, no quality checks, no documentation → consumers don't trust data</td><td>Define standards FIRST → enforce via Config rules and SCPs → reject non-compliant publications</td></tr><tr><td>4</td><td>Resource links become stale when producer deletes or renames tables</td><td>Consumer queries fail with table-not-found errors</td><td>EventBridge schema change notifications → automated resource link validation → alerting on broken links</td></tr><tr><td>5</td><td>Lake Formation permissions too restrictive</td><td>Consumers cannot access data they need → create workarounds (shadow copies)</td><td>Use TBAC for scalable permission management → regular access reviews → self-service access request process</td></tr><tr><td>6</td><td>Lake Formation permissions too permissive</td><td>Data leaks across domains → compliance violation</td><td>Column-level security for PII → classification tags → regular audit via IAM Access Analyzer</td></tr><tr><td>7</td><td>EventBridge events lost or delayed</td><td>Consumer dashboards show stale data → SLA breach</td><td>Dead letter queue on EventBridge rules → monitor event delivery metrics → retry logic in Lambda targets</td></tr><tr><td>8</td><td>Cross-account CloudWatch not configured</td><td>Governance team blind to domain pipeline failures → issues discovered by consumers hours later</td><td>Configure cross-account observability for ALL domain accounts → automated alerts → SLA monitoring</td></tr><tr><td>9</td><td>Schema Registry not enforced</td><td>Producer makes breaking change → all consumers break simultaneously</td><td>Enforce BACKWARD compatibility mode → block incompatible schema versions → notify consumers of changes</td></tr><tr><td>10</td><td>Data Product Registry not maintained</td><td>Teams can't discover available data → build duplicate datasets</td><td>Automate registry updates via EventBridge → require registration before Lake Formation access is granted</td></tr><tr><td>11</td><td>Too many domains too fast</td><td>Governance overhead explodes → platform team overwhelmed</td><td>Start with 2-3 pilot domains → prove the model → add 1-2 domains per quarter</td></tr><tr><td>12</td><td>Ignoring cross-domain dependencies</td><td>Finance depends on Marketing data → Marketing pipeline failure breaks Finance reports</td><td>Map dependencies in Data Product Registry → alert dependent domains on upstream failures</td></tr><tr><td>13</td><td>No cost allocation per domain</td><td>Cannot track which domain costs what → no accountability</td><td>Enforce tagging → Cost Allocation Tags (Project 56) → per-domain budgets</td></tr><tr><td>14</td><td>Consumer Athena queries scan entire producer S3 bucket</td><td>Expensive queries → producer's S3 costs increase → billing disputes</td><td>Partition data products → set Athena workgroup scan limits → monitor per-consumer scan volumes</td></tr><tr><td>15</td><td>Central governance becomes new bottleneck</td><td>Access requests take weeks → same problem as before but with different name</td><td>Automate access via TBAC → self-service request/approval workflow → SLA for access provisioning (&lt; 24 hours)</td></tr><tr><td>16</td><td>Domain teams don't publish quality metrics</td><td>Consumers don't know if data is trustworthy → adoption drops</td><td>Make quality checks mandatory in pipeline → publish quality scores to registry → dashboard visibility</td></tr><tr><td>17</td><td>No deprecation process for data products</td><td>Old data products never cleaned up → catalog becomes cluttered → consumers confused</td><td>Require lifecycle status in registry → 90-day deprecation notice → automated consumer notification</td></tr><tr><td>18</td><td>Redshift in consumer account cannot query Lake Formation shared tables</td><td>Redshift doesn't natively support Lake Formation resource links for all scenarios</td><td>Use Redshift Spectrum with external schema pointing to Glue Catalog → or use Athena federated query from Redshift</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Account Scaling</strong></p>
+<table><thead><tr><th>Scale</th><th>Accounts</th><th>Approach</th></tr></thead><tbody><tr><td>Small (2-3 domains)</td><td>5-8 total accounts</td><td>Manual account setup → manual Lake Formation grants</td></tr><tr><td>Medium (5-10 domains)</td><td>10-15 total accounts</td><td>Account Factory (Control Tower) → TBAC for permissions</td></tr><tr><td>Large (10-30 domains)</td><td>20-40 total accounts</td><td>AWS Control Tower Account Factory → automated account vending → TBAC mandatory</td></tr><tr><td>Enterprise (30+ domains)</td><td>50+ total accounts</td><td>Full FinOps + dedicated platform team → automated everything → third-party catalog tools</td></tr></tbody></table>
+<p>→ AWS Control Tower Account Factory for Terraform (AFT):</p>
+<ul>
+<li>Automates new account creation with standardized configuration</li>
+<li>Each new domain account gets: VPC, CloudTrail, Config, Lake Formation baseline, Glue Catalog structure</li>
+<li>Domain team receives a "ready to use" account within hours, not weeks</li>
+</ul>
+<p>→ <strong>Data Product Scaling</strong></p>
+<table><thead><tr><th>Scale</th><th>Products</th><th>Governance Approach</th></tr></thead><tbody><tr><td>&lt; 10 products</td><td>Manual grants, spreadsheet registry</td><td>Simple and effective</td></tr><tr><td>10-50 products</td><td>TBAC, DynamoDB registry, EventBridge notifications</td><td>Automated but manageable</td></tr><tr><td>50-200 products</td><td>TBAC mandatory, automated quality scoring, discovery portal</td><td>Dedicated governance team needed</td></tr><tr><td>200+ products</td><td>Third-party data catalog (AWS DataZone, Collibra, Alation)</td><td>Platform investment required</td></tr></tbody></table>
+<p>→ <strong>AWS DataZone (Native Data Mesh Service)</strong></p>
+<ul>
+<li>AWS released DataZone as a managed service for data mesh</li>
+<li>Provides: Data catalog, access management, discovery portal, workflow automation</li>
+<li>Integrates with: Lake Formation, Glue, Athena, Redshift, S3</li>
+<li>Consider DataZone when &gt; 50 data products across &gt; 10 domains</li>
+<li>Our manual implementation (this project) provides deeper understanding of mechanics</li>
+<li>DataZone automates many of the manual steps we configured</li>
+</ul>
+<p>→ <strong>Lake Formation Permission Scaling</strong></p>
+<table><thead><tr><th>Method</th><th>Max Practical Scale</th><th>Overhead</th></tr></thead><tbody><tr><td>Individual grants</td><td>~50 grants per table</td><td>High — each consumer needs individual grant</td></tr><tr><td>TBAC</td><td>Unlimited</td><td>Low — tags manage everything</td></tr><tr><td>TBAC + Individual overrides</td><td>Unlimited with exceptions</td><td>Medium — TBAC for bulk, individual for edge cases</td></tr></tbody></table>
+<p>→ At 20 domains × 10 products × 5 consumers = 1,000 permission relationships<br>
+→ Individual grants: 1,000 grants to manage → unsustainable<br>
+→ TBAC: ~20 tag assignments on resources + ~5 tag assignments on principals → manageable</p>
+<p>→ <strong>EventBridge Scaling</strong></p>
+<table><thead><tr><th>Scale</th><th>Events/Day</th><th>Approach</th></tr></thead><tbody><tr><td>&lt; 100 events/day</td><td>Small mesh</td><td>Default event bus, simple rules</td></tr><tr><td>100-10,000 events/day</td><td>Medium mesh</td><td>Custom event bus, multiple rules, DLQ</td></tr><tr><td>10,000+ events/day</td><td>Large mesh</td><td>Multiple custom event buses, event archive, replay capability</td></tr></tbody></table>
+<p>→ EventBridge handles millions of events per second — technical scaling is not the concern<br>
+→ ORGANIZATIONAL scaling is the challenge: managing rules, monitoring delivery, debugging failures</p>
+<p>→ <strong>Cost Scaling per Domain</strong></p>
+<table><thead><tr><th>Component</th><th>Cost per Domain Account (Estimated)</th></tr></thead><tbody><tr><td>S3 Storage (10 TB average)</td><td>~$230/month (Intelligent-Tiering — Project 56)</td></tr><tr><td>Glue ETL (10 jobs, daily)</td><td>~$150/month</td></tr><tr><td>Glue Crawlers (3 crawlers, daily)</td><td>~$30/month</td></tr><tr><td>Athena (domain team queries)</td><td>~$50/month</td></tr><tr><td>CloudWatch Logs + Metrics</td><td>~$30/month</td></tr><tr><td>KMS Keys (2-3 per domain)</td><td>~$3/month</td></tr><tr><td>Lake Formation</td><td>Free (no additional charge)</td></tr><tr><td>EventBridge</td><td>~$1/month</td></tr><tr><td><strong>Total per domain</strong></td><td><strong>~$494/month</strong></td></tr></tbody></table>
+<p>→ 5 domains: ~$2,470/month for domain infrastructure<br>
+→ Plus governance account: ~$200/month<br>
+→ Plus consumption account: ~$534/month (Project 59)<br>
+→ Plus infrastructure accounts: ~$500/month (shared services)<br>
+→ <strong>Total Data Mesh platform: ~$3,704/month</strong></p>
+<p>→ Compare to previous centralized model: ~$39,505/month (after Project 56 optimization)<br>
+→ Data Mesh adds ~$3,704/month in platform overhead but REDUCES central team dependency by 70%<br>
+→ Net ROI comes from: faster time-to-insight, reduced data team bottleneck, domain team self-service</p>
+<p>→ <strong>Observability Scaling</strong></p>
+<table><thead><tr><th>Scale</th><th>Approach</th></tr></thead><tbody><tr><td>5 accounts</td><td>Single CloudWatch cross-account dashboard</td></tr><tr><td>10-20 accounts</td><td>Multiple dashboards (one per concern: pipelines, quality, cost)</td></tr><tr><td>20+ accounts</td><td>CloudWatch + third-party (Datadog, Grafana) for unified observability</td></tr><tr><td>50+ accounts</td><td>Dedicated observability platform with custom metrics pipeline</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to Verify the Data Mesh is Working:</strong></p>
+<table><thead><tr><th>Verification Area</th><th>Method</th><th>Success Criteria</th></tr></thead><tbody><tr><td>Domain Ownership</td><td>Check: Each data product has owner in registry</td><td>100% of products have assigned owner</td></tr><tr><td>Data Quality</td><td>Check: Quality scores in registry</td><td>All products &gt; 90% quality score</td></tr><tr><td>Freshness SLA</td><td>Check: SLA compliance dashboard</td><td>&gt; 95% SLA compliance across all products</td></tr><tr><td>Cross-Account Sharing</td><td>Query from consumer account</td><td>Athena returns data from producer's S3</td></tr><tr><td>TBAC Working</td><td>Add new tag to consumer → verify access changes</td><td>Access granted/revoked based on tag changes</td></tr><tr><td>Event Notifications</td><td>Trigger producer ETL → verify consumer SPICE refreshes</td><td>SPICE refresh within 30 minutes of ETL completion</td></tr><tr><td>Schema Compatibility</td><td>Attempt incompatible schema change</td><td>Glue Schema Registry rejects the change</td></tr><tr><td>Observability</td><td>Check governance dashboard</td><td>All domain pipelines visible in one dashboard</td></tr><tr><td>Discovery</td><td>Search registry for "campaign"</td><td>Returns marketing campaign attribution product</td></tr><tr><td>Cost Allocation</td><td>Check Cost Explorer by domain tag</td><td>Costs accurately attributed to each domain</td></tr></tbody></table>
+<p>→ <strong>Data Mesh Maturity Model:</strong></p>
+<table><thead><tr><th>Level</th><th>Characteristics</th><th>DataPulse Status</th></tr></thead><tbody><tr><td>Level 0: Centralized</td><td>Single team owns all data → bottleneck</td><td>❌ Where we started</td></tr><tr><td>Level 1: Domain Ownership</td><td>Domains own pipelines → data still shared ad-hoc</td><td>✅ Achieved</td></tr><tr><td>Level 2: Data Products</td><td>Domains publish standardized data products → discoverable</td><td>✅ Achieved</td></tr><tr><td>Level 3: Self-Serve Platform</td><td>Domain teams self-serve → minimal central dependency</td><td>✅ Achieved</td></tr><tr><td>Level 4: Federated Governance</td><td>Automated governance → TBAC → quality enforcement</td><td>✅ Achieved</td></tr><tr><td>Level 5: Optimized Mesh</td><td>Continuous improvement → cost optimization → advanced observability</td><td>🔄 Ongoing</td></tr></tbody></table>
+<p>→ <strong>Key Performance Indicators for Data Mesh:</strong></p>
+<table><thead><tr><th>KPI</th><th>Measurement</th><th>Target</th><th>Current</th></tr></thead><tbody><tr><td>Time to publish new data product</td><td>Days from request to production</td><td>&lt; 5 business days</td><td>Baseline TBD</td></tr><tr><td>Time to grant consumer access</td><td>Hours from request to access</td><td>&lt; 4 hours (automated via TBAC)</td><td>Baseline TBD</td></tr><tr><td>Data product adoption</td><td>% of products with &gt; 1 consumer</td><td>&gt; 80%</td><td>Baseline TBD</td></tr><tr><td>Pipeline reliability</td><td>% of ETL runs succeeding</td><td>&gt; 99%</td><td>Baseline TBD</td></tr><tr><td>Data freshness SLA compliance</td><td>% of SLAs met</td><td>&gt; 95%</td><td>Baseline TBD</td></tr><tr><td>Central team ticket volume</td><td>Tickets/week for data requests</td><td>Reduce by 70%</td><td>Baseline TBD</td></tr><tr><td>Domain team satisfaction</td><td>Survey score (1-5)</td><td>&gt; 4.0</td><td>Baseline TBD</td></tr><tr><td>Cross-domain query volume</td><td>Queries/day across domains</td><td>Growing month-over-month</td><td>Baseline TBD</td></tr><tr><td>Data quality average score</td><td>Average across all products</td><td>&gt; 95%</td><td>Baseline TBD</td></tr><tr><td>Cost per data product</td><td>Monthly infrastructure cost</td><td>&lt; $500/product</td><td>~$494 ✅</td></tr></tbody></table>
+<p>→ <strong>Monthly Data Mesh Review:</strong></p>
+<table><thead><tr><th>Week</th><th>Review Topic</th><th>Participants</th><th>Outputs</th></tr></thead><tbody><tr><td>Week 1</td><td>Pipeline Health</td><td>Domain engineers + Governance</td><td>Fix failing pipelines, address quality issues</td></tr><tr><td>Week 2</td><td>Consumer Feedback</td><td>Consumer leads + Domain owners</td><td>Improve data products based on consumer needs</td></tr><tr><td>Week 3</td><td>Cost Review</td><td>Domain owners + FinOps</td><td>Optimize per-domain costs (Project 56 principles)</td></tr><tr><td>Week 4</td><td>Governance Review</td><td>All domain leads + Governance</td><td>Review standards, update TBAC tags, plan new products</td></tr></tbody></table>
+<p>→ <strong>Executive Dashboard for Data Mesh:</strong></p>
+<table><thead><tr><th>Section</th><th>Metrics</th><th>Source</th></tr></thead><tbody><tr><td>Platform Health</td><td>Pipeline success rate, SLA compliance, active alerts</td><td>CloudWatch cross-account dashboard</td></tr><tr><td>Data Products</td><td>Total products, new products this month, quality scores</td><td>DynamoDB Data Product Registry</td></tr><tr><td>Consumption</td><td>Dashboard views, API requests, Athena queries</td><td>CloudWatch (Consumer Account)</td></tr><tr><td>Cost</td><td>Total platform cost, cost per domain, month-over-month trend</td><td>Cost Explorer with domain tags</td></tr><tr><td>Adoption</td><td>Active consumers, new consumer requests, access grant latency</td><td>Custom metrics from governance Lambda</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Data Mesh is an ORGANIZATIONAL pattern implemented with technology — not just a technology pattern<br>
+→ The 4 principles (Domain Ownership, Data as Product, Self-Serve Platform, Federated Governance) must work together<br>
+→ AWS provides ALL the building blocks: Organizations, Lake Formation, Glue, EventBridge, CloudWatch Cross-Account<br>
+→ Lake Formation with TBAC is the cornerstone — enables scalable cross-account data sharing without per-table grants<br>
+→ Resource Links share metadata without copying data — data stays in the producer's control<br>
+→ EventBridge cross-account event bus enables event-driven data product consumption<br>
+→ Glue Schema Registry enforces backward compatibility — prevents producers from breaking consumers<br>
+→ Cross-account CloudWatch observability provides single-pane-of-glass monitoring<br>
+→ Data Product Registry (DynamoDB) provides discoverability — teams find data products before building duplicates<br>
+→ Central governance team role SHIFTS from gatekeeping to enabling — they build self-serve tooling<br>
+→ Start small: 2-3 pilot domains → prove value → expand incrementally<br>
+→ Data Mesh is a JOURNEY, not a destination — continuous improvement is expected</p>
+<p>→ <strong>This project connects backward to EVERY previous project:</strong></p>
+<table><thead><tr><th>Project</th><th>Connection to Data Mesh</th></tr></thead><tbody><tr><td>Project 1 (S3)</td><td>Storage foundation for every domain's data lake</td></tr><tr><td>Project 2 (IAM)</td><td>Access control foundation — roles per domain</td></tr><tr><td>Project 5 (VPC)</td><td>Network isolation per domain account</td></tr><tr><td>Project 9 (RDS MariaDB)</td><td>Domain operational databases</td></tr><tr><td>Project 12 (S3 Lifecycle)</td><td>Cost optimization per domain storage</td></tr><tr><td>Project 16 (Redshift)</td><td>Domain or shared analytical warehouse</td></tr><tr><td>Project 17 (Glue Crawler)</td><td>Domain data catalog management</td></tr><tr><td>Project 18 (Athena)</td><td>Cross-domain query engine</td></tr><tr><td>Project 21 (Glue ETL)</td><td>Domain ETL pipelines</td></tr><tr><td>Project 22 (Redshift COPY)</td><td>Domain warehouse loading</td></tr><tr><td>Project 25 (S3→Glue→Athena)</td><td>Domain pipeline pattern</td></tr><tr><td>Project 27 (VPC Endpoints)</td><td>Secure service access per domain</td></tr><tr><td>Project 30 (Cross-Region Replication)</td><td>Domain DR strategy</td></tr><tr><td>Project 31 (Glue Workflow)</td><td>Domain pipeline orchestration</td></tr><tr><td>Project 38 (EventBridge)</td><td>Cross-domain event notifications</td></tr><tr><td>Project 39-42 (Cross-Account)</td><td>Multi-account data sharing foundation</td></tr><tr><td>Project 46 (Glue Bookmarks)</td><td>Domain incremental ETL</td></tr><tr><td>Project 47 (Lake Formation)</td><td>Federated governance engine</td></tr><tr><td>Project 49 (Multi-Service Orchestration)</td><td>Domain pipeline complexity</td></tr><tr><td>Project 50 (Transit Gateway)</td><td>Multi-account network connectivity</td></tr><tr><td>Project 51 (Enterprise Data Lake)</td><td>Data lake architecture per domain</td></tr><tr><td>Project 54 (Organizations + SCPs)</td><td>Account structure and guardrails</td></tr><tr><td>Project 56 (Cost Optimization)</td><td>Per-domain cost management</td></tr><tr><td>Project 57 (Security)</td><td>Zero-Trust security per domain</td></tr><tr><td>Project 58 (DMS Migration)</td><td>Onboarding new domains (acquired companies)</td></tr><tr><td>Project 59 (Serverless Analytics)</td><td>Consumption layer for the mesh</td></tr></tbody></table>
+<p>→ Project 60 is the CAPSTONE — it integrates everything into a unified enterprise architecture</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO WHAT COMES NEXT — BEYOND THE AWS MASTERCLASS</h2>
+<hr>
+<p>→ You have now completed 60 projects spanning the ENTIRE AWS data and analytics landscape<br>
+→ From a single S3 bucket (Project 1) to an enterprise Data Mesh (Project 60)<br>
+→ Each project built on the previous — creating a chain of knowledge that mirrors real-world complexity</p>
+<p><strong>What comes AFTER mastering this subject:</strong></p>
+<table><thead><tr><th>Next Domain</th><th>Why It's Next</th><th>Key AWS Services</th></tr></thead><tbody><tr><td><strong>Machine Learning on AWS</strong></td><td>Data Mesh provides the DATA — ML provides the INTELLIGENCE</td><td>SageMaker, Bedrock, Feature Store</td></tr><tr><td><strong>Real-Time Analytics</strong></td><td>Batch data mesh → extend to streaming data products</td><td>Kinesis, MSK (Kafka), Flink, Lambda</td></tr><tr><td><strong>Infrastructure as Code</strong></td><td>Manual console configuration → automated reproducible infrastructure</td><td>CloudFormation, CDK, Terraform</td></tr><tr><td><strong>CI/CD for Data Pipelines</strong></td><td>Manual ETL deployment → automated testing and deployment</td><td>CodePipeline, CodeBuild, CodeDeploy</td></tr><tr><td><strong>Containerized Data Workloads</strong></td><td>Glue ETL → custom containers for complex processing</td><td>ECS, EKS, Fargate</td></tr><tr><td><strong>Advanced Governance</strong></td><td>Basic Data Mesh → enterprise data governance with lineage</td><td>AWS DataZone, Apache Atlas, OpenLineage</td></tr><tr><td><strong>Multi-Cloud / Hybrid</strong></td><td>AWS-only → extending to on-premises and other clouds</td><td>Outposts, EKS Anywhere, Anthos</td></tr></tbody></table>
+<p><strong>The Learning Path Forward:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>YOU ARE HERE
+</span>     │
+     ▼
+┌─────────────────────────────┐
+│  AWS MASTERCLASS COMPLETE    │
+│  (60 Projects)               │
+│                               │
+│  You understand:             │
+│  • Every core AWS service    │
+│  • How services connect      │
+│  • Cross-account patterns    │
+│  • Enterprise architecture   │
+│  • Security + Cost + Scale   │
+└──────────────┬──────────────┘
+               │
+     ┌─────────┼─────────┐
+     │         │         │
+     ▼         ▼         ▼
+┌─────────┐ ┌────────┐ ┌──────────┐
+│  ML/AI  │ │  IaC   │ │ Real-Time│
+│  on AWS │ │  (CDK/ │ │ Streaming│
+│         │ │  TF)   │ │  (Kinesis│
+│ Sage-   │ │        │ │   MSK)   │
+│ Maker   │ │ Auto-  │ │          │
+│ Bedrock │ │ mate   │ │ Event-   │
+│ Feature │ │ every- │ │ Driven   │
+│ Store   │ │ thing  │ │ Mesh     │
+└─────────┘ └────────┘ └──────────┘</code></pre></div>
+<p>→ The foundation you've built in these 60 projects makes EVERY next step dramatically easier<br>
+→ You understand the WHY behind every service — not just the HOW<br>
+→ You can architect solutions that are secure, scalable, cost-effective, and maintainable<br>
+→ You can communicate with stakeholders at every level — from developer to CTO to CFO</p>
+<hr>
+<hr>
+<h2>🏆 AWS MASTERCLASS — COMPLETE</h2>
+<hr>
+<p><strong>60 Projects | 5 Phases | Very Easy → Very Hard</strong></p>
+<table><thead><tr><th>Phase</th><th>Projects</th><th>Theme</th><th>Status</th></tr></thead><tbody><tr><td>Phase 1</td><td>1-10</td><td>Foundation Thinking</td><td>✅ Complete</td></tr><tr><td>Phase 2</td><td>11-20</td><td>Core Patterns</td><td>✅ Complete</td></tr><tr><td>Phase 3</td><td>21-38</td><td>Professional Techniques</td><td>✅ Complete</td></tr><tr><td>Phase 4</td><td>39-50</td><td>Advanced Patterns</td><td>✅ Complete</td></tr><tr><td>Phase 5</td><td>51-60</td><td>Mastery + Enterprise Architecture</td><td>✅ Complete</td></tr></tbody></table>
+<p><strong>Services Covered:</strong> S3, IAM, EC2, VPC, SNS, SQS, CloudWatch, RDS MariaDB, Redshift, Glue, Athena, Lambda, Step Functions, KMS, Secrets Manager, EventBridge, Lake Formation, Transit Gateway, Kinesis, DMS, QuickSight, Organizations, API Gateway, Cognito, WAF, Security Hub, GuardDuty, Config, CloudTrail, Cost Explorer, Trusted Advisor, Storage Lens, Budgets</p>
+<p><strong>Patterns Mastered:</strong> Intra-account → Cross-account → Multi-account → Enterprise Data Mesh</p>
+<p><strong>Architecture Achieved:</strong> From a single S3 bucket → to a fully governed, secure, cost-optimized, observable, multi-domain enterprise data platform</p>
+<hr>
+<blockquote>
+<p><strong>🎓 Congratulations on completing the AWS Masterclass.</strong><br>
+<strong>The 60 projects form a complete, interconnected knowledge graph.</strong><br>
+<strong>Each project you revisit will reveal deeper connections to the others.</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-59.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 60/60</span></div><span class="nav-btn next disabled">NEXT &#8594;</span></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

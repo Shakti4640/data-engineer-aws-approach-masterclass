@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 26: THE ORDER PROCESSING SYSTEM THAT NEEDED DECOUPLING — SNS → SQS → Lam — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 26: THE ORDER PROCESSING SYSTEM THAT NEEDED DECOUPLING — SNS → SQS → Lambda Event-Driven Pipeline</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's order processing system has grown significantly<br>
+→ The current architecture (from Project 13) uses SNS → SQS fan-out:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Order placed on website
+</span>       ↓
+Application on EC2 publishes to SNS topic: order-events
+       ↓
+SNS fans out to 3 SQS queues:
+  ├── order-fulfillment    (+ DLQ from Project 20)
+  ├── order-invoicing      (+ DLQ from Project 20)
+  └── order-analytics      (+ DLQ from Project 20)</code></pre></div>
+<p>→ Currently — EC2-based consumer applications poll each SQS queue continuously<br>
+→ Each consumer runs on a dedicated EC2 instance 24/7</p>
+<p>→ <strong>Problem 1: Wasted Compute During Off-Peak Hours</strong></p>
+<ul>
+<li>Order volume: 50,000 orders/day</li>
+<li>Peak: 5,000 orders/hour (10 AM - 8 PM)</li>
+<li>Off-peak: 200 orders/hour (midnight - 6 AM)</li>
+<li>Three EC2 instances (t3.medium) run 24/7 for the three consumers</li>
+<li>During off-peak (10 hours/day) → instances are 95% idle</li>
+<li>Monthly cost: 3 × t3.medium × 730 hours = ~$93/month</li>
+<li>Actual compute needed during off-peak: $5 worth of processing</li>
+<li><strong>$88/month wasted</strong> on idle instances</li>
+</ul>
+<p>→ <strong>Problem 2: Scaling Complexity</strong></p>
+<ul>
+<li>During flash sales → order volume spikes to 20,000 orders/hour (4x normal peak)</li>
+<li>Single EC2 consumer can process ~3,000 messages/hour</li>
+<li>Queue depth grows → orders delayed by 2-4 hours during flash sales</li>
+<li>Auto Scaling (Project 33 concept) could help — but takes 5-10 minutes to launch new instances</li>
+<li>By the time new instances are ready → the spike may be over</li>
+</ul>
+<p>→ <strong>Problem 3: Consumer Code Deployment Overhead</strong></p>
+<ul>
+<li>Each consumer is a full Java application running on EC2</li>
+<li>Deployment requires: build JAR → upload to S3 → deploy to EC2 → restart service</li>
+<li>Three separate applications to maintain, monitor, and patch</li>
+<li>OS patches, Java updates, dependency management for each instance</li>
+<li>The fulfillment consumer is 15 lines of actual business logic wrapped in 500 lines of boilerplate</li>
+</ul>
+<p>→ <strong>Problem 4: New Event-Driven Requirements</strong></p>
+<ul>
+<li>The data team wants: "When a new file lands in S3 → automatically trigger Glue ETL"</li>
+<li>The operations team wants: "When an order status changes → send customer notification"</li>
+<li>The security team wants: "When a new IAM user is created → log to compliance system"</li>
+<li>Each requirement needs a new consumer — another EC2 instance, another application</li>
+</ul>
+<p>→ <strong>Problem 5: Error Handling Gaps</strong></p>
+<ul>
+<li>When a consumer crashes → messages pile up in the queue</li>
+<li>The DLQ (Project 20) catches poison messages — but who processes DLQ messages?</li>
+<li>Currently: Manual investigation by an engineer</li>
+<li>Desired: Automatic processing of DLQ messages (log, alert, store for analysis)</li>
+</ul>
+<p>→ The CTO says: "I want event-driven processing that scales to zero when idle, scales instantly during spikes, requires zero server management, and deploys in seconds"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what "serverless compute" means in this context</p>
+<table><thead><tr><th>Aspect</th><th>EC2 Consumer (Current)</th><th>Lambda Consumer (Target)</th></tr></thead><tbody><tr><td>Provisioning</td><td>You launch and manage instances</td><td>AWS provisions compute on demand</td></tr><tr><td>Scaling</td><td>Manual or Auto Scaling (minutes)</td><td>Automatic (milliseconds)</td></tr><tr><td>Idle cost</td><td>Full instance cost 24/7</td><td>$0 when no messages</td></tr><tr><td>Deployment</td><td>Build → upload → deploy → restart</td><td>Upload code package → deploy → instant</td></tr><tr><td>OS management</td><td>You patch, update, secure</td><td>AWS manages everything</td></tr><tr><td>Monitoring</td><td>CloudWatch Agent (Project 19)</td><td>Built-in CloudWatch Logs integration</td></tr><tr><td>Concurrency</td><td>Limited by instance count</td><td>Limited by account concurrency (1000 default)</td></tr><tr><td>Execution model</td><td>Long-running process polling queue</td><td>Short-lived function invoked per message batch</td></tr></tbody></table>
+<p>→ AWS Lambda is the serverless compute service that eliminates all the EC2 overhead<br>
+→ Lambda + SQS integration: Lambda automatically polls SQS and invokes your function with message batches</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand Lambda fundamentals (execution model, pricing, limits)</li>
+<li>Step 2 — Create IAM Role for Lambda</li>
+<li>Step 3 — Create Lambda function for order fulfillment</li>
+<li>Step 4 — Configure SQS as Lambda event source (trigger)</li>
+<li>Step 5 — Configure batch processing settings</li>
+<li>Step 6 — Configure error handling (connects to DLQ — Project 20)</li>
+<li>Step 7 — Configure concurrency controls</li>
+<li>Step 8 — Replace all three EC2 consumers with Lambda functions</li>
+<li>Step 9 — Implement S3 event → Lambda pattern (for data pipeline)</li>
+<li>Step 10 — Monitor and optimize</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND LAMBDA FUNDAMENTALS</h3>
+<p><strong>What is Lambda?</strong><br>
+→ A compute service that runs your code in response to EVENTS<br>
+→ No servers to provision, manage, or scale<br>
+→ You provide: code + configuration<br>
+→ AWS provides: compute, scaling, availability, monitoring</p>
+<p><strong>Execution Model:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EVENT occurs (SQS message, S3 upload, API call, schedule)
+</span>       ↓
+Lambda service receives the event
+       ↓
+Lambda provisions a lightweight compute environment ("execution environment")
+       ↓
+Your code runs inside this environment
+       ↓
+Code completes (success or failure)
+       ↓
+Environment may be REUSED for next invocation (warm start)
+  OR destroyed after idle period (cold start on next invocation)</code></pre></div>
+<p><strong>Key Lambda Concepts:</strong></p>
+<table><thead><tr><th>Concept</th><th>Definition</th><th>Analogy</th></tr></thead><tbody><tr><td>Function</td><td>Your code + configuration</td><td>A single microservice</td></tr><tr><td>Event</td><td>The trigger data (SQS message, S3 notification)</td><td>The input</td></tr><tr><td>Handler</td><td>The entry point function in your code</td><td>The main() method</td></tr><tr><td>Execution environment</td><td>The container running your code</td><td>A temporary VM</td></tr><tr><td>Cold start</td><td>First invocation — new environment created</td><td>Booting a fresh computer</td></tr><tr><td>Warm start</td><td>Subsequent invocation — reuses existing environment</td><td>Computer already running</td></tr><tr><td>Invocation</td><td>One execution of your function</td><td>One function call</td></tr><tr><td>Concurrency</td><td>Number of simultaneous executions</td><td>How many parallel workers</td></tr></tbody></table>
+<p><strong>Lambda Pricing:</strong></p>
+<table><thead><tr><th>Component</th><th>Price</th><th>Billed By</th></tr></thead><tbody><tr><td>Requests</td><td>$0.20 per 1 million invocations</td><td>Per invocation</td></tr><tr><td>Duration</td><td>$0.0000166667 per GB-second</td><td>Memory × time</td></tr><tr><td>Free tier</td><td>1 million requests + 400,000 GB-seconds per month</td><td>Monthly</td></tr></tbody></table>
+<p><strong>Example cost for ShopNow order processing:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td>Orders per day</td><td>50,000</td></tr><tr><td>Lambda invocations per day</td><td>~5,000 (batching 10 messages per invocation)</td></tr><tr><td>Average duration per invocation</td><td>500 ms</td></tr><tr><td>Memory allocated</td><td>256 MB</td></tr><tr><td>GB-seconds per day</td><td>5,000 × 0.5s × 0.25 GB = 625</td></tr><tr><td>Monthly GB-seconds</td><td>625 × 30 = 18,750</td></tr><tr><td>Monthly cost (duration)</td><td>18,750 × $0.0000166667 = $0.31</td></tr><tr><td>Monthly cost (requests)</td><td>150,000 × $0.20/1M = $0.03</td></tr><tr><td><strong>Total monthly cost</strong></td><td><strong>$0.34</strong></td></tr></tbody></table>
+<p>→ Compare to EC2: $93/month → Lambda: $0.34/month → <strong>99.6% cost reduction</strong></p>
+<p><strong>Lambda Limits:</strong></p>
+<table><thead><tr><th>Limit</th><th>Value</th><th>Adjustable?</th></tr></thead><tbody><tr><td>Maximum execution time</td><td>15 minutes</td><td>No (hard limit)</td></tr><tr><td>Maximum memory</td><td>10,240 MB (10 GB)</td><td>No (hard limit)</td></tr><tr><td>Maximum deployment package (zipped)</td><td>50 MB (direct upload) / 250 MB (via S3)</td><td>No</td></tr><tr><td>Maximum concurrent executions per account</td><td>1,000</td><td>Yes (request increase to 100,000+)</td></tr><tr><td>Maximum environment variables</td><td>4 KB total</td><td>No</td></tr><tr><td>Maximum /tmp storage</td><td>10,240 MB</td><td>No</td></tr><tr><td>Maximum payload (synchronous)</td><td>6 MB</td><td>No</td></tr><tr><td>Maximum payload (asynchronous)</td><td>256 KB</td><td>No</td></tr><tr><td>Maximum SQS batch size</td><td>10,000 messages</td><td>No</td></tr></tbody></table>
+<p>→ For order processing (500ms per batch) → well within 15-minute limit<br>
+→ For ETL triggering → may approach limit for large orchestration tasks</p>
+<hr>
+<h3>STEP 2 — CREATE IAM ROLE FOR LAMBDA</h3>
+<p>→ Lambda needs an IAM Role — same pattern as EC2 (Project 11) and Glue (Project 21)<br>
+→ This role is called the "Lambda Execution Role"</p>
+<p>→ Navigate to IAM → Roles → Create Role</p>
+<p><strong>Trust Relationship:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity type</td><td>AWS Service</td></tr><tr><td>Service</td><td>Lambda</td></tr></tbody></table>
+<p>→ Trust policy: <code>"Service": "lambda.amazonaws.com"</code> can AssumeRole</p>
+<p><strong>Permissions Required for Order Fulfillment Lambda:</strong></p>
+<table><thead><tr><th>Permission</th><th>Purpose</th><th>Policy</th></tr></thead><tbody><tr><td>SQS read/delete</td><td>Receive and delete messages from source queue</td><td>Custom policy</td></tr><tr><td>SQS send (DLQ)</td><td>Send to DLQ on failure (handled by SQS, not Lambda)</td><td>Not needed — SQS handles DLQ internally</td></tr><tr><td>CloudWatch Logs</td><td>Write execution logs</td><td><code>AWSLambdaBasicExecutionRole</code> (managed)</td></tr><tr><td>SNS publish</td><td>Send notifications on order status change</td><td>Custom policy</td></tr><tr><td>S3 read/write</td><td>Read order details / write fulfillment records</td><td>Custom policy</td></tr></tbody></table>
+<p><strong>AWS Managed Policy: <code>AWSLambdaBasicExecutionRole</code></strong></p>
+<table><thead><tr><th>Permission</th><th>Purpose</th></tr></thead><tbody><tr><td><code>logs:CreateLogGroup</code></td><td>Create CloudWatch Log Group for this function</td></tr><tr><td><code>logs:CreateLogStream</code></td><td>Create Log Stream per execution environment</td></tr><tr><td><code>logs:PutLogEvents</code></td><td>Write log entries</td></tr></tbody></table>
+<p>→ This is the MINIMUM policy every Lambda function needs<br>
+→ Without it → function runs but you can't see any logs → impossible to debug</p>
+<p><strong>Custom SQS Policy:</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>sqs:ReceiveMessage</code>, <code>sqs:DeleteMessage</code>, <code>sqs:GetQueueAttributes</code></td></tr><tr><td>Resource</td><td><code>arn:aws:sqs:ap-south-1:123456789012:order-fulfillment</code></td></tr></tbody></table>
+<p>→ <code>ReceiveMessage</code> — Lambda polls the queue<br>
+→ <code>DeleteMessage</code> — Lambda deletes successfully processed messages<br>
+→ <code>GetQueueAttributes</code> — Lambda reads queue metadata (for scaling decisions)</p>
+<p>→ Note: Lambda does NOT need <code>sqs:SendMessage</code> for DLQ<br>
+→ When Lambda fails to process a message → it does NOT delete the message → SQS visibility timeout expires → SQS increments ReceiveCount → SQS moves to DLQ (Project 20 mechanism)</p>
+<p><strong>Custom SNS Policy (for sending notifications):</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>sns:Publish</code></td></tr><tr><td>Resource</td><td><code>arn:aws:sns:ap-south-1:123456789012:order-status-notifications</code></td></tr></tbody></table>
+<p><strong>Role Name:</strong> <code>Lambda-OrderFulfillment-Role</code></p>
+<hr>
+<h3>STEP 3 — CREATE LAMBDA FUNCTION</h3>
+<p>→ Navigate to Lambda Console → Create Function</p>
+<p><strong>Function Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Function name</td><td><code>order-fulfillment-processor</code></td><td>Descriptive name</td></tr><tr><td>Runtime</td><td>Python 3.12</td><td>Language runtime (also supports Node.js, Java, Go, .NET, Ruby)</td></tr><tr><td>Architecture</td><td>arm64</td><td>Graviton2 — 20% cheaper than x86_64, same performance</td></tr><tr><td>Execution role</td><td><code>Lambda-OrderFulfillment-Role</code></td><td>Role created in Step 2</td></tr></tbody></table>
+<p><strong>Runtime Selection Guide:</strong></p>
+<table><thead><tr><th>Runtime</th><th>Cold Start</th><th>Best For</th><th>ShopNow Choice</th></tr></thead><tbody><tr><td>Python 3.12</td><td>~200ms</td><td>Data processing, AWS SDK calls, simple logic</td><td>✅ Recommended</td></tr><tr><td>Node.js 20.x</td><td>~150ms</td><td>API handlers, event processing, async I/O</td><td>Good alternative</td></tr><tr><td>Java 21</td><td>~2-5 seconds</td><td>Complex business logic, enterprise patterns</td><td>Avoid (cold start too slow for SQS)</td></tr><tr><td>Go</td><td>~50ms</td><td>Fastest cold start, high-performance processing</td><td>Good for latency-critical</td></tr><tr><td>.NET 8</td><td>~1-3 seconds</td><td>Enterprise .NET shops</td><td>Avoid for SQS (cold start)</td></tr><tr><td>Ruby 3.3</td><td>~300ms</td><td>Simple scripts, prototyping</td><td>Acceptable</td></tr></tbody></table>
+<p>→ Python is ideal for SQS processing: fast cold start, excellent AWS SDK (boto3), minimal boilerplate</p>
+<p><strong>Architecture Selection:</strong></p>
+<table><thead><tr><th>Architecture</th><th>Pricing</th><th>Performance</th><th>Recommendation</th></tr></thead><tbody><tr><td>x86_64</td><td>Baseline</td><td>Baseline</td><td>Legacy — use for compatibility</td></tr><tr><td>arm64 (Graviton2)</td><td>20% cheaper</td><td>Same or better</td><td>✅ Default choice for new functions</td></tr></tbody></table>
+<p>→ arm64 is 20% cheaper with equal or better performance — always choose unless you have x86-specific dependencies</p>
+<hr>
+<p><strong>General Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Memory</td><td>256 MB</td><td>Sufficient for SQS message processing</td></tr><tr><td>Timeout</td><td>60 seconds</td><td>Max time per invocation (batch of messages)</td></tr><tr><td>Ephemeral storage (/tmp)</td><td>512 MB (default)</td><td>Temporary file storage during execution</td></tr></tbody></table>
+<p><strong>Memory Sizing Guide:</strong></p>
+<table><thead><tr><th>Memory</th><th>CPU Allocation</th><th>Use Case</th><th>Cost per 100ms</th></tr></thead><tbody><tr><td>128 MB</td><td>~0.08 vCPU</td><td>Minimal processing (logging, forwarding)</td><td>$0.000000208</td></tr><tr><td>256 MB</td><td>~0.17 vCPU</td><td>Light processing (JSON parsing, validation)</td><td>$0.000000417</td></tr><tr><td>512 MB</td><td>~0.33 vCPU</td><td>Moderate processing (DB calls, transformations)</td><td>$0.000000833</td></tr><tr><td>1024 MB</td><td>~0.67 vCPU</td><td>Heavy processing (data manipulation, encryption)</td><td>$0.000001667</td></tr><tr><td>1769 MB</td><td>1 full vCPU</td><td>CPU-intensive tasks</td><td>$0.000002946</td></tr><tr><td>3008 MB</td><td>2 vCPUs</td><td>Parallel processing</td><td>$0.000005013</td></tr><tr><td>10240 MB</td><td>6 vCPUs</td><td>Maximum compute</td><td>$0.000017067</td></tr></tbody></table>
+<p>→ Key insight: Lambda allocates CPU proportionally to memory<br>
+→ At 1,769 MB → you get exactly 1 full vCPU<br>
+→ Below 1,769 MB → you get fractional CPU<br>
+→ Doubling memory = doubling CPU = potentially halving execution time = same cost</p>
+<p>→ For order fulfillment (JSON parsing + validation + API call): 256 MB is sufficient<br>
+→ If execution time seems slow → try 512 MB — faster execution may offset higher per-ms cost</p>
+<p><strong>Timeout Configuration:</strong></p>
+<table><thead><tr><th>Timeout</th><th>Use Case</th><th>Risk</th></tr></thead><tbody><tr><td>3 seconds (default)</td><td>API Gateway responses</td><td>Too short for SQS batch processing</td></tr><tr><td>30 seconds</td><td>Simple SQS processing</td><td>Sufficient for most cases</td></tr><tr><td>60 seconds</td><td>SQS batch with external API calls</td><td>Good balance</td></tr><tr><td>300 seconds (5 min)</td><td>Complex processing, database operations</td><td>Longer failure detection</td></tr><tr><td>900 seconds (15 min)</td><td>Maximum — ETL-like tasks, large batch processing</td><td>Long wait before timeout failure</td></tr></tbody></table>
+<p>→ For order fulfillment: <strong>60 seconds</strong><br>
+→ Must be LESS than the SQS visibility timeout (from Project 7)<br>
+→ Why? If Lambda timeout &gt; SQS visibility timeout → message becomes visible again while Lambda is still processing → duplicate processing</p>
+<p><strong>Critical Rule:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda Timeout &lt; SQS Visibility Timeout
+</span>
+If Lambda timeout = 60 seconds
+Then SQS visibility timeout should be ≥ 90 seconds (1.5x buffer)</code></pre></div>
+<p>→ Update <code>order-fulfillment</code> queue visibility timeout to 90 seconds (Project 7 → Edit Queue)</p>
+<hr>
+<p><strong>Environment Variables:</strong></p>
+<table><thead><tr><th>Key</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>NOTIFICATION_TOPIC_ARN</code></td><td><code>arn:aws:sns:ap-south-1:…:order-status-notifications</code></td><td>SNS topic for customer notifications</td></tr><tr><td><code>FULFILLMENT_BUCKET</code></td><td><code>shopnow-fulfillment-records</code></td><td>S3 bucket for fulfillment records</td></tr><tr><td><code>ENVIRONMENT</code></td><td><code>production</code></td><td>Environment identifier</td></tr><tr><td><code>LOG_LEVEL</code></td><td><code>INFO</code></td><td>Control logging verbosity</td></tr></tbody></table>
+<p>→ Environment variables separate configuration from code<br>
+→ Same function code can run in dev/staging/prod with different environment variables<br>
+→ Never put secrets (passwords, API keys) in environment variables → use Secrets Manager (Project 37)</p>
+<hr>
+<h3>STEP 4 — CONFIGURE SQS AS LAMBDA EVENT SOURCE</h3>
+<p>→ This is the KEY configuration that connects SQS to Lambda<br>
+→ Lambda automatically polls the SQS queue and invokes your function with message batches</p>
+<p>→ Navigate to Lambda Console → Select function → Configuration → Triggers → Add Trigger</p>
+<p><strong>Event Source Mapping Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Trigger type</td><td>SQS</td><td>SQS queue as event source</td></tr><tr><td>SQS queue</td><td><code>arn:aws:sqs:ap-south-1:123456789012:order-fulfillment</code></td><td>Source queue</td></tr><tr><td>Batch size</td><td>10</td><td>Number of messages per Lambda invocation</td></tr><tr><td>Batch window</td><td>5 seconds</td><td>Wait up to 5 seconds to fill the batch</td></tr><tr><td>Enabled</td><td>Yes</td><td>Activate the trigger</td></tr></tbody></table>
+<p>→ Click "Add" → Event Source Mapping is created</p>
+<p><strong>What happens after configuration:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda Event Source Mapping (managed by AWS):
+</span>       ↓
+Continuously polls SQS queue using long polling
+       ↓
+When messages available:
+  ├── Collects up to [batch size] messages
+  ├── OR waits up to [batch window] seconds
+  ├── (whichever comes first)
+  └── Invokes Lambda function with the batch
+       ↓
+Lambda function receives event containing:
+  ├── Records[0]: First SQS message (body, attributes, messageId, ...)
+  ├── Records[1]: Second SQS message
+  ├── ...
+  └── Records[9]: Tenth SQS message (if batch size = 10)
+       ↓
+Function processes all messages in the batch
+       ↓
+IF function returns SUCCESS:
+  └── Lambda automatically DELETES all messages from the queue
+       (No need for your code to call DeleteMessage!)
+
+IF function throws an error/exception:
+  └── Lambda does NOT delete any messages
+  └── Messages return to queue after visibility timeout
+  └── ReceiveCount increments → eventually reaches DLQ (Project 20)</code></pre></div>
+<p>→ Critical insight: Lambda manages the ENTIRE SQS polling lifecycle<br>
+→ Your code receives messages, processes them, and returns success/failure<br>
+→ No polling logic, no DeleteMessage calls, no visibility timeout management in your code</p>
+<hr>
+<h3>STEP 5 — CONFIGURE BATCH PROCESSING SETTINGS</h3>
+<p><strong>Batch Size:</strong></p>
+<table><thead><tr><th>Batch Size</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>1</td><td>One message per Lambda invocation</td><td>Simple processing, low volume, need per-message isolation</td></tr><tr><td>5</td><td>Five messages per invocation</td><td>Moderate volume, moderate processing time</td></tr><tr><td>10</td><td>Ten messages per invocation (default max for standard SQS)</td><td>High volume, efficient processing</td></tr><tr><td>10,000</td><td>Maximum (for standard SQS)</td><td>Very high volume, batch-oriented processing</td></tr></tbody></table>
+<p>→ For FIFO queues: Maximum batch size = 10<br>
+→ For Standard queues: Maximum batch size = 10,000</p>
+<p>→ Larger batch = fewer Lambda invocations = lower request cost<br>
+→ But: if ANY message in the batch fails → entire batch is returned to queue</p>
+<p>→ For order fulfillment: <strong>Batch size = 10</strong><br>
+→ Processing 10 orders per invocation is efficient<br>
+→ If one fails → 9 successfully processed orders are also returned to queue → reprocessed (duplicate concern)<br>
+→ Solution: "Report Batch Item Failures" (Step 6)</p>
+<p><strong>Batch Window (Maximum Batching Window):</strong></p>
+<table><thead><tr><th>Window</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>0 seconds (default)</td><td>Invoke immediately with available messages</td><td>Low latency — process ASAP</td></tr><tr><td>5 seconds</td><td>Wait up to 5 seconds to collect batch size messages</td><td>Balance latency and efficiency</td></tr><tr><td>30 seconds</td><td>Wait up to 30 seconds</td><td>High efficiency, acceptable latency</td></tr><tr><td>300 seconds (5 min)</td><td>Maximum wait</td><td>Batch-heavy processing, analytics</td></tr></tbody></table>
+<p>→ Without batch window: Lambda invokes with 1 message even if 9 more are arriving<br>
+→ With 5-second window: Lambda waits up to 5 seconds to fill the batch to 10</p>
+<p>→ For order fulfillment: <strong>Batch window = 5 seconds</strong><br>
+→ 5-second delay is acceptable for order processing<br>
+→ Reduces invocations by ~50% during steady traffic</p>
+<hr>
+<h3>STEP 6 — CONFIGURE ERROR HANDLING</h3>
+<p>→ This is where Lambda + SQS + DLQ (Project 20) integrate tightly</p>
+<p><strong>Scenario: One message in a batch of 10 fails</strong></p>
+<p><strong>Default behavior (WITHOUT Report Batch Item Failures):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda receives batch of 10 messages
+</span>  ├── Message 1: ✅ Processed successfully
+  ├── Message 2: ✅ Processed successfully
+  ├── ...
+  ├── Message 7: ❌ Processing FAILS (bad data)
+  ├── ...
+  └── Message 10: ✅ Processed successfully
+
+Function throws exception due to Message 7
+  ↓
+Lambda treats ENTIRE BATCH as failed
+  ↓
+ALL 10 messages return to queue (including 9 that succeeded)
+  ↓
+All 10 messages will be reprocessed → 9 messages processed TWICE
+  ↓
+Eventually Message 7 hits maxReceiveCount → goes to DLQ
+  But Messages 1-6, 8-10 were also retried unnecessarily</code></pre></div>
+<p>→ This is wasteful and creates duplicate processing</p>
+<p><strong>Improved behavior (WITH Report Batch Item Failures):</strong></p>
+<p>→ Navigate to Lambda → Event Source Mapping → Edit</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Report batch item failures</td><td>Enabled</td><td>Function can report individual failures</td></tr></tbody></table>
+<p>→ Now your function returns a response identifying WHICH specific messages failed</p>
+<p><strong>Function response format:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "batchItemFailures": [
+    {"itemIdentifier": "message-id-of-failed-message-7"}
+  ]
+}</code></pre></div>
+<p>→ Lambda processes the response:</p>
+<ul>
+<li>Messages NOT in batchItemFailures → DELETED from queue (successfully processed)</li>
+<li>Messages IN batchItemFailures → RETURNED to queue (will be retried)</li>
+</ul>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lambda receives batch of 10 messages
+</span>  ├── Message 1: ✅ Processed → deleted
+  ├── Message 2: ✅ Processed → deleted
+  ├── ...
+  ├── Message 7: ❌ Failed → returned to queue (ReceiveCount++)
+  ├── ...
+  └── Message 10: ✅ Processed → deleted
+
+Only Message 7 retries → eventually goes to DLQ
+Other 9 messages processed exactly once ✅</code></pre></div>
+<p>→ This is the RECOMMENDED configuration for all production SQS → Lambda setups<br>
+→ Without it → batch failures cause cascading retries and duplicates</p>
+<hr>
+<p><strong>Lambda Destination Configuration (for async invocations):</strong></p>
+<p>→ Lambda Destinations route invocation results to another service<br>
+→ Note: Destinations work for ASYNC invocations, NOT for SQS event source mappings<br>
+→ For SQS → Lambda, error handling is via batch item failures + SQS DLQ (Project 20)</p>
+<p><strong>However — for ASYNC Lambda invocations (e.g., S3 event → Lambda):</strong></p>
+<table><thead><tr><th>Destination Type</th><th>Target Service</th><th>Use Case</th></tr></thead><tbody><tr><td>On Success</td><td>SQS / SNS / Lambda / EventBridge</td><td>Forward successful result for downstream processing</td></tr><tr><td>On Failure</td><td>SQS / SNS / Lambda / EventBridge</td><td>Capture failed invocations for investigation</td></tr></tbody></table>
+<p>→ Configure On Failure destination:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Condition</td><td>On failure</td></tr><tr><td>Destination type</td><td>SQS</td></tr><tr><td>Destination queue</td><td><code>lambda-async-failure-dlq</code></td></tr></tbody></table>
+<p>→ Failed async invocations (including error details, stack trace, input event) are sent to this queue<br>
+→ Different from SQS DLQ — this catches Lambda-level failures, not SQS message-level failures</p>
+<hr>
+<p><strong>Maximum Retry Attempts (for async invocations):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Behavior</th></tr></thead><tbody><tr><td>Maximum retry attempts</td><td>2 (default)</td><td>Lambda retries failed async invocations twice</td></tr><tr><td>Maximum retry attempts</td><td>0</td><td>No retries — failure goes directly to destination</td></tr><tr><td>Maximum event age</td><td>6 hours (default)</td><td>Discard events older than this if not yet processed</td></tr></tbody></table>
+<p>→ For SQS event source mapping → these settings DON'T apply<br>
+→ SQS retry behavior is controlled by visibility timeout + maxReceiveCount (Project 7, 20)</p>
+<hr>
+<h3>STEP 7 — CONFIGURE CONCURRENCY CONTROLS</h3>
+<p><strong>Understanding Lambda Concurrency:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1 message arrives → 1 concurrent execution
+</span>10 messages arrive simultaneously → up to 10 concurrent executions
+1000 messages in queue → Lambda scales up to process them
+
+Scaling behavior:
+  ├── Initial burst: Up to 1,000 concurrent executions immediately
+  ├── After burst: Scales up 500 additional concurrent executions per minute
+  └── Maximum: Account-level concurrency limit (default 1,000)</code></pre></div>
+<p>→ For SQS specifically:</p>
+<ul>
+<li>Lambda starts with 5 concurrent invocations (5 pollers)</li>
+<li>Every minute, Lambda adds 60 more concurrent invocations if queue has messages</li>
+<li>Scales until queue is drained or concurrency limit is reached</li>
+</ul>
+<p><strong>Concurrency Types:</strong></p>
+<table><thead><tr><th>Type</th><th>Configuration</th><th>Behavior</th></tr></thead><tbody><tr><td>Unreserved</td><td>Default — shares account pool</td><td>Function uses whatever concurrency is available</td></tr><tr><td>Reserved</td><td>Set specific limit per function</td><td>Guarantees AND caps concurrency for this function</td></tr><tr><td>Provisioned</td><td>Pre-warm execution environments</td><td>Eliminates cold starts (at a cost)</td></tr></tbody></table>
+<p><strong>Reserved Concurrency:</strong></p>
+<p>→ Navigate to Lambda → Function → Configuration → Concurrency</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Reserved concurrency</td><td>50</td><td>Maximum 50 simultaneous executions for this function</td></tr></tbody></table>
+<p>→ Why set a limit?</p>
+<ul>
+<li>Protect downstream systems from overload</li>
+<li>Order fulfillment calls an inventory API → API can handle 50 concurrent requests</li>
+<li>Without limit → Lambda could scale to 1000 concurrent → overwhelm the API</li>
+<li>Also prevents one function from consuming all account concurrency</li>
+</ul>
+<p><strong>Reserved Concurrency for each function:</strong></p>
+<table><thead><tr><th>Function</th><th>Reserved Concurrency</th><th>Rationale</th></tr></thead><tbody><tr><td><code>order-fulfillment-processor</code></td><td>50</td><td>Inventory API limit</td></tr><tr><td><code>order-invoicing-processor</code></td><td>30</td><td>Invoice generation system limit</td></tr><tr><td><code>order-analytics-processor</code></td><td>100</td><td>S3 writes — can handle more parallelism</td></tr><tr><td>Unreserved pool</td><td>820 (1000 - 50 - 30 - 100)</td><td>Available for other functions</td></tr></tbody></table>
+<p>→ Sum of all reserved concurrency must be &lt; account limit (1000)<br>
+→ Leave at least 100 unreserved for other functions</p>
+<p><strong>Provisioned Concurrency (Eliminating Cold Starts):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Provisioned concurrency</td><td>5</td><td>Keep 5 execution environments always warm</td></tr></tbody></table>
+<p>→ Cold start for Python: ~200ms → may be acceptable for SQS processing<br>
+→ Provisioned concurrency eliminates cold starts but costs $0.000004646 per GB-second even when idle<br>
+→ For SQS consumers: Usually NOT needed — cold starts are acceptable<br>
+→ For API Gateway backends: Often needed — cold starts affect user experience</p>
+<p>→ ShopNow decision: <strong>No provisioned concurrency</strong> — 200ms cold start is invisible in SQS processing</p>
+<hr>
+<h3>STEP 8 — REPLACE ALL THREE EC2 CONSUMERS</h3>
+<p><strong>Function 1: Order Fulfillment (detailed above)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function name</td><td><code>order-fulfillment-processor</code></td></tr><tr><td>Source queue</td><td><code>order-fulfillment</code></td></tr><tr><td>Batch size</td><td>10</td></tr><tr><td>Batch window</td><td>5 seconds</td></tr><tr><td>Report batch item failures</td><td>Enabled</td></tr><tr><td>Reserved concurrency</td><td>50</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>60 seconds</td></tr></tbody></table>
+<p><strong>Function 2: Order Invoicing</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function name</td><td><code>order-invoicing-processor</code></td></tr><tr><td>Source queue</td><td><code>order-invoicing</code></td></tr><tr><td>Batch size</td><td>5</td></tr><tr><td>Batch window</td><td>10 seconds</td></tr><tr><td>Report batch item failures</td><td>Enabled</td></tr><tr><td>Reserved concurrency</td><td>30</td></tr><tr><td>Memory</td><td>512 MB</td></tr><tr><td>Timeout</td><td>120 seconds</td></tr></tbody></table>
+<p>→ Why different settings?</p>
+<ul>
+<li>Invoicing calls an external tax API (slow) → longer timeout</li>
+<li>Tax API is rate-limited → smaller batch size, lower concurrency</li>
+<li>PDF generation needs more memory → 512 MB</li>
+</ul>
+<p><strong>Function 3: Order Analytics</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function name</td><td><code>order-analytics-processor</code></td></tr><tr><td>Source queue</td><td><code>order-analytics</code></td></tr><tr><td>Batch size</td><td>100</td></tr><tr><td>Batch window</td><td>30 seconds</td></tr><tr><td>Report batch item failures</td><td>Enabled</td></tr><tr><td>Reserved concurrency</td><td>100</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>60 seconds</td></tr></tbody></table>
+<p>→ Why different settings?</p>
+<ul>
+<li>Analytics is batch-friendly — larger batch sizes are more efficient</li>
+<li>No external API calls → higher concurrency is safe</li>
+<li>Writes to S3 → S3 handles any level of parallelism</li>
+<li>Longer batch window acceptable — analytics doesn't need sub-second latency</li>
+</ul>
+<hr>
+<p><strong>Decommission EC2 Consumers:</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th></tr></thead><tbody><tr><td>1</td><td>Verify Lambda functions are processing successfully (monitor for 24-48 hours)</td></tr><tr><td>2</td><td>Verify DLQ message count is not increasing abnormally</td></tr><tr><td>3</td><td>Verify message processing latency meets SLA</td></tr><tr><td>4</td><td>Stop EC2 consumer applications</td></tr><tr><td>5</td><td>Monitor queues — ensure Lambda is handling all messages</td></tr><tr><td>6</td><td>Terminate EC2 instances</td></tr><tr><td>7</td><td>Remove EC2 security group rules for consumers</td></tr></tbody></table>
+<p>→ Run both EC2 and Lambda in parallel for 48 hours (dual-processing)<br>
+→ Verify Lambda handles everything → then decommission EC2</p>
+<p><strong>Cost Comparison After Migration:</strong></p>
+<table><thead><tr><th>Component</th><th>EC2 (Before)</th><th>Lambda (After)</th><th>Savings</th></tr></thead><tbody><tr><td>Fulfillment processing</td><td>$31/month</td><td>$0.34/month</td><td>99%</td></tr><tr><td>Invoicing processing</td><td>$31/month</td><td>$0.52/month</td><td>98%</td></tr><tr><td>Analytics processing</td><td>$31/month</td><td>$0.18/month</td><td>99%</td></tr><tr><td><strong>Total</strong></td><td><strong>$93/month</strong></td><td><strong>$1.04/month</strong></td><td><strong>98.9%</strong></td></tr></tbody></table>
+<hr>
+<h3>STEP 9 — IMPLEMENT S3 EVENT → LAMBDA PATTERN</h3>
+<p>→ This solves the data pipeline automation need from Project 25<br>
+→ "When a vendor uploads a file to S3 → automatically trigger processing"</p>
+<p><strong>Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Vendor uploads file to S3: s3://shopnow-data-lake/raw/vendor-products/new-catalog.csv
+</span>       ↓
+S3 Event Notification (Project 15 concept) fires
+       ↓
+Event can go to: SNS / SQS / Lambda directly
+       ↓
+For this use case: S3 → Lambda (direct invocation)
+       ↓
+Lambda function: validate-and-trigger-etl
+  ├── Validates the uploaded file (correct format, expected columns)
+  ├── Logs the upload event
+  ├── Triggers Glue ETL job via AWS SDK
+  └── Sends SNS notification: "New vendor catalog received, ETL triggered"</code></pre></div>
+<p><strong>S3 Event Notification Configuration:</strong></p>
+<p>→ Navigate to S3 Console → Bucket → Properties → Event Notifications → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Event name</td><td><code>vendor-file-upload</code></td><td>Descriptive name</td></tr><tr><td>Prefix filter</td><td><code>raw/vendor-products/</code></td><td>Only trigger for files in this prefix</td></tr><tr><td>Suffix filter</td><td><code>.csv</code></td><td>Only trigger for CSV files</td></tr><tr><td>Event types</td><td><code>s3:ObjectCreated:Put</code>, <code>s3:ObjectCreated:CompleteMultipartUpload</code></td><td>Trigger on file upload</td></tr><tr><td>Destination</td><td>Lambda function</td><td>Direct invocation</td></tr><tr><td>Lambda function</td><td><code>validate-and-trigger-etl</code></td><td>Target function</td></tr></tbody></table>
+<p><strong>Lambda Function for ETL Triggering:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Function name</td><td><code>validate-and-trigger-etl</code></td></tr><tr><td>Runtime</td><td>Python 3.12</td></tr><tr><td>Memory</td><td>256 MB</td></tr><tr><td>Timeout</td><td>300 seconds (5 min)</td></tr><tr><td>IAM Role permissions</td><td>S3 read + Glue StartJobRun + SNS Publish</td></tr></tbody></table>
+<p><strong>Event received by Lambda:</strong></p>
+<p>→ S3 sends an event containing:</p>
+<table><thead><tr><th>Field</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3.bucket.name</code></td><td><code>shopnow-data-lake</code></td><td>Which bucket</td></tr><tr><td><code>s3.object.key</code></td><td><code>raw/vendor-products/new-catalog.csv</code></td><td>Which file</td></tr><tr><td><code>s3.object.size</code></td><td><code>5242880</code></td><td>File size in bytes</td></tr><tr><td><code>eventTime</code></td><td><code>2025-01-15T14:30:00.000Z</code></td><td>When the upload occurred</td></tr><tr><td><code>eventName</code></td><td><code>ObjectCreated:Put</code></td><td>What happened</td></tr></tbody></table>
+<p><strong>Function Logic (configuration-level description):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Receive S3 event
+</span>  ↓
+Extract bucket name and object key from event
+  ↓
+VALIDATE:
+  ├── File size &gt; 0? (not empty)
+  ├── File extension is .csv?
+  ├── Download first 1KB → check header row → expected columns present?
+  └── If validation fails → publish to SNS "Invalid file uploaded" → RETURN
+  ↓
+TRIGGER GLUE JOB:
+  ├── Call Glue API: StartJobRun
+  ├── Job name: shopnow-products-csv-to-parquet (from Project 21)
+  ├── Pass S3 path as job argument
+  └── Log job run ID for tracking
+  ↓
+NOTIFY:
+  ├── Publish to SNS topic: "Vendor catalog received, ETL job {run_id} triggered"
+  └── Include file name, size, upload time in notification
+  ↓
+RETURN success</code></pre></div>
+<p><strong>S3 → Lambda Permission:</strong></p>
+<p>→ S3 needs permission to INVOKE the Lambda function<br>
+→ This is a resource-based policy on the Lambda function (different from the execution role)</p>
+<p>→ Navigate to Lambda → Function → Configuration → Permissions → Resource-based policy</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Statement ID</td><td><code>AllowS3Invoke</code></td></tr><tr><td>Principal</td><td><code>s3.amazonaws.com</code></td></tr><tr><td>Action</td><td><code>lambda:InvokeFunction</code></td></tr><tr><td>Source ARN</td><td><code>arn:aws:s3:::shopnow-data-lake</code></td></tr><tr><td>Source Account</td><td><code>123456789012</code></td></tr></tbody></table>
+<p>→ This allows S3 (and only S3 from your account and bucket) to invoke this Lambda function</p>
+<hr>
+<h3>STEP 10 — MONITORING AND OBSERVABILITY</h3>
+<p><strong>Lambda CloudWatch Integration (Built-in — No Agent Needed):</strong></p>
+<p>→ Unlike EC2 (Project 19 — CloudWatch Agent required), Lambda writes to CloudWatch Logs AUTOMATICALLY<br>
+→ Every Lambda function gets a Log Group: <code>/aws/lambda/{function-name}</code><br>
+→ Every execution environment gets a Log Stream within the group</p>
+<table><thead><tr><th>Log Group</th><th>Purpose</th></tr></thead><tbody><tr><td><code>/aws/lambda/order-fulfillment-processor</code></td><td>Fulfillment function logs</td></tr><tr><td><code>/aws/lambda/order-invoicing-processor</code></td><td>Invoicing function logs</td></tr><tr><td><code>/aws/lambda/order-analytics-processor</code></td><td>Analytics function logs</td></tr><tr><td><code>/aws/lambda/validate-and-trigger-etl</code></td><td>ETL trigger function logs</td></tr></tbody></table>
+<p>→ Set retention on each Log Group (Project 19 guidance): 30-90 days</p>
+<p><strong>Lambda CloudWatch Metrics (Automatic):</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th><th>Alert Threshold</th></tr></thead><tbody><tr><td><code>Invocations</code></td><td>Number of function calls</td><td>Sudden drop = queue not being polled</td></tr><tr><td><code>Duration</code></td><td>Execution time per invocation</td><td>&gt; 80% of timeout = risk of timeout</td></tr><tr><td><code>Errors</code></td><td>Number of failed invocations</td><td>&gt; 0 = investigate</td></tr><tr><td><code>Throttles</code></td><td>Invocations rejected due to concurrency limit</td><td>&gt; 0 = increase reserved concurrency</td></tr><tr><td><code>ConcurrentExecutions</code></td><td>Current parallel executions</td><td>Approaching reserved limit = scaling bottleneck</td></tr><tr><td><code>IteratorAge</code> (for SQS)</td><td>Age of oldest message being processed</td><td>Increasing = falling behind</td></tr></tbody></table>
+<p><strong>Critical Alarms to Create (Project 8 pattern):</strong></p>
+<p><strong>Alarm 1: Function Errors</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>AWS/Lambda</code> → <code>Errors</code></td></tr><tr><td>Function name dimension</td><td><code>order-fulfillment-processor</code></td></tr><tr><td>Statistic</td><td>Sum</td></tr><tr><td>Period</td><td>300 seconds</td></tr><tr><td>Threshold</td><td>&gt; 5</td></tr><tr><td>Alarm action</td><td>SNS topic (Project 6)</td></tr></tbody></table>
+<p><strong>Alarm 2: Throttles</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>AWS/Lambda</code> → <code>Throttles</code></td></tr><tr><td>Function name dimension</td><td><code>order-fulfillment-processor</code></td></tr><tr><td>Statistic</td><td>Sum</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Threshold</td><td>&gt; 0</td></tr><tr><td>Alarm action</td><td>SNS topic</td></tr></tbody></table>
+<p>→ Throttles = messages can't be processed = queue depth growing<br>
+→ Resolution: Increase reserved concurrency or request account limit increase</p>
+<p><strong>Alarm 3: Iterator Age (Queue Processing Delay)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>AWS/Lambda</code> → <code>IteratorAge</code></td></tr><tr><td>Function name dimension</td><td><code>order-fulfillment-processor</code></td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>300 seconds</td></tr><tr><td>Threshold</td><td>&gt; 300000 (5 minutes in milliseconds)</td></tr><tr><td>Alarm action</td><td>SNS topic</td></tr></tbody></table>
+<p>→ IteratorAge &gt; 5 minutes = Lambda is falling 5+ minutes behind the queue<br>
+→ Indicates: too few concurrent executions, slow processing, or upstream spike</p>
+<p><strong>Alarm 4: DLQ Depth (from Project 20 — still applies)</strong></p>
+<p>→ DLQ alarms remain exactly as configured in Project 20<br>
+→ Lambda failures increment ReceiveCount → messages still flow to DLQ<br>
+→ DLQ monitoring is INDEPENDENT of whether the consumer is EC2 or Lambda</p>
+<hr>
+<p><strong>Monitoring Dashboard:</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>Invocations per function (line chart)</td><td>Invocations over time</td><td>Traffic pattern visibility</td></tr><tr><td>Error rate per function (percentage)</td><td>Errors / Invocations × 100</td><td>Health indicator</td></tr><tr><td>Duration distribution (percentiles)</td><td>P50, P90, P99 duration</td><td>Performance monitoring</td></tr><tr><td>Concurrent executions (area chart)</td><td>ConcurrentExecutions</td><td>Scaling visibility</td></tr><tr><td>Throttle count (number)</td><td>Throttles sum</td><td>Capacity indicator</td></tr><tr><td>Iterator age (number)</td><td>IteratorAge maximum</td><td>Processing delay indicator</td></tr><tr><td>SQS queue depth (from Project 20)</td><td>ApproximateNumberOfMessagesVisible</td><td>Backlog indicator</td></tr><tr><td>DLQ message count (from Project 20)</td><td>ApproximateNumberOfMessagesVisible on DLQ</td><td>Failure indicator</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable "Report batch item failures" — prevents entire batch retry on single message failure<br>
+→ Always set Lambda timeout &lt; SQS visibility timeout — prevents duplicate processing<br>
+→ Always set reserved concurrency — protects downstream systems from Lambda's aggressive scaling<br>
+→ Always use arm64 (Graviton2) architecture — 20% cheaper, same or better performance<br>
+→ Always start with minimal memory (256 MB) and optimize based on CloudWatch metrics<br>
+→ Always use environment variables for configuration — never hardcode ARNs, bucket names, or settings<br>
+→ Always create function-specific IAM Roles with least privilege — don't share roles across functions<br>
+→ Always set CloudWatch Log retention — Lambda logs can grow rapidly (especially with DEBUG logging)<br>
+→ Always monitor Iterator Age for SQS event sources — it's the best indicator of processing health<br>
+→ Always test with a small batch first — send 10 test messages, verify processing, then enable for production<br>
+→ Always keep Lambda functions focused — one function per responsibility (single responsibility principle)<br>
+→ Always use batch window &gt; 0 for non-latency-critical processing — reduces invocations and cost</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never set Lambda timeout &gt; SQS visibility timeout — causes duplicate message processing<br>
+→ Never use batch size &gt; 1 without "Report batch item failures" — one failure retries entire batch<br>
+→ Never put secrets in environment variables — use Secrets Manager (Project 37)<br>
+→ Never set reserved concurrency to 0 — this DISABLES the function entirely (0 = throttle everything)<br>
+→ Never forget the Lambda resource-based policy for S3 triggers — S3 can't invoke without permission<br>
+→ Never use x86_64 architecture without reason — arm64 is 20% cheaper<br>
+→ Never deploy Java runtime for SQS consumers unless cold start is acceptable — 2-5 second cold starts<br>
+→ Never run long-running processes (&gt; 15 minutes) in Lambda — use ECS/Fargate or Step Functions<br>
+→ Never give Lambda <code>sqs:*</code> permissions — only <code>ReceiveMessage</code>, <code>DeleteMessage</code>, <code>GetQueueAttributes</code><br>
+→ Never ignore throttle metrics — throttled invocations mean messages are not being processed<br>
+→ Never process and delete messages manually in Lambda code when using SQS event source — Lambda handles deletion<br>
+→ Never create a Lambda function without <code>AWSLambdaBasicExecutionRole</code> — you lose all logging capability</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE LAMBDA WITH SQS</h2>
+<table><thead><tr><th>Scenario</th><th>Use Lambda + SQS?</th><th>Why</th></tr></thead><tbody><tr><td>Event-driven message processing (variable volume)</td><td>✅ Yes</td><td>Scales to zero, scales to thousands</td></tr><tr><td>Order/event processing with spiky traffic</td><td>✅ Yes</td><td>Instant scaling during spikes</td></tr><tr><td>Simple message transformation and forwarding</td><td>✅ Yes</td><td>Minimal code, no infrastructure</td></tr><tr><td>Processing with &lt; 15 minute execution time</td><td>✅ Yes</td><td>Within Lambda limits</td></tr><tr><td>Processing that calls external APIs</td><td>✅ Yes</td><td>With reserved concurrency to protect APIs</td></tr><tr><td>Fan-out pattern: one event → multiple processors</td><td>✅ Yes</td><td>SNS → multiple SQS → multiple Lambdas</td></tr><tr><td>Processing requiring &gt; 15 minutes</td><td>❌ No</td><td>Lambda timeout limit — use ECS/Fargate</td></tr><tr><td>Processing requiring &gt; 10 GB memory</td><td>❌ No</td><td>Lambda memory limit — use ECS/Fargate</td></tr><tr><td>Continuous streaming (not queue-based)</td><td>❌ No</td><td>Use Kinesis → Lambda or Kinesis Data Analytics</td></tr><tr><td>Processing requiring GPU</td><td>❌ No</td><td>Lambda has no GPU — use SageMaker or EC2</td></tr><tr><td>Stateful processing (maintain state across invocations)</td><td>❌ No</td><td>Lambda is stateless — use ECS or Step Functions</td></tr><tr><td>Processing requiring local disk &gt; 10 GB</td><td>❌ No</td><td>Lambda /tmp limit — use ECS with EBS</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE LAMBDA</h2>
+<p>→ When processing time exceeds 15 minutes → Use ECS Fargate, Step Functions, or EC2<br>
+→ When you need persistent network connections (WebSockets, long-polling) → Use ECS or EC2<br>
+→ When you need GPU compute → Use SageMaker or EC2 with GPU instances<br>
+→ When you need more than 10 GB memory → Use ECS Fargate (up to 30 GB) or EC2<br>
+→ When cold starts are unacceptable (&lt; 50ms response required) → Use provisioned concurrency or ECS<br>
+→ When processing requires stateful sessions → Use ECS or EC2 with session management<br>
+→ When cost predictability matters more than optimization → EC2 reserved instances have fixed monthly cost; Lambda cost varies with traffic</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → LAMBDA SQS EVENT SOURCE MAPPING INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EVENT SOURCE MAPPING (managed by Lambda service):
+</span>       ↓
+Lambda creates INTERNAL pollers (you don't see or manage these)
+       ↓
+Initial state: 5 concurrent pollers
+       ↓
+Each poller calls SQS ReceiveMessage with long polling (20 seconds)
+       ↓
+SCALING UP:
+  ├── If queue has messages AND current pollers are all busy
+  ├── Lambda adds 60 more pollers per minute
+  ├── Each poller can invoke one Lambda function
+  └── Scales until: queue is empty OR concurrency limit reached
+       ↓
+SCALING DOWN:
+  ├── If queue is empty
+  ├── Pollers receive no messages
+  ├── Lambda gradually reduces poller count
+  └── Eventually: back to 5 minimum pollers
+       ↓
+MESSAGE PROCESSING:
+  ├── Poller receives batch of messages (up to batch size)
+  ├── Poller invokes Lambda function synchronously
+  ├── Passes messages as event payload
+  ├── Waits for function to complete
+  │     ├── SUCCESS: Poller calls DeleteMessageBatch for all messages
+  │     ├── PARTIAL FAILURE (batch item failures): Delete successful, return failed
+  │     └── FAILURE: Poller does nothing → visibility timeout expires → messages retry
+  └── Poller returns to polling</code></pre></div>
+<p><strong>Key detail: Lambda polls SQS — SQS does NOT push to Lambda</strong><br>
+→ Despite the "trigger" terminology, Lambda is PULLING from SQS<br>
+→ The Event Source Mapping is a managed poller — Lambda manages the polling infrastructure<br>
+→ This is important because: polling costs apply to Lambda's SQS API calls, not yours<br>
+→ These polling API calls are FREE — Lambda absorbs the cost</p>
+<hr>
+<h3>2 → COLD START VS WARM START</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COLD START (First invocation or after idle period):
+</span>  ├── Lambda provisions new execution environment
+  │     ├── Download function code from S3 (or container image from ECR)
+  │     ├── Create runtime environment (Python interpreter, libraries)
+  │     ├── Execute initialization code (imports, global variables)
+  │     └── Total time: 100ms - 5s (depends on runtime, package size)
+  ├── Execute handler function with event
+  └── Return result
+  
+  Timeline: |---cold start (200ms)---|---handler execution (500ms)---|
+  Total: 700ms
+
+WARM START (Subsequent invocation, environment reused):
+  ├── Environment already exists
+  ├── Runtime already initialized
+  ├── Execute handler function with event
+  └── Return result
+  
+  Timeline: |---handler execution (500ms)---|
+  Total: 500ms
+
+ENVIRONMENT LIFECYCLE:
+  ├── Created on cold start
+  ├── Reused for subsequent invocations (warm)
+  ├── Kept alive for ~5-15 minutes after last invocation
+  ├── Frozen between invocations (CPU suspended, memory preserved)
+  └── Destroyed after idle timeout</code></pre></div>
+<p><strong>Cold start by runtime:</strong></p>
+<table><thead><tr><th>Runtime</th><th>Typical Cold Start</th><th>With 256 MB</th><th>With 1024 MB</th></tr></thead><tbody><tr><td>Python 3.12</td><td>150-300ms</td><td>200ms</td><td>150ms</td></tr><tr><td>Node.js 20.x</td><td>100-250ms</td><td>170ms</td><td>120ms</td></tr><tr><td>Go</td><td>30-80ms</td><td>50ms</td><td>35ms</td></tr><tr><td>Java 21</td><td>2,000-5,000ms</td><td>4,000ms</td><td>2,500ms</td></tr><tr><td>.NET 8</td><td>800-2,000ms</td><td>1,500ms</td><td>900ms</td></tr></tbody></table>
+<p>→ More memory = faster cold start (more CPU allocated for initialization)<br>
+→ For SQS processing: cold starts add ~200ms to occasional invocations — negligible impact</p>
+<hr>
+<h3>3 → CONCURRENCY AND SCALING DEEP DIVE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TIME: 00:00 — Queue is empty
+</span>  Active pollers: 5 (minimum)
+  Concurrent executions: 0
+
+TIME: 00:01 — Flash sale starts, 10,000 orders/minute flood the queue
+  Queue depth: 10,000 messages
+  Active pollers: 5 → detect full queue
+  Concurrent executions: 5 (each processing batch of 10)
+
+TIME: 00:02 — Lambda scales up
+  Active pollers: 5 + 60 = 65
+  Concurrent executions: 50 (reserved concurrency limit)
+  Queue depth: 10,000 - 500 (processed) + 10,000 (new) = 19,500
+
+TIME: 00:03 — Steady state at reserved concurrency
+  Concurrent executions: 50 (capped)
+  Processing rate: 50 × 10 messages × 1 invocation/second = 500 messages/second
+  Queue depth: Growing (input &gt; processing)
+
+TIME: 00:10 — Flash sale ends, input rate drops
+  Queue depth: 15,000 (backlog)
+  Concurrent executions: 50 (still processing backlog)
+
+TIME: 00:30 — Backlog cleared
+  Queue depth: 0
+  Concurrent executions: Scaling down
+  Active pollers: Reducing
+
+TIME: 01:00 — Back to baseline
+  Active pollers: 5 (minimum)
+  Concurrent executions: 0
+  Cost during idle: $0</code></pre></div>
+<p>→ Reserved concurrency (50) acts as both GUARANTEE and CAP:</p>
+<ul>
+<li>Guarantee: 50 concurrent executions are always available for this function</li>
+<li>Cap: Never exceeds 50, protecting downstream systems</li>
+</ul>
+<hr>
+<h3>4 → SQS FIFO + LAMBDA BEHAVIOR</h3>
+<p>→ For FIFO queues (Project 7), Lambda's behavior is different:</p>
+<table><thead><tr><th>Aspect</th><th>Standard Queue</th><th>FIFO Queue</th></tr></thead><tbody><tr><td>Concurrent executions</td><td>Up to concurrency limit</td><td>One concurrent execution per Message Group ID</td></tr><tr><td>Ordering guarantee</td><td>None</td><td>Messages in same group processed in order</td></tr><tr><td>Scaling</td><td>Based on queue depth</td><td>Based on number of unique Message Group IDs</td></tr><tr><td>Maximum batch size</td><td>10,000</td><td>10</td></tr></tbody></table>
+<p>→ FIFO + Lambda:</p>
+<ul>
+<li>100 messages across 10 message groups → up to 10 concurrent Lambda invocations</li>
+<li>100 messages all in 1 message group → only 1 concurrent Lambda invocation (ordered processing)</li>
+<li>More message groups = more parallelism</li>
+</ul>
+<p>→ Design implication: Use meaningful Message Group IDs that distribute load</p>
+<ul>
+<li>Good: <code>customer_id</code> as group ID (thousands of unique values = high parallelism)</li>
+<li>Bad: <code>"all"</code> as group ID (single group = no parallelism)</li>
+</ul>
+<hr>
+<h3>5 → S3 → LAMBDA INVOCATION INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>File uploaded to S3
+</span>       ↓
+S3 detects the upload event
+       ↓
+S3 checks Event Notification configuration:
+  ├── Does prefix match? raw/vendor-products/ ✅
+  ├── Does suffix match? .csv ✅
+  └── Destination: Lambda function ARN
+       ↓
+S3 calls Lambda Invoke API (asynchronous invocation)
+  ├── Payload: S3 event (bucket, key, size, timestamp)
+  ├── Lambda checks resource-based policy: Is S3 allowed to invoke? ✅
+  └── Lambda queues the invocation
+       ↓
+Lambda processes the invocation:
+  ├── Provisions execution environment (cold start if needed)
+  ├── Invokes handler with S3 event
+  └── Handler processes the event
+       ↓
+If handler fails:
+  ├── Lambda retries up to 2 more times (async retry policy)
+  ├── If all retries fail → sends to On Failure destination (if configured)
+  └── Event is discarded after max retries
+       ↓
+KEY DIFFERENCE from SQS:
+  ├── SQS → Lambda: SYNCHRONOUS (Lambda polls, waits for result)
+  ├── S3 → Lambda: ASYNCHRONOUS (S3 fires and forgets)
+  ├── SQS: Lambda manages retries via ReceiveCount
+  └── S3: Lambda manages retries via async retry policy (max 2)</code></pre></div>
+<hr>
+<h3>6 → LAMBDA EXECUTION ENVIRONMENT REUSE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Invocation 1 (Cold Start):
+</span>  ├── INIT phase: Import libraries, initialize clients, read config
+  │     (This code runs ONCE per cold start)
+  │     Example: Create S3 client, create SNS client, parse environment variables
+  ├── HANDLER phase: Process the specific event
+  │     (This code runs EVERY invocation)
+  └── Environment frozen (CPU suspended, memory preserved)
+
+Invocation 2 (Warm Start):
+  ├── INIT phase: SKIPPED (already done)
+  ├── HANDLER phase: Process the new event
+  │     (S3 client, SNS client from Invocation 1 are still in memory!)
+  └── Environment frozen again
+
+Invocation 3 (Warm Start):
+  ├── Same pattern — reuses initialized resources
+  └── ...
+
+After 5-15 minutes of no invocations:
+  └── Environment destroyed → next invocation = cold start</code></pre></div>
+<p>→ Best practice: Initialize expensive resources (SDK clients, DB connections) OUTSIDE the handler<br>
+→ These resources persist across warm invocations → faster processing<br>
+→ The handler should only contain per-invocation logic</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>Lambda timeout &gt; SQS visibility timeout</td><td>Duplicate message processing</td><td>Message becomes visible before Lambda finishes</td><td>Set visibility timeout ≥ 6x Lambda timeout</td></tr><tr><td>2</td><td>Entire batch retried on single failure</td><td>9 good messages reprocessed with 1 bad one</td><td>"Report batch item failures" not enabled</td><td>Enable batch item failure reporting</td></tr><tr><td>3</td><td>Lambda can't write to CloudWatch Logs</td><td>No logs visible — impossible to debug</td><td>Execution role missing <code>AWSLambdaBasicExecutionRole</code></td><td>Attach managed policy</td></tr><tr><td>4</td><td>Lambda throttled despite available concurrency</td><td>Throttle metric &gt; 0</td><td>Reserved concurrency too low OR account limit reached</td><td>Increase reserved concurrency or request limit increase</td></tr><tr><td>5</td><td>S3 trigger invokes Lambda twice</td><td>Duplicate processing of uploaded file</td><td>S3 event notification fires for both PutObject and CompleteMultipartUpload</td><td>Filter event types OR make function idempotent</td></tr><tr><td>6</td><td>Cold start causes SQS visibility timeout</td><td>Message retried before Lambda finishes initializing + processing</td><td>Heavy initialization (large libraries) + short visibility timeout</td><td>Increase visibility timeout; reduce package size; use provisioned concurrency</td></tr><tr><td>7</td><td>Lambda scales too aggressively</td><td>Downstream API overwhelmed with requests</td><td>No reserved concurrency limit</td><td>Set reserved concurrency to match downstream capacity</td></tr><tr><td>8</td><td>Function runs out of memory</td><td><code>Runtime.OutOfMemory</code> error</td><td>Processing large messages or holding too much data in memory</td><td>Increase memory allocation</td></tr><tr><td>9</td><td>/tmp storage full</td><td><code>No space left on device</code> error</td><td>Writing large files to /tmp without cleanup</td><td>Clean /tmp between invocations; increase ephemeral storage</td></tr><tr><td>10</td><td>Environment variable size exceeded</td><td>Deployment fails</td><td>Total environment variables &gt; 4 KB</td><td>Move large configs to S3 or SSM Parameter Store</td></tr><tr><td>11</td><td>Circular trigger: Lambda writes to S3 → S3 triggers Lambda</td><td>Infinite loop, massive costs</td><td>Lambda writes output to same bucket/prefix that triggers it</td><td>Use DIFFERENT bucket or prefix for output; add prefix/suffix filters</td></tr><tr><td>12</td><td>FIFO queue with Lambda processes slowly</td><td>Low throughput despite messages in queue</td><td>All messages in single Message Group ID</td><td>Distribute across multiple Message Group IDs</td></tr><tr><td>13</td><td>Reserved concurrency set to 0</td><td>Function never executes, queue depth grows</td><td>Accidentally set to 0 (disables function)</td><td>Set to desired value &gt; 0; monitor for throttles</td></tr><tr><td>14</td><td>Lambda function can't reach VPC resources</td><td>Timeout connecting to RDS or ElastiCache</td><td>Lambda not configured for VPC access</td><td>Configure VPC settings (Project 45 deep dive)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Message Volume Scaling</strong></p>
+<table><thead><tr><th>Messages/Second</th><th>Lambda Concurrency Needed</th><th>Reserved Concurrency</th><th>Notes</th></tr></thead><tbody><tr><td>1-10</td><td>1-2</td><td>10</td><td>Minimal load</td></tr><tr><td>10-100</td><td>5-20</td><td>50</td><td>Moderate load</td></tr><tr><td>100-1,000</td><td>20-200</td><td>200</td><td>High load</td></tr><tr><td>1,000-10,000</td><td>200-2,000</td><td>Request increase</td><td>Very high — may need account limit increase</td></tr><tr><td>10,000+</td><td>2,000+</td><td>Request increase to 10,000+</td><td>Extreme — consider Kinesis for streaming</td></tr></tbody></table>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Messages/Day</th><th>Invocations (batch 10)</th><th>Duration (500ms, 256MB)</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>1,000</td><td>100</td><td>50 GB-seconds</td><td>$0.001 (free tier)</td></tr><tr><td>10,000</td><td>1,000</td><td>500 GB-seconds</td><td>$0.01</td></tr><tr><td>100,000</td><td>10,000</td><td>5,000 GB-seconds</td><td>$0.11</td></tr><tr><td>1,000,000</td><td>100,000</td><td>50,000 GB-seconds</td><td>$1.03</td></tr><tr><td>10,000,000</td><td>1,000,000</td><td>500,000 GB-seconds</td><td>$10.33</td></tr></tbody></table>
+<p>→ Lambda cost scales LINEARLY with volume — no step functions in pricing<br>
+→ At very high volumes (&gt;10M messages/day) → compare Lambda cost vs dedicated EC2/ECS</p>
+<p><strong>Break-even analysis: Lambda vs EC2</strong></p>
+<table><thead><tr><th>Volume</th><th>Lambda Monthly Cost</th><th>EC2 (t3.medium) Monthly Cost</th><th>Winner</th></tr></thead><tbody><tr><td>&lt; 1M messages/day</td><td>&lt; $1</td><td>$31</td><td>Lambda</td></tr><tr><td>1-10M messages/day</td><td>$1-$10</td><td>$31-$62 (1-2 instances)</td><td>Lambda</td></tr><tr><td>10-50M messages/day</td><td>$10-$50</td><td>$62-$155 (2-5 instances)</td><td>Lambda</td></tr><tr><td>50-100M messages/day</td><td>$50-$100</td><td>$93-$186 (3-6 instances)</td><td>Roughly equal</td></tr><tr><td>&gt; 100M messages/day</td><td>&gt; $100</td><td>$93-$310 (3-10 instances)</td><td>EC2 may be cheaper</td></tr></tbody></table>
+<p>→ Lambda wins for variable/spiky workloads under ~50M messages/day<br>
+→ EC2 wins for constant high-volume workloads (24/7 sustained throughput)<br>
+→ ShopNow at 50K orders/day → Lambda is dramatically cheaper</p>
+<p>→ <strong>Multi-Function Scaling</strong></p>
+<table><thead><tr><th>Pattern</th><th>Functions</th><th>Total Concurrency</th><th>Approach</th></tr></thead><tbody><tr><td>Simple fan-out (current)</td><td>3 (fulfillment, invoicing, analytics)</td><td>180 reserved</td><td>Individual functions per queue</td></tr><tr><td>Microservice fan-out</td><td>10-20 functions</td><td>500-800 reserved</td><td>Service-specific functions</td></tr><tr><td>Event mesh</td><td>50+ functions</td><td>Request limit increase</td><td>Consider Step Functions for orchestration</td></tr></tbody></table>
+<p>→ <strong>Account Concurrency Planning</strong></p>
+<table><thead><tr><th>Component</th><th>Reserved</th><th>Purpose</th></tr></thead><tbody><tr><td>Order fulfillment</td><td>50</td><td>Inventory API protection</td></tr><tr><td>Order invoicing</td><td>30</td><td>Tax API protection</td></tr><tr><td>Order analytics</td><td>100</td><td>Parallel S3 writes</td></tr><tr><td>S3 ETL triggers</td><td>5</td><td>Infrequent — low concurrency needed</td></tr><tr><td>DLQ processors</td><td>10</td><td>Background processing</td></tr><tr><td>Future functions</td><td>200</td><td>Growth buffer</td></tr><tr><td><strong>Unreserved pool</strong></td><td><strong>605</strong></td><td>Available for any function</td></tr><tr><td><strong>Account total</strong></td><td><strong>1,000</strong></td><td>Default limit</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify Lambda + SQS integration is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Event source mapping active?</td><td>Lambda → Triggers tab</td><td>SQS trigger shows "Enabled"</td></tr><tr><td>Function invoked?</td><td>CloudWatch → Metrics → Invocations</td><td>Count &gt; 0</td></tr><tr><td>Messages processed?</td><td>SQS → Queue → Messages Available</td><td>Decreasing toward 0</td></tr><tr><td>No errors?</td><td>CloudWatch → Metrics → Errors</td><td>0</td></tr><tr><td>No throttles?</td><td>CloudWatch → Metrics → Throttles</td><td>0</td></tr><tr><td>Processing timely?</td><td>CloudWatch → Metrics → IteratorAge</td><td>&lt; acceptable threshold</td></tr><tr><td>Logs present?</td><td>CloudWatch Logs → <code>/aws/lambda/function-name</code></td><td>Log entries visible</td></tr><tr><td>DLQ empty?</td><td>SQS → DLQ → Messages Available</td><td>0 (healthy state)</td></tr><tr><td>Batch item failures working?</td><td>Send batch with 1 bad message → verify only bad message retries</td><td>Only bad message in DLQ after maxReceiveCount</td></tr></tbody></table>
+<p>→ <strong>End-to-End Test Procedure:</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Send 10 valid test messages to SQS</td><td>Messages visible in queue</td></tr><tr><td>2</td><td>Wait 10 seconds</td><td>Lambda invoked (check CloudWatch)</td></tr><tr><td>3</td><td>Check SQS queue</td><td>0 messages (all processed)</td></tr><tr><td>4</td><td>Check CloudWatch Logs</td><td>10 messages processed in logs</td></tr><tr><td>5</td><td>Check DLQ</td><td>0 messages (no failures)</td></tr><tr><td>6</td><td>Send 1 invalid message</td><td>Message visible in queue</td></tr><tr><td>7</td><td>Wait for maxReceiveCount cycles</td><td>Message moves to DLQ</td></tr><tr><td>8</td><td>Check DLQ</td><td>1 message (the invalid one)</td></tr><tr><td>9</td><td>Check CloudWatch Alarms</td><td>DLQ alarm fires → SNS notification received</td></tr></tbody></table>
+<p>→ <strong>Troubleshooting Decision Tree:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Messages piling up in SQS (not being processed)?
+</span>  │
+  ├── Is event source mapping enabled?
+  │     └── No → Enable it in Lambda triggers
+  │
+  ├── Is Lambda function being invoked?
+  │     ├── No invocations → Check IAM role permissions for SQS
+  │     └── Yes → Continue below
+  │
+  ├── Is function erroring?
+  │     ├── Yes → Check CloudWatch Logs for error details
+  │     │     ├── Timeout → Increase timeout or optimize code
+  │     │     ├── Out of memory → Increase memory
+  │     │     ├── Permission denied → Fix IAM role
+  │     │     └── Business logic error → Fix code
+  │     └── No errors → Continue below
+  │
+  ├── Is function throttled?
+  │     ├── Yes → Increase reserved concurrency
+  │     └── No → Continue below
+  │
+  └── Is processing slower than input rate?
+        ├── Yes → Increase concurrency or optimize processing time
+        └── No → Should be draining — check queue metrics for timing</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Lambda + SQS is the serverless replacement for EC2-based queue consumers<br>
+→ The cost savings are dramatic: $93/month → $1.04/month (98.9% reduction) for ShopNow<br>
+→ Lambda scales to ZERO when idle and scales INSTANTLY during spikes — no Auto Scaling lag<br>
+→ "Report batch item failures" is ESSENTIAL — without it, one bad message causes entire batch retries<br>
+→ Lambda timeout MUST be less than SQS visibility timeout — this is the #1 configuration error<br>
+→ Reserved concurrency protects downstream systems from Lambda's aggressive auto-scaling<br>
+→ The S3 → Lambda pattern enables event-driven data pipelines — files land in S3, processing starts automatically<br>
+→ Lambda writes to CloudWatch Logs AUTOMATICALLY — no agent needed (unlike EC2 in Project 19)<br>
+→ The event-driven architecture fundamentally changes the platform from "scheduled batch" to "reactive"</p>
+<p>→ This project connects the entire messaging + compute stack:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 6 (SNS)</td><td>SNS fans out events → SQS queues → Lambda consumes</td></tr><tr><td>Project 7 (SQS)</td><td>SQS is the event source; visibility timeout must exceed Lambda timeout</td></tr><tr><td>Project 13 (SNS → SQS Fan-Out)</td><td>Fan-out pattern now has Lambda consumers instead of EC2</td></tr><tr><td>Project 15 (S3 Event Notifications)</td><td>S3 events trigger Lambda for pipeline automation</td></tr><tr><td>Project 19 (CloudWatch Logs)</td><td>Lambda writes logs automatically — no agent needed</td></tr><tr><td>Project 20 (DLQ)</td><td>Failed Lambda processing still flows to DLQ via SQS ReceiveCount</td></tr><tr><td>Project 21 (Glue ETL)</td><td>Lambda triggers Glue jobs when files arrive</td></tr><tr><td>Project 25 (Pipeline)</td><td>Lambda enables event-driven steps in the pipeline</td></tr><tr><td>Project 32 (Step Functions)</td><td>Step Functions orchestrate multiple Lambda functions</td></tr><tr><td>Project 34 (Lambda → Redshift)</td><td>Lambda calls Redshift Data API for automated loading</td></tr><tr><td>Project 35 (Federated Query)</td><td>Athena uses Lambda-based connectors for federated queries</td></tr><tr><td>Project 45 (Lambda in VPC)</td><td>Lambda accessing RDS and private resources</td></tr></tbody></table>
+<p>→ The complete messaging architecture is now:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ORDER PLACED
+</span>     │
+     ▼
+EC2 Application
+     │
+     ▼
+SNS Topic: order-events
+     │
+     ├──────────────────────┬──────────────────────┐
+     ▼                      ▼                      ▼
+SQS: order-fulfillment  SQS: order-invoicing   SQS: order-analytics
+  │  (DLQ configured)     │  (DLQ configured)     │  (DLQ configured)
+  ▼                        ▼                       ▼
+Lambda:                  Lambda:                 Lambda:
+order-fulfillment-       order-invoicing-        order-analytics-
+processor                processor               processor
+  │                        │                       │
+  ├── Validate order       ├── Generate invoice    ├── Write to S3
+  ├── Check inventory      ├── Call tax API        ├── Update metrics
+  ├── Reserve stock        ├── Create PDF          └── Trigger Glue
+  └── Notify customer      └── Email invoice           (if batch ready)
+       (via SNS)                (via SES)
+
+ADDITIONALLY:
+
+FILE UPLOADED TO S3
+     │
+     ▼
+S3 Event Notification
+     │
+     ▼
+Lambda: validate-and-trigger-etl
+     │
+     ├── Validate file
+     ├── Trigger Glue ETL
+     └── Notify via SNS</code></pre></div>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ Lambda functions now process messages from SQS and respond to S3 events<br>
+→ But there's a networking gap we haven't addressed</p>
+<p>→ Consider this scenario:</p>
+<ul>
+<li>The <code>order-fulfillment-processor</code> Lambda needs to check inventory</li>
+<li>Inventory data lives in the RDS MariaDB database (Project 9)</li>
+<li>MariaDB is in a PRIVATE subnet (Project 5) — not accessible from the internet</li>
+<li>Lambda runs in AWS-managed infrastructure OUTSIDE your VPC</li>
+<li>Lambda cannot reach MariaDB — connection times out</li>
+</ul>
+<p>→ Similarly:</p>
+<ul>
+<li>The S3 data lake is accessed via public S3 endpoint (HTTPS)</li>
+<li>But what if security policy requires ALL traffic to stay within the VPC?</li>
+<li>What if Redshift in a private subnet needs to reach S3 without going through the internet?</li>
+<li>What if Glue ENIs (Project 24) need S3 access from a private subnet?</li>
+</ul>
+<p>→ The common thread: <strong>Private resources need to communicate with AWS services without traversing the public internet</strong></p>
+<p>→ <strong>This is exactly what Project 27 solves</strong><br>
+→ Project 27 introduces VPC Endpoints — private network paths from your VPC to AWS services<br>
+→ You will learn the difference between Gateway Endpoints (S3, DynamoDB) and Interface Endpoints (all other services)<br>
+→ You will configure S3 VPC Endpoints that allow Glue, Lambda, and EC2 in private subnets to access S3 without NAT Gateway<br>
+→ This is the networking foundation for Lambda in VPC (Project 45), secure architectures (Project 57), and cost optimization (eliminating NAT Gateway data transfer charges)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 27: "The Data Pipeline That Shouldn't Traverse the Internet — VPC Endpoints for S3 &amp; DynamoDB"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-25.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 26/60</span></div><a class="nav-btn next" href="project-27.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

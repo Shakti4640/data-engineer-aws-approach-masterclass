@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 9: THE E-COMMERCE APP THAT NEEDED A DATABASE — RDS MariaDB Instance Setu — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 9: THE E-COMMERCE APP THAT NEEDED A DATABASE — RDS MariaDB Instance Setup</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-8) now has:</p>
+<ul>
+<li>S3 bucket for product images (Project 1)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instances in a properly architected VPC (Projects 3, 4, 5)</li>
+<li>SNS topics and SQS queues for messaging (Projects 6, 7)</li>
+<li>CloudWatch monitoring and alerting (Project 8)</li>
+</ul>
+<p>→ Currently — ShopNow runs MariaDB on an EC2 instance in the private data subnet (Project 5)<br>
+→ The database stores: products, customers, orders, inventory, and payment records</p>
+<p>→ Incident 1: The database EC2 instance's EBS volume failed at 2 AM<br>
+→ Last manual backup was 3 days ago → 3 days of order data LOST<br>
+→ Recovery took 14 hours → manual restore from backup → reconfigure application connections<br>
+→ 14 hours of complete application downtime → estimated loss: ₹12,00,000</p>
+<p>→ Incident 2: MariaDB needed a critical security patch (CVE with severity: CRITICAL)<br>
+→ Nobody on the team knew HOW to patch MariaDB without breaking it<br>
+→ The DBA had resigned 2 months ago → no database expertise remained<br>
+→ The patch sat uninstalled for 6 weeks → security audit flagged it as HIGH RISK</p>
+<p>→ Incident 3: During Diwali sale — database CPU hit 99% due to heavy read queries<br>
+→ The team wanted to add a read replica to offload read traffic<br>
+→ Setting up MariaDB replication manually requires: binary log configuration, replica server setup, CHANGE MASTER TO command, monitoring replication lag<br>
+→ Nobody knew how → took 3 days to configure → sale was already over</p>
+<p>→ Incident 4: The application team asked for a staging database identical to production<br>
+→ Manually creating a copy of a 500 GB database took 8 hours<br>
+→ During the copy → production database slowed down (backup I/O competing with application I/O)</p>
+<p>→ The CTO says: "I don't want us to MANAGE a database server. I want us to USE a database. Someone else should handle:</p>
+<ul>
+<li>Automated backups every day</li>
+<li>Automated patching of the database engine</li>
+<li>One-click read replicas</li>
+<li>Automatic failover if hardware fails</li>
+<li>Monitoring built-in</li>
+<li>Encryption at rest and in transit</li>
+<li>Point-in-time recovery to any second in the last 35 days"</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a MANAGED DATABASE problem<br>
+→ AWS RDS (Relational Database Service) provides fully managed relational databases<br>
+→ YOU manage: Schema, queries, application logic, connection strings<br>
+→ AWS manages: Hardware, patching, backups, replication, failover, monitoring, encryption</p>
+<p><strong>RDS Supported Engines:</strong></p>
+<table><thead><tr><th>Engine</th><th>Use Case</th><th>License</th></tr></thead><tbody><tr><td>Amazon Aurora (MySQL-compatible)</td><td>High-performance MySQL workloads</td><td>Commercial (AWS proprietary)</td></tr><tr><td>Amazon Aurora (PostgreSQL-compatible)</td><td>High-performance PostgreSQL workloads</td><td>Commercial (AWS proprietary)</td></tr><tr><td>MySQL</td><td>Standard MySQL workloads</td><td>Open source</td></tr><tr><td>MariaDB</td><td>MySQL-fork with enhancements</td><td>Open source</td></tr><tr><td>PostgreSQL</td><td>Advanced relational features, JSON support</td><td>Open source</td></tr><tr><td>Oracle</td><td>Enterprise Oracle workloads</td><td>Commercial (BYOL or License Included)</td></tr><tr><td>Microsoft SQL Server</td><td>Windows/.NET ecosystem</td><td>Commercial (License Included or BYOL)</td></tr></tbody></table>
+<p>→ ShopNow uses MariaDB → We'll set up RDS MariaDB<br>
+→ MariaDB is a community-developed fork of MySQL with additional features<br>
+→ Fully compatible with MySQL clients, drivers, and tools</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand RDS architecture (how it differs from EC2-hosted database)</li>
+<li>Step 2 — Create a DB Subnet Group</li>
+<li>Step 3 — Create a Parameter Group and Option Group</li>
+<li>Step 4 — Launch the RDS instance</li>
+<li>Step 5 — Configure backup and maintenance settings</li>
+<li>Step 6 — Understand storage types and auto-scaling</li>
+<li>Step 7 — Understand the RDS endpoint and connectivity</li>
+<li>Step 8 — Configure monitoring and CloudWatch integration</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND RDS ARCHITECTURE</h3>
+<p><strong>EC2-Hosted Database vs RDS:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EC2-HOSTED DATABASE (What ShopNow had):
+</span>┌──────────────────────────────────┐
+│ YOU MANAGE EVERYTHING            │
+│                                  │
+│ ┌──────────────────────────────┐ │
+│ │ EC2 Instance                 │ │
+│ │                              │ │
+│ │  ┌────────────────────────┐  │ │
+│ │  │ Operating System       │  │ │  ← You patch the OS
+│ │  │ (Amazon Linux)         │  │ │
+│ │  │                        │  │ │
+│ │  │  ┌──────────────────┐  │  │ │
+│ │  │  │ MariaDB Engine   │  │  │ │  ← You install, configure, patch
+│ │  │  │                  │  │  │ │
+│ │  │  │  ┌────────────┐  │  │  │ │
+│ │  │  │  │ Your Data  │  │  │  │ │  ← You manage backups
+│ │  │  │  └────────────┘  │  │  │ │
+│ │  │  └──────────────────┘  │  │ │
+│ │  └────────────────────────┘  │ │
+│ │                              │ │
+│ │  EBS Volume                  │ │  ← You manage storage, snapshots
+│ └──────────────────────────────┘ │
+│                                  │
+│ Security Groups, Backups,        │  ← You configure everything
+│ Replication, Failover,           │
+│ Monitoring, Encryption           │
+└──────────────────────────────────┘
+
+RDS MANAGED DATABASE (What ShopNow will have):
+┌──────────────────────────────────┐
+│ AWS MANAGES                      │
+│                                  │
+│ ┌──────────────────────────────┐ │
+│ │ Hardware + Hypervisor        │ │  ← AWS manages
+│ │                              │ │
+│ │  ┌────────────────────────┐  │ │
+│ │  │ Operating System       │  │ │  ← AWS patches
+│ │  │                        │  │ │
+│ │  │  ┌──────────────────┐  │  │ │
+│ │  │  │ MariaDB Engine   │  │  │ │  ← AWS installs, patches
+│ │  │  │                  │  │  │ │
+│ │  │  │  ┌────────────┐  │  │  │ │
+│ │  │  │  │ Your Data  │  │  │  │ │  ← YOU manage schema + queries
+│ │  │  │  └────────────┘  │  │  │ │
+│ │  │  └──────────────────┘  │  │ │
+│ │  └────────────────────────┘  │ │
+│ │                              │ │
+│ │  Managed Storage             │ │  ← AWS manages, auto-scales
+│ └──────────────────────────────┘ │
+│                                  │
+│ Automated Backups, Patching,     │  ← AWS handles automatically
+│ Replication, Failover,           │
+│ Monitoring, Encryption           │
+└──────────────────────────────────┘
+
+YOU MANAGE:
+  → Database schema (tables, indexes, views)
+  → SQL queries and optimization
+  → Application connection configuration
+  → Parameter tuning (via Parameter Groups)
+  → Security Group rules (who can connect)
+  → Backup retention and maintenance window timing</code></pre></div>
+<p>→ KEY: You have NO SSH access to the underlying EC2 instance<br>
+→ You CANNOT log into the OS running MariaDB<br>
+→ You interact with RDS through: AWS Console, AWS CLI, RDS API, and SQL client (connecting to the database endpoint)<br>
+→ This is a TRADEOFF: Less control → Less responsibility</p>
+<hr>
+<h3>STEP 2 — CREATE A DB SUBNET GROUP</h3>
+<p>→ A DB Subnet Group tells RDS WHICH subnets to place the database in<br>
+→ It MUST include subnets in at least 2 different Availability Zones<br>
+→ This is required even for Single-AZ deployments (RDS enforces it for future Multi-AZ capability)</p>
+<p>→ RDS Console → "Subnet groups" → "Create DB subnet group"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-db-subnet-group</code></td><td>Descriptive name</td></tr><tr><td>Description</td><td>"Private data subnets for ShopNow databases"</td><td>Required field</td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td><td>Must match the VPC where your application runs (Project 5)</td></tr></tbody></table>
+<p><strong>Add Subnets:</strong></p>
+<table><thead><tr><th>Availability Zone</th><th>Subnet</th><th>CIDR</th></tr></thead><tbody><tr><td>ap-south-1a</td><td>shopnow-private-data-subnet-1a</td><td>10.0.11.0/24</td></tr><tr><td>ap-south-1b</td><td>shopnow-private-data-subnet-1b</td><td>10.0.12.0/24</td></tr></tbody></table>
+<p>→ Click "Create"</p>
+<p><strong>Why Private Subnets?</strong><br>
+→ Databases should NEVER be in public subnets (Project 5 design principle)<br>
+→ Private subnets have NO route to Internet Gateway → database is unreachable from internet<br>
+→ Only instances within the VPC (via Security Group referencing — Project 4) can connect<br>
+→ This is ARCHITECTURAL security — not just firewall rules</p>
+<p><strong>Why 2 AZs Minimum?</strong><br>
+→ Even for Single-AZ deployment → RDS requires 2 AZ subnets in the group<br>
+→ If you later enable Multi-AZ → RDS needs to place the standby in a different AZ<br>
+→ If you don't have 2 AZ subnets → Multi-AZ conversion fails<br>
+→ Always include all data-tier subnets across all AZs</p>
+<hr>
+<h3>STEP 3 — UNDERSTAND PARAMETER GROUPS AND OPTION GROUPS</h3>
+<hr>
+<p><strong>PARAMETER GROUPS:</strong></p>
+<p>→ A Parameter Group is a collection of database engine configuration settings<br>
+→ Think of it as the <code>my.cnf</code> (MariaDB config file) but managed through AWS</p>
+<p>→ RDS Console → "Parameter groups" → "Create parameter group"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Parameter group family</td><td>mariadb10.11</td></tr><tr><td>Type</td><td>DB Parameter Group</td></tr><tr><td>Group name</td><td><code>shopnow-mariadb-params</code></td></tr><tr><td>Description</td><td>"Custom parameters for ShopNow MariaDB"</td></tr></tbody></table>
+<p>→ Click "Create"</p>
+<p><strong>Key Parameters to Customize:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Default</th><th>Recommended</th><th>Why</th></tr></thead><tbody><tr><td><code>max_connections</code></td><td>~{DBInstanceClassMemory/12582880} (formula)</td><td>Depends on instance class</td><td>Controls maximum simultaneous database connections</td></tr><tr><td><code>character_set_server</code></td><td>latin1</td><td>utf8mb4</td><td>Support full Unicode including emojis</td></tr><tr><td><code>collation_server</code></td><td>latin1_swedish_ci</td><td>utf8mb4_unicode_ci</td><td>Proper Unicode sorting</td></tr><tr><td><code>innodb_buffer_pool_size</code></td><td>75% of instance memory (default)</td><td>Keep default</td><td>InnoDB cache — larger = more data in memory</td></tr><tr><td><code>slow_query_log</code></td><td>0 (disabled)</td><td>1 (enabled)</td><td>Log queries taking longer than threshold</td></tr><tr><td><code>long_query_time</code></td><td>10 (seconds)</td><td>2</td><td>Threshold for slow query logging</td></tr><tr><td><code>log_output</code></td><td>FILE</td><td>FILE</td><td>Where to write slow query log (RDS manages the file)</td></tr><tr><td><code>general_log</code></td><td>0</td><td>0 (keep disabled in production)</td><td>Logs ALL queries — massive I/O overhead</td></tr><tr><td><code>innodb_print_all_deadlocks</code></td><td>0</td><td>1</td><td>Log deadlock information for debugging</td></tr><tr><td><code>performance_schema</code></td><td>0</td><td>1</td><td>Enable performance monitoring (slight overhead)</td></tr><tr><td><code>max_allowed_packet</code></td><td>4194304 (4 MB)</td><td>67108864 (64 MB)</td><td>Maximum size of a single SQL statement/result</td></tr><tr><td><code>wait_timeout</code></td><td>28800 (8 hours)</td><td>300 (5 minutes)</td><td>Close idle connections faster — free resources</td></tr><tr><td><code>interactive_timeout</code></td><td>28800</td><td>300</td><td>Same as wait_timeout for interactive sessions</td></tr></tbody></table>
+<p>→ Select <code>shopnow-mariadb-params</code> → "Edit parameters" → Modify values → "Save changes"</p>
+<p><strong>Parameter Types:</strong></p>
+<table><thead><tr><th>Type</th><th>When Applied</th><th>Example</th></tr></thead><tbody><tr><td>Dynamic</td><td>Immediately (no restart needed)</td><td><code>max_connections</code>, <code>wait_timeout</code></td></tr><tr><td>Static</td><td>Requires database REBOOT</td><td><code>character_set_server</code>, <code>performance_schema</code></td></tr></tbody></table>
+<p>→ The "Apply type" column in the console shows Dynamic or Static<br>
+→ Static changes require: Modify → select "Apply immediately" or "Apply during maintenance window" → then reboot</p>
+<p><strong>Default vs Custom Parameter Groups:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Default Parameter Group</th><th>Custom Parameter Group</th></tr></thead><tbody><tr><td>Editable</td><td>NO — read-only</td><td>YES — fully editable</td></tr><tr><td>Created by</td><td>AWS (one per engine version)</td><td>You</td></tr><tr><td>Use for</td><td>Quick testing</td><td>Production (always)</td></tr></tbody></table>
+<p>→ NEVER use the default parameter group for production → you cannot modify it later<br>
+→ Always create a custom parameter group BEFORE launching the RDS instance</p>
+<hr>
+<p><strong>OPTION GROUPS:</strong></p>
+<p>→ An Option Group enables additional features for the database engine<br>
+→ MariaDB has fewer options than Oracle/SQL Server</p>
+<p>→ RDS Console → "Option groups" → "Create group"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-mariadb-options</code></td></tr><tr><td>Description</td><td>"Custom options for ShopNow MariaDB"</td></tr><tr><td>Engine</td><td>mariadb</td></tr><tr><td>Major engine version</td><td>10.11</td></tr></tbody></table>
+<p><strong>MariaDB Available Options:</strong></p>
+<table><thead><tr><th>Option</th><th>Purpose</th></tr></thead><tbody><tr><td>MARIADB_AUDIT_PLUGIN</td><td>Audit logging for compliance — logs all connections and queries to CloudWatch</td></tr></tbody></table>
+<p>→ For ShopNow → Add MARIADB_AUDIT_PLUGIN if compliance requires audit logging<br>
+→ For basic setup → default option group is sufficient</p>
+<p>→ Click "Create"</p>
+<hr>
+<h3>STEP 4 — LAUNCH THE RDS INSTANCE</h3>
+<p>→ RDS Console → "Databases" → "Create database"</p>
+<p><strong>Step 4a: Choose Creation Method</strong></p>
+<table><thead><tr><th>Method</th><th>Description</th></tr></thead><tbody><tr><td>Standard create</td><td>Full control over all settings</td></tr><tr><td>Easy create</td><td>AWS chooses defaults — fewer decisions</td></tr></tbody></table>
+<p>→ Choose: Standard create (we want full control)</p>
+<hr>
+<p><strong>Step 4b: Engine Options</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Engine type</td><td>MariaDB</td></tr><tr><td>Edition</td><td>Community (only option for MariaDB)</td></tr><tr><td>Engine version</td><td>10.11.x (latest stable)</td></tr></tbody></table>
+<p>→ Choose the latest minor version within the major version<br>
+→ AWS will auto-patch minor versions if you enable auto minor version upgrade</p>
+<hr>
+<p><strong>Step 4c: Templates</strong></p>
+<table><thead><tr><th>Template</th><th>Pre-configured For</th></tr></thead><tbody><tr><td>Production</td><td>Multi-AZ, provisioned IOPS, larger instances</td></tr><tr><td>Dev/Test</td><td>Single-AZ, general purpose storage</td></tr><tr><td>Free tier</td><td>db.t3.micro, 20 GB storage, Single-AZ</td></tr></tbody></table>
+<p>→ Choose: Production (we'll configure each setting individually)</p>
+<hr>
+<p><strong>Step 4d: Settings</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>DB instance identifier</td><td><code>shopnow-prod-mariadb</code></td><td>Unique name for this RDS instance (not the database name)</td></tr><tr><td>Master username</td><td><code>shopnow_admin</code></td><td>The root/admin database user</td></tr><tr><td>Credentials management</td><td>Self managed</td><td>You set the password (or use Secrets Manager — Project 37)</td></tr><tr><td>Master password</td><td>(Strong random password)</td><td>Minimum 8 characters, stored securely</td></tr></tbody></table>
+<p>→ DB instance identifier: Used in the endpoint URL, console display, CLI commands<br>
+→ Master username: The DBA account — has full privileges on all databases<br>
+→ Master password: Store in a password manager or Secrets Manager (Project 37)<br>
+→ NEVER use <code>root</code>, <code>admin</code>, or <code>sa</code> as master username — too predictable</p>
+<hr>
+<p><strong>Step 4e: Instance Configuration</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>DB instance class</td><td>db.r6g.large</td><td>Memory-optimized — best for databases</td></tr><tr><td>vCPUs</td><td>2</td><td></td></tr><tr><td>RAM</td><td>16 GB</td><td>Larger InnoDB buffer pool = more data cached in memory</td></tr></tbody></table>
+<p><strong>RDS Instance Class Families:</strong></p>
+<table><thead><tr><th>Family</th><th>Optimized For</th><th>Example</th><th>Use Case</th></tr></thead><tbody><tr><td>db.t3 / db.t4g</td><td>Burstable general purpose</td><td>db.t3.micro (2 vCPU, 1 GB)</td><td>Dev/test, small workloads</td></tr><tr><td>db.m6g / db.m6i</td><td>General purpose (fixed)</td><td>db.m6g.large (2 vCPU, 8 GB)</td><td>Medium production workloads</td></tr><tr><td>db.r6g / db.r6i</td><td>Memory optimized</td><td>db.r6g.large (2 vCPU, 16 GB)</td><td>Large production databases</td></tr><tr><td>db.x2g</td><td>Memory optimized (extra large)</td><td>db.x2g.large (2 vCPU, 32 GB)</td><td>Very large in-memory datasets</td></tr></tbody></table>
+<p>→ <code>g</code> suffix = Graviton (ARM) → ~20% cheaper, same or better performance than Intel<br>
+→ <code>i</code> suffix = Intel<br>
+→ For databases → ALWAYS prefer memory-optimized (r-family) or at minimum general purpose (m-family)<br>
+→ Burstable (t-family) is OK for dev/test but NOT for production (CPU credit exhaustion — Project 3 reference)</p>
+<p>→ For ShopNow production: <code>db.r6g.large</code> (2 vCPU, 16 GB RAM)<br>
+→ 16 GB RAM means InnoDB buffer pool ≈ 12 GB → most frequently accessed data stays in memory</p>
+<hr>
+<p><strong>Step 4f: Storage</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Storage type</td><td>General Purpose SSD (gp3)</td><td>Best price-performance for most workloads</td></tr><tr><td>Allocated storage</td><td>100 GB</td><td>Initial storage size</td></tr><tr><td>Provisioned IOPS</td><td>3,000 (gp3 baseline)</td><td>I/O operations per second</td></tr><tr><td>Storage throughput</td><td>125 MB/s (gp3 baseline)</td><td>Sequential read/write speed</td></tr><tr><td>Storage autoscaling</td><td>Enable</td><td>Automatically increase storage when running low</td></tr><tr><td>Maximum storage threshold</td><td>500 GB</td><td>Maximum size auto-scaling can grow to</td></tr></tbody></table>
+<p><strong>RDS Storage Types:</strong></p>
+<table><thead><tr><th>Storage Type</th><th>Code</th><th>IOPS</th><th>Use Case</th></tr></thead><tbody><tr><td>General Purpose SSD</td><td>gp3</td><td>3,000 baseline (configurable to 16,000)</td><td>Most production workloads</td></tr><tr><td>General Purpose SSD (older)</td><td>gp2</td><td>3 IOPS per GB (scales with size)</td><td>Legacy — gp3 is better</td></tr><tr><td>Provisioned IOPS SSD</td><td>io1/io2</td><td>1,000 - 256,000 (you specify)</td><td>High-performance databases needing consistent IOPS</td></tr><tr><td>Magnetic</td><td>standard</td><td>~100 IOPS</td><td>Legacy — do NOT use</td></tr></tbody></table>
+<p>→ gp3 advantages over gp2:</p>
+<ul>
+<li>Baseline 3,000 IOPS regardless of volume size (gp2 needs 1 TB to reach 3,000 IOPS)</li>
+<li>Independent IOPS and throughput scaling (gp2 couples them)</li>
+<li>20% cheaper per GB</li>
+</ul>
+<p><strong>Storage Auto-Scaling:</strong></p>
+<p>→ When enabled → RDS automatically increases storage when:</p>
+<ul>
+<li>Free storage falls below 10% of allocated storage</li>
+<li>Low storage condition lasts at least 5 minutes</li>
+<li>At least 6 hours since last auto-scaling event</li>
+</ul>
+<p>→ Storage ONLY scales UP — it NEVER scales down<br>
+→ Once auto-scaled from 100 GB to 150 GB → it stays at 150 GB<br>
+→ To reduce → you must create a new instance with smaller storage and migrate data<br>
+→ The maximum threshold prevents runaway growth (important for cost control)</p>
+<hr>
+<p><strong>Step 4g: Availability &amp; Durability</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Multi-AZ deployment</td><td>No (for now)</td><td>Single-AZ is cheaper — Multi-AZ covered in Project 29</td></tr></tbody></table>
+<p><strong>Multi-AZ Options (Preview — Deep dive in Project 29):</strong></p>
+<table><thead><tr><th>Option</th><th>How It Works</th><th>Failover Time</th></tr></thead><tbody><tr><td>No Multi-AZ</td><td>Single instance in one AZ</td><td>No automatic failover</td></tr><tr><td>Multi-AZ DB Instance</td><td>Synchronous standby in different AZ</td><td>~60 seconds automatic failover</td></tr><tr><td>Multi-AZ DB Cluster</td><td>One writer + two reader instances across 3 AZs</td><td>~35 seconds failover</td></tr></tbody></table>
+<p>→ For ShopNow's initial setup → Single-AZ (learn the basics first)<br>
+→ Project 29 will convert this to Multi-AZ with read replicas</p>
+<hr>
+<p><strong>Step 4h: Connectivity</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td><td>Same VPC as EC2 instances (Project 5)</td></tr><tr><td>DB subnet group</td><td>shopnow-db-subnet-group</td><td>Created in Step 2 — private data subnets</td></tr><tr><td>Public access</td><td>No</td><td>CRITICAL — database should NOT have public IP</td></tr><tr><td>VPC security group</td><td>Create new or choose existing</td><td>Controls network access</td></tr><tr><td>Availability Zone</td><td>No preference (or specific AZ)</td><td>AWS chooses optimal AZ</td></tr><tr><td>Database port</td><td>3306</td><td>Default MariaDB port</td></tr></tbody></table>
+<p><strong>Security Group for RDS:</strong></p>
+<p>→ Create or select: <code>shopnow-db-sg</code> (from Project 4)<br>
+→ If creating new:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Description</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-web-sg</code></td><td>MariaDB access from web tier only</td></tr><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-app-sg</code> (if exists)</td><td>MariaDB access from app tier</td></tr></tbody></table>
+<p>→ Security Group referencing (Project 4) is used here<br>
+→ ONLY instances with <code>shopnow-web-sg</code> or <code>shopnow-app-sg</code> can connect to the database<br>
+→ NO public access → NO internet-facing rule → database is invisible to the outside world</p>
+<p><strong>Public Access = No (CRITICAL):</strong></p>
+<p>→ When set to "No" → RDS does NOT assign a public IP to the instance<br>
+→ The database is accessible ONLY from within the VPC<br>
+→ Even if someone gets the endpoint URL → they cannot reach it from the internet<br>
+→ This is the correct setting for ALL production databases<br>
+→ When set to "Yes" → RDS assigns a public IP → database is reachable from internet (DANGEROUS)<br>
+→ The ONLY valid reason for "Yes": Development/testing from your local machine (and even then, prefer VPN)</p>
+<hr>
+<p><strong>Step 4i: Database Authentication</strong></p>
+<table><thead><tr><th>Option</th><th>How It Works</th><th>Use Case</th></tr></thead><tbody><tr><td>Password authentication</td><td>Traditional username/password</td><td>Simple, works with all clients</td></tr><tr><td>Password and IAM database authentication</td><td>Password OR IAM token-based auth</td><td>No hardcoded passwords — use IAM roles</td></tr><tr><td>Password and Kerberos authentication</td><td>Active Directory integration</td><td>Enterprise Windows environments</td></tr></tbody></table>
+<p>→ Choose: Password and IAM database authentication<br>
+→ IAM authentication: Instead of storing database passwords → generate temporary auth tokens using IAM<br>
+→ This connects to IAM Roles (Project 11) and Secrets Manager (Project 37)<br>
+→ For initial setup → we'll use password authentication and migrate to IAM/Secrets Manager later</p>
+<hr>
+<p><strong>Step 4j: Additional Configuration</strong></p>
+<p><strong>Database Options:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Initial database name</td><td><code>shopnow</code></td><td>Creates this database on launch (optional but recommended)</td></tr><tr><td>DB parameter group</td><td>shopnow-mariadb-params</td><td>Custom parameters from Step 3</td></tr><tr><td>Option group</td><td>shopnow-mariadb-options (or default)</td><td>Additional engine features</td></tr></tbody></table>
+<p>→ If you don't specify initial database name → no database is created → you must create one manually after launch<br>
+→ Always specify → saves a step</p>
+<hr>
+<p><strong>Backup Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Automated backups</td><td>Enable</td><td>Creates daily backups automatically</td></tr><tr><td>Backup retention period</td><td>7 days</td><td>Keep backups for 7 days (range: 0-35 days)</td></tr><tr><td>Backup window</td><td>No preference (or specific time)</td><td>When the daily backup runs</td></tr><tr><td>Copy tags to snapshots</td><td>Yes</td><td>Snapshots inherit instance tags</td></tr></tbody></table>
+<p>→ Setting retention to 0 = DISABLES automated backups → NEVER do this for production<br>
+→ Maximum 35 days retention → for longer → copy snapshots to S3 or use AWS Backup</p>
+<p><strong>How Automated Backups Work:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Daily Backup Process:
+</span>1. RDS takes a SNAPSHOT of the entire database storage volume
+2. RDS captures TRANSACTION LOGS continuously throughout the day
+3. Snapshot + Transaction Logs = Point-in-time recovery capability
+
+Point-in-Time Recovery:
+  → Can restore to ANY SECOND within the retention period
+  → Example: "Restore to 2025-01-15 14:23:47 UTC"
+  → RDS restores from latest snapshot → replays transaction logs to exact second
+  → Creates a NEW RDS instance with the restored data (doesn't overwrite original)</code></pre></div>
+<p>→ This is what ShopNow was missing → automatic daily backups + point-in-time recovery<br>
+→ No more "last backup was 3 days ago" → recovery to any second within 7 days</p>
+<p><strong>Backup Window:</strong></p>
+<p>→ A 30-minute window during which the daily backup runs<br>
+→ Brief I/O suspension may occur (for Single-AZ) → schedule during low-traffic hours<br>
+→ For Multi-AZ → backup taken from standby → no performance impact on primary<br>
+→ If "No preference" → AWS assigns a random window based on region</p>
+<p>→ For ShopNow (India): Set to <code>18:30-19:00 UTC</code> (midnight-12:30 AM IST) → lowest traffic</p>
+<hr>
+<p><strong>Maintenance Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Auto minor version upgrade</td><td>Enable</td><td>AWS automatically upgrades to latest minor version</td></tr><tr><td>Maintenance window</td><td>No preference (or specific window)</td><td>When maintenance operations (patches) are applied</td></tr></tbody></table>
+<p><strong>How Maintenance Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>AWS releases MariaDB 10.11.7 (security patch)
+</span>        │
+        ▼
+RDS identifies instances running 10.11.6 with auto-upgrade enabled
+        │
+        ▼
+During the next maintenance window:
+  1. For Multi-AZ: Patch standby first → failover → patch old primary
+     Downtime: ~60 seconds during failover
+  2. For Single-AZ: Patch the instance directly
+     Downtime: Several minutes (database unavailable during restart)
+        │
+        ▼
+Instance now runs 10.11.7</code></pre></div>
+<p>→ Maintenance window: A 30-minute weekly window<br>
+→ For ShopNow: Set to <code>sun:18:30-sun:19:00 UTC</code> (Sunday midnight IST)<br>
+→ Not ALL maintenance windows have maintenance → only when patches are available</p>
+<p><strong>Pending Modifications:</strong></p>
+<p>→ Some changes can be applied immediately or deferred to the maintenance window:</p>
+<table><thead><tr><th>Change</th><th>Apply Immediately</th><th>Apply During Maintenance</th></tr></thead><tbody><tr><td>Instance class change</td><td>Brief downtime NOW</td><td>Downtime during window</td></tr><tr><td>Storage increase</td><td>No downtime (usually)</td><td>Same</td></tr><tr><td>Parameter group changes (static)</td><td>Requires reboot NOW</td><td>Reboot during window</td></tr><tr><td>Engine version upgrade</td><td>Downtime NOW</td><td>Downtime during window</td></tr><tr><td>Multi-AZ conversion</td><td>Background process</td><td>Same</td></tr></tbody></table>
+<hr>
+<p><strong>Encryption:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Encryption</td><td>Enable</td><td>Encrypt storage at rest</td></tr><tr><td>AWS KMS key</td><td>aws/rds (AWS managed key)</td><td>Simplest option — no extra configuration</td></tr></tbody></table>
+<p>→ When enabled → ALL of the following are encrypted:</p>
+<ul>
+<li>Database storage volume</li>
+<li>Automated backups</li>
+<li>Read replicas (Project 29)</li>
+<li>Snapshots</li>
+<li>Transaction logs</li>
+</ul>
+<p>→ Encryption uses AES-256 via KMS<br>
+→ CANNOT enable encryption on an existing unencrypted instance → must create encrypted snapshot → restore to new instance<br>
+→ Always enable encryption at creation time</p>
+<p>→ KMS deep dive in Project 36</p>
+<hr>
+<p><strong>Monitoring:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Enhanced monitoring</td><td>Enable</td><td>OS-level metrics (CPU, memory, disk, processes)</td></tr><tr><td>Granularity</td><td>60 seconds</td><td>How often enhanced metrics are collected</td></tr><tr><td>Monitoring Role</td><td>Default (rds-monitoring-role)</td><td>IAM role for publishing to CloudWatch</td></tr><tr><td>Performance Insights</td><td>Enable</td><td>Advanced query-level performance monitoring</td></tr><tr><td>Retention period</td><td>7 days (free tier)</td><td>How long Performance Insights data is retained</td></tr></tbody></table>
+<p><strong>Enhanced Monitoring vs Basic CloudWatch Metrics:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Basic CloudWatch</th><th>Enhanced Monitoring</th></tr></thead><tbody><tr><td>Source</td><td>Hypervisor-level (like EC2 basic — Project 8)</td><td>OS-level agent inside the RDS instance</td></tr><tr><td>CPU breakdown</td><td>Total CPU only</td><td>CPU by: user, system, idle, iowait, steal</td></tr><tr><td>Memory</td><td>NOT available</td><td>Total, free, cached, buffered</td></tr><tr><td>Disk I/O</td><td>Read/Write IOPS and throughput</td><td>Detailed I/O by device</td></tr><tr><td>Processes</td><td>NOT available</td><td>Top processes by CPU/memory</td></tr><tr><td>Network</td><td>Basic in/out</td><td>Detailed by interface</td></tr><tr><td>Cost</td><td>Free</td><td>Included at 60-second granularity</td></tr></tbody></table>
+<p>→ Enhanced Monitoring runs a lightweight agent INSIDE the RDS instance (you don't install it — AWS manages it)<br>
+→ This gives you the memory/disk visibility that basic CloudWatch cannot provide (same limitation as EC2 — Project 8)</p>
+<p><strong>Performance Insights:</strong></p>
+<p>→ A visual tool for identifying database performance bottlenecks<br>
+→ Shows: Top SQL queries by load, wait events, database threads<br>
+→ Answers: "Which query is causing the database to be slow?"<br>
+→ Free tier: 7 days retention → paid: up to 2 years</p>
+<hr>
+<p><strong>Log Exports:</strong></p>
+<table><thead><tr><th>Log Type</th><th>Enable?</th><th>What It Contains</th></tr></thead><tbody><tr><td>Audit log</td><td>Yes (if audit plugin enabled)</td><td>All connections and queries (compliance)</td></tr><tr><td>Error log</td><td>Yes</td><td>Database errors, warnings, startup/shutdown</td></tr><tr><td>General log</td><td>No (production)</td><td>ALL queries — extremely verbose, performance impact</td></tr><tr><td>Slow query log</td><td>Yes</td><td>Queries exceeding long_query_time threshold</td></tr></tbody></table>
+<p>→ Logs are exported to CloudWatch Logs → can be searched, alerted on, and retained<br>
+→ Slow query log is ESSENTIAL for performance tuning<br>
+→ General log is useful for debugging but causes significant I/O overhead → enable only temporarily</p>
+<hr>
+<p><strong>Deletion Protection:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Deletion protection</td><td>Enable</td></tr></tbody></table>
+<p>→ Prevents accidental deletion of the database instance<br>
+→ Must disable protection first → then delete<br>
+→ Same concept as EC2 termination protection (Project 3)</p>
+<p>→ Click "Create database"<br>
+→ Status: "Creating" → takes 10-20 minutes → "Available"</p>
+<hr>
+<h3>STEP 5 — UNDERSTAND THE RDS ENDPOINT</h3>
+<p>→ After creation → RDS Console → Select instance → "Connectivity &amp; security" tab</p>
+<p><strong>Endpoint Information:</strong></p>
+<table><thead><tr><th>Property</th><th>Example Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Endpoint</td><td><code>shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com</code></td><td>DNS hostname for connecting</td></tr><tr><td>Port</td><td>3306</td><td>MariaDB default port</td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td><td>Which VPC the instance is in</td></tr><tr><td>Subnets</td><td>shopnow-private-data-subnet-1a, 1b</td><td>Which subnets (from DB subnet group)</td></tr><tr><td>Availability Zone</td><td>ap-south-1a</td><td>Which AZ the instance is currently in</td></tr><tr><td>Security Groups</td><td>shopnow-db-sg</td><td>Network access control</td></tr></tbody></table>
+<p><strong>How the Endpoint Works:</strong></p>
+<p>→ The endpoint is a DNS CNAME (alias) that resolves to the private IP of the RDS instance<br>
+→ You NEVER connect to an IP address directly → always use the endpoint<br>
+→ Why: If the instance fails over to another AZ (Multi-AZ — Project 29) → the DNS CNAME updates to the new IP<br>
+→ Applications using the endpoint → automatically connect to the new instance after failover<br>
+→ Applications hardcoding an IP → break during failover</p>
+<p><strong>Connection String Format:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Host:     shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com
+</span>Port:     3306
+Database: shopnow
+Username: shopnow_admin
+Password: (stored in Secrets Manager — Project 37)</code></pre></div>
+<p>→ The application (running on EC2 in the public or app subnet) uses this connection string<br>
+→ Traffic flows: EC2 → Security Group allows → Route table routes within VPC → RDS endpoint resolves → Connection established</p>
+<hr>
+<h3>STEP 6 — UNDERSTAND RDS SNAPSHOTS</h3>
+<p><strong>Two Types of Backups:</strong></p>
+<table><thead><tr><th>Type</th><th>Created By</th><th>Retention</th><th>Stored Where</th><th>Cost</th></tr></thead><tbody><tr><td>Automated Backups</td><td>RDS automatically (daily)</td><td>0-35 days (configurable)</td><td>AWS managed — same region</td><td>Free (up to 100% of DB storage)</td></tr><tr><td>Manual Snapshots</td><td>You (on-demand)</td><td>Forever (until you delete)</td><td>Your account — can copy cross-region</td><td>Storage cost per GB</td></tr></tbody></table>
+<p><strong>Automated Backup:</strong><br>
+→ Daily snapshot + continuous transaction log capture<br>
+→ Enables point-in-time recovery to any second<br>
+→ Deleted when: Instance is deleted (if "retain automated backups" is not checked) OR retention period expires<br>
+→ CANNOT be shared cross-account → copy to manual snapshot first</p>
+<p><strong>Manual Snapshot:</strong><br>
+→ Created on-demand: RDS Console → Select instance → Actions → "Take snapshot"<br>
+→ Retained until YOU delete it → even if the RDS instance is deleted<br>
+→ CAN be shared cross-account<br>
+→ CAN be copied to other regions (for disaster recovery — Project 55)</p>
+<p><strong>Restoring from Snapshot:</strong></p>
+<p>→ CRITICAL UNDERSTANDING: Restoring creates a NEW RDS instance<br>
+→ It does NOT overwrite the existing instance<br>
+→ The new instance gets a new endpoint<br>
+→ You must update your application's connection string to point to the new instance</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Original Instance: shopnow-prod-mariadb (endpoint: abc.rds.amazonaws.com)
+</span>        │
+        ▼
+Restore from snapshot → Creates NEW instance
+New Instance: shopnow-prod-mariadb-restored (endpoint: xyz.rds.amazonaws.com)
+        │
+        ▼
+You must: Update application → point to new endpoint → verify → delete old instance (if desired)</code></pre></div>
+<hr>
+<h3>STEP 7 — CLOUDWATCH METRICS FOR RDS</h3>
+<p>→ RDS automatically publishes metrics to CloudWatch (Project 8)</p>
+<p><strong>Critical RDS Metrics:</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Measures</th><th>Alarm Threshold (ShopNow)</th></tr></thead><tbody><tr><td>CPUUtilization</td><td>Database CPU percentage</td><td>&gt; 80% for 3/5 periods</td></tr><tr><td>DatabaseConnections</td><td>Number of active connections</td><td>&gt; 80% of max_connections</td></tr><tr><td>FreeStorageSpace</td><td>Available storage in bytes</td><td>&lt; 10 GB (10% of 100 GB)</td></tr><tr><td>FreeableMemory</td><td>Available RAM in bytes</td><td>&lt; 1 GB</td></tr><tr><td>ReadIOPS</td><td>Read operations per second</td><td>Depends on workload pattern</td></tr><tr><td>WriteIOPS</td><td>Write operations per second</td><td>Depends on workload pattern</td></tr><tr><td>ReadLatency</td><td>Average read I/O latency</td><td>&gt; 20ms</td></tr><tr><td>WriteLatency</td><td>Average write I/O latency</td><td>&gt; 20ms</td></tr><tr><td>DiskQueueDepth</td><td>Number of I/O operations waiting</td><td>&gt; 10</td></tr><tr><td>ReplicaLag</td><td>Seconds behind primary (read replicas — Project 29)</td><td>&gt; 30 seconds</td></tr><tr><td>BurstBalance</td><td>Remaining I/O burst credits (gp2 only)</td><td>&lt; 20%</td></tr><tr><td>SwapUsage</td><td>Swap memory used (bytes)</td><td>&gt; 0 (any swap usage = memory pressure)</td></tr></tbody></table>
+<p><strong>Creating RDS Alarms (Reference Project 8):</strong></p>
+<p>→ CloudWatch Console → Create alarm → Select metric → RDS → Per-Database Metrics</p>
+<p><strong>Alarm: FreeStorageSpace Low</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>FreeStorageSpace</td></tr><tr><td>DBInstanceIdentifier</td><td>shopnow-prod-mariadb</td></tr><tr><td>Statistic</td><td>Minimum</td></tr><tr><td>Period</td><td>300 seconds</td></tr><tr><td>Threshold</td><td>Less than 10,737,418,240 (10 GB in bytes)</td></tr><tr><td>Datapoints</td><td>1 out of 1</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td>shopnow-db-storage-low</td></tr></tbody></table>
+<p>→ Why Minimum statistic? Storage only decreases — we want to catch the LOWEST point<br>
+→ Even one period below threshold is concerning → "1 out of 1"</p>
+<p><strong>Alarm: CPUUtilization High</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>CPUUtilization</td></tr><tr><td>DBInstanceIdentifier</td><td>shopnow-prod-mariadb</td></tr><tr><td>Statistic</td><td>Average</td></tr><tr><td>Period</td><td>300 seconds</td></tr><tr><td>Threshold</td><td>Greater than 80%</td></tr><tr><td>Datapoints</td><td>3 out of 5</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td>shopnow-db-cpu-high</td></tr></tbody></table>
+<p><strong>Alarm: DatabaseConnections High</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>DatabaseConnections</td></tr><tr><td>DBInstanceIdentifier</td><td>shopnow-prod-mariadb</td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Threshold</td><td>Greater than 100 (depends on max_connections parameter)</td></tr><tr><td>Datapoints</td><td>2 out of 3</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td>shopnow-db-connections-high</td></tr></tbody></table>
+<p>→ High connection count → connection pool exhaustion → application errors<br>
+→ Solution: Connection pooling at application level or use RDS Proxy</p>
+<hr>
+<h3>STEP 8 — RDS EVENT SUBSCRIPTIONS</h3>
+<p>→ RDS generates events for important database lifecycle activities<br>
+→ You can subscribe to these events via SNS</p>
+<p>→ RDS Console → "Event subscriptions" → "Create event subscription"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td>shopnow-db-events</td></tr><tr><td>Target</td><td>SNS topic: shopnow-ops-alerts</td></tr><tr><td>Source type</td><td>Instances</td></tr><tr><td>Instances</td><td>shopnow-prod-mariadb</td></tr></tbody></table>
+<p><strong>Event Categories to Subscribe:</strong></p>
+<table><thead><tr><th>Category</th><th>Events Included</th><th>Why Subscribe</th></tr></thead><tbody><tr><td>availability</td><td>Instance started, stopped, restarted</td><td>Know when database state changes</td></tr><tr><td>backup</td><td>Backup started, completed, failed</td><td>Verify backups are running</td></tr><tr><td>configuration change</td><td>Parameter group changed, instance modified</td><td>Audit configuration changes</td></tr><tr><td>deletion</td><td>Instance being deleted</td><td>Catch accidental deletions</td></tr><tr><td>failover</td><td>Multi-AZ failover occurred</td><td>Know when failover happens (Project 29)</td></tr><tr><td>failure</td><td>Instance failure, storage failure</td><td>Critical — immediate investigation needed</td></tr><tr><td>maintenance</td><td>Maintenance starting, completed</td><td>Know when patching occurs</td></tr><tr><td>notification</td><td>Storage limit approaching, exceeding</td><td>Early warning for storage issues</td></tr><tr><td>recovery</td><td>Instance recovery completed</td><td>Know when instance recovers from failure</td></tr></tbody></table>
+<p>→ Subscribe to ALL categories for production databases<br>
+→ These events appear in the RDS Console → Events tab AND are sent to SNS</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use private subnets for database placement — never public subnets<br>
+→ Always create custom Parameter Groups before launching — default groups are read-only<br>
+→ Always enable automated backups with retention of at least 7 days (35 for critical data)<br>
+→ Always enable encryption at creation time — cannot add later without migration<br>
+→ Always enable deletion protection for production databases<br>
+→ Always set Public Access to "No" for production databases<br>
+→ Always use Security Group referencing (Project 4) to control database access<br>
+→ Always enable Enhanced Monitoring and Performance Insights for production<br>
+→ Always export slow query logs and error logs to CloudWatch<br>
+→ Always create CloudWatch alarms for: CPU, storage, connections, latency (Project 8)<br>
+→ Always set the maintenance window during lowest-traffic hours<br>
+→ Always use gp3 storage instead of gp2 for new instances<br>
+→ Always use the RDS endpoint hostname — never hardcode IP addresses<br>
+→ Always take a manual snapshot before making significant changes (version upgrade, parameter changes)<br>
+→ Always subscribe to RDS events via SNS for lifecycle notifications<br>
+→ Always set character set to utf8mb4 for proper Unicode support</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never set Public Access to "Yes" for production databases<br>
+→ Never use the default Parameter Group for production — it's read-only<br>
+→ Never set backup retention to 0 — this disables all automated backups<br>
+→ Never hardcode the database IP in application configuration — use the endpoint DNS<br>
+→ Never use the master username/password in application code — use Secrets Manager (Project 37)<br>
+→ Never enable the General Log in production — extreme I/O overhead<br>
+→ Never use burstable instances (db.t3) for production with consistent load — use db.r6g or db.m6g<br>
+→ Never skip encryption — compliance and security require it<br>
+→ Never ignore the slow query log — it's the primary tool for performance optimization<br>
+→ Never forget that storage auto-scaling only grows UP — plan initial size carefully<br>
+→ Never restore a snapshot expecting it to overwrite the original — it creates a NEW instance<br>
+→ Never skip deletion protection — accidental deletion = catastrophic data loss<br>
+→ Never connect from the internet to a private RDS instance and wonder why it times out — it has no public IP</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>Standard relational database with managed operations</td><td>RDS (this project)</td></tr><tr><td>Need MySQL/MariaDB compatibility with higher performance</td><td>Aurora MySQL</td></tr><tr><td>Need PostgreSQL with higher performance</td><td>Aurora PostgreSQL</td></tr><tr><td>Need to run Oracle with existing licenses</td><td>RDS Oracle (BYOL)</td></tr><tr><td>Need SQL Server for .NET applications</td><td>RDS SQL Server</td></tr><tr><td>Need sub-millisecond key-value lookups</td><td>DynamoDB (not RDS)</td></tr><tr><td>Need data warehousing with analytical queries</td><td>Redshift (Project 16)</td></tr><tr><td>Need in-memory caching layer in front of database</td><td>ElastiCache (Redis/Memcached)</td></tr><tr><td>Need serverless database that scales to zero</td><td>Aurora Serverless v2</td></tr><tr><td>Need to run database on EC2 with full OS control</td><td>EC2 with self-managed database (rare — only for unsupported engines)</td></tr></tbody></table>
+<p><strong>RDS MariaDB vs RDS MySQL:</strong></p>
+<table><thead><tr><th>Feature</th><th>MariaDB</th><th>MySQL</th></tr></thead><tbody><tr><td>Origin</td><td>Community fork of MySQL</td><td>Oracle-owned</td></tr><tr><td>Thread pool</td><td>Built-in (better connection handling)</td><td>Not available in community edition</td></tr><tr><td>Storage engines</td><td>More options (Aria, ColumnStore)</td><td>InnoDB, MyISAM</td></tr><tr><td>JSON support</td><td>Good</td><td>Slightly more mature</td></tr><tr><td>Oracle compatibility</td><td>Better (e.g., sequences, INTERSECT/EXCEPT)</td><td>Less</td></tr><tr><td>AWS ecosystem integration</td><td>Same as MySQL</td><td>Same as MariaDB</td></tr><tr><td>Community</td><td>Independent, community-driven</td><td>Oracle-controlled</td></tr></tbody></table>
+<p>→ For most use cases → MariaDB and MySQL are interchangeable<br>
+→ MariaDB has better built-in thread pooling → slightly better for high-connection workloads</p>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use RDS for NoSQL workloads (document, key-value, graph) → Use DynamoDB, DocumentDB, Neptune<br>
+→ Do NOT use RDS for data warehousing / analytical queries on TB+ data → Use Redshift (Project 16)<br>
+→ Do NOT use RDS for caching / sub-millisecond reads → Use ElastiCache<br>
+→ Do NOT use RDS when you need full OS-level access to the database server → Use EC2 self-managed<br>
+→ Do NOT use RDS for time-series data → Use Amazon Timestream<br>
+→ Do NOT use RDS for ledger/immutable data → Use Amazon QLDB<br>
+→ Do NOT use RDS for graph relationships → Use Amazon Neptune<br>
+→ Do NOT use RDS when you need serverless scaling to zero → Use Aurora Serverless v2</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → RDS ARCHITECTURE UNDER THE HOOD</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────────────────────────┐
+</span>│                 RDS MANAGED INFRASTRUCTURE                  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │              RDS CONTROL PLANE                       │  │
+│  │                                                      │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │  │
+│  │  │ Provisioning │  │ Monitoring   │  │ Backup     │ │  │
+│  │  │ Engine       │  │ Agent        │  │ Scheduler  │ │  │
+│  │  └──────────────┘  └──────────────┘  └────────────┘ │  │
+│  │                                                      │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │  │
+│  │  │ Patching     │  │ Failover     │  │ Event      │ │  │
+│  │  │ Manager      │  │ Controller   │  │ Publisher  │ │  │
+│  │  └──────────────┘  └──────────────┘  └────────────┘ │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                           │                                │
+│                           │ Manages                        │
+│                           ▼                                │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │              RDS DATA PLANE                          │  │
+│  │                                                      │  │
+│  │  ┌─────────────────────────────────┐                 │  │
+│  │  │  EC2 Instance (Hidden from you) │                 │  │
+│  │  │                                 │                 │  │
+│  │  │  ┌───────────────────────────┐  │                 │  │
+│  │  │  │  Operating System         │  │                 │  │
+│  │  │  │  (AWS managed Linux)      │  │                 │  │
+│  │  │  │                           │  │                 │  │
+│  │  │  │  ┌─────────────────────┐  │  │                 │  │
+│  │  │  │  │  MariaDB Engine     │  │  │                 │  │
+│  │  │  │  │  (Your version)     │  │  │                 │  │
+│  │  │  │  └─────────────────────┘  │  │                 │  │
+│  │  │  │                           │  │                 │  │
+│  │  │  │  ┌─────────────────────┐  │  │                 │  │
+│  │  │  │  │  Enhanced Monitor   │  │  │                 │  │
+│  │  │  │  │  Agent              │  │  │                 │  │
+│  │  │  │  └─────────────────────┘  │  │                 │  │
+│  │  │  └───────────────────────────┘  │                 │  │
+│  │  │                                 │                 │  │
+│  │  │  EBS Volume (Encrypted)         │                 │  │
+│  │  │  ┌───────────────────────────┐  │                 │  │
+│  │  │  │  Database Files           │  │                 │  │
+│  │  │  │  Transaction Logs         │  │                 │  │
+│  │  │  │  Temp Files               │  │                 │  │
+│  │  │  └───────────────────────────┘  │                 │  │
+│  │  └─────────────────────────────────┘                 │  │
+│  │                                                      │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+└────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ RDS runs on EC2 instances — but they are HIDDEN from you<br>
+→ You cannot see them in the EC2 console<br>
+→ You cannot SSH into them<br>
+→ You cannot attach additional EBS volumes<br>
+→ The RDS Control Plane manages everything: provisioning, patching, backups, failover</p>
+<hr>
+<h3>2 → HOW AUTOMATED BACKUPS WORK INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CONTINUOUS OPERATION:
+</span>Transaction logs are captured and uploaded to S3 every 5 minutes
+        │
+        ▼
+DAILY BACKUP WINDOW (e.g., 18:30-19:00 UTC):
+        │
+        ▼
+Step 1: RDS initiates EBS snapshot of the database volume
+        │
+        ├── Single-AZ: Brief I/O suspension (~seconds) during snapshot initialization
+        │   After initialization → snapshot proceeds in background → no I/O impact
+        │
+        └── Multi-AZ: Snapshot taken from STANDBY instance → ZERO impact on primary
+        │
+        ▼
+Step 2: Snapshot stored in S3 (AWS-managed, not visible in your S3 console)
+        │
+        ▼
+Step 3: Transaction logs since last snapshot → also stored in S3
+        │
+        ▼
+Step 4: Old backups beyond retention period → automatically deleted
+
+POINT-IN-TIME RECOVERY:
+User requests: "Restore to 2025-01-15 14:23:47 UTC"
+        │
+        ▼
+Step 1: RDS identifies the closest daily snapshot BEFORE the target time
+        (e.g., snapshot from 2025-01-15 06:00 UTC)
+        │
+        ▼
+Step 2: RDS restores the snapshot → creates new instance
+        │
+        ▼
+Step 3: RDS replays transaction logs from 06:00 to 14:23:47
+        │
+        ▼
+Step 4: New instance is available with data as of 14:23:47 UTC
+        Data after 14:23:47 is NOT present (that's the recovery point)</code></pre></div>
+<p>→ Backups are stored in S3 but you CANNOT see or access them directly<br>
+→ Transaction log uploads every 5 minutes → recovery point objective (RPO) is ~5 minutes<br>
+→ The most you can lose in a disaster = last 5 minutes of transactions</p>
+<hr>
+<h3>3 → HOW THE ENDPOINT DNS WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application connects to:
+</span>  shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com
+        │
+        ▼
+DNS resolution (VPC DNS resolver — Project 5):
+  CNAME → private IP: 10.0.11.47
+        │
+        ▼
+TCP connection to 10.0.11.47:3306
+        │
+        ▼
+Security Group evaluation (Project 4):
+  Source: EC2 instance with shopnow-web-sg
+  Destination: RDS instance with shopnow-db-sg
+  Port 3306 allowed from shopnow-web-sg → ALLOWED
+        │
+        ▼
+MariaDB authentication:
+  Username: shopnow_admin
+  Password: (verified against stored hash)
+  → Connection ESTABLISHED
+        │
+        ▼
+Application sends SQL queries over the connection</code></pre></div>
+<p><strong>Why DNS-based Endpoint:</strong></p>
+<p>→ During Multi-AZ failover (Project 29):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE FAILOVER:
+</span>  Endpoint DNS → 10.0.11.47 (Primary in AZ-a)
+
+FAILOVER OCCURS (primary AZ-a fails):
+  RDS promotes standby in AZ-b to primary
+  RDS updates DNS: Endpoint → 10.0.12.23 (New primary in AZ-b)
+
+AFTER FAILOVER:
+  Endpoint DNS → 10.0.12.23
+  Application reconnects using same endpoint → reaches new primary
+  DNS TTL is low (typically 5 seconds) → propagation is fast</code></pre></div>
+<p>→ Applications using the endpoint → automatically failover<br>
+→ Applications using hardcoded IP → break → manual intervention needed</p>
+<hr>
+<h3>4 → HOW STORAGE WORKS</h3>
+<p><strong>RDS Storage Layer:</strong></p>
+<p>→ RDS uses EBS volumes under the hood<br>
+→ The EBS volumes are in the same AZ as the RDS instance<br>
+→ For Multi-AZ → separate EBS volumes in each AZ (synchronously replicated)</p>
+<p><strong>Storage Auto-Scaling Internal Process:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Free storage monitoring runs every minute
+</span>        │
+        ▼
+Check: Is free storage &lt; 10% of allocated?
+        │
+        ├── NO → Do nothing
+        │
+        └── YES → Has this condition persisted for 5+ minutes?
+            │
+            ├── NO → Wait
+            │
+            └── YES → Was last auto-scale &gt; 6 hours ago?
+                │
+                ├── NO → Wait (cooldown period)
+                │
+                └── YES → Trigger auto-scaling
+                    │
+                    ▼
+                    Calculate new size:
+                    New = MAX(10% increase, 5 GB, free storage trigger amount)
+                    New = MIN(New, Maximum storage threshold)
+                    │
+                    ▼
+                    Modify storage → transparent to application
+                    (Brief I/O optimization period after resize)</code></pre></div>
+<p>→ The 6-hour cooldown prevents rapid successive scaling events<br>
+→ The maximum threshold prevents unbounded growth<br>
+→ Storage modification happens online → no downtime</p>
+<hr>
+<h3>5 → RDS PRICING MODEL</h3>
+<table><thead><tr><th>Component</th><th>How It's Charged</th></tr></thead><tbody><tr><td>Instance hours</td><td>Per-second billing (minimum 10 minutes) — based on instance class</td></tr><tr><td>Storage</td><td>Per GB-month provisioned</td></tr><tr><td>Provisioned IOPS (io1/io2)</td><td>Per IOPS-month provisioned</td></tr><tr><td>Backup storage</td><td>Free up to 100% of DB storage, then per GB-month</td></tr><tr><td>Snapshot storage</td><td>Per GB-month for manual snapshots</td></tr><tr><td>Data transfer</td><td>Standard VPC data transfer rules</td></tr><tr><td>Multi-AZ</td><td>~2x instance cost (standby instance)</td></tr><tr><td>Read Replicas</td><td>Separate instance billing</td></tr></tbody></table>
+<p><strong>Example Cost for ShopNow (ap-south-1, db.r6g.large, Single-AZ):</strong></p>
+<table><thead><tr><th>Component</th><th>Monthly Cost (Approximate)</th></tr></thead><tbody><tr><td>db.r6g.large instance</td><td>~$140/month</td></tr><tr><td>100 GB gp3 storage</td><td>~$12/month</td></tr><tr><td>Automated backups (100 GB)</td><td>Free (within 100% allocation)</td></tr><tr><td>Enhanced Monitoring</td><td>Free (at 60-second granularity)</td></tr><tr><td>Performance Insights (7 days)</td><td>Free</td></tr><tr><td><strong>Total</strong></td><td><strong>~$152/month</strong></td></tr></tbody></table>
+<p>→ Compare to EC2 self-managed:</p>
+<ul>
+<li>EC2 instance + EBS + your time for patching/backups/monitoring</li>
+<li>The "your time" cost often exceeds the RDS premium</li>
+<li>RDS is more expensive per hour BUT saves significant operational effort</li>
+</ul>
+<hr>
+<h3>6 → RDS LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Limit</th></tr></thead><tbody><tr><td>DB instances per account per region</td><td>40</td></tr><tr><td>Manual snapshots per account per region</td><td>100</td></tr><tr><td>Storage per instance (gp2/gp3)</td><td>64 TB</td></tr><tr><td>Storage per instance (io1/io2)</td><td>64 TB</td></tr><tr><td>Storage per instance (magnetic)</td><td>3 TB</td></tr><tr><td>Read replicas per primary</td><td>15 (Aurora), 5 (other engines)</td></tr><tr><td>Parameter groups per account</td><td>50</td></tr><tr><td>Option groups per account</td><td>20</td></tr><tr><td>DB subnet groups per account</td><td>50</td></tr><tr><td>Subnets per DB subnet group</td><td>20</td></tr><tr><td>Event subscriptions per account</td><td>20</td></tr><tr><td>Maximum database name length</td><td>64 characters</td></tr><tr><td>Maximum master username length</td><td>16 characters (MariaDB)</td></tr><tr><td>Backup retention period</td><td>0-35 days</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Public Access = Yes in production</td><td>Database exposed to internet → brute-force attacks</td><td>Always set Public Access = No + private subnets</td></tr><tr><td>2</td><td>Using default Parameter Group</td><td>Cannot modify parameters later → must create new group + reboot</td><td>Always create custom Parameter Group before launch</td></tr><tr><td>3</td><td>Backup retention = 0</td><td>No automated backups → no point-in-time recovery → data loss risk</td><td>Set retention to at least 7 days (35 for critical)</td></tr><tr><td>4</td><td>Forgetting encryption at creation</td><td>Cannot enable later without migration → create encrypted copy → switch</td><td>Always enable encryption at creation time</td></tr><tr><td>5</td><td>Hardcoding IP instead of endpoint</td><td>Multi-AZ failover breaks application → manual intervention</td><td>Always use the RDS endpoint DNS hostname</td></tr><tr><td>6</td><td>Storing master password in code</td><td>Code pushed to Git → password leaked → database compromised</td><td>Use Secrets Manager (Project 37) or environment variables</td></tr><tr><td>7</td><td>Using db.t3 for consistent production load</td><td>CPU credits exhausted → database becomes unresponsive</td><td>Use db.r6g or db.m6g for production</td></tr><tr><td>8</td><td>Not monitoring FreeStorageSpace</td><td>Storage fills up → database becomes read-only → application crashes</td><td>CloudWatch alarm on FreeStorageSpace (this project)</td></tr><tr><td>9</td><td>Maintenance window during peak hours</td><td>Patching causes brief downtime during busiest period</td><td>Set maintenance window to lowest-traffic hours</td></tr><tr><td>10</td><td>Deleting instance without final snapshot</td><td>All data permanently lost → no recovery possible</td><td>Always take final snapshot before deletion</td></tr><tr><td>11</td><td>Restoring snapshot expecting it overwrites original</td><td>Creates NEW instance → application still points to old one</td><td>Understand: restore = new instance with new endpoint</td></tr><tr><td>12</td><td>DB subnet group with subnets in only 1 AZ</td><td>Cannot enable Multi-AZ later → must recreate subnet group</td><td>Always include subnets in at least 2 AZs</td></tr><tr><td>13</td><td>Character set left as latin1</td><td>Non-ASCII characters (Hindi, emojis) stored incorrectly → data corruption</td><td>Set character_set_server = utf8mb4 in Parameter Group</td></tr><tr><td>14</td><td>Not enabling slow query log</td><td>No visibility into query performance → can't optimize</td><td>Enable slow_query_log + set long_query_time = 2 seconds</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Vertical Scaling (Scale Up)</strong></p>
+<ul>
+<li>Change instance class: db.r6g.large → db.r6g.xlarge → db.r6g.2xlarge</li>
+<li>Requires brief downtime (Single-AZ) or ~60-second failover (Multi-AZ)</li>
+<li>Schedule during maintenance window</li>
+<li>Maximum: db.r6g.16xlarge (64 vCPU, 512 GB RAM)</li>
+</ul>
+<p>→ <strong>Storage Scaling</strong></p>
+<ul>
+<li>Increase storage: 100 GB → 200 GB → 500 GB (online, no downtime)</li>
+<li>Storage auto-scaling handles growth automatically</li>
+<li>Maximum: 64 TB</li>
+<li>Storage CANNOT be reduced — only increased</li>
+</ul>
+<p>→ <strong>Read Scaling (Horizontal)</strong></p>
+<ul>
+<li>Read Replicas (Project 29): Up to 5 replicas for MariaDB</li>
+<li>Each replica has its own endpoint → application reads from replicas</li>
+<li>Reduces read load on primary → primary handles writes</li>
+<li>Replicas can be in different AZs or different regions</li>
+</ul>
+<p>→ <strong>Connection Scaling</strong></p>
+<ul>
+<li>max_connections limited by instance memory</li>
+<li>db.r6g.large: ~700 default max connections</li>
+<li>For more connections: Scale up instance OR use RDS Proxy (managed connection pooling)</li>
+<li>RDS Proxy: Maintains a pool of database connections → shares them across many application connections</li>
+<li>Reduces connection overhead on the database</li>
+</ul>
+<p>→ <strong>Write Scaling</strong></p>
+<ul>
+<li>RDS MariaDB: Single writer (primary instance)</li>
+<li>Cannot horizontally scale writes with standard RDS</li>
+<li>For write-heavy workloads: Scale up instance class OR use Aurora (up to 128 TB, distributed storage)</li>
+<li>For extreme write scaling: Consider DynamoDB (NoSQL) or application-level sharding</li>
+</ul>
+<p>→ <strong>Cross-Region Scaling</strong></p>
+<ul>
+<li>Cross-region Read Replicas for global read performance</li>
+<li>Cross-region snapshots for disaster recovery (Project 55)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify RDS is correctly configured:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th></tr></thead><tbody><tr><td>Instance status</td><td>RDS Console → Databases → Status: "Available"</td></tr><tr><td>Endpoint accessible from EC2</td><td>SSH to EC2 → telnet endpoint 3306 → Connection established</td></tr><tr><td>Security Group correct</td><td>RDS Console → Instance → Connectivity → Security Groups</td></tr><tr><td>Public Access disabled</td><td>RDS Console → Instance → Connectivity → "Publicly accessible: No"</td></tr><tr><td>Encryption enabled</td><td>RDS Console → Instance → Configuration → "Encryption: Enabled"</td></tr><tr><td>Backup configured</td><td>RDS Console → Instance → Maintenance &amp; backups → Retention period</td></tr><tr><td>Parameter Group applied</td><td>RDS Console → Instance → Configuration → Parameter group name</td></tr><tr><td>Enhanced Monitoring active</td><td>RDS Console → Instance → Monitoring → Enhanced Monitoring tab has data</td></tr><tr><td>Slow query log enabled</td><td>RDS Console → Instance → Logs &amp; events → slow-query log present</td></tr><tr><td>Deletion protection on</td><td>RDS Console → Instance → Configuration → "Deletion protection: Enabled"</td></tr></tbody></table>
+<p>→ <strong>How to debug "cannot connect to RDS":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Is the RDS instance in "Available" state?
+</span>        RDS Console → Status column
+        If "Creating" or "Modifying" → wait
+        If "Failed" → check event log
+
+STEP 2: Is the EC2 instance in the same VPC?
+        EC2 instance VPC must match RDS VPC
+        Different VPCs → cannot connect (unless VPC Peering — Project 44)
+
+STEP 3: Check Security Group
+        RDS Security Group → Inbound rules → Port 3306 from EC2 SG?
+        If missing → add rule (Project 4)
+
+STEP 4: Check route table
+        EC2 subnet route table → has route to RDS subnet?
+        Both in same VPC → local route handles this (automatic)
+
+STEP 5: Check NACL (Project 4)
+        NACL on EC2 subnet → allows outbound to port 3306?
+        NACL on RDS subnet → allows inbound on port 3306?
+        NACL on RDS subnet → allows outbound on ephemeral ports (return traffic)?
+
+STEP 6: Check DNS resolution
+        From EC2: nslookup shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com
+        Should resolve to private IP in 10.0.11.x or 10.0.12.x range
+        If fails → VPC DNS resolution not enabled (Project 5)
+
+STEP 7: Check credentials
+        Wrong username/password → "Access denied for user"
+        Correct endpoint but wrong database name → "Unknown database"
+
+STEP 8: Check parameter group
+        max_connections reached → "Too many connections" error
+        wait_timeout too low → connections dropping unexpectedly
+
+STEP 9: Check SSL/TLS
+        If SSL required but client doesn't use SSL → connection refused
+        Download RDS CA certificate → configure client to use it</code></pre></div>
+<p>→ <strong>Performance Insights for Query Analysis:</strong></p>
+<p>→ RDS Console → Select instance → "Performance Insights"<br>
+→ Shows:</p>
+<ul>
+<li>Database load (Average Active Sessions) over time</li>
+<li>Top SQL queries by load</li>
+<li>Wait events breakdown (CPU, I/O, lock waits, network)</li>
+<li>Slice by: SQL statement, User, Host, Database</li>
+</ul>
+<p>→ If database is slow → Performance Insights shows WHICH query is causing the load<br>
+→ This replaces the need for manual EXPLAIN analysis on individual queries</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ RDS eliminates database administration overhead — AWS manages hardware, patching, backups, encryption<br>
+→ You manage schema, queries, application connections, and parameter tuning<br>
+→ The RDS endpoint is a DNS CNAME — NEVER hardcode IPs — DNS enables transparent failover<br>
+→ Automated backups + transaction logs = point-in-time recovery to any second within retention period<br>
+→ Restoring creates a NEW instance — it does NOT overwrite the existing one<br>
+→ DB Subnet Groups enforce multi-AZ subnet placement — required even for Single-AZ<br>
+→ Custom Parameter Groups are mandatory for production — default groups are read-only<br>
+→ Storage auto-scaling grows UP only — never shrinks — plan initial size carefully<br>
+→ Encryption must be enabled at creation — cannot be added later without migration<br>
+→ Enhanced Monitoring gives OS-level visibility that basic CloudWatch cannot provide (same gap as EC2 — Project 8)<br>
+→ Performance Insights answers "which query is causing slowness" — essential for optimization</p>
+<p>→ Connection to Project 5: RDS lives in private data subnets within the custom VPC</p>
+<ul>
+<li>DB Subnet Group references <code>shopnow-private-data-subnet-1a</code> and <code>shopnow-private-data-subnet-1b</code></li>
+<li>No public IP → no Internet Gateway route → architecturally isolated</li>
+</ul>
+<p>→ Connection to Project 4: Security Group referencing controls who can connect</p>
+<ul>
+<li><code>shopnow-db-sg</code> allows port 3306 ONLY from <code>shopnow-web-sg</code></li>
+<li>NACLs on data subnets add secondary protection layer</li>
+</ul>
+<p>→ Connection to Project 8: CloudWatch monitors RDS metrics automatically</p>
+<ul>
+<li>CPU, storage, connections, latency → alarms → SNS (Project 6) → ops team notified</li>
+</ul>
+<p>→ Connection to Project 2: IAM policies control who can manage the RDS instance</p>
+<ul>
+<li><code>rds:CreateDBInstance</code>, <code>rds:DeleteDBInstance</code>, <code>rds:ModifyDBInstance</code></li>
+<li>IAM database authentication enables token-based access without passwords</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 10: S3 bucket policies (already in TOC — builds on Projects 1, 2)</li>
+<li>Project 14: EC2 to RDS MariaDB private connectivity (application connection patterns)</li>
+<li>Project 24: Glue ETL reading from MariaDB via JDBC connection</li>
+<li>Project 29: Multi-AZ deployment with Read Replicas (high availability)</li>
+<li>Project 35: Athena Federated Query to RDS MariaDB</li>
+<li>Project 37: Secrets Manager for database credentials (no hardcoded passwords)</li>
+<li>Project 43: Redshift to MariaDB data sync via Glue</li>
+<li>Project 48: Redshift Federated Query to RDS MariaDB</li>
+<li>Project 55: Cross-region disaster recovery for MariaDB</li>
+<li>Project 58: DMS migration from on-premises MariaDB to RDS</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has a properly configured RDS MariaDB instance in private subnets<br>
+→ But the security consultant returns and says: "Your S3 bucket policy needs tightening"<br>
+→ Currently — IAM policies (Project 2) control who can access the S3 bucket<br>
+→ But IAM policies are attached to USERS — they define what the USER can do<br>
+→ What about controlling what the BUCKET allows? What if another AWS account needs access?<br>
+→ What if you want to enforce encryption on ALL uploads regardless of who uploads?<br>
+→ What if you want to restrict access to specific VPC endpoints only?</p>
+<p>→ The consultant explains: "IAM policies are IDENTITY-based — attached to the person making the request. Bucket policies are RESOURCE-based — attached to the resource being accessed. You need BOTH for defense in depth."</p>
+<p>→ <strong>This is exactly what Project 10 solves</strong><br>
+→ Project 10 introduces S3 Bucket Policies and Access Control Lists<br>
+→ It explains the relationship between IAM policies (Project 2) and resource-based policies<br>
+→ It shows how both are evaluated together during access decisions<br>
+→ It prepares you for cross-account S3 access (Project 39) and VPC endpoint policies (Project 27)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 10: "The Public Bucket That Cost $50,000 — S3 Bucket Policies &amp; Access Control Lists"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-8.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 9/60</span></div><a class="nav-btn next" href="project-10.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

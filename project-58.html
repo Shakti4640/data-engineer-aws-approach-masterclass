@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 58: THE ON-PREMISES MIGRATION — On-Prem MariaDB → DMS → RDS → Glue → Red — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 58: THE ON-PREMISES MIGRATION — On-Prem MariaDB → DMS → RDS → Glue → Redshift Full Pipeline</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ DataPulse Corp (from Projects 56 and 57) acquires a smaller analytics company called "InsightWorks"<br>
+→ InsightWorks runs a MariaDB 10.6 database on a physical server in their office data center<br>
+→ The database contains:</p>
+<table><thead><tr><th>Table Category</th><th>Tables</th><th>Rows</th><th>Size</th></tr></thead><tbody><tr><td>Customer Records</td><td>12 tables</td><td>45 million rows</td><td>120 GB</td></tr><tr><td>Transaction History</td><td>8 tables</td><td>380 million rows</td><td>280 GB</td></tr><tr><td>Product Catalog</td><td>6 tables</td><td>2 million rows</td><td>15 GB</td></tr><tr><td>Analytics Aggregates</td><td>15 tables</td><td>90 million rows</td><td>85 GB</td></tr><tr><td>Total</td><td>41 tables</td><td>517 million rows</td><td>500 GB</td></tr></tbody></table>
+<p>→ InsightWorks' application is LIVE — serving 200 concurrent users during business hours<br>
+→ The application writes approximately 50,000 INSERT/UPDATE/DELETE operations per hour during peak</p>
+<p><strong>Business Requirements:</strong><br>
+→ Migrate ALL 500 GB to AWS RDS MariaDB (already set up in Project 9, secured in Project 57)<br>
+→ Maximum acceptable downtime: 30 minutes (application cutover window)<br>
+→ After migration to RDS → data must flow into existing Glue ETL pipeline (Project 24)<br>
+→ Glue transforms and loads into Redshift (Project 22) for DataPulse's unified analytics<br>
+→ Migration must be encrypted in transit (TLS) — per security policies from Project 57<br>
+→ All migration activities must be auditable via CloudTrail (Project 57)<br>
+→ Migration must be repeatable — InsightWorks has 3 more regional databases to migrate later</p>
+<p><strong>Technical Challenges:</strong><br>
+→ On-premises server is behind a corporate firewall<br>
+→ No existing VPN or Direct Connect to AWS<br>
+→ Database is actively receiving writes during migration<br>
+→ Schema differences exist between InsightWorks' MariaDB and DataPulse's target schema<br>
+→ Some tables have foreign keys and triggers that complicate migration order<br>
+→ Binary logs (binlog) are enabled but in MIXED format — CDC requires ROW format<br>
+→ Character set is latin1 on some tables — target uses utf8mb4</p>
+<p><strong>What the team considered and rejected:</strong><br>
+→ mysqldump export → S3 upload → RDS import</p>
+<ul>
+<li>Rejected: Would require 6+ hours of downtime for 500 GB<br>
+→ Manual application-level data sync</li>
+<li>Rejected: Error-prone, doesn't handle ongoing changes<br>
+→ Shut down application → migrate → restart</li>
+<li>Rejected: 6+ hour downtime unacceptable</li>
+</ul>
+<p><strong>What they chose:</strong><br>
+→ AWS Database Migration Service (DMS) with Full Load + Change Data Capture (CDC)<br>
+→ This allows migrating the entire database while the source continues receiving writes<br>
+→ Cutover window reduced to minutes instead of hours</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ Database migration is a multi-phase operation — NOT a single step<br>
+→ Each phase has specific prerequisites, configurations, and validation checkpoints</p>
+<p><strong>Migration Phases:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PHASE A                 PHASE B              PHASE C              PHASE D
+</span>PREPARATION             FULL LOAD            CDC (ONGOING         CUTOVER &amp;
+                                             REPLICATION)         VALIDATION
+                                             
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ Network      │    │ DMS loads   │    │ DMS captures │    │ Stop source │
+│ Connectivity │    │ all existing│    │ ongoing      │    │ application │
+│ Source Prep  │───▶│ data from   │───▶│ changes from │───▶│ Verify data │
+│ Target Prep  │    │ source to   │    │ binlog and   │    │ Switch DNS  │
+│ DMS Setup    │    │ target      │    │ applies to   │    │ Start target│
+│              │    │             │    │ target       │    │ application │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+   Days 1-5          Hours 8-14         Days until          30 min window
+                                        cutover ready</code></pre></div>
+<p>→ Approach must address:</p>
+<ol>
+<li>Network connectivity between on-premises and AWS</li>
+<li>Source database preparation (binlog format, permissions)</li>
+<li>Target database preparation (schema, character sets)</li>
+<li>DMS infrastructure setup (replication instance, endpoints, task)</li>
+<li>Full load execution and monitoring</li>
+<li>CDC activation and lag monitoring</li>
+<li>Cutover planning and execution</li>
+<li>Post-migration validation</li>
+<li>Integration with existing Glue → Redshift pipeline</li>
+</ol>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>SECTION A — NETWORK CONNECTIVITY: ON-PREMISES TO AWS</h3>
+<hr>
+<p><strong>Step A1 — Evaluate Connectivity Options</strong></p>
+<table><thead><tr><th>Option</th><th>Setup Time</th><th>Bandwidth</th><th>Cost</th><th>Security</th><th>Best For</th></tr></thead><tbody><tr><td>AWS Site-to-Site VPN</td><td>1-3 days</td><td>Up to 1.25 Gbps per tunnel</td><td>~$36/month + data transfer</td><td>IPSec encrypted</td><td>Quick setup, moderate data</td></tr><tr><td>AWS Direct Connect</td><td>2-8 weeks</td><td>1 Gbps or 10 Gbps</td><td>$0.03-0.30/GB + port fee</td><td>Private connection, optional MACsec</td><td>Large data, ongoing connectivity</td></tr><tr><td>DMS over Public Internet (with SSL)</td><td>Hours</td><td>Depends on ISP</td><td>Data transfer only</td><td>TLS encryption</td><td>One-time migration, simplest</td></tr><tr><td>AWS VPN + DMS</td><td>1-3 days</td><td>Up to 1.25 Gbps</td><td>VPN cost + data transfer</td><td>IPSec + TLS</td><td>Balanced security and speed</td></tr></tbody></table>
+<p>→ DataPulse decision: AWS Site-to-Site VPN<br>
+→ Reasoning:</p>
+<ul>
+<li>Direct Connect takes too long to provision (8 weeks)</li>
+<li>Public internet is acceptable but VPN adds network-level encryption (defense in depth — Project 57)</li>
+<li>VPN can be set up in days and reused for 3 more regional database migrations</li>
+<li>500 GB over 1 Gbps ≈ ~1.5 hours for raw transfer (with overhead, ~4-6 hours realistic)</li>
+</ul>
+<p><strong>Step A2 — Create Virtual Private Gateway</strong></p>
+<p>→ VPC Console → Virtual Private Gateways → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>datapulse-migration-vgw</code></td></tr><tr><td>ASN</td><td>Amazon default ASN (64512)</td></tr></tbody></table>
+<p>→ After creation → Attach to the VPC where RDS MariaDB resides (Project 5)<br>
+→ VPC Console → Select VGW → Actions → Attach to VPC → Select migration VPC</p>
+<p><strong>Step A3 — Create Customer Gateway</strong></p>
+<p>→ VPC Console → Customer Gateways → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>insightworks-office-cgw</code></td></tr><tr><td>BGP ASN</td><td>InsightWorks' router ASN (e.g., 65000) OR static routing</td></tr><tr><td>IP Address</td><td>InsightWorks' public IP of their VPN-capable router/firewall</td></tr></tbody></table>
+<p><strong>Step A4 — Create VPN Connection</strong></p>
+<p>→ VPC Console → Site-to-Site VPN Connections → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>datapulse-insightworks-vpn</code></td></tr><tr><td>Target Gateway Type</td><td>Virtual Private Gateway</td></tr><tr><td>Virtual Private Gateway</td><td><code>datapulse-migration-vgw</code></td></tr><tr><td>Customer Gateway</td><td><code>insightworks-office-cgw</code></td></tr><tr><td>Routing Options</td><td>Static (simpler for one-time migration)</td></tr><tr><td>Static IP Prefixes</td><td>InsightWorks' on-prem CIDR (e.g., <code>192.168.1.0/24</code>)</td></tr><tr><td>Tunnel 1 Options</td><td>Pre-shared key (auto-generated or custom)</td></tr><tr><td>Tunnel 2 Options</td><td>Pre-shared key (redundant tunnel)</td></tr></tbody></table>
+<p>→ After creation → Download Configuration file<br>
+→ Configuration file contains settings for InsightWorks' router (Cisco, Juniper, pfSense, etc.)</p>
+<p><strong>Step A5 — Configure On-Premises Router</strong></p>
+<p>→ InsightWorks' network admin applies the downloaded configuration to their router/firewall:</p>
+<ul>
+<li>IPSec tunnel parameters (encryption algorithm, integrity algorithm, DH group)</li>
+<li>Pre-shared keys for both tunnels</li>
+<li>Static routes pointing AWS VPC CIDR to the VPN tunnel interface</li>
+</ul>
+<p>→ Required on-premises firewall rules:</p>
+<table><thead><tr><th>Direction</th><th>Protocol</th><th>Port</th><th>Purpose</th></tr></thead><tbody><tr><td>Outbound</td><td>UDP</td><td>500</td><td>IKE negotiation</td></tr><tr><td>Outbound</td><td>IP Protocol 50</td><td>N/A</td><td>ESP (encrypted payload)</td></tr><tr><td>Outbound</td><td>UDP</td><td>4500</td><td>NAT Traversal</td></tr></tbody></table>
+<p><strong>Step A6 — Update VPC Route Tables</strong></p>
+<p>→ VPC Console → Route Tables → Select private subnet route table</p>
+<table><thead><tr><th>Destination</th><th>Target</th></tr></thead><tbody><tr><td>10.0.0.0/16</td><td>local (existing)</td></tr><tr><td>192.168.1.0/24</td><td>vgw-xxxxx (Virtual Private Gateway)</td></tr></tbody></table>
+<p>→ This tells the VPC: "To reach InsightWorks' on-prem network, route through the VPN"</p>
+<p><strong>Step A7 — Update Security Groups</strong></p>
+<p>→ RDS Security Group (from Project 14) → Add inbound rule:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td>192.168.1.0/24</td><td>Allow DMS replication instance to reach on-prem (NOT needed — DMS reaches SOURCE, not target reaching source)</td></tr></tbody></table>
+<p>→ CORRECTION: DMS Replication Instance needs to reach BOTH source AND target<br>
+→ DMS Replication Instance Security Group:</p>
+<table><thead><tr><th>Direction</th><th>Type</th><th>Port</th><th>Source/Destination</th><th>Purpose</th></tr></thead><tbody><tr><td>Outbound</td><td>TCP</td><td>3306</td><td>192.168.1.0/24 (on-prem)</td><td>Connect to source MariaDB</td></tr><tr><td>Outbound</td><td>TCP</td><td>3306</td><td>RDS Security Group</td><td>Connect to target RDS MariaDB</td></tr><tr><td>Inbound</td><td>TCP</td><td>ALL</td><td>Self-reference</td><td>Internal communication</td></tr></tbody></table>
+<p>→ On-premises firewall must allow INBOUND from AWS VPC CIDR on port 3306</p>
+<p><strong>Step A8 — Verify Connectivity</strong></p>
+<p>→ Launch a test EC2 instance in the same subnet as DMS will use<br>
+→ Attempt to telnet/nc to InsightWorks' MariaDB IP on port 3306<br>
+→ If connection succeeds → VPN is working and firewall rules are correct<br>
+→ If connection fails → check VPN tunnel status, route tables, security groups, on-prem firewall<br>
+→ Terminate test instance after verification</p>
+<hr>
+<h3>SECTION B — SOURCE DATABASE PREPARATION (On-Premises MariaDB)</h3>
+<hr>
+<p><strong>Step B1 — Enable Binary Logging in ROW Format</strong></p>
+<p>→ DMS CDC requires binary logging in ROW format<br>
+→ InsightWorks' MariaDB currently uses MIXED format — must change</p>
+<p>→ On-premises MariaDB configuration file (<code>/etc/mysql/my.cnf</code> or <code>/etc/my.cnf</code>):</p>
+<table><thead><tr><th>Parameter</th><th>Current Value</th><th>Required Value</th><th>Purpose</th></tr></thead><tbody><tr><td>log_bin</td><td>ON</td><td>ON (already correct)</td><td>Enable binary logging</td></tr><tr><td>binlog_format</td><td>MIXED</td><td>ROW</td><td>DMS CDC requires ROW format for accurate change capture</td></tr><tr><td>binlog_row_image</td><td>minimal</td><td>full</td><td>DMS needs full row image for UPDATE operations</td></tr><tr><td>expire_logs_days</td><td>1</td><td>7</td><td>Keep binlogs long enough for migration duration</td></tr><tr><td>server_id</td><td>1</td><td>1 (unique, already set)</td><td>Required for replication</td></tr><tr><td>binlog_checksum</td><td>CRC32</td><td>NONE</td><td>DMS compatibility with MariaDB</td></tr><tr><td>log_slave_updates</td><td>OFF</td><td>ON</td><td>If source is a replica — ensures changes are logged</td></tr></tbody></table>
+<p>→ IMPORTANT: Changing <code>binlog_format</code> from MIXED to ROW requires MariaDB restart<br>
+→ Schedule during InsightWorks' maintenance window<br>
+→ Application impact: None (ROW format is compatible with all applications — just generates larger binlogs)</p>
+<p><strong>Step B2 — Create DMS Replication User on Source</strong></p>
+<p>→ Connect to on-premises MariaDB as admin<br>
+→ Create a dedicated user for DMS:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Username</td><td><code>dms_replication_user</code></td></tr><tr><td>Host</td><td>AWS VPC CIDR (e.g., <code>10.0.%</code>)</td></tr><tr><td>Authentication</td><td>Password (stored in Secrets Manager — Project 37)</td></tr></tbody></table>
+<p>→ Required privileges:</p>
+<table><thead><tr><th>Privilege</th><th>Purpose</th></tr></thead><tbody><tr><td>SELECT</td><td>Read table data during full load</td></tr><tr><td>REPLICATION CLIENT</td><td>Query binlog position</td></tr><tr><td>REPLICATION SLAVE</td><td>Read binlog events for CDC</td></tr><tr><td>SUPER</td><td>Required for certain DMS operations on MariaDB</td></tr><tr><td>SHOW VIEW</td><td>Migrate views (if needed)</td></tr><tr><td>EVENT</td><td>Migrate events (if needed)</td></tr><tr><td>TRIGGER</td><td>Migrate triggers (if needed)</td></tr></tbody></table>
+<p>→ Why a dedicated user?</p>
+<ul>
+<li>Least privilege: Only has permissions DMS needs</li>
+<li>Auditing: All DMS activity attributed to this specific user</li>
+<li>Revocation: Easy to disable after migration completes</li>
+</ul>
+<p><strong>Step B3 — Assess Source Database for Migration Issues</strong></p>
+<p>→ AWS provides the <strong>AWS Schema Conversion Tool (SCT)</strong> for assessment<br>
+→ Download and install SCT on a machine with connectivity to both source and target</p>
+<p>→ SCT Assessment Report reveals:</p>
+<table><thead><tr><th>Issue Category</th><th>Finding</th><th>Impact</th><th>Resolution</th></tr></thead><tbody><tr><td>Character Set</td><td>6 tables use latin1</td><td>Data may display incorrectly in utf8mb4 target</td><td>DMS handles conversion — configure endpoint with CharacterSet parameter</td></tr><tr><td>Storage Engine</td><td>All tables use InnoDB</td><td>✅ Compatible — no issue</td><td>None needed</td></tr><tr><td>Auto Increment</td><td>3 tables near MAX INT</td><td>Will overflow after migration if not addressed</td><td>Alter column to BIGINT before or after migration</td></tr><tr><td>Foreign Keys</td><td>23 foreign key constraints</td><td>May cause load failures if child loaded before parent</td><td>DMS table mapping controls load order OR disable FK checks during load</td></tr><tr><td>Triggers</td><td>4 triggers on transaction tables</td><td>Triggers fire during DMS load → duplicate side effects</td><td>Disable triggers on target during migration → re-enable after cutover</td></tr><tr><td>Stored Procedures</td><td>12 procedures</td><td>DMS does NOT migrate stored procedures</td><td>Manually recreate on target using SCT conversion</td></tr><tr><td>Views</td><td>8 views</td><td>DMS does NOT migrate views by default</td><td>Manually recreate OR configure DMS to include views</td></tr><tr><td>Indexes</td><td>47 secondary indexes</td><td>Indexes slow down full load (DMS inserts with indexes)</td><td>Drop secondary indexes before load → recreate after load completes</td></tr></tbody></table>
+<p><strong>Step B4 — Estimate Binlog Generation Rate</strong></p>
+<p>→ During CDC, DMS reads binlog events from the source<br>
+→ Need to ensure binlog retention covers the entire migration period</p>
+<p>→ Check current binlog size:</p>
+<ul>
+<li>Current binlog generation: ~2 GB/hour during peak</li>
+<li>Migration estimated duration: 3 days (full load + CDC catchup)</li>
+<li>Required binlog retention: 7 days × 24 hours × 2 GB = 336 GB of binlog space</li>
+<li>Verify on-premises server has sufficient disk space for binlog retention</li>
+</ul>
+<hr>
+<h3>SECTION C — TARGET DATABASE PREPARATION (AWS RDS MariaDB)</h3>
+<hr>
+<p><strong>Step C1 — Verify Target RDS Instance Configuration</strong></p>
+<p>→ RDS Console → Select target MariaDB instance (from Project 9)<br>
+→ Verify configuration:</p>
+<table><thead><tr><th>Parameter</th><th>Required Value</th><th>Why</th></tr></thead><tbody><tr><td>Engine Version</td><td>MariaDB 10.6 (match source)</td><td>Version compatibility</td></tr><tr><td>Instance Class</td><td>db.r6g.xlarge (or larger)</td><td>Sufficient for 500 GB import workload</td></tr><tr><td>Storage</td><td>600 GB gp3 (headroom above 500 GB)</td><td>Room for data + indexes + overhead</td></tr><tr><td>Storage Autoscaling</td><td>✅ Enabled with max 1 TB</td><td>Safety net if data grows during migration</td></tr><tr><td>Multi-AZ</td><td>✅ Enabled (from Project 29)</td><td>High availability during and after migration</td></tr><tr><td>Encryption</td><td>✅ Enabled with KMS key (from Project 57)</td><td>Security compliance</td></tr><tr><td>Parameter Group</td><td>Custom (see Step C2)</td><td>Optimized for bulk import</td></tr></tbody></table>
+<p><strong>Step C2 — Create Migration-Optimized Parameter Group</strong></p>
+<p>→ RDS Console → Parameter Groups → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Parameter Group Family</td><td>mariadb10.6</td></tr><tr><td>Name</td><td><code>datapulse-migration-params</code></td></tr><tr><td>Description</td><td>Optimized for DMS bulk import</td></tr></tbody></table>
+<p>→ Modify parameters for migration performance:</p>
+<table><thead><tr><th>Parameter</th><th>Default</th><th>Migration Value</th><th>Purpose</th></tr></thead><tbody><tr><td>max_allowed_packet</td><td>16 MB</td><td>64 MB</td><td>Allow larger row batches from DMS</td></tr><tr><td>innodb_buffer_pool_size</td><td>75% of memory</td><td>75% (keep default)</td><td>InnoDB caching</td></tr><tr><td>innodb_log_file_size</td><td>128 MB</td><td>512 MB</td><td>Reduce checkpoint frequency during bulk load</td></tr><tr><td>innodb_flush_log_at_trx_commit</td><td>1</td><td>2</td><td>Reduce fsync during bulk load (revert after migration)</td></tr><tr><td>sync_binlog</td><td>1</td><td>0</td><td>Reduce disk I/O during bulk load (revert after migration)</td></tr><tr><td>foreign_key_checks</td><td>1</td><td>0</td><td>Disable FK checks during DMS load</td></tr><tr><td>unique_checks</td><td>1</td><td>0</td><td>Speed up bulk inserts (revert after migration)</td></tr><tr><td>local_infile</td><td>0</td><td>1</td><td>Allow local file loading if needed</td></tr><tr><td>character_set_server</td><td>utf8mb4</td><td>utf8mb4</td><td>Target character set</td></tr><tr><td>collation_server</td><td>utf8mb4_general_ci</td><td>utf8mb4_general_ci</td><td>Target collation</td></tr></tbody></table>
+<p>→ Associate this parameter group with the target RDS instance<br>
+→ RDS Console → Modify Instance → Parameter Group → Select migration params → Apply Immediately</p>
+<p>→ IMPORTANT: After migration completes → revert these parameters to production values:</p>
+<ul>
+<li><code>innodb_flush_log_at_trx_commit</code> → back to 1 (full durability)</li>
+<li><code>sync_binlog</code> → back to 1</li>
+<li><code>foreign_key_checks</code> → back to 1</li>
+<li><code>unique_checks</code> → back to 1</li>
+</ul>
+<p><strong>Step C3 — Create Target Schema</strong></p>
+<p>→ Two approaches:</p>
+<p><strong>Approach 1: Let DMS Create Tables Automatically</strong><br>
+→ DMS can create tables on the target with basic structure<br>
+→ Limitation: DMS creates tables with MINIMAL structure — no secondary indexes, no foreign keys, no triggers<br>
+→ Suitable for simple migrations</p>
+<p><strong>Approach 2: Pre-Create Schema Using SCT (Recommended)</strong><br>
+→ AWS Schema Conversion Tool converts source schema to target-compatible DDL<br>
+→ SCT handles:</p>
+<ul>
+<li>Data type mappings (latin1 → utf8mb4)</li>
+<li>Index definitions</li>
+<li>Constraint definitions</li>
+<li>Stored procedure conversion (if applicable)</li>
+</ul>
+<p>→ Process:</p>
+<ol>
+<li>SCT connects to source MariaDB</li>
+<li>SCT generates converted DDL for target</li>
+<li>Review and apply DDL to target RDS</li>
+<li>Drop secondary indexes (will be recreated after full load)</li>
+<li>Disable triggers (will be re-enabled after cutover)</li>
+<li>Keep primary keys (DMS needs them for CDC)</li>
+</ol>
+<p>→ DataPulse chooses Approach 2 — pre-create schema for full control</p>
+<p><strong>Step C4 — Verify Target Connectivity</strong></p>
+<p>→ From the same subnet where DMS replication instance will run:</p>
+<ul>
+<li>Verify connectivity to RDS endpoint on port 3306</li>
+<li>RDS Security Group must allow inbound from DMS replication instance security group (Project 14 cross-reference pattern)</li>
+</ul>
+<hr>
+<h3>SECTION D — DMS INFRASTRUCTURE SETUP</h3>
+<hr>
+<p><strong>Step D1 — Create DMS Replication Subnet Group</strong></p>
+<p>→ DMS Console → Subnet Groups → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>datapulse-dms-subnet-group</code></td></tr><tr><td>Description</td><td>Private subnets for DMS replication instance</td></tr><tr><td>VPC</td><td>DataPulse migration VPC</td></tr><tr><td>Subnets</td><td>Select private subnets in at least 2 AZs</td></tr></tbody></table>
+<p>→ DMS replication instance must be in a subnet that can reach BOTH:</p>
+<ul>
+<li>On-premises MariaDB (via VPN — routed through Virtual Private Gateway)</li>
+<li>Target RDS MariaDB (via private subnet — same VPC or peered VPC)</li>
+</ul>
+<p><strong>Step D2 — Create DMS Replication Instance</strong></p>
+<p>→ DMS Console → Replication Instances → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>datapulse-migration-ri</code></td></tr><tr><td>Description</td><td>Replication instance for InsightWorks MariaDB migration</td></tr><tr><td>Instance Class</td><td><code>dms.r5.xlarge</code> (4 vCPU, 32 GB RAM)</td></tr><tr><td>Engine Version</td><td>Latest (3.5.x)</td></tr><tr><td>Allocated Storage</td><td>100 GB</td></tr><tr><td>VPC</td><td>DataPulse migration VPC</td></tr><tr><td>Replication Subnet Group</td><td><code>datapulse-dms-subnet-group</code></td></tr><tr><td>Multi-AZ</td><td>✅ Yes (for production migrations)</td></tr><tr><td>Publicly Accessible</td><td>❌ No (replication instance stays in private subnet)</td></tr><tr><td>Security Group</td><td>DMS-specific security group (from Step A7)</td></tr><tr><td>KMS Key</td><td><code>alias/datapulse-database</code> (encrypt replication instance storage)</td></tr></tbody></table>
+<p><strong>How to choose Replication Instance size:</strong></p>
+<table><thead><tr><th>Source DB Size</th><th>Recommended Instance</th><th>RAM</th><th>Reasoning</th></tr></thead><tbody><tr><td>&lt; 50 GB</td><td>dms.t3.medium</td><td>4 GB</td><td>Small dataset, low throughput</td></tr><tr><td>50 – 200 GB</td><td>dms.r5.large</td><td>16 GB</td><td>Medium dataset</td></tr><tr><td>200 GB – 1 TB</td><td>dms.r5.xlarge</td><td>32 GB</td><td>Large dataset, CDC with high change rate</td></tr><tr><td>1 TB – 5 TB</td><td>dms.r5.2xlarge</td><td>64 GB</td><td>Very large dataset</td></tr><tr><td>&gt; 5 TB</td><td>dms.r5.4xlarge+</td><td>128 GB+</td><td>Massive migration</td></tr></tbody></table>
+<p>→ DataPulse: 500 GB with 50K changes/hour → <code>dms.r5.xlarge</code> is appropriate</p>
+<p><strong>Replication Instance Internal Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────────────────┐
+</span>│           DMS REPLICATION INSTANCE                  │
+│                                                      │
+│  ┌────────────────┐    ┌────────────────┐           │
+│  │  SOURCE         │    │  TARGET         │           │
+│  │  CONNECTOR      │    │  CONNECTOR      │           │
+│  │  (Reads from    │    │  (Writes to     │           │
+│  │   on-prem DB)   │    │   RDS target)   │           │
+│  └───────┬────────┘    └───────▲────────┘           │
+│          │                     │                     │
+│  ┌───────▼─────────────────────┴────────┐           │
+│  │     REPLICATION ENGINE                │           │
+│  │                                        │           │
+│  │  • Full Load Manager                  │           │
+│  │  • CDC Engine (binlog reader)         │           │
+│  │  • Transaction Applicator             │           │
+│  │  • Data Transformation Engine         │           │
+│  │  • Error Handler                      │           │
+│  └───────────────────────────────────────┘           │
+│                                                      │
+│  ┌───────────────────────────────────────┐           │
+│  │     LOCAL STORAGE (100 GB)            │           │
+│  │                                        │           │
+│  │  • Sort buffers for large tables      │           │
+│  │  • CDC transaction cache              │           │
+│  │  • LOB storage cache                  │           │
+│  │  • Task logs                          │           │
+│  └───────────────────────────────────────┘           │
+└────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>Step D3 — Create Source Endpoint (On-Premises MariaDB)</strong></p>
+<p>→ DMS Console → Endpoints → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Endpoint Type</td><td>Source</td></tr><tr><td>Endpoint Identifier</td><td><code>insightworks-onprem-mariadb-source</code></td></tr><tr><td>Source Engine</td><td>MariaDB</td></tr><tr><td>Server Name</td><td>Private IP of on-prem MariaDB (reachable via VPN, e.g., <code>192.168.1.50</code>)</td></tr><tr><td>Port</td><td>3306</td></tr><tr><td>SSL Mode</td><td>require (TLS encryption in transit — Project 57 requirement)</td></tr><tr><td>User Name</td><td><code>dms_replication_user</code></td></tr><tr><td>Password</td><td>Retrieve from Secrets Manager (Project 37) OR enter directly</td></tr></tbody></table>
+<p><strong>Extra Connection Attributes (Source):</strong></p>
+<table><thead><tr><th>Attribute</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>initstmt=SET FOREIGN_KEY_CHECKS=0</code></td><td>Disable FK on source reads</td><td>Prevent FK-related read issues</td></tr><tr><td><code>afterConnectScript=SET time_zone='+00:00'</code></td><td>UTC timezone</td><td>Consistent timestamp handling</td></tr><tr><td><code>parallelLoadThreads=8</code></td><td>8 parallel threads</td><td>Speed up full load for large tables</td></tr><tr><td><code>parallelLoadBufferSize=500</code></td><td>500 rows per buffer</td><td>Batch size for parallel load</td></tr></tbody></table>
+<p><strong>SSL Configuration for Source Endpoint:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>SSL Mode</td><td>require</td></tr><tr><td>CA Certificate</td><td>Upload on-premises CA cert (if using self-signed)</td></tr><tr><td>Client Certificate</td><td>Upload if mutual TLS required</td></tr><tr><td>Client Key</td><td>Upload if mutual TLS required</td></tr></tbody></table>
+<p>→ If InsightWorks' MariaDB doesn't have SSL configured:</p>
+<ul>
+<li>Configure SSL on the on-premises MariaDB first</li>
+<li>Generate server certificate, CA certificate</li>
+<li>Upload CA certificate to DMS</li>
+</ul>
+<p>→ Test Connection: DMS Console → Select endpoint → Test Connection → Select replication instance<br>
+→ Status must show "successful"<br>
+→ If failed → check VPN connectivity, security groups, database credentials, SSL certificates</p>
+<p><strong>Step D4 — Create Target Endpoint (AWS RDS MariaDB)</strong></p>
+<p>→ DMS Console → Endpoints → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Endpoint Type</td><td>Target</td></tr><tr><td>Endpoint Identifier</td><td><code>datapulse-rds-mariadb-target</code></td></tr><tr><td>Target Engine</td><td>MariaDB</td></tr><tr><td>Server Name</td><td>RDS endpoint (e.g., <code>datapulse-db.xxxxx.ap-south-1.rds.amazonaws.com</code>)</td></tr><tr><td>Port</td><td>3306</td></tr><tr><td>SSL Mode</td><td>require (RDS supports SSL by default)</td></tr><tr><td>User Name</td><td>Master user OR dedicated DMS user</td></tr><tr><td>Password</td><td>From Secrets Manager (Project 37)</td></tr></tbody></table>
+<p><strong>Extra Connection Attributes (Target):</strong></p>
+<table><thead><tr><th>Attribute</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>initstmt=SET FOREIGN_KEY_CHECKS=0</code></td><td>Disable FK during load</td><td>Prevent FK constraint failures during bulk insert</td></tr><tr><td><code>parallelLoadThreads=8</code></td><td>8 parallel threads</td><td>Speed up full load writes</td></tr><tr><td><code>Initstmt=SET UNIQUE_CHECKS=0</code></td><td>Disable unique checks</td><td>Speed up bulk inserts</td></tr><tr><td><code>afterConnectScript=SET time_zone='+00:00'</code></td><td>UTC timezone</td><td>Match source timezone setting</td></tr></tbody></table>
+<p>→ Test Connection: Must show "successful"<br>
+→ RDS Security Group must allow inbound from DMS replication instance security group on port 3306</p>
+<p><strong>Step D5 — Understanding DMS Endpoint SSL Modes</strong></p>
+<table><thead><tr><th>SSL Mode</th><th>Behavior</th><th>Use When</th></tr></thead><tbody><tr><td>none</td><td>No encryption</td><td>Never in production</td></tr><tr><td>require</td><td>Encrypts connection, doesn't verify certificate</td><td>Quick setup, trusted network (VPN)</td></tr><tr><td>verify-ca</td><td>Encrypts + verifies CA certificate</td><td>Production — verifies server identity</td></tr><tr><td>verify-full</td><td>Encrypts + verifies CA + hostname match</td><td>Highest security — full certificate validation</td></tr></tbody></table>
+<p>→ DataPulse uses <code>require</code> for source (on-prem — already over VPN)<br>
+→ DataPulse uses <code>verify-ca</code> for target (RDS — verify AWS CA)<br>
+→ For RDS, download the AWS RDS CA bundle and upload to DMS endpoint configuration</p>
+<hr>
+<h3>SECTION E — DMS MIGRATION TASK CONFIGURATION</h3>
+<hr>
+<p><strong>Step E1 — Create Migration Task</strong></p>
+<p>→ DMS Console → Database Migration Tasks → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Task Identifier</td><td><code>insightworks-fullload-cdc</code></td></tr><tr><td>Replication Instance</td><td><code>datapulse-migration-ri</code></td></tr><tr><td>Source Endpoint</td><td><code>insightworks-onprem-mariadb-source</code></td></tr><tr><td>Target Endpoint</td><td><code>datapulse-rds-mariadb-target</code></td></tr><tr><td>Migration Type</td><td>Migrate existing data and replicate ongoing changes (Full Load + CDC)</td></tr></tbody></table>
+<p><strong>Step E2 — Configure Task Settings</strong></p>
+<p><strong>Target Table Preparation Mode:</strong></p>
+<table><thead><tr><th>Option</th><th>Behavior</th><th>When to Use</th></tr></thead><tbody><tr><td>Do nothing</td><td>Assumes target tables exist and are empty</td><td>Pre-created schema (our approach)</td></tr><tr><td>Drop tables on target</td><td>DMS drops and recreates tables</td><td>Simple migration, no schema customization</td></tr><tr><td>Truncate</td><td>DMS empties existing tables before load</td><td>Re-running migration on same target</td></tr></tbody></table>
+<p>→ DataPulse chooses: <strong>Do nothing</strong> (schema pre-created via SCT in Step C3)</p>
+<p><strong>Full Load Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Maximum number of tables to load in parallel</td><td>8</td><td>Load 8 tables simultaneously</td></tr><tr><td>Transaction consistency timeout (seconds)</td><td>600</td><td>Wait up to 10 min for open transactions to complete before starting</td></tr><tr><td>Create control table in target</td><td>✅ Yes</td><td>DMS creates status tracking tables</td></tr><tr><td>Start task on create</td><td>❌ No (start manually after verification)</td><td>Control when migration begins</td></tr></tbody></table>
+<p><strong>Logging Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Enable CloudWatch Logs</td><td>✅ Yes</td></tr><tr><td>Log Level</td><td>Default (or Detailed for troubleshooting)</td></tr><tr><td>Log Component</td><td>SOURCE_UNLOAD, SOURCE_CAPTURE, TARGET_LOAD, TARGET_APPLY</td></tr></tbody></table>
+<p>→ CloudWatch Log Group: <code>/dms/tasks/insightworks-fullload-cdc</code><br>
+→ Encrypt with KMS key <code>alias/datapulse-logging</code> (Project 57)</p>
+<p><strong>CDC Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>CDC start mode</td><td>From full load start</td><td>Begin CDC when full load starts — captures changes during load</td></tr><tr><td>CDC stop mode</td><td>Don't stop (continuous)</td><td>Keep replicating until manual cutover</td></tr><tr><td>Commit rate</td><td>1000</td><td>Apply changes in batches of 1000 for performance</td></tr><tr><td>Change processing tuning → Memory limit (MB)</td><td>1024</td><td>Buffer size for CDC changes</td></tr><tr><td>Change processing tuning → Batch apply</td><td>✅ Enabled</td><td>Group changes for efficient application</td></tr></tbody></table>
+<p><strong>Validation Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Enable validation</td><td>✅ Yes</td><td>DMS compares source and target row counts and data</td></tr><tr><td>Failure handling → Data validation mode</td><td>Row level</td><td>Compare individual rows</td></tr><tr><td>Validation only</td><td>❌ No (validate during migration)</td><td>Continuous validation</td></tr><tr><td>Thread count</td><td>8</td><td>Parallel validation threads</td></tr></tbody></table>
+<p>→ Validation compares:</p>
+<ul>
+<li>Row counts per table</li>
+<li>Column-level data comparison (sampling)</li>
+<li>Reports mismatches in CloudWatch and DMS console</li>
+</ul>
+<p><strong>Error Handling Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Data truncation error handling</td><td>Suspend table</td><td>If data doesn't fit, pause that table's migration</td></tr><tr><td>Data type error handling</td><td>Suspend table</td><td>Pause table on type mismatch</td></tr><tr><td>Apply exceptions error handling</td><td>Log and continue</td><td>Log errors but continue other tables</td></tr><tr><td>Full load error handling</td><td>Suspend table</td><td>Pause problematic table, continue others</td></tr></tbody></table>
+<p><strong>Step E3 — Configure Table Mapping</strong></p>
+<p>→ Table mapping defines WHICH tables to migrate and HOW</p>
+<p><strong>Selection Rules — What to Migrate:</strong></p>
+<table><thead><tr><th>Rule Type</th><th>Schema</th><th>Table Name</th><th>Action</th></tr></thead><tbody><tr><td>Include</td><td>insightworks_db</td><td>% (all tables)</td><td>Include</td></tr><tr><td>Exclude</td><td>insightworks_db</td><td>tmp_% (temporary tables)</td><td>Exclude</td></tr><tr><td>Exclude</td><td>insightworks_db</td><td>log_% (application log tables)</td><td>Exclude</td></tr></tbody></table>
+<p>→ This migrates all tables EXCEPT temporary and log tables</p>
+<p><strong>Transformation Rules — How to Transform:</strong></p>
+<table><thead><tr><th>Rule Type</th><th>Target</th><th>Action</th><th>Value</th></tr></thead><tbody><tr><td>Rename schema</td><td>insightworks_db</td><td>Rename to</td><td>datapulse_acquired</td></tr><tr><td>Rename table</td><td>insightworks_db.tbl_customers</td><td>Rename to</td><td>customers</td></tr><tr><td>Remove column</td><td>insightworks_db.tbl_customers.internal_notes</td><td>Remove</td><td>N/A</td></tr><tr><td>Add column</td><td>All tables</td><td>Add column</td><td><code>migration_timestamp</code> with value <code>$AR_H_TIMESTAMP</code></td></tr><tr><td>Convert to lowercase</td><td>All table names</td><td>Convert</td><td>lowercase</td></tr></tbody></table>
+<p>→ DMS transformation rules handle:</p>
+<ul>
+<li>Schema renaming (map source schema to target schema)</li>
+<li>Table renaming (normalize naming conventions)</li>
+<li>Column removal (exclude sensitive/unnecessary columns)</li>
+<li>Column addition (add metadata columns for tracking)</li>
+<li>Data type conversion (handled by DMS automatically for compatible types)</li>
+</ul>
+<p><strong>Step E4 — Configure Table-Level Settings</strong></p>
+<p>→ For large tables (&gt; 50 million rows), configure parallel load:</p>
+<table><thead><tr><th>Table</th><th>Partition Type</th><th>Boundaries</th></tr></thead><tbody><tr><td>transaction_history (380M rows)</td><td>Range partition on <code>transaction_date</code></td><td>2020-01-01, 2021-01-01, 2022-01-01, 2023-01-01, 2024-01-01</td></tr><tr><td>customer_records (45M rows)</td><td>Range partition on <code>customer_id</code></td><td>0, 10000000, 20000000, 30000000, 45000000</td></tr></tbody></table>
+<p>→ Parallel load on large tables splits the table into segments<br>
+→ Each segment is loaded by a separate thread simultaneously<br>
+→ Dramatically reduces load time for large tables</p>
+<p>→ DMS Console → Task → Table Mappings → Add table-level setting:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Table</td><td>transaction_history</td></tr><tr><td>Parallel Load</td><td>✅ Enabled</td></tr><tr><td>Partition Type</td><td>Ranges</td></tr><tr><td>Column</td><td>transaction_date</td></tr><tr><td>Boundaries</td><td>(as above)</td></tr></tbody></table>
+<hr>
+<h3>SECTION F — EXECUTING THE MIGRATION</h3>
+<hr>
+<p><strong>Step F1 — Pre-Migration Checklist</strong></p>
+<table><thead><tr><th>Check</th><th>Status</th><th>How to Verify</th></tr></thead><tbody><tr><td>VPN tunnel UP</td><td>✅</td><td>VPC Console → VPN Connections → Tunnel Status = UP</td></tr><tr><td>Source endpoint test passed</td><td>✅</td><td>DMS Console → Endpoints → Test Connection</td></tr><tr><td>Target endpoint test passed</td><td>✅</td><td>DMS Console → Endpoints → Test Connection</td></tr><tr><td>Source binlog_format = ROW</td><td>✅</td><td>Query source: SHOW VARIABLES LIKE 'binlog_format'</td></tr><tr><td>Source binlog retention ≥ 7 days</td><td>✅</td><td>Query source: SHOW VARIABLES LIKE 'expire_logs_days'</td></tr><tr><td>Target schema created</td><td>✅</td><td>Connect to target → SHOW TABLES</td></tr><tr><td>Target secondary indexes dropped</td><td>✅</td><td>Speeds up full load</td></tr><tr><td>Target triggers disabled</td><td>✅</td><td>Prevents duplicate side effects</td></tr><tr><td>Target FK checks disabled</td><td>✅</td><td>Parameter group (Step C2)</td></tr><tr><td>Replication instance running</td><td>✅</td><td>DMS Console → Replication Instances → Status = Available</td></tr><tr><td>CloudWatch dashboard created</td><td>✅</td><td>Monitor migration progress</td></tr><tr><td>SNS alerts configured</td><td>✅</td><td>Alert on DMS task failure</td></tr></tbody></table>
+<p><strong>Step F2 — Start Migration Task</strong></p>
+<p>→ DMS Console → Tasks → Select task → Actions → Start/Resume<br>
+→ Start option: Start from scratch (full load from beginning)</p>
+<p><strong>Step F3 — Monitor Full Load Phase</strong></p>
+<p>→ DMS Console → Tasks → Select task → Table Statistics tab</p>
+<table><thead><tr><th>Column</th><th>Meaning</th></tr></thead><tbody><tr><td>Table Name</td><td>Which table</td></tr><tr><td>Full Load Rows</td><td>Rows loaded so far</td></tr><tr><td>Inserts</td><td>Rows inserted during full load</td></tr><tr><td>Deletes</td><td>Rows deleted (from CDC during load)</td></tr><tr><td>Updates</td><td>Rows updated (from CDC during load)</td></tr><tr><td>DDLs</td><td>Schema changes captured</td></tr><tr><td>Full Load State</td><td>Table state: Before load / Full load / Table completed</td></tr><tr><td>Last Updated</td><td>Timestamp of last activity</td></tr><tr><td>Validation State</td><td>Validated / Pending / Mismatched / Error</td></tr></tbody></table>
+<p>→ DMS Console → Tasks → Select task → Task Monitoring tab</p>
+<table><thead><tr><th>Metric</th><th>What It Shows</th><th>Healthy Value</th></tr></thead><tbody><tr><td>CDCLatencySource</td><td>Seconds of lag at source</td><td>&lt; 10 seconds</td></tr><tr><td>CDCLatencyTarget</td><td>Seconds of lag at target</td><td>&lt; 30 seconds</td></tr><tr><td>CDCIncomingChanges</td><td>Pending changes to apply</td><td>Trending toward 0</td></tr><tr><td>FullLoadThroughputBandwidthTarget</td><td>MB/s written to target</td><td>&gt; 10 MB/s for this dataset</td></tr><tr><td>FullLoadThroughputRowsTarget</td><td>Rows/s written to target</td><td>&gt; 10,000 rows/s</td></tr></tbody></table>
+<p>→ CloudWatch Metrics → Namespace: AWS/DMS → Dimension: ReplicationInstanceIdentifier</p>
+<p><strong>Step F4 — Monitor CDC Phase</strong></p>
+<p>→ After full load completes → DMS automatically transitions to CDC<br>
+→ CDC reads binlog from source → applies changes to target<br>
+→ Key CDC metrics to watch:</p>
+<table><thead><tr><th>Metric</th><th>Critical Threshold</th><th>Action if Exceeded</th></tr></thead><tbody><tr><td>CDCLatencySource</td><td>&gt; 60 seconds</td><td>Check source binlog generation rate → may need larger replication instance</td></tr><tr><td>CDCLatencyTarget</td><td>&gt; 120 seconds</td><td>Check target RDS performance → may need larger instance class</td></tr><tr><td>CDCIncomingChanges</td><td>Continuously increasing</td><td>Replication falling behind → investigate bottleneck</td></tr><tr><td>FreeStorageSpace (Replication Instance)</td><td>&lt; 10 GB</td><td>Increase replication instance storage</td></tr><tr><td>CPUUtilization (Replication Instance)</td><td>&gt; 80% sustained</td><td>Upgrade replication instance class</td></tr></tbody></table>
+<p><strong>Step F5 — Configure CloudWatch Alarms for Migration</strong></p>
+<p>→ CloudWatch Console → Alarms → Create (builds on Project 8)</p>
+<p><strong>Alarm 1: CDC Latency Alert</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>CDCLatencyTarget</td></tr><tr><td>Threshold</td><td>&gt; 300 seconds for 5 consecutive periods</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Action</td><td>SNS Topic → Migration team alert</td></tr></tbody></table>
+<p><strong>Alarm 2: Task State Change</strong></p>
+<p>→ EventBridge Rule (builds on Project 38):</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Event Source</td><td>aws.dms</td></tr><tr><td>Detail Type</td><td>DMS Replication Task State Change</td></tr><tr><td>Detail</td><td>state = FAILED or STOPPED</td></tr><tr><td>Target</td><td>SNS Topic → Immediate alert</td></tr></tbody></table>
+<p><strong>Step F6 — Expected Migration Timeline</strong></p>
+<table><thead><tr><th>Phase</th><th>Duration</th><th>What Happens</th></tr></thead><tbody><tr><td>Task initialization</td><td>5-10 minutes</td><td>DMS connects to source and target, validates configuration</td></tr><tr><td>Full Load</td><td>6-10 hours</td><td>500 GB transferred at ~15-25 MB/s through VPN</td></tr><tr><td>CDC Catchup</td><td>1-4 hours</td><td>DMS applies changes accumulated during full load</td></tr><tr><td>CDC Steady State</td><td>Days until cutover</td><td>DMS maintains near-zero lag, applying changes in real-time</td></tr><tr><td>Cutover</td><td>30 minutes</td><td>Stop source app → wait for CDC lag = 0 → switch to target</td></tr></tbody></table>
+<hr>
+<h3>SECTION G — CUTOVER PLANNING AND EXECUTION</h3>
+<hr>
+<p><strong>Step G1 — Pre-Cutover Validation</strong></p>
+<p>→ Before scheduling cutover, verify:</p>
+<table><thead><tr><th>Validation Check</th><th>How</th><th>Expected Result</th></tr></thead><tbody><tr><td>Row count comparison</td><td>DMS validation statistics</td><td>All tables: Validated, 0 mismatches</td></tr><tr><td>CDC Latency</td><td>DMS monitoring</td><td>CDCLatencyTarget &lt; 5 seconds</td></tr><tr><td>CDCIncomingChanges</td><td>DMS monitoring</td><td>Near 0 (target is caught up)</td></tr><tr><td>Data sampling</td><td>Query same records on source and target</td><td>Identical results</td></tr><tr><td>Application compatibility</td><td>Connect staging app to target RDS</td><td>All queries work correctly</td></tr></tbody></table>
+<p><strong>Step G2 — Cutover Execution Plan</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TIME    ACTION                                          RESPONSIBLE
+</span>─────   ──────────────────────────────────────────────  ──────────
+T-60m   Notify all stakeholders of maintenance window   Project Manager
+T-30m   Verify CDC lag &lt; 5 seconds                      DBA
+T-15m   Scale down InsightWorks application to 0        DevOps
+T-10m   Stop all application writes to source           DevOps
+T-8m    Wait for CDC lag to reach 0 seconds             DBA
+T-5m    Verify final row counts match source = target   DBA
+T-3m    Stop DMS replication task                       DBA
+T-2m    Recreate secondary indexes on target RDS        DBA
+T-1m    Re-enable triggers on target RDS                DBA
+T-0m    Revert target parameter group to production     DBA
+T+0m    Update application connection string to RDS     DevOps
+T+2m    Start application pointing to RDS               DevOps
+T+5m    Verify application functionality                QA
+T+10m   Monitor for errors in application logs          DevOps
+T+15m   Confirm cutover successful                      Project Manager
+T+30m   Close maintenance window                        Project Manager</code></pre></div>
+<p><strong>Step G3 — Post-Cutover Actions</strong></p>
+<table><thead><tr><th>Action</th><th>Timing</th><th>Details</th></tr></thead><tbody><tr><td>Revert RDS parameter group</td><td>T+0m</td><td>Change <code>innodb_flush_log_at_trx_commit</code> back to 1, <code>sync_binlog</code> back to 1, re-enable FK checks</td></tr><tr><td>Recreate secondary indexes</td><td>T-2m to T+30m</td><td>May take time for large tables — can run in background</td></tr><tr><td>Re-enable triggers</td><td>T-1m</td><td>Re-enable all 4 triggers that were disabled</td></tr><tr><td>Recreate stored procedures</td><td>T+30m</td><td>Apply SCT-converted procedures to target</td></tr><tr><td>Recreate views</td><td>T+30m</td><td>Apply views to target</td></tr><tr><td>Verify Glue connectivity</td><td>T+1h</td><td>Ensure Glue JDBC connection (Project 24) reaches new RDS</td></tr><tr><td>Run Glue ETL test</td><td>T+2h</td><td>Execute Glue job to verify data flows to Redshift</td></tr><tr><td>Delete DMS resources</td><td>T+7d</td><td>Keep for 7 days as safety net → then delete replication instance, task, endpoints</td></tr><tr><td>Decommission source</td><td>T+30d</td><td>After 30 days of successful operation → decommission on-prem server</td></tr></tbody></table>
+<p><strong>Step G4 — Rollback Plan</strong></p>
+<p>→ If cutover fails:</p>
+<table><thead><tr><th>Scenario</th><th>Rollback Action</th></tr></thead><tbody><tr><td>Application errors on target</td><td>Switch connection string back to on-prem source within 5 minutes</td></tr><tr><td>Data integrity issues</td><td>Restart DMS task in CDC mode → re-sync → retry cutover</td></tr><tr><td>Performance issues on target</td><td>Scale up RDS instance class → retry</td></tr><tr><td>Network issues</td><td>Verify VPN → fall back to on-prem until resolved</td></tr></tbody></table>
+<p>→ Rollback is possible ONLY if the on-premises source is still running<br>
+→ Do NOT decommission source until 30 days of successful operation on target</p>
+<hr>
+<h3>SECTION H — POST-MIGRATION: INTEGRATION WITH GLUE → REDSHIFT PIPELINE</h3>
+<hr>
+<p><strong>Step H1 — Update Glue JDBC Connection</strong></p>
+<p>→ Builds on Project 24 (MariaDB to S3 via Glue ETL)<br>
+→ Glue Console → Connections → Select existing MariaDB connection → Edit</p>
+<table><thead><tr><th>Setting</th><th>Previous Value</th><th>New Value</th></tr></thead><tbody><tr><td>JDBC URL</td><td><code>jdbc:mysql://old-rds-endpoint:3306/datapulse_db</code></td><td><code>jdbc:mysql://datapulse-db.xxxxx.ap-south-1.rds.amazonaws.com:3306/datapulse_acquired</code></td></tr><tr><td>Username</td><td>Previous user</td><td>DMS migration user OR dedicated Glue user</td></tr><tr><td>Password</td><td>Previous password</td><td>New password from Secrets Manager</td></tr><tr><td>VPC</td><td>Same</td><td>Same (RDS is in same VPC)</td></tr><tr><td>Subnet</td><td>Same</td><td>Same</td></tr><tr><td>Security Group</td><td>Same</td><td>Same (or update if RDS SG changed)</td></tr></tbody></table>
+<p>→ Test Connection → Verify success</p>
+<p><strong>Step H2 — Update Glue Crawler for New Schema</strong></p>
+<p>→ Builds on Project 17 (Glue Crawler)<br>
+→ Glue Console → Crawlers → Create new crawler for acquired data</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Crawler Name</td><td><code>insightworks-acquired-data-crawler</code></td></tr><tr><td>Data Source</td><td>JDBC → <code>datapulse-rds-mariadb</code> connection</td></tr><tr><td>Include Path</td><td><code>datapulse_acquired/%</code></td></tr><tr><td>IAM Role</td><td>Glue service role (existing)</td></tr><tr><td>Database</td><td><code>datapulse_acquired_catalog</code></td></tr><tr><td>Schedule</td><td>Daily (or on-demand initially)</td></tr></tbody></table>
+<p>→ Run crawler → Glue Data Catalog now has table definitions for all acquired tables</p>
+<p><strong>Step H3 — Create Glue ETL Job for Acquired Data</strong></p>
+<p>→ Builds on Project 24 (MariaDB to S3) and Project 21 (Glue ETL)<br>
+→ Glue Console → ETL Jobs → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job Name</td><td><code>insightworks-mariadb-to-s3-etl</code></td></tr><tr><td>IAM Role</td><td>Glue service role</td></tr><tr><td>Type</td><td>Spark</td></tr><tr><td>Glue Version</td><td>4.0</td></tr><tr><td>Worker Type</td><td>G.1X</td></tr><tr><td>Number of Workers</td><td>10</td></tr><tr><td>Job Bookmark</td><td>✅ Enable (Project 46 — incremental processing)</td></tr><tr><td>Source</td><td>JDBC → datapulse_acquired database</td></tr><tr><td>Transformations</td><td>Schema mapping, data type alignment, deduplication</td></tr><tr><td>Target</td><td>S3 → <code>s3://datapulse-data-lake-prod/acquired/insightworks/</code> → Parquet format</td></tr><tr><td>Partitioning</td><td>year/month/day based on transaction_date</td></tr></tbody></table>
+<p><strong>Step H4 — Extend Existing Glue Workflow</strong></p>
+<p>→ Builds on Project 31 (Glue Workflow)<br>
+→ Glue Console → Workflows → Edit existing pipeline workflow</p>
+<p>→ Add new steps:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXISTING WORKFLOW:
+</span>┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Crawler:      │     │ ETL Job:     │     │ Redshift     │
+│ DataPulse     │────▶│ Transform &amp;  │────▶│ COPY from    │
+│ Core Data     │     │ Load to S3   │     │ S3           │
+└──────────────┘     └──────────────┘     └──────────────┘
+
+EXTENDED WORKFLOW (parallel branch):
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Crawler:      │     │ ETL Job:     │     │ Redshift     │
+│ InsightWorks  │────▶│ Transform &amp;  │────▶│ COPY from    │
+│ Acquired Data │     │ Load to S3   │     │ S3 (acquired)│
+└──────────────┘     └──────────────┘     └──────────────┘</code></pre></div>
+<p>→ Both branches run in parallel within the same workflow<br>
+→ After both complete → trigger a Glue job that creates unified views in Redshift</p>
+<p><strong>Step H5 — Load Acquired Data into Redshift</strong></p>
+<p>→ Builds on Project 22 (Redshift COPY from S3)<br>
+→ Redshift schema for acquired data:</p>
+<table><thead><tr><th>Redshift Schema</th><th>Tables</th><th>Source</th></tr></thead><tbody><tr><td><code>acquired_insightworks</code></td><td>Mirrors acquired MariaDB tables</td><td>S3 Parquet files from Glue ETL</td></tr></tbody></table>
+<p>→ COPY configuration:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Source</td><td><code>s3://datapulse-data-lake-prod/acquired/insightworks/customers/</code></td></tr><tr><td>Format</td><td>Parquet</td></tr><tr><td>IAM Role</td><td>Redshift service role (existing — from Project 22)</td></tr><tr><td>COMPUPDATE</td><td>ON (auto-detect compression)</td></tr></tbody></table>
+<p><strong>Step H6 — Create Unified Analytics Views</strong></p>
+<p>→ In Redshift, create views that JOIN core DataPulse data with acquired InsightWorks data:</p>
+<table><thead><tr><th>View</th><th>Purpose</th><th>Tables Joined</th></tr></thead><tbody><tr><td><code>analytics.unified_customers</code></td><td>All customers from both companies</td><td><code>core.customers</code> + <code>acquired_insightworks.customers</code></td></tr><tr><td><code>analytics.unified_transactions</code></td><td>All transactions</td><td><code>core.transactions</code> + <code>acquired_insightworks.transaction_history</code></td></tr><tr><td><code>analytics.unified_products</code></td><td>Combined product catalog</td><td><code>core.products</code> + <code>acquired_insightworks.product_catalog</code></td></tr></tbody></table>
+<p>→ These views power the unified analytics dashboards<br>
+→ QuickSight (Project 59) can query these views for cross-company analytics</p>
+<hr>
+<h3>SECTION I — PREPARING FOR FUTURE MIGRATIONS (3 MORE DATABASES)</h3>
+<hr>
+<p><strong>Step I1 — Document Migration Runbook</strong></p>
+<table><thead><tr><th>Section</th><th>Content</th></tr></thead><tbody><tr><td>Prerequisites</td><td>VPN setup, source prep, target prep checklist</td></tr><tr><td>DMS Configuration</td><td>Replication instance specs, endpoint settings, task settings</td></tr><tr><td>Table Mapping Template</td><td>Standard transformation rules for InsightWorks schema</td></tr><tr><td>Cutover Procedure</td><td>Step-by-step cutover plan with timestamps and responsible parties</td></tr><tr><td>Rollback Procedure</td><td>How to revert if cutover fails</td></tr><tr><td>Post-Migration Validation</td><td>Queries to verify data integrity</td></tr><tr><td>Pipeline Integration</td><td>Steps to add new source to Glue → Redshift workflow</td></tr></tbody></table>
+<p><strong>Step I2 — Create Reusable DMS Configuration</strong></p>
+<p>→ For the 3 remaining regional databases:</p>
+<ul>
+<li>Reuse the same replication instance (if regions are accessible via VPN)</li>
+<li>Create new source endpoints per regional database</li>
+<li>Reuse the same target endpoint (same RDS instance, different schema)</li>
+<li>Clone the migration task with modified table mappings per region</li>
+</ul>
+<p>→ Naming convention for future migrations:</p>
+<table><thead><tr><th>Database</th><th>Source Endpoint</th><th>Target Schema</th><th>Task Name</th></tr></thead><tbody><tr><td>InsightWorks HQ (done)</td><td><code>insightworks-hq-source</code></td><td><code>datapulse_acquired_hq</code></td><td><code>iw-hq-migration</code></td></tr><tr><td>InsightWorks West</td><td><code>insightworks-west-source</code></td><td><code>datapulse_acquired_west</code></td><td><code>iw-west-migration</code></td></tr><tr><td>InsightWorks East</td><td><code>insightworks-east-source</code></td><td><code>datapulse_acquired_east</code></td><td><code>iw-east-migration</code></td></tr><tr><td>InsightWorks South</td><td><code>insightworks-south-source</code></td><td><code>datapulse_acquired_south</code></td><td><code>iw-south-migration</code></td></tr></tbody></table>
+<p><strong>Step I3 — Consider DMS Serverless for Future Migrations</strong></p>
+<p>→ DMS Serverless (newer offering) eliminates replication instance management:</p>
+<table><thead><tr><th>Aspect</th><th>DMS Classic (Used Above)</th><th>DMS Serverless</th></tr></thead><tbody><tr><td>Instance Management</td><td>You choose and manage instance class</td><td>AWS auto-provisions and scales</td></tr><tr><td>Sizing</td><td>Manual — you choose dms.r5.xlarge</td><td>Automatic — specify min/max capacity units</td></tr><tr><td>Scaling</td><td>Manual resize (causes downtime)</td><td>Automatic scaling based on workload</td></tr><tr><td>Cost</td><td>Per-hour based on instance class</td><td>Per-hour based on capacity units consumed</td></tr><tr><td>Best For</td><td>Predictable, well-understood migrations</td><td>Variable workloads, multiple concurrent tasks</td></tr></tbody></table>
+<p>→ For the 3 remaining migrations → evaluate DMS Serverless:<br>
+→ DMS Console → Serverless Replications → Create</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Min Capacity Units (DCU)</td><td>2</td></tr><tr><td>Max Capacity Units (DCU)</td><td>16</td></tr><tr><td>Multi-AZ</td><td>✅ Yes</td></tr></tbody></table>
+<p>→ DMS Serverless auto-scales between 2 and 16 DCUs based on migration workload<br>
+→ No instance class selection needed</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use Full Load + CDC for production migrations — minimizes downtime to minutes<br>
+→ Always test endpoint connectivity BEFORE creating the migration task<br>
+→ Always pre-create schema on target using SCT — gives you full control over schema design<br>
+→ Always drop secondary indexes before full load — recreate after load completes (10x+ speed improvement)<br>
+→ Always disable triggers on target during migration — prevents duplicate side effects<br>
+→ Always enable DMS validation — catches data mismatches automatically<br>
+→ Always configure CloudWatch logging and alarms for DMS tasks<br>
+→ Always use SSL/TLS for both source and target endpoints — encrypt data in transit<br>
+→ Always encrypt the replication instance storage with KMS<br>
+→ Always keep the source database running for 30 days after cutover — safety net for rollback<br>
+→ Always partition large tables for parallel load — dramatically reduces load time<br>
+→ Always document the migration runbook — essential for repeatable migrations<br>
+→ Always verify binlog_format = ROW before starting CDC — MIXED or STATEMENT format will cause failures<br>
+→ Always set binlog retention to cover the entire migration duration plus buffer<br>
+→ Always configure the replication instance in a private subnet — never publicly accessible<br>
+→ Always revert target parameter group to production values after migration completes</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never start migration without testing endpoint connectivity first — silent failures waste hours<br>
+→ Never use DMS to migrate stored procedures, views, or triggers — they must be migrated separately via SCT<br>
+→ Never keep secondary indexes during full load — each INSERT triggers index update → 5-10x slower<br>
+→ Never ignore CDC latency metrics — growing latency means replication is falling behind<br>
+→ Never cutover while CDCIncomingChanges &gt; 0 — target is not caught up<br>
+→ Never decommission source immediately after cutover — always keep as rollback option<br>
+→ Never use public internet for DMS endpoints without SSL — data traverses unencrypted<br>
+→ Never run DMS replication instance with insufficient storage — if local storage fills up, task fails<br>
+→ Never skip the SCT assessment — it identifies migration issues BEFORE they become runtime failures<br>
+→ Never use binlog_format = STATEMENT for DMS CDC — non-deterministic statements cause data inconsistency<br>
+→ Never create the DMS replication instance in a public subnet — security violation<br>
+→ Never assume DMS handles all data types identically — test edge cases (BLOBs, JSON, spatial data)<br>
+→ Never run multiple large migration tasks on an undersized replication instance — resource contention causes failures<br>
+→ Never forget to re-enable foreign key checks and triggers after cutover — application behavior depends on them</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Right Tool</th></tr></thead><tbody><tr><td>Migrate database with &lt; 30 minutes downtime</td><td>DMS Full Load + CDC</td></tr><tr><td>One-time migration, hours of downtime acceptable</td><td>mysqldump/pg_dump → S3 → import</td></tr><tr><td>Continuous replication between on-prem and AWS</td><td>DMS CDC only (ongoing)</td></tr><tr><td>Schema conversion between different engines (Oracle → PostgreSQL)</td><td>AWS Schema Conversion Tool (SCT) + DMS</td></tr><tr><td>Same engine migration (MariaDB → MariaDB)</td><td>DMS (minimal schema conversion needed)</td></tr><tr><td>Very large database (&gt; 10 TB)</td><td>AWS Snowball Edge + DMS CDC for delta sync</td></tr><tr><td>Real-time analytics replication (DB → Redshift)</td><td>DMS with Redshift as target</td></tr><tr><td>Ongoing data sync between two databases</td><td>DMS CDC continuous replication</td></tr><tr><td>One-time migration of small database (&lt; 10 GB)</td><td>Native database tools (mysqldump, etc.)</td></tr><tr><td>Network bandwidth limited (&lt; 100 Mbps)</td><td>AWS Snowball for initial load + DMS CDC for ongoing</td></tr><tr><td>Migrate to Aurora from MySQL/MariaDB</td><td>DMS OR native Aurora migration (Aurora supports MySQL binary log replication natively)</td></tr><tr><td>Need to transform data during migration</td><td>DMS table mappings + transformation rules</td></tr><tr><td>Need complex transformations beyond DMS capability</td><td>DMS to staging → Glue ETL for complex transforms → target</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use DMS when native replication works (e.g., MySQL → Aurora MySQL — native binlog replication is simpler)<br>
+→ Do NOT use DMS for application-level data migration (ETL between different data models) — use Glue instead<br>
+→ Do NOT use DMS Full Load alone when you need near-zero downtime — you need CDC for that<br>
+→ Do NOT use DMS for migrating to/from file-based systems — DMS works with databases, not files<br>
+→ Do NOT use DMS for streaming data ingestion — use Kinesis (Project 52)<br>
+→ Do NOT use DMS when database is &lt; 1 GB and downtime is acceptable — native tools are simpler<br>
+→ Do NOT use DMS for data warehouse loading when data is already in S3 — use Redshift COPY directly (Project 22)<br>
+→ Do NOT use DMS to replicate between two Redshift clusters — use Redshift data sharing or snapshot copy<br>
+→ Do NOT use DMS Serverless for migrations requiring precise resource control — use Classic for predictable sizing</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>DMS ARCHITECTURE</h3>
+<p><strong>1 → Replication Instance Internals</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────────────────────────┐
+</span>│              DMS REPLICATION INSTANCE                        │
+│              (Managed EC2 under the hood)                    │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                REPLICATION ENGINE                      │   │
+│  │                                                        │   │
+│  │  ┌─────────────┐    ┌─────────────┐                   │   │
+│  │  │ SOURCE       │    │ TARGET       │                   │   │
+│  │  │ CONNECTOR    │    │ CONNECTOR    │                   │   │
+│  │  │              │    │              │                   │   │
+│  │  │ • MySQL/     │    │ • MySQL/     │                   │   │
+│  │  │   MariaDB    │    │   MariaDB    │                   │   │
+│  │  │   protocol   │    │   protocol   │                   │   │
+│  │  │ • Binlog     │    │ • Batch      │                   │   │
+│  │  │   reader     │    │   writer     │                   │   │
+│  │  └──────┬───────┘    └──────▲───────┘                   │   │
+│  │         │                   │                            │   │
+│  │  ┌──────▼───────────────────┴───────┐                   │   │
+│  │  │     REPLICATION TASK ENGINE       │                   │   │
+│  │  │                                   │                   │   │
+│  │  │  ┌──────────────────────────────┐ │                   │   │
+│  │  │  │  FULL LOAD MANAGER           │ │                   │   │
+│  │  │  │  • Table iterator            │ │                   │   │
+│  │  │  │  • Parallel load scheduler   │ │                   │   │
+│  │  │  │  • Segment manager           │ │                   │   │
+│  │  │  └──────────────────────────────┘ │                   │   │
+│  │  │                                   │                   │   │
+│  │  │  ┌──────────────────────────────┐ │                   │   │
+│  │  │  │  CDC ENGINE                  │ │                   │   │
+│  │  │  │  • Binlog position tracker   │ │                   │   │
+│  │  │  │  • Change event parser       │ │                   │   │
+│  │  │  │  • Transaction grouper       │ │                   │   │
+│  │  │  │  • Conflict resolver         │ │                   │   │
+│  │  │  └──────────────────────────────┘ │                   │   │
+│  │  │                                   │                   │   │
+│  │  │  ┌──────────────────────────────┐ │                   │   │
+│  │  │  │  TRANSFORMATION ENGINE       │ │                   │   │
+│  │  │  │  • Table mapping rules       │ │                   │   │
+│  │  │  │  • Column mapping            │ │                   │   │
+│  │  │  │  • Data type conversion      │ │                   │   │
+│  │  │  │  • Filter rules              │ │                   │   │
+│  │  │  └──────────────────────────────┘ │                   │   │
+│  │  └───────────────────────────────────┘                   │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              LOCAL STORAGE                             │   │
+│  │                                                        │   │
+│  │  • Sort space for large tables                        │   │
+│  │  • CDC change cache (before applying to target)       │   │
+│  │  • LOB (Large Object) temporary storage               │   │
+│  │  • Task logs and diagnostic data                      │   │
+│  └──────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>2 → Full Load Internal Process</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: DMS queries source for list of tables matching selection rules
+</span>            │
+            ▼
+Step 2: For each table (up to N in parallel):
+            │
+            ├── Query: SELECT * FROM table [WHERE partition_condition]
+            │   (Reads in chunks — not one giant query)
+            │
+            ├── Data flows through transformation engine
+            │   (Apply renaming, column removal, type conversion)
+            │
+            ├── Data buffered in replication instance memory/disk
+            │
+            └── Bulk INSERT into target table
+                (Batched for performance)
+            │
+            ▼
+Step 3: After all rows loaded for a table:
+            │
+            ├── Mark table as "Full Load Complete"
+            │
+            └── Begin applying cached CDC changes for this table
+                (Changes that occurred DURING full load)
+            │
+            ▼
+Step 4: After ALL tables complete full load:
+            │
+            └── Transition to pure CDC mode</code></pre></div>
+<p><strong>3 → CDC (Change Data Capture) Internal Process for MariaDB</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: DMS connects to source MariaDB as a replication slave
+</span>            │
+            ├── Uses REPLICATION SLAVE privilege
+            │
+            └── Requests binlog events starting from the position
+                recorded at full load start
+            │
+            ▼
+Step 2: MariaDB sends binlog events to DMS:
+            │
+            ├── INSERT events → Row image of new row
+            │
+            ├── UPDATE events → Before image + After image
+            │   (This is why binlog_row_image = FULL is required)
+            │
+            └── DELETE events → Row image of deleted row
+            │
+            ▼
+Step 3: DMS CDC Engine processes events:
+            │
+            ├── Parse binlog event format
+            │
+            ├── Map to source table/column definitions
+            │
+            ├── Apply transformation rules
+            │
+            ├── Group changes by transaction (maintain consistency)
+            │
+            └── Apply to target in transaction batches
+            │
+            ▼
+Step 4: DMS tracks binlog position:
+            │
+            ├── After successful apply → update checkpoint
+            │
+            └── If DMS restarts → resume from last checkpoint
+                (No data loss, no duplicate processing)</code></pre></div>
+<p><strong>4 → Why ROW Format is Required</strong></p>
+<table><thead><tr><th>Binlog Format</th><th>What is Logged</th><th>DMS Compatibility</th></tr></thead><tbody><tr><td>STATEMENT</td><td>The SQL statement itself</td><td>❌ Incompatible — non-deterministic functions (NOW(), RAND()) produce different results on target</td></tr><tr><td>ROW</td><td>Actual row data changes</td><td>✅ Compatible — exact data is captured and replayed</td></tr><tr><td>MIXED</td><td>Statement for safe operations, Row for unsafe</td><td>❌ Partially incompatible — DMS cannot reliably parse mixed format</td></tr></tbody></table>
+<p>→ ROW format logs the ACTUAL data that changed — not the SQL that caused the change<br>
+→ This guarantees the target receives identical data regardless of function behavior</p>
+<p><strong>5 → DMS Validation Internal Mechanics</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VALIDATION PROCESS:
+</span>            │
+Step 1:     ├── DMS selects a batch of rows from SOURCE
+            │   (Using primary key range)
+            │
+Step 2:     ├── DMS selects the same rows from TARGET
+            │   (Using same primary key values)
+            │
+Step 3:     ├── DMS compares row-by-row:
+            │   │
+            │   ├── Row exists in source but NOT in target → "Missing" finding
+            │   │
+            │   ├── Row exists in target but NOT in source → "Extra" finding  
+            │   │
+            │   └── Row exists in both but column values differ → "Mismatch" finding
+            │
+Step 4:     ├── Mismatched rows are logged to:
+            │   │
+            │   ├── DMS control table: awsdms_validation_failures_v1
+            │   │   (Created on target database)
+            │   │
+            │   ├── CloudWatch Logs (if enabled)
+            │   │
+            │   └── DMS Console → Table Statistics → Validation columns
+            │
+Step 5:     └── Validation runs CONTINUOUSLY during CDC
+                │
+                ├── Re-validates previously mismatched rows on next pass
+                │
+                └── Accounts for CDC lag (waits for target to catch up
+                    before comparing recently changed rows)</code></pre></div>
+<p>→ Validation does NOT compare every column of every row every time<br>
+→ It uses a hash-based comparison:</p>
+<ul>
+<li>Computes hash of row on source</li>
+<li>Computes hash of same row on target</li>
+<li>If hashes match → row is validated (no column-by-column comparison needed)</li>
+<li>If hashes differ → performs column-by-column comparison to identify which columns mismatch</li>
+<li>This makes validation efficient even for tables with many columns</li>
+</ul>
+<p>→ Validation limitations:</p>
+<ul>
+<li>Tables WITHOUT primary keys cannot be validated (DMS needs PK to identify rows)</li>
+<li>LOB columns are not included in validation by default (too large for hash comparison)</li>
+<li>Validation adds ~10-20% overhead to replication instance CPU</li>
+</ul>
+<p><strong>6 → DMS Task State Machine</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    ┌──────────┐
+</span>                    │ CREATING │
+                    └────┬─────┘
+                         │
+                    ┌────▼─────┐
+                    │  READY   │
+                    └────┬─────┘
+                         │ (Start Task)
+                    ┌────▼─────┐
+                    │ STARTING │
+                    └────┬─────┘
+                         │
+                    ┌────▼─────┐
+                    │ RUNNING  │ ◄── Normal operational state
+                    └────┬─────┘
+                         │
+              ┌──────────┼──────────┐
+              │          │          │
+         ┌────▼───┐ ┌───▼────┐ ┌──▼──────┐
+         │STOPPING│ │MODIFYING│ │ FAILED  │
+         └────┬───┘ └───┬────┘ └────┬────┘
+              │         │           │
+         ┌────▼───┐ ┌───▼────┐     │
+         │STOPPED │ │RUNNING │     │ (Restart)
+         └────────┘ └────────┘     │
+                                   │
+                              ┌────▼────┐
+                              │ RUNNING │
+                              └─────────┘</code></pre></div>
+<p>→ Key state transitions:</p>
+<ul>
+<li>RUNNING → STOPPED: Manual stop or scheduled stop</li>
+<li>RUNNING → FAILED: Unrecoverable error (connection lost, permission denied, disk full)</li>
+<li>FAILED → RUNNING: Restart task (resumes from last checkpoint)</li>
+<li>STOPPED → RUNNING: Resume task (resumes from last checkpoint)</li>
+</ul>
+<p><strong>7 → DMS Replication Instance Multi-AZ Mechanics</strong></p>
+<p>→ When Multi-AZ is enabled on the replication instance:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────┐     ┌─────────────────────┐
+</span>│  PRIMARY INSTANCE   │     │  STANDBY INSTANCE   │
+│  (AZ-a)             │     │  (AZ-b)             │
+│                     │     │                     │
+│  • Runs all tasks   │────▶│  • Synchronous      │
+│  • Processes CDC    │     │    replication of    │
+│  • Handles I/O      │     │    task state        │
+│                     │     │  • No tasks running  │
+│                     │     │  • Ready for failover│
+└──────────┬──────────┘     └──────────┬──────────┘
+           │                           │
+           │     If Primary fails:     │
+           │                           │
+           └───────────────────────────┘
+                        │
+                   ┌────▼────────────────┐
+                   │  STANDBY becomes    │
+                   │  PRIMARY            │
+                   │                     │
+                   │  • Tasks resume     │
+                   │    from checkpoint  │
+                   │  • No data loss     │
+                   │  • Automatic        │
+                   │    (no manual       │
+                   │     intervention)   │
+                   └─────────────────────┘</code></pre></div>
+<p>→ Failover typically completes in under 1 minute<br>
+→ Tasks resume from last committed checkpoint — no data loss<br>
+→ CDC position is preserved — no duplicate or missing changes</p>
+<p><strong>8 → DMS Network Path for Full Load + CDC</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────┐                    ┌────────────────────────────┐
+</span>│  ON-PREMISES     │                    │  AWS VPC                    │
+│                  │                    │                              │
+│  ┌────────────┐  │    VPN Tunnel      │  ┌────────────────────┐    │
+│  │ MariaDB    │  │◄═══════════════════│  │ DMS Replication    │    │
+│  │ Source     │  │  (IPSec encrypted) │  │ Instance           │    │
+│  │            │──┤                    │  │                    │    │
+│  │ Port 3306  │  │ Full Load:         │  │ Reads from source  │    │
+│  │            │  │ SELECT * FROM...   │  │ via MySQL protocol │    │
+│  │ Binlog     │  │                    │  │                    │    │
+│  │ stream  ───┤──┤ CDC:              │  │ Writes to target   │    │
+│  │            │  │ Binlog events      │  │ via MySQL protocol │    │
+│  └────────────┘  │                    │  └─────────┬──────────┘    │
+│                  │                    │            │                │
+└──────────────────┘                    │            │ Private subnet │
+                                        │            │ connectivity   │
+                                        │  ┌─────────▼──────────┐    │
+                                        │  │ RDS MariaDB        │    │
+                                        │  │ Target             │    │
+                                        │  │                    │    │
+                                        │  │ Port 3306          │    │
+                                        │  └────────────────────┘    │
+                                        │                              │
+                                        └────────────────────────────┘</code></pre></div>
+<p>→ DMS replication instance INITIATES connections to both source and target<br>
+→ Source does NOT need to connect to AWS — DMS reaches out to the source<br>
+→ This is why the DMS security group needs OUTBOUND rules to both endpoints<br>
+→ The on-premises firewall needs INBOUND from AWS VPC CIDR on port 3306</p>
+<p><strong>9 → DMS Task Metrics Internal Collection</strong></p>
+<p>→ DMS publishes metrics to CloudWatch every 60 seconds:</p>
+<table><thead><tr><th>Metric</th><th>How It's Calculated</th></tr></thead><tbody><tr><td>CDCLatencySource</td><td>Time difference between current binlog position and latest binlog event on source</td></tr><tr><td>CDCLatencyTarget</td><td>Time difference between event timestamp in binlog and when it's applied on target</td></tr><tr><td>CDCIncomingChanges</td><td>Count of binlog events received but not yet applied to target</td></tr><tr><td>CDCChangesMemorySource</td><td>Binlog events cached in memory waiting to be processed</td></tr><tr><td>CDCChangesMemoryTarget</td><td>Processed events cached in memory waiting to be written to target</td></tr><tr><td>CDCChangesDiskSource</td><td>Binlog events spilled to disk (memory full)</td></tr><tr><td>CDCChangesDiskTarget</td><td>Processed events spilled to disk</td></tr><tr><td>FullLoadThroughputBandwidthTarget</td><td>Bytes/second written to target during full load</td></tr><tr><td>FullLoadThroughputRowsTarget</td><td>Rows/second written to target during full load</td></tr><tr><td>FreeableMemory</td><td>Available memory on replication instance</td></tr><tr><td>FreeStorageSpace</td><td>Available disk on replication instance</td></tr><tr><td>CPUUtilization</td><td>CPU usage of replication instance</td></tr></tbody></table>
+<p>→ When CDCChangesDiskSource or CDCChangesDiskTarget &gt; 0:</p>
+<ul>
+<li>Replication instance memory is insufficient</li>
+<li>Events are spilling to disk → significant performance degradation</li>
+<li>Action: Upgrade replication instance class (more memory)</li>
+</ul>
+<hr>
+<h3>AWS SCHEMA CONVERSION TOOL (SCT) INTERNAL MECHANICS</h3>
+<p><strong>1 → SCT Assessment Process</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+</span>│  CONNECT TO  │     │  ANALYZE     │     │  GENERATE    │
+│  SOURCE DB   │────▶│  SCHEMA      │────▶│  REPORT      │
+│              │     │  OBJECTS     │     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │ For each    │
+                     │ object:     │
+                     │             │
+                     │ • Tables    │
+                     │ • Columns   │
+                     │ • Indexes   │
+                     │ • Views     │
+                     │ • Procedures│
+                     │ • Functions │
+                     │ • Triggers  │
+                     │ • Sequences │
+                     └──────┬──────┘
+                            │
+                     ┌──────▼──────┐
+                     │ CLASSIFY:   │
+                     │             │
+                     │ GREEN:      │
+                     │ Auto-convert│
+                     │ (no issues) │
+                     │             │
+                     │ YELLOW:     │
+                     │ Auto-convert│
+                     │ with warning│
+                     │             │
+                     │ RED:        │
+                     │ Cannot auto-│
+                     │ convert —   │
+                     │ manual fix  │
+                     │ required    │
+                     └─────────────┘</code></pre></div>
+<p>→ SCT classification for same-engine migration (MariaDB → MariaDB):</p>
+<ul>
+<li>Most objects are GREEN (identical syntax)</li>
+<li>YELLOW items: Character set differences, deprecated features</li>
+<li>RED items: Engine-specific features not available in RDS version</li>
+</ul>
+<p>→ SCT classification for cross-engine migration (Oracle → PostgreSQL):</p>
+<ul>
+<li>Many RED items: PL/SQL → PL/pgSQL conversion required</li>
+<li>Stored procedures often need manual rewriting</li>
+<li>This is where SCT provides the most value</li>
+</ul>
+<p><strong>2 → SCT vs DMS Responsibility Split</strong></p>
+<table><thead><tr><th>Object Type</th><th>SCT Responsibility</th><th>DMS Responsibility</th></tr></thead><tbody><tr><td>Table structure (DDL)</td><td>✅ Converts and creates</td><td>✅ Can create basic structure (no indexes/constraints)</td></tr><tr><td>Table data</td><td>❌ Does not migrate data</td><td>✅ Full Load + CDC</td></tr><tr><td>Primary keys</td><td>✅ Converts</td><td>✅ Creates if using "Do nothing" mode</td></tr><tr><td>Secondary indexes</td><td>✅ Converts</td><td>❌ Does not create</td></tr><tr><td>Foreign keys</td><td>✅ Converts</td><td>❌ Does not create</td></tr><tr><td>Triggers</td><td>✅ Converts</td><td>❌ Does not migrate</td></tr><tr><td>Stored procedures</td><td>✅ Converts (best effort)</td><td>❌ Does not migrate</td></tr><tr><td>Views</td><td>✅ Converts</td><td>❌ Does not migrate by default</td></tr><tr><td>Sequences</td><td>✅ Converts</td><td>❌ Does not migrate</td></tr><tr><td>User-defined types</td><td>✅ Converts</td><td>❌ Does not migrate</td></tr></tbody></table>
+<p>→ Best practice: Use SCT for schema + DMS for data<br>
+→ This gives you the most control and the most complete migration</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Impact</th><th>Prevention</th></tr></thead><tbody><tr><td>1</td><td>binlog_format not set to ROW</td><td>CDC fails completely — DMS cannot parse STATEMENT or MIXED format changes</td><td>Verify <code>SHOW VARIABLES LIKE 'binlog_format'</code> = ROW before starting</td></tr><tr><td>2</td><td>binlog_row_image set to minimal</td><td>UPDATE events missing before-image — DMS cannot identify which row to update on target</td><td>Set <code>binlog_row_image = FULL</code></td></tr><tr><td>3</td><td>Binlog expired before CDC catches up</td><td>DMS loses position in binlog → cannot continue CDC → must restart full load</td><td>Set <code>expire_logs_days</code> to cover migration duration + 50% buffer</td></tr><tr><td>4</td><td>Replication instance storage fills up</td><td>Task fails with storage error → CDC events lost</td><td>Monitor FreeStorageSpace → set CloudWatch alarm at 20% remaining → increase storage proactively</td></tr><tr><td>5</td><td>Source table has no primary key</td><td>DMS cannot perform CDC on tables without PK — full load works but CDC skips the table</td><td>Add primary key to source tables before migration OR use unique index</td></tr><tr><td>6</td><td>Foreign key constraints on target during full load</td><td>Child table loaded before parent → FK violation → task fails for that table</td><td>Disable FK checks via parameter group (Step C2) OR DMS task setting</td></tr><tr><td>7</td><td>Triggers firing on target during full load</td><td>Trigger creates duplicate records or side effects</td><td>Disable all triggers on target before migration → re-enable after cutover</td></tr><tr><td>8</td><td>LOB columns with "Limited LOB mode"</td><td>Data truncated at LOB size limit (default 32 KB)</td><td>Use "Full LOB mode" for tables with large LOB data — slower but complete</td></tr><tr><td>9</td><td>Character set mismatch (latin1 source → utf8mb4 target)</td><td>Special characters display as garbled text</td><td>Configure DMS endpoint extra connection attributes for character set conversion → validate sample data</td></tr><tr><td>10</td><td>VPN tunnel drops during full load</td><td>DMS loses source connection → task fails</td><td>Use redundant VPN tunnels → DMS retries connection → if persistent failure, task pauses and can be resumed</td></tr><tr><td>11</td><td>Replication instance undersized for CDC change rate</td><td>CDCLatencyTarget grows continuously → never catches up → cutover impossible</td><td>Monitor CDCLatencyTarget trend → if consistently increasing, upgrade replication instance class</td></tr><tr><td>12</td><td>Source database performance degradation during full load</td><td>DMS SELECT queries compete with application queries → application slows down</td><td>Reduce parallel load threads → schedule full load during low-traffic hours → use read replica as source</td></tr><tr><td>13</td><td>Cutover without verifying CDC lag = 0</td><td>Target missing recent changes → data inconsistency → application errors</td><td>Always verify CDCIncomingChanges = 0 AND CDCLatencyTarget &lt; 5 seconds before cutover</td></tr><tr><td>14</td><td>Not recreating secondary indexes after full load</td><td>Query performance on target is terrible — full table scans everywhere</td><td>Include index recreation in cutover checklist → time it (large tables may take hours)</td></tr><tr><td>15</td><td>DMS task configured with wrong schema/table mapping</td><td>Wrong tables migrated OR tables migrated to wrong target schema</td><td>Test table mapping with "Premigration assessment" feature before starting full load</td></tr><tr><td>16</td><td>Auto-increment values reset on target</td><td>New inserts on target start from 1 instead of continuing from source's max value</td><td>DMS preserves auto-increment values during full load — but verify after migration</td></tr><tr><td>17</td><td>Timezone mismatch between source and target</td><td>Timestamp columns shift by hours → data appears incorrect</td><td>Set both endpoints to UTC via extra connection attributes</td></tr><tr><td>18</td><td>Running migration without premigration assessment</td><td>Issues discovered during runtime → task fails mid-migration → wasted hours</td><td>Always run DMS premigration assessment first → fix all FAILED checks</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Database Size Scaling</strong></p>
+<table><thead><tr><th>Source Size</th><th>Recommended Approach</th><th>Estimated Full Load Time (100 Mbps VPN)</th></tr></thead><tbody><tr><td>&lt; 10 GB</td><td>Single DMS task, dms.t3.medium</td><td>&lt; 30 minutes</td></tr><tr><td>10 – 100 GB</td><td>Single DMS task, dms.r5.large, parallel load</td><td>1 – 4 hours</td></tr><tr><td>100 GB – 1 TB</td><td>Single DMS task, dms.r5.xlarge, aggressive parallel load</td><td>4 – 24 hours</td></tr><tr><td>1 – 10 TB</td><td>Multiple DMS tasks (split by schema/table groups), dms.r5.2xlarge</td><td>1 – 5 days</td></tr><tr><td>10 – 50 TB</td><td>Snowball Edge for initial load + DMS CDC for delta sync</td><td>Days (Snowball shipping) + hours (CDC sync)</td></tr><tr><td>&gt; 50 TB</td><td>Direct Connect + multiple DMS tasks + parallel Snowball</td><td>Weeks of planning and execution</td></tr></tbody></table>
+<p>→ <strong>Network Bandwidth Impact</strong></p>
+<table><thead><tr><th>Bandwidth</th><th>Full Load 500 GB Duration</th><th>CDC Sustainable Change Rate</th></tr></thead><tbody><tr><td>10 Mbps</td><td>~4.6 days</td><td>~1.25 MB/s max throughput</td></tr><tr><td>100 Mbps</td><td>~11 hours</td><td>~12.5 MB/s max throughput</td></tr><tr><td>1 Gbps (VPN max)</td><td>~1.5 hours</td><td>~125 MB/s max throughput</td></tr><tr><td>10 Gbps (Direct Connect)</td><td>~10 minutes</td><td>~1.25 GB/s max throughput</td></tr></tbody></table>
+<p>→ DataPulse has ~100 Mbps effective VPN throughput → ~11 hours for full load<br>
+→ With overhead (CDC concurrent, metadata, retries) → realistic estimate: 6-10 hours</p>
+<p>→ <strong>Multiple Concurrent Migrations</strong></p>
+<table><thead><tr><th>Scenario</th><th>Configuration</th></tr></thead><tbody><tr><td>1 migration at a time</td><td>Single replication instance, appropriately sized</td></tr><tr><td>2-3 concurrent migrations</td><td>Single large replication instance (dms.r5.2xlarge+) with multiple tasks</td></tr><tr><td>4+ concurrent migrations</td><td>Multiple replication instances — each handling 1-2 tasks</td></tr><tr><td>10+ concurrent migrations</td><td>DMS Serverless — auto-scales capacity across tasks</td></tr></tbody></table>
+<p>→ Rule of thumb: Each DMS task consumes ~4-8 GB RAM depending on table count and LOB usage<br>
+→ dms.r5.xlarge (32 GB) can handle 2-3 concurrent tasks comfortably<br>
+→ dms.r5.2xlarge (64 GB) can handle 4-6 concurrent tasks</p>
+<p>→ <strong>Replication Instance Sizing Heuristic</strong></p>
+<table><thead><tr><th>Factor</th><th>Impact on Sizing</th></tr></thead><tbody><tr><td>Number of tables</td><td>More tables = more parallel threads = more memory</td></tr><tr><td>LOB columns</td><td>Full LOB mode requires significant memory per LOB column</td></tr><tr><td>CDC change rate</td><td>Higher change rate = more memory for CDC cache</td></tr><tr><td>Number of transformation rules</td><td>Complex transformations use more CPU</td></tr><tr><td>Validation enabled</td><td>Adds ~10-20% CPU and memory overhead</td></tr></tbody></table>
+<p>→ <strong>Post-Migration Pipeline Scaling</strong></p>
+<p>→ After migration to RDS → data flows into Glue → Redshift<br>
+→ As more databases are migrated (3 more InsightWorks regional DBs):</p>
+<ul>
+<li>RDS instance may need scaling (more storage, larger instance class)</li>
+<li>Glue ETL jobs need more workers for larger data volume</li>
+<li>Redshift may need more nodes (but RA3 managed storage scales automatically — Project 56)</li>
+<li>S3 data lake grows — Intelligent-Tiering (Project 56) handles cost optimization automatically</li>
+</ul>
+<p>→ <strong>Future Architecture: DMS for Ongoing Replication</strong></p>
+<p>→ After all 4 databases are migrated, DataPulse might keep DMS running for:</p>
+<ul>
+<li>Ongoing replication from RDS MariaDB to Redshift (real-time analytics)</li>
+<li>Cross-region replication for DR (replicating to RDS in another region)</li>
+<li>DMS supports Redshift as a target → can replace Glue ETL for simple load scenarios</li>
+</ul>
+<table><thead><tr><th>Pattern</th><th>Use Case</th></tr></thead><tbody><tr><td>DMS → RDS (one-time)</td><td>Migration (this project)</td></tr><tr><td>DMS → RDS (ongoing CDC)</td><td>Cross-region DR, read replica alternative</td></tr><tr><td>DMS → Redshift (ongoing CDC)</td><td>Real-time operational analytics</td></tr><tr><td>DMS → S3 (ongoing CDC)</td><td>Data lake ingestion from operational database</td></tr><tr><td>DMS → Kinesis (ongoing CDC)</td><td>Stream database changes for event-driven architectures</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to Verify Migration Success:</strong></p>
+<table><thead><tr><th>Verification Level</th><th>Method</th><th>Acceptable Result</th></tr></thead><tbody><tr><td>Row Count</td><td>Compare total rows per table: source vs target</td><td>Exact match (0 difference)</td></tr><tr><td>Data Integrity</td><td>DMS validation report</td><td>0 mismatches, 0 missing, 0 extra</td></tr><tr><td>Schema Completeness</td><td>Compare table structures source vs target</td><td>All columns, types, constraints present</td></tr><tr><td>Index Verification</td><td>List indexes on target</td><td>All primary + secondary indexes exist</td></tr><tr><td>Trigger Verification</td><td>List triggers on target</td><td>All triggers re-enabled and functional</td></tr><tr><td>Stored Procedure Test</td><td>Execute each procedure on target</td><td>Same results as source</td></tr><tr><td>Application Smoke Test</td><td>Run critical application paths against target</td><td>All features work correctly</td></tr><tr><td>Performance Benchmark</td><td>Run standard query set against target</td><td>Response times within 20% of source</td></tr><tr><td>CDC Lag Verification</td><td>DMS monitoring</td><td>CDCLatencyTarget &lt; 5 seconds at cutover time</td></tr></tbody></table>
+<p>→ <strong>How to Monitor During Migration:</strong></p>
+<table><thead><tr><th>Dashboard</th><th>Metrics to Watch</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>DMS Console → Task Monitoring</td><td>CDCLatencySource, CDCLatencyTarget</td><td>&gt; 300 seconds</td></tr><tr><td>DMS Console → Table Statistics</td><td>Full Load progress, validation status</td><td>Any table in FAILED state</td></tr><tr><td>CloudWatch → DMS Metrics</td><td>CPUUtilization, FreeStorageSpace, FreeableMemory</td><td>CPU &gt; 80%, Storage &lt; 20%, Memory &lt; 2 GB</td></tr><tr><td>CloudWatch → RDS Metrics</td><td>WriteIOPS, CPUUtilization, FreeStorageSpace</td><td>CPU &gt; 80%, Storage &lt; 20%</td></tr><tr><td>CloudWatch → VPN Metrics</td><td>TunnelState, TunnelDataIn, TunnelDataOut</td><td>TunnelState = DOWN</td></tr><tr><td>DMS CloudWatch Logs</td><td>Error messages, warning patterns</td><td>Any ERROR level log entries</td></tr></tbody></table>
+<p>→ <strong>Post-Migration Monitoring (First 30 Days):</strong></p>
+<table><thead><tr><th>Week</th><th>Focus Area</th><th>Actions</th></tr></thead><tbody><tr><td>Week 1</td><td>Application stability</td><td>Monitor error rates, response times, user reports</td></tr><tr><td>Week 2</td><td>Data consistency</td><td>Run validation queries comparing source and target</td></tr><tr><td>Week 3</td><td>Pipeline integration</td><td>Verify Glue → Redshift pipeline processing acquired data correctly</td></tr><tr><td>Week 4</td><td>Performance optimization</td><td>Analyze slow queries → add indexes → optimize parameter group</td></tr></tbody></table>
+<p>→ <strong>Migration Report Template:</strong></p>
+<table><thead><tr><th>Section</th><th>Content</th></tr></thead><tbody><tr><td>Executive Summary</td><td>Migration completed on [date], [downtime] minutes of downtime, [rows] rows migrated</td></tr><tr><td>Source Details</td><td>Database version, size, table count, row count</td></tr><tr><td>Target Details</td><td>RDS instance class, storage, parameter group</td></tr><tr><td>Migration Timeline</td><td>Full load start/end, CDC duration, cutover window</td></tr><tr><td>Data Validation</td><td>Row count comparison, DMS validation results, sample data verification</td></tr><tr><td>Issues Encountered</td><td>Any errors, workarounds applied, lessons learned</td></tr><tr><td>Post-Migration Actions</td><td>Indexes recreated, triggers enabled, parameters reverted, procedures deployed</td></tr><tr><td>Cost</td><td>DMS instance hours, data transfer, VPN costs, total migration cost</td></tr><tr><td>Recommendations</td><td>Improvements for next 3 regional migrations</td></tr></tbody></table>
+<p>→ <strong>How to Audit Migration Activities (Project 57 Integration):</strong></p>
+<table><thead><tr><th>Audit Requirement</th><th>How It's Captured</th></tr></thead><tbody><tr><td>Who created the DMS task?</td><td>CloudTrail: <code>dms:CreateReplicationTask</code> event</td></tr><tr><td>Who started the migration?</td><td>CloudTrail: <code>dms:StartReplicationTask</code> event</td></tr><tr><td>Who modified task settings?</td><td>CloudTrail: <code>dms:ModifyReplicationTask</code> event</td></tr><tr><td>Who stopped the task?</td><td>CloudTrail: <code>dms:StopReplicationTask</code> event</td></tr><tr><td>Network traffic during migration</td><td>VPC Flow Logs: DMS ↔ Source, DMS ↔ Target</td></tr><tr><td>Data encryption verification</td><td>KMS: <code>kms:Decrypt</code>, <code>kms:GenerateDataKey</code> events for replication instance</td></tr><tr><td>Database access during migration</td><td>RDS audit logs: All SQL statements executed by DMS user</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Database migration is a MULTI-PHASE operation — not a single step<br>
+→ DMS Full Load + CDC is the gold standard for near-zero-downtime migrations<br>
+→ Preparation is 70% of the work — network, source prep, target prep, schema conversion<br>
+→ CDC requires ROW-format binary logging — MIXED and STATEMENT formats are incompatible<br>
+→ Tables WITHOUT primary keys cannot use CDC — add PKs before migration<br>
+→ Always drop secondary indexes before full load and recreate after — 10x performance difference<br>
+→ Always disable triggers on target during migration — prevents duplicate side effects<br>
+→ DMS validation is essential — never assume data migrated correctly without verification<br>
+→ Cutover requires CDC lag = 0 — never cutover while target is behind source<br>
+→ Keep source running for 30 days after cutover — rollback safety net<br>
+→ Migration is only half the job — integration with existing Glue → Redshift pipeline completes the value chain<br>
+→ This project connects backward to:</p>
+<ul>
+<li>Project 9 (RDS MariaDB — the target database setup)</li>
+<li>Project 24 (MariaDB to S3 via Glue — the pipeline that consumes migrated data)</li>
+<li>Project 22 (Redshift COPY — loading data into the warehouse)</li>
+<li>Project 37 (Secrets Manager — storing database credentials securely)</li>
+<li>Project 57 (Security — encryption in transit, audit trail, VPC endpoints)</li>
+<li>Project 31 (Glue Workflow — extending the orchestration for acquired data)</li>
+<li>Project 46 (Glue Bookmarks — incremental processing of newly migrated data)<br>
+→ This project connects forward to:</li>
+<li>Project 59 (Serverless Analytics Platform) — the migrated data becomes available for self-service analytics via API Gateway → Lambda → Athena → QuickSight</li>
+<li>Project 60 (Data Mesh) — each acquired company becomes a "domain" in the data mesh, owning and publishing their data products</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ DataPulse has successfully migrated InsightWorks' on-premises MariaDB to AWS<br>
+→ The data flows through Glue → S3 → Redshift and is available for analytics<br>
+→ But the analytics team has a NEW demand:</p>
+<p>→ "We want business users to access analytics without needing SQL knowledge"<br>
+→ "We want a web-based dashboard that non-technical users can interact with"<br>
+→ "We want an API that mobile apps can call to get real-time analytics results"<br>
+→ "We want all of this WITHOUT managing any servers"</p>
+<p>→ Currently, accessing analytics requires:</p>
+<ul>
+<li>Connecting to Redshift with a SQL client (technical skill required)</li>
+<li>Running Athena queries in the AWS Console (AWS knowledge required)</li>
+<li>No mobile or web API for programmatic access</li>
+<li>No visualization layer for business users</li>
+</ul>
+<p>→ <strong>This is exactly the problem Project 59 solves</strong><br>
+→ Project 59 builds a Fully Serverless Analytics Platform:</p>
+<ul>
+<li>API Gateway provides REST API endpoints for programmatic access</li>
+<li>Lambda executes queries against Athena/Redshift</li>
+<li>S3 serves as the data lake (already built)</li>
+<li>Glue catalogs the data (already built)</li>
+<li>Athena provides serverless queries (already configured)</li>
+<li>QuickSight provides interactive dashboards with row-level security<br>
+→ No servers to manage — fully serverless, fully scalable<br>
+→ The data migrated in THIS project becomes immediately accessible to business users through Project 59's platform</li>
+</ul>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 59: "The Fully Serverless Analytics Platform — API Gateway → Lambda → S3 → Glue → Athena → QuickSight"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-57.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 58/60</span></div><a class="nav-btn next" href="project-59.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 41: THE CENTRAL ACCOUNT THAT NEEDED ALERTS FROM ALL ACCOUNTS — Inter-Acc — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 41: THE CENTRAL ACCOUNT THAT NEEDED ALERTS FROM ALL ACCOUNTS — Inter-Account SNS → SQS Notification</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's multi-account architecture is maturing (5 accounts from Project 40)<br>
+→ The Shared Services account (<code>555555555555</code>) is the centralized operations hub<br>
+→ Cross-account IAM role assumption is working (Project 40)<br>
+→ EventBridge rules exist within each account (Project 38)<br>
+→ But there is NO cross-account event flow for messaging</p>
+<p><strong>The Current Broken State:</strong></p>
+<table><thead><tr><th>Account</th><th>Events Generated</th><th>Who Needs to Know</th><th>Current Notification</th></tr></thead><tbody><tr><td>HQ (<code>111111111111</code>)</td><td>Glue ETL job failed</td><td>Shared Services monitoring team</td><td>SNS topic in HQ → emails HQ team only</td></tr><tr><td>HQ (<code>111111111111</code>)</td><td>Redshift COPY completed</td><td>Shared Services data pipeline orchestrator</td><td>No notification — Shared Services polls manually</td></tr><tr><td>Europe (<code>222222222222</code>)</td><td>New data file uploaded to S3</td><td>Shared Services validation pipeline</td><td>No notification — Shared Services doesn't know</td></tr><tr><td>Europe (<code>222222222222</code>)</td><td>RDS failover occurred</td><td>Shared Services incident management</td><td>SNS topic in Europe → emails Europe team only</td></tr><tr><td>US (<code>333333333333</code>)</td><td>Secrets Manager rotation failed</td><td>Shared Services security team</td><td>CloudTrail in US only — nobody monitors</td></tr><tr><td>US (<code>333333333333</code>)</td><td>Lambda function error spike</td><td>Shared Services monitoring dashboard</td><td>CloudWatch alarm in US → SNS in US only</td></tr><tr><td>Japan (<code>444444444444</code>)</td><td>Daily ETL completed successfully</td><td>Shared Services data quality team</td><td>No notification at all</td></tr></tbody></table>
+<p><strong>Specific Pain Points:</strong></p>
+<p><strong>Pain Point 1 — Notification Silos:</strong><br>
+→ Each account has its own SNS topics (Project 6)<br>
+→ Each account has its own SQS queues (Project 7)<br>
+→ Each account has its own EventBridge rules (Project 38)<br>
+→ The Shared Services team must log into EACH account individually to see what's happening<br>
+→ With 5 accounts → 5 separate consoles, 5 separate SNS dashboards, 5 separate alarm views</p>
+<p><strong>Pain Point 2 — Delayed Incident Response:</strong><br>
+→ HQ's Glue job fails at 2 AM<br>
+→ HQ's SNS topic sends email to HQ data engineers<br>
+→ HQ data engineers are sleeping<br>
+→ Shared Services on-call team (24/7) has no visibility<br>
+→ Issue discovered 6 hours later when HQ team wakes up<br>
+→ Downstream pipelines in Europe and US are broken because they depend on HQ's data</p>
+<p><strong>Pain Point 3 — Centralized Processing:</strong><br>
+→ Shared Services needs to:</p>
+<ul>
+<li>Aggregate alerts from all accounts into ONE processing queue</li>
+<li>Apply consistent incident classification logic</li>
+<li>Route to appropriate response teams based on severity and account</li>
+<li>Maintain a centralized audit trail of all operational events<br>
+→ This requires events from ALL accounts to flow into Shared Services' SQS queue</li>
+</ul>
+<p><strong>Pain Point 4 — Fan-Out Complexity:</strong><br>
+→ When HQ's Glue job fails:</p>
+<ul>
+<li>Shared Services monitoring should know (for dashboards)</li>
+<li>Shared Services incident management should know (for ticket creation)</li>
+<li>Europe team should know (their downstream pipeline depends on HQ's data)</li>
+<li>US team should know (their dashboard uses HQ's data)<br>
+→ This requires fan-out ACROSS accounts — not just within one account (Project 13)</li>
+</ul>
+<p><strong>The Operations Lead asks:</strong></p>
+<blockquote>
+<p>"I need a centralized notification architecture where:<br>
+Events from ANY account can publish to a CENTRAL topic or queue in Shared Services.<br>
+Shared Services can also push notifications TO other accounts when needed.<br>
+All of this with proper security — no account should be able to spam another."</p>
+</blockquote>
+<p>→ This requires cross-account SNS and SQS configuration — applying the trust model from Projects 39-40 to messaging services</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the THREE architectural patterns for cross-account messaging</p>
+<p><strong>Pattern 1 — Cross-Account SNS Publishing (Source publishes to central SNS topic):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account 111 (HQ)                    Account 555 (Shared Services)
+</span>┌──────────────────┐               ┌──────────────────────────────┐
+│ EventBridge Rule │──────────────►│ SNS Topic: Central-Alerts    │
+│ "Glue Job Failed"│  SNS Publish  │   ├── SQS: Monitoring Queue  │
+└──────────────────┘  (cross-acct) │   ├── SQS: Incident Queue    │
+                                   │   └── Lambda: Alert Processor │
+                                   └──────────────────────────────┘</code></pre></div>
+<p>→ HQ's EventBridge rule publishes directly to Shared Services' SNS topic<br>
+→ Requires: SNS topic policy in Shared Services allowing HQ to publish</p>
+<p><strong>Pattern 2 — Cross-Account SQS Sending (Source sends directly to central SQS queue):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account 222 (Europe)               Account 555 (Shared Services)
+</span>┌──────────────────┐               ┌──────────────────────────────┐
+│ EventBridge Rule │──────────────►│ SQS Queue: Central-Events    │
+│ "S3 Upload"      │  SQS Send    │   └── Lambda: Event Processor │
+└──────────────────┘  (cross-acct) └──────────────────────────────┘</code></pre></div>
+<p>→ Europe's EventBridge rule sends directly to Shared Services' SQS queue<br>
+→ Requires: SQS queue policy in Shared Services allowing Europe to send</p>
+<p><strong>Pattern 3 — Cross-Account EventBridge Bus-to-Bus (Most powerful):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account 333 (US)                   Account 555 (Shared Services)
+</span>┌──────────────────┐               ┌──────────────────────────────┐
+│ EventBridge Rule │──────────────►│ EventBridge: Central Bus      │
+│ "Rotation Failed"│  PutEvents   │   ├── Rule 1 → SQS           │
+└──────────────────┘  (cross-acct) │   ├── Rule 2 → Lambda        │
+                                   │   └── Rule 3 → SNS           │
+                                   └──────────────────────────────┘</code></pre></div>
+<p>→ US's EventBridge rule forwards events to Shared Services' custom event bus<br>
+→ Requires: EventBridge resource policy allowing US to put events</p>
+<p><strong>Which pattern for which use case:</strong></p>
+<table><thead><tr><th>Use Case</th><th>Best Pattern</th><th>Why</th></tr></thead><tbody><tr><td>Simple alert notification → email/SMS</td><td>Pattern 1 (SNS)</td><td>SNS handles fan-out to email/SMS subscribers</td></tr><tr><td>Buffered processing with guaranteed delivery</td><td>Pattern 2 (SQS)</td><td>SQS provides message retention, DLQ, visibility timeout</td></tr><tr><td>Complex routing with content-based filtering</td><td>Pattern 3 (EventBridge)</td><td>EventBridge rules provide rich pattern matching</td></tr><tr><td>Fan-out to multiple targets in central account</td><td>Pattern 1 (SNS → multiple SQS)</td><td>SNS fan-out pattern (Project 13)</td></tr><tr><td>High-volume event aggregation</td><td>Pattern 2 (SQS)</td><td>SQS handles high throughput with buffering</td></tr></tbody></table>
+<p>→ For ShopNow → Implement ALL THREE patterns for different use cases<br>
+→ The approach:</p>
+<ul>
+<li>Step 1 — Set up the central SNS topic with cross-account publish policy (Pattern 1)</li>
+<li>Step 2 — Set up the central SQS queue with cross-account send policy (Pattern 2)</li>
+<li>Step 3 — Set up cross-account SNS → SQS fan-out (Pattern 1 + Project 13)</li>
+<li>Step 4 — Configure source account EventBridge rules to target central SNS/SQS</li>
+<li>Step 5 — Set up cross-account EventBridge bus-to-bus forwarding (Pattern 3)</li>
+<li>Step 6 — Implement organizational condition for simplified multi-account policies</li>
+<li>Step 7 — Configure DLQ and error handling for cross-account messaging</li>
+<li>Step 8 — Set up encryption for cross-account messaging</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE CENTRAL SNS TOPIC WITH CROSS-ACCOUNT PUBLISH POLICY</h3>
+<p>→ Sign into Account <code>555555555555</code> (Shared Services)<br>
+→ Navigate to SNS → "Create topic"</p>
+<p><strong>Topic Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Type</td><td>Standard (not FIFO — EventBridge doesn't support FIFO SNS targets)</td></tr><tr><td>Name</td><td><code>shopnow-central-operations-alerts</code></td></tr><tr><td>Display name</td><td><code>ShopNow Central Ops</code> (appears in SMS/email headers)</td></tr><tr><td>Encryption</td><td>✅ Enable SSE-KMS</td></tr><tr><td>KMS key</td><td>Create new: <code>shopnow-sns-central-key</code> OR use existing <code>shopnow-shared-services-key</code></td></tr><tr><td>Tags — Purpose</td><td><code>CentralAlerts</code></td></tr><tr><td>Tags — Accounts</td><td><code>111,222,333,444</code></td></tr></tbody></table>
+<p><strong>Understanding SNS Topic Policy (Resource-Based Policy):</strong></p>
+<p>→ Just like S3 bucket policies (Project 10, 39) and KMS key policies (Project 36)<br>
+→ SNS topics have their own RESOURCE POLICY that controls who can perform actions on the topic<br>
+→ This is the mechanism for cross-account access — same dual-authorization model</p>
+<p><strong>Default Topic Policy (Auto-generated):</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Condition</th></tr></thead><tbody><tr><td>Default Owner Statement</td><td>Allow</td><td>Account <code>555555555555</code> (topic owner)</td><td><code>sns:*</code></td><td>None</td></tr></tbody></table>
+<p>→ By default → ONLY the owning account can publish/subscribe<br>
+→ We need to ADD cross-account publishing permissions</p>
+<p><strong>Enhanced Topic Policy — Cross-Account Publishing:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Owner Full Access</td><td>Allow</td><td><code>arn:aws:iam::555555555555:root</code></td><td><code>sns:*</code></td><td>Topic ARN</td><td>None</td></tr><tr><td>Allow HQ Account Publish</td><td>Allow</td><td><code>arn:aws:iam::111111111111:root</code></td><td><code>sns:Publish</code></td><td>Topic ARN</td><td>None</td></tr><tr><td>Allow Europe Account Publish</td><td>Allow</td><td><code>arn:aws:iam::222222222222:root</code></td><td><code>sns:Publish</code></td><td>Topic ARN</td><td>None</td></tr><tr><td>Allow US Account Publish</td><td>Allow</td><td><code>arn:aws:iam::333333333333:root</code></td><td><code>sns:Publish</code></td><td>Topic ARN</td><td>None</td></tr><tr><td>Allow Japan Account Publish</td><td>Allow</td><td><code>arn:aws:iam::444444444444:root</code></td><td><code>sns:Publish</code></td><td>Topic ARN</td><td>None</td></tr><tr><td>Allow EventBridge Service</td><td>Allow</td><td><code>events.amazonaws.com</code></td><td><code>sns:Publish</code></td><td>Topic ARN</td><td><code>aws:SourceAccount</code> in <code>[111111111111, 22222222222[REDACTED:BANK_ACCOUNT_NUMBER]333, 444444444444]</code></td></tr></tbody></table>
+<p><strong>CRITICAL: Understanding the Two Types of Cross-Account SNS Access:</strong></p>
+<p><strong>Type A — Account Principal (for IAM roles/users calling SNS API directly):</strong></p>
+<table><thead><tr><th>Principal</th><th>What It Means</th></tr></thead><tbody><tr><td><code>arn:aws:iam::111111111111:root</code></td><td>ANY IAM identity in Account 111 with <code>sns:Publish</code> IAM permission</td></tr><tr><td><code>arn:aws:iam::111111111111:role/HQ-EventBridgeRole</code></td><td>ONLY this specific role in Account 111</td></tr></tbody></table>
+<p>→ Using <code>:root</code> → Account A controls WHO specifically can publish via IAM policies<br>
+→ Using specific role ARN → Shared Services controls WHO specifically can publish via topic policy<br>
+→ Same dual-authorization pattern as Project 39's trust policy</p>
+<p><strong>Type B — Service Principal (for AWS services publishing on behalf of accounts):</strong></p>
+<table><thead><tr><th>Principal</th><th>Condition</th><th>What It Means</th></tr></thead><tbody><tr><td><code>events.amazonaws.com</code></td><td><code>aws:SourceAccount = 111111111111</code></td><td>EventBridge in Account 111 can publish to this topic</td></tr><tr><td><code>s3.amazonaws.com</code></td><td><code>aws:SourceArn = arn:aws:s3:::bucket-name</code></td><td>Specific S3 bucket can publish (Project 15 pattern)</td></tr><tr><td><code>cloudwatch.amazonaws.com</code></td><td><code>aws:SourceAccount = 111111111111</code></td><td>CloudWatch alarms in Account 111 can publish</td></tr></tbody></table>
+<p>→ When EventBridge sends an event to an SNS topic → it uses the SERVICE principal (<code>events.amazonaws.com</code>)<br>
+→ NOT the IAM role that created the rule<br>
+→ Therefore → the topic policy must allow the SERVICE principal with account condition</p>
+<p><strong>Why <code>aws:SourceAccount</code> condition is essential:</strong></p>
+<p>→ Without it:</p>
+<ul>
+<li><code>events.amazonaws.com</code> can publish → ANY account's EventBridge can publish</li>
+<li>An attacker in Account <code>999999999999</code> could spam your central topic<br>
+→ With it:</li>
+<li>Only EventBridge from accounts <code>111</code>, <code>222</code>, <code>333</code>, <code>444</code> can publish</li>
+<li>Other accounts → Denied</li>
+</ul>
+<hr>
+<p><strong>Add Subscriptions to Central Topic:</strong></p>
+<p>→ SNS → <code>shopnow-central-operations-alerts</code> → "Create subscription"</p>
+<p><strong>Subscription 1 — Monitoring SQS Queue:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td><code>arn:aws:sqs:ap-south-1:555555555555:shopnow-central-monitoring-queue</code></td></tr><tr><td>Enable raw message delivery</td><td>✅ Yes (avoids SNS wrapping — cleaner messages)</td></tr></tbody></table>
+<p><strong>Subscription 2 — Incident Management SQS Queue:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Amazon SQS</td></tr><tr><td>Endpoint</td><td><code>arn:aws:sqs:ap-south-1:555555555555:shopnow-central-incident-queue</code></td></tr><tr><td>Enable raw message delivery</td><td>✅ Yes</td></tr><tr><td>Filter policy</td><td><code>{"severity": ["CRITICAL", "HIGH"]}</code></td></tr></tbody></table>
+<p><strong>Subscription 3 — Email to On-Call Team:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>Email</td></tr><tr><td>Endpoint</td><td><code>oncall@shopnow.com</code></td></tr><tr><td>Filter policy</td><td><code>{"severity": ["CRITICAL"]}</code></td></tr></tbody></table>
+<p><strong>Understanding Filter Policies (Extending Project 13 Fan-Out):</strong></p>
+<p>→ In Project 13 → All SNS subscribers received ALL messages<br>
+→ With filter policies → Each subscriber receives ONLY matching messages</p>
+<table><thead><tr><th>Subscriber</th><th>Filter</th><th>Receives</th></tr></thead><tbody><tr><td>Monitoring Queue</td><td>No filter</td><td>ALL alerts (for dashboards and analytics)</td></tr><tr><td>Incident Queue</td><td><code>severity: [CRITICAL, HIGH]</code></td><td>Only critical and high severity alerts</td></tr><tr><td>Email On-Call</td><td><code>severity: [CRITICAL]</code></td><td>Only critical alerts (avoid email fatigue)</td></tr></tbody></table>
+<p><strong>How filter policies work:</strong><br>
+→ Publisher includes message attributes when publishing<br>
+→ SNS evaluates each subscription's filter policy against message attributes<br>
+→ Only matching messages are delivered to the subscriber<br>
+→ Non-matching messages are silently dropped for that subscriber (not lost — other subscribers may still receive)</p>
+<p><strong>Message Attribute Structure for Publishing:</strong></p>
+<table><thead><tr><th>Attribute Name</th><th>Type</th><th>Example Values</th></tr></thead><tbody><tr><td><code>severity</code></td><td>String</td><td><code>CRITICAL</code>, <code>HIGH</code>, <code>MEDIUM</code>, <code>LOW</code>, <code>INFO</code></td></tr><tr><td><code>sourceAccount</code></td><td>String</td><td><code>111111111111</code>, <code>222222222222</code></td></tr><tr><td><code>sourceService</code></td><td>String</td><td><code>glue</code>, <code>rds</code>, <code>secretsmanager</code>, <code>s3</code></td></tr><tr><td><code>eventType</code></td><td>String</td><td><code>failure</code>, <code>success</code>, <code>warning</code>, <code>security</code></td></tr></tbody></table>
+<p>→ These attributes enable rich filtering at the subscription level<br>
+→ Each subscriber self-selects what it cares about</p>
+<hr>
+<h3>STEP 2 — CREATE CENTRAL SQS QUEUES WITH CROSS-ACCOUNT POLICIES</h3>
+<p>→ Still in Account <code>555555555555</code> (Shared Services)</p>
+<p><strong>Queue 1 — Central Monitoring Queue:</strong></p>
+<p>→ Navigate to SQS → "Create queue"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td></tr><tr><td>Name</td><td><code>shopnow-central-monitoring-queue</code></td></tr><tr><td>Visibility timeout</td><td>300 seconds (5 minutes — processing time for monitoring Lambda)</td></tr><tr><td>Message retention</td><td>7 days</td></tr><tr><td>Maximum message size</td><td>256 KB</td></tr><tr><td>Delivery delay</td><td>0 seconds</td></tr><tr><td>Receive message wait time</td><td>20 seconds (long polling — from Project 7)</td></tr><tr><td>Encryption</td><td>SSE-KMS → <code>shopnow-shared-services-key</code></td></tr></tbody></table>
+<p><strong>SQS Queue Policy (Resource-Based):</strong></p>
+<p>→ This queue receives messages from TWO sources:</p>
+<ol>
+<li>SNS topic subscription (same account — already works)</li>
+<li>Direct cross-account sending (for Pattern 2 scenarios)</li>
+</ol>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Allow SNS to Send</td><td>Allow</td><td><code>sns.amazonaws.com</code></td><td><code>sqs:SendMessage</code></td><td>Queue ARN</td><td><code>aws:SourceArn = shopnow-central-operations-alerts topic ARN</code></td></tr><tr><td>Allow HQ EventBridge Direct</td><td>Allow</td><td><code>events.amazonaws.com</code></td><td><code>sqs:SendMessage</code></td><td>Queue ARN</td><td><code>aws:SourceAccount = 111111111111</code></td></tr><tr><td>Allow Europe EventBridge Direct</td><td>Allow</td><td><code>events.amazonaws.com</code></td><td><code>sqs:SendMessage</code></td><td>Queue ARN</td><td><code>aws:SourceAccount = 222222222222</code></td></tr><tr><td>Allow US EventBridge Direct</td><td>Allow</td><td><code>events.amazonaws.com</code></td><td><code>sqs:SendMessage</code></td><td>Queue ARN</td><td><code>aws:SourceAccount = 333333333333</code></td></tr><tr><td>Allow Japan EventBridge Direct</td><td>Allow</td><td><code>events.amazonaws.com</code></td><td><code>sqs:SendMessage</code></td><td>Queue ARN</td><td><code>aws:SourceAccount = 444444444444</code></td></tr></tbody></table>
+<p><strong>Why allow BOTH SNS and direct EventBridge?</strong></p>
+<p>→ Some events flow through the SNS fan-out path (Pattern 1):</p>
+<ul>
+<li>Source EventBridge → Central SNS → Central SQS (via subscription)</li>
+<li>Used when multiple subscribers need the same event</li>
+</ul>
+<p>→ Some events flow directly to SQS (Pattern 2):</p>
+<ul>
+<li>Source EventBridge → Central SQS (direct)</li>
+<li>Used for high-volume events where fan-out is not needed</li>
+<li>Lower latency (one fewer hop)</li>
+</ul>
+<hr>
+<p><strong>Queue 2 — Central Incident Queue:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td></tr><tr><td>Name</td><td><code>shopnow-central-incident-queue</code></td></tr><tr><td>Visibility timeout</td><td>600 seconds (10 minutes — incident processing takes longer)</td></tr><tr><td>Message retention</td><td>14 days (maximum — incidents may need investigation)</td></tr><tr><td>Encryption</td><td>SSE-KMS</td></tr></tbody></table>
+<p><strong>SQS Queue Policy:</strong> Same structure as Queue 1 but with:</p>
+<ul>
+<li>SNS source: Same central topic (filtered subscription handles severity)</li>
+<li>Direct EventBridge: Only from accounts that generate incidents</li>
+</ul>
+<hr>
+<p><strong>Queue 3 — Dead Letter Queue for Failed Processing:</strong></p>
+<p>→ Following Project 20's DLQ pattern</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Type</td><td>Standard</td></tr><tr><td>Name</td><td><code>shopnow-central-events-dlq</code></td></tr><tr><td>Message retention</td><td>14 days</td></tr><tr><td>Encryption</td><td>SSE-KMS</td></tr></tbody></table>
+<p>→ Configure Queue 1 and Queue 2 redrive policies:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Dead-letter queue</td><td><code>shopnow-central-events-dlq</code></td></tr><tr><td>Maximum receives</td><td>3 (after 3 failed processing attempts → move to DLQ)</td></tr></tbody></table>
+<hr>
+<h3>STEP 3 — CONFIGURE SNS TOPIC POLICY FOR SNS-TO-SQS CROSS-SERVICE ACCESS</h3>
+<p>→ When SNS sends messages to SQS (within the same account) → the SQS queue policy must allow it<br>
+→ This was covered in Project 13 (SNS → SQS fan-out)<br>
+→ The key addition here: The SQS queue policy must allow <code>sns.amazonaws.com</code> with condition on source ARN</p>
+<p><strong>Verification Checklist (from Project 13 — don't repeat, just verify):</strong></p>
+<table><thead><tr><th>Check</th><th>Status</th></tr></thead><tbody><tr><td>SQS queue policy allows <code>sns.amazonaws.com</code> to <code>sqs:SendMessage</code></td><td>✅ Configured in Step 2</td></tr><tr><td>Condition restricts to specific SNS topic ARN</td><td>✅ <code>aws:SourceArn</code> condition</td></tr><tr><td>Raw message delivery enabled on subscription</td><td>✅ Configured in Step 1</td></tr><tr><td>Filter policy set on selective subscriptions</td><td>✅ Severity filter on incident queue</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — CONFIGURE SOURCE ACCOUNT EVENTBRIDGE RULES TO TARGET CENTRAL SNS/SQS</h3>
+<p>→ Sign into Account <code>111111111111</code> (HQ)<br>
+→ Navigate to EventBridge → Rules</p>
+<hr>
+<p><strong>Rule: Glue Job Failure → Central SNS Topic (Cross-Account)</strong></p>
+<p>→ Create rule on <code>default</code> event bus</p>
+<p><strong>Page 1 — Rule Detail:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-hq-glue-failure-to-central-sns</code></td></tr><tr><td>Description</td><td><code>Forwards Glue job failures to Shared Services central operations topic</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Rule type</td><td>Rule with event pattern</td></tr></tbody></table>
+<p><strong>Page 2 — Event Pattern:</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Source</td><td><code>aws.glue</code></td></tr><tr><td>detail-type</td><td><code>Glue Job State Change</code></td></tr><tr><td>detail.state</td><td><code>["FAILED", "TIMEOUT", "ERROR"]</code></td></tr></tbody></table>
+<p><strong>Page 3 — Target:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Target type</td><td>EventBridge API destination OR AWS service</td></tr><tr><td>Target</td><td>SNS topic</td></tr><tr><td>Topic ARN</td><td><code>arn:aws:sns:ap-south-1:555555555555:shopnow-central-operations-alerts</code></td></tr></tbody></table>
+<p><strong>CRITICAL: Cross-Account SNS Target from EventBridge</strong></p>
+<p>→ EventBridge in Account <code>111111111111</code> is targeting an SNS topic in Account <code>555555555555</code><br>
+→ For this to work:</p>
+<p><strong>Requirement 1 — SNS Topic Policy (already configured in Step 1):</strong><br>
+→ Allows <code>events.amazonaws.com</code> with <code>aws:SourceAccount = 111111111111</code></p>
+<p><strong>Requirement 2 — EventBridge IAM Role in HQ:</strong><br>
+→ The EventBridge rule needs an IAM role that has <code>sns:Publish</code> permission on the cross-account topic</p>
+<p>→ Create IAM Role in Account <code>111111111111</code>:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>HQ-EventBridge-CrossAccount-SNS-Role</code></td></tr><tr><td>Trust policy — Principal</td><td><code>events.amazonaws.com</code></td></tr><tr><td>Trust policy — Action</td><td><code>sts:AssumeRole</code></td></tr></tbody></table>
+<p><strong>IAM Policy attached to this role:</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>sns:Publish</code></td><td><code>arn:aws:sns:ap-south-1:555555555555:shopnow-central-operations-alerts</code></td></tr></tbody></table>
+<p>→ Select this role in the EventBridge rule's target configuration</p>
+<p><strong>Adding Message Attributes for Filtering:</strong></p>
+<p>→ In the target configuration → "Configure target input" → Input transformer</p>
+<p><strong>Input Path:</strong></p>
+<table><thead><tr><th>Variable</th><th>Path</th></tr></thead><tbody><tr><td><code>&lt;jobName&gt;</code></td><td><code>$.detail.jobName</code></td></tr><tr><td><code>&lt;state&gt;</code></td><td><code>$.detail.state</code></td></tr><tr><td><code>&lt;message&gt;</code></td><td><code>$.detail.message</code></td></tr><tr><td><code>&lt;time&gt;</code></td><td><code>$.time</code></td></tr><tr><td><code>&lt;account&gt;</code></td><td><code>$.account</code></td></tr></tbody></table>
+<p><strong>Input Template:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "source": "hq-glue",
+  "severity": "CRITICAL",
+  "account": "&lt;account&gt;",
+  "service": "glue",
+  "eventType": "failure",
+  "summary": "Glue job &lt;jobName&gt; &lt;state&gt; at &lt;time&gt;",
+  "detail": "&lt;message&gt;"
+}</code></pre></div>
+<p><strong>Message Attributes (configured on SNS target):</strong></p>
+<table><thead><tr><th>Attribute Name</th><th>Value</th><th>Type</th></tr></thead><tbody><tr><td><code>severity</code></td><td><code>CRITICAL</code></td><td>String</td></tr><tr><td><code>sourceAccount</code></td><td><code>111111111111</code></td><td>String</td></tr><tr><td><code>sourceService</code></td><td><code>glue</code></td><td>String</td></tr><tr><td><code>eventType</code></td><td><code>failure</code></td><td>String</td></tr></tbody></table>
+<p>→ These attributes enable the subscription filter policies configured in Step 1<br>
+→ The incident queue receives this (severity = CRITICAL matches filter)<br>
+→ The monitoring queue receives this (no filter — receives everything)<br>
+→ The on-call email receives this (severity = CRITICAL matches filter)</p>
+<hr>
+<p><strong>Repeat for Other Accounts:</strong></p>
+<p>→ Sign into each source account → Create equivalent EventBridge rules</p>
+<p><strong>Account <code>222222222222</code> (Europe):</strong></p>
+<table><thead><tr><th>Rule Name</th><th>Event Pattern</th><th>Target</th><th>Severity</th></tr></thead><tbody><tr><td><code>shopnow-eu-s3-upload-to-central-sns</code></td><td>S3 Object Created in raw bucket</td><td>Central SNS topic</td><td><code>INFO</code></td></tr><tr><td><code>shopnow-eu-rds-failover-to-central-sns</code></td><td>RDS DB Instance Event — failover</td><td>Central SNS topic</td><td><code>CRITICAL</code></td></tr></tbody></table>
+<p><strong>Account <code>333333333333</code> (US):</strong></p>
+<table><thead><tr><th>Rule Name</th><th>Event Pattern</th><th>Target</th><th>Severity</th></tr></thead><tbody><tr><td><code>shopnow-us-rotation-failure-to-central-sns</code></td><td>Secrets Manager rotation failed</td><td>Central SNS topic</td><td><code>HIGH</code></td></tr><tr><td><code>shopnow-us-lambda-error-to-central-sqs</code></td><td>CloudWatch alarm state → ALARM for Lambda errors</td><td>Central SQS (direct)</td><td><code>MEDIUM</code></td></tr></tbody></table>
+<p><strong>Account <code>444444444444</code> (Japan):</strong></p>
+<table><thead><tr><th>Rule Name</th><th>Event Pattern</th><th>Target</th><th>Severity</th></tr></thead><tbody><tr><td><code>shopnow-jp-etl-complete-to-central-sns</code></td><td>Glue Job State Change — SUCCEEDED</td><td>Central SNS topic</td><td><code>INFO</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 5 — SET UP CROSS-ACCOUNT EVENTBRIDGE BUS-TO-BUS FORWARDING (Pattern 3)</h3>
+<p>→ This is the MOST POWERFUL cross-account messaging pattern<br>
+→ Instead of targeting SNS or SQS directly → forward entire events to a central EventBridge bus<br>
+→ Central bus then applies its OWN rules for routing</p>
+<p><strong>Step 5a — Create Custom Event Bus in Shared Services:</strong></p>
+<p>→ Sign into Account <code>555555555555</code> (Shared Services)<br>
+→ Navigate to EventBridge → "Event buses" → "Create event bus"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-central-event-bus</code></td></tr><tr><td>Description</td><td><code>Receives events from all ShopNow accounts for centralized routing</code></td></tr><tr><td>Tags — Purpose</td><td><code>CrossAccountEventAggregation</code></td></tr></tbody></table>
+<p><strong>Step 5b — Configure Resource Policy on Central Event Bus:</strong></p>
+<p>→ The event bus resource policy controls WHO can publish events to this bus</p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Allow HQ Events</td><td>Allow</td><td><code>arn:aws:iam::111111111111:root</code></td><td><code>events:PutEvents</code></td><td>Bus ARN</td><td>None</td></tr><tr><td>Allow Europe Events</td><td>Allow</td><td><code>arn:aws:iam::222222222222:root</code></td><td><code>events:PutEvents</code></td><td>Bus ARN</td><td>None</td></tr><tr><td>Allow US Events</td><td>Allow</td><td><code>arn:aws:iam::333333333333:root</code></td><td><code>events:PutEvents</code></td><td>Bus ARN</td><td>None</td></tr><tr><td>Allow Japan Events</td><td>Allow</td><td><code>arn:aws:iam::444444444444:root</code></td><td><code>events:PutEvents</code></td><td>Bus ARN</td><td>None</td></tr><tr><td>Allow EventBridge Service</td><td>Allow</td><td><code>events.amazonaws.com</code></td><td><code>events:PutEvents</code></td><td>Bus ARN</td><td><code>aws:SourceAccount</code> in <code>[111, 222, 333, 444]</code></td></tr></tbody></table>
+<p><strong>Step 5c — Create Rules in Source Accounts to Forward Events:</strong></p>
+<p>→ Sign into Account <code>111111111111</code> (HQ)<br>
+→ EventBridge → Rules → Create rule</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-hq-forward-all-operational-events</code></td></tr><tr><td>Event bus</td><td><code>default</code></td></tr><tr><td>Event pattern</td><td>Match specific events (Glue failures, RDS events, S3 critical uploads)</td></tr><tr><td>Target type</td><td>EventBridge event bus</td></tr><tr><td>Target event bus</td><td><code>arn:aws:events:ap-south-1:555555555555:event-bus/shopnow-central-event-bus</code></td></tr></tbody></table>
+<p><strong>IAM Role for Cross-Account EventBridge Target:</strong></p>
+<p>→ Create role in Account <code>111111111111</code>:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>HQ-EventBridge-CrossAccount-Bus-Role</code></td></tr><tr><td>Trust policy — Principal</td><td><code>events.amazonaws.com</code></td></tr></tbody></table>
+<p><strong>IAM Policy:</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>events:PutEvents</code></td><td><code>arn:aws:events:ap-south-1:555555555555:event-bus/shopnow-central-event-bus</code></td></tr></tbody></table>
+<p>→ Repeat for all source accounts</p>
+<p><strong>Step 5d — Create Rules on Central Event Bus:</strong></p>
+<p>→ Back in Account <code>555555555555</code> (Shared Services)<br>
+→ EventBridge → Rules → Select <code>shopnow-central-event-bus</code></p>
+<p><strong>Central Rule 1 — All Failures → Incident Queue:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>central-all-failures-to-incident-queue</code></td></tr><tr><td>Event bus</td><td><code>shopnow-central-event-bus</code></td></tr><tr><td>Event pattern — detail.state</td><td><code>["FAILED", "TIMEOUT", "ERROR"]</code></td></tr><tr><td>Target</td><td>SQS → <code>shopnow-central-incident-queue</code></td></tr></tbody></table>
+<p><strong>Central Rule 2 — All Events → Monitoring Queue:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>central-all-events-to-monitoring-queue</code></td></tr><tr><td>Event bus</td><td><code>shopnow-central-event-bus</code></td></tr><tr><td>Event pattern</td><td>Match ALL events (empty filter)</td></tr><tr><td>Target</td><td>SQS → <code>shopnow-central-monitoring-queue</code></td></tr></tbody></table>
+<p><strong>Central Rule 3 — Security Events → Security Lambda:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>central-security-events-to-lambda</code></td></tr><tr><td>Event bus</td><td><code>shopnow-central-event-bus</code></td></tr><tr><td>Event pattern — source</td><td><code>aws.secretsmanager</code> OR <code>aws.iam</code> OR <code>aws.kms</code></td></tr><tr><td>Target</td><td>Lambda → <code>shopnow-security-event-processor</code></td></tr></tbody></table>
+<p><strong>Central Rule 4 — HQ Glue Completion → Trigger Europe Downstream:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>central-hq-glue-success-trigger-europe-pipeline</code></td></tr><tr><td>Event bus</td><td><code>shopnow-central-event-bus</code></td></tr><tr><td>Event pattern — source</td><td><code>aws.glue</code></td></tr><tr><td>Event pattern — detail.state</td><td><code>SUCCEEDED</code></td></tr><tr><td>Event pattern — account</td><td><code>111111111111</code></td></tr><tr><td>Target</td><td>EventBridge bus → <code>arn:aws:events:eu-west-1:222222222222:event-bus/default</code></td></tr></tbody></table>
+<p>→ This creates a CHAIN: HQ → Central Bus → Europe<br>
+→ HQ's Glue completion triggers Europe's downstream pipeline<br>
+→ Shared Services acts as the routing hub</p>
+<p><strong>Architecture Achieved (Bus-to-Bus Pattern):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account 111 (HQ)           Account 555 (Shared)         Account 222 (Europe)
+</span>┌────────────────┐         ┌─────────────────────┐      ┌────────────────────┐
+│ EventBridge    │         │ Central Event Bus    │      │ EventBridge        │
+│ default bus    │────────►│                      │─────►│ default bus        │
+│                │ Forward │ Rule 1 → SQS Incident│      │                    │
+└────────────────┘         │ Rule 2 → SQS Monitor │      │ Rule: Trigger      │
+                           │ Rule 3 → Lambda Sec  │      │ Europe ETL pipeline│
+Account 222 (Europe)       │ Rule 4 → Europe Bus  │      └────────────────────┘
+┌────────────────┐         │                      │
+│ EventBridge    │────────►│                      │
+│ default bus    │ Forward │                      │
+└────────────────┘         └─────────────────────┘
+
+Account 333 (US)
+┌────────────────┐
+│ EventBridge    │────────►│
+│ default bus    │ Forward │
+└────────────────┘
+
+Account 444 (Japan)
+┌────────────────┐
+│ EventBridge    │────────►│
+│ default bus    │ Forward │
+└────────────────┘</code></pre></div>
+<p>→ Central event bus is the HUB<br>
+→ Source accounts forward events IN<br>
+→ Central rules route events to targets or OTHER accounts<br>
+→ This is the EVENT-DRIVEN equivalent of the hub-and-spoke network model (Project 50 preview)</p>
+<hr>
+<h3>STEP 6 — IMPLEMENT ORGANIZATIONAL CONDITION FOR SIMPLIFIED POLICIES</h3>
+<p>→ With 4 source accounts → listing each account ID in every policy is manageable<br>
+→ With 20+ accounts → listing becomes error-prone and policy size becomes a concern<br>
+→ AWS provides <code>aws:PrincipalOrgID</code> condition for organizational simplification</p>
+<p><strong>Prerequisites:</strong><br>
+→ All 5 accounts must be in the SAME AWS Organization (Project 54 preview)<br>
+→ The Organization has an ID like <code>o-abc123def4</code></p>
+<p><strong>Simplified SNS Topic Policy (Replacing per-account statements):</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Condition</th></tr></thead><tbody><tr><td>Allow Organization Publish</td><td>Allow</td><td><code>*</code></td><td><code>sns:Publish</code></td><td><code>aws:PrincipalOrgID = o-abc123def4</code></td></tr></tbody></table>
+<p>→ ONE statement replaces FOUR account-specific statements<br>
+→ When a new account joins the Organization → automatically allowed to publish<br>
+→ When an account leaves the Organization → automatically denied</p>
+<p><strong>Simplified SQS Queue Policy:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Condition</th></tr></thead><tbody><tr><td>Allow Organization Send</td><td>Allow</td><td><code>*</code></td><td><code>sqs:SendMessage</code></td><td><code>aws:PrincipalOrgID = o-abc123def4</code></td></tr></tbody></table>
+<p><strong>Simplified EventBridge Bus Resource Policy:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Condition</th></tr></thead><tbody><tr><td>Allow Organization PutEvents</td><td>Allow</td><td><code>*</code></td><td><code>events:PutEvents</code></td><td><code>aws:PrincipalOrgID = o-abc123def4</code></td></tr></tbody></table>
+<p><strong>CRITICAL: <code>aws:PrincipalOrgID</code> vs <code>aws:SourceAccount</code>:</strong></p>
+<table><thead><tr><th>Condition Key</th><th>What It Checks</th><th>When to Use</th></tr></thead><tbody><tr><td><code>aws:PrincipalOrgID</code></td><td>The Organization ID of the CALLER</td><td>When the caller is an IAM principal (role, user)</td></tr><tr><td><code>aws:SourceAccount</code></td><td>The account ID of the SERVICE that initiated the call</td><td>When an AWS service (EventBridge, S3) publishes on behalf of an account</td></tr><tr><td><code>aws:PrincipalOrgPaths</code></td><td>The OU path of the caller</td><td>When you want to restrict to specific OUs within the Organization</td></tr></tbody></table>
+<p>→ For EventBridge service principal targets → use <code>aws:SourceAccount</code> (the service publishes)<br>
+→ For IAM role direct publishing → use <code>aws:PrincipalOrgID</code> (the role publishes)<br>
+→ For comprehensive coverage → include BOTH conditions in separate statements</p>
+<p><strong>Combined Policy with Both Conditions:</strong></p>
+<table><thead><tr><th>Statement</th><th>Principal</th><th>Condition</th><th>Use Case</th></tr></thead><tbody><tr><td>Statement 1</td><td><code>*</code> (IAM principals)</td><td><code>aws:PrincipalOrgID = o-abc123def4</code></td><td>Roles calling SNS Publish API directly</td></tr><tr><td>Statement 2</td><td><code>events.amazonaws.com</code></td><td><code>aws:SourceAccount</code> in Org accounts</td><td>EventBridge service publishing to SNS</td></tr></tbody></table>
+<hr>
+<h3>STEP 7 — CONFIGURE ENCRYPTION FOR CROSS-ACCOUNT MESSAGING</h3>
+<p>→ Connecting to Project 36 KMS concepts</p>
+<p><strong>The Encryption Challenge for Cross-Account SNS/SQS:</strong></p>
+<p>→ Central SNS topic and SQS queues are encrypted with KMS keys in Account <code>555555555555</code><br>
+→ When EventBridge from Account <code>111111111111</code> publishes to the central SNS topic:</p>
+<ul>
+<li>SNS needs to encrypt the message using the KMS key</li>
+<li>The caller identity is <code>events.amazonaws.com</code> with source Account <code>111111111111</code></li>
+<li>KMS key is in Account <code>555555555555</code></li>
+<li>KMS must allow the SNS service to use the key</li>
+</ul>
+<p><strong>KMS Key Policy for Cross-Account SNS/SQS Encryption:</strong></p>
+<p>→ Navigate to KMS in Account <code>555555555555</code> → Select <code>shopnow-shared-services-key</code></p>
+<p><strong>Add Key Policy Statements:</strong></p>
+<table><thead><tr><th>Statement</th><th>Principal</th><th>Actions</th><th>Condition</th><th>Purpose</th></tr></thead><tbody><tr><td>Allow SNS to use key</td><td><code>sns.amazonaws.com</code></td><td><code>kms:Decrypt</code>, <code>kms:GenerateDataKey*</code></td><td>None</td><td>SNS encrypts/decrypts messages</td></tr><tr><td>Allow SQS to use key</td><td><code>sqs.amazonaws.com</code></td><td><code>kms:Decrypt</code>, <code>kms:GenerateDataKey*</code></td><td>None</td><td>SQS encrypts/decrypts messages</td></tr></tbody></table>
+<p><strong>Why service principals need KMS access:</strong><br>
+→ When SNS receives a message → it encrypts with KMS before storing<br>
+→ When SQS delivers a message to a consumer → it decrypts with KMS<br>
+→ These are SERVICE-level operations → the service principal needs key access<br>
+→ This is different from user-level KMS access (Project 36)</p>
+<p><strong>Consumer KMS Access:</strong><br>
+→ Lambda functions or EC2 instances CONSUMING messages from the encrypted SQS queue also need <code>kms:Decrypt</code><br>
+→ These consumers are in Account <code>555555555555</code> → standard KMS key user setup (Project 36)</p>
+<hr>
+<h3>STEP 8 — CONFIGURE DLQ AND ERROR HANDLING FOR CROSS-ACCOUNT MESSAGING</h3>
+<p><strong>Error Scenarios in Cross-Account Messaging:</strong></p>
+<table><thead><tr><th>Scenario</th><th>What Happens</th><th>Mitigation</th></tr></thead><tbody><tr><td>SNS topic policy denies the publisher</td><td>Message never reaches SNS → EventBridge retries</td><td>EventBridge DLQ (Project 38) captures failed delivery</td></tr><tr><td>SQS queue policy denies SNS</td><td>SNS cannot deliver to SQS subscriber → delivery fails</td><td>SNS delivery status logging + SQS DLQ</td></tr><tr><td>KMS key denies encryption</td><td>Message cannot be encrypted → delivery fails</td><td>KMS key policy review</td></tr><tr><td>SQS consumer fails to process</td><td>Message returns to queue after visibility timeout</td><td>SQS redrive policy → DLQ (Project 20)</td></tr><tr><td>EventBridge cross-account bus rejects event</td><td>Event not accepted by central bus → source EventBridge retries</td><td>Source EventBridge DLQ</td></tr></tbody></table>
+<p><strong>Multi-Layer DLQ Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Source Account EventBridge
+</span>    │
+    ├── Delivery to Central SNS fails → Source EventBridge DLQ (SQS in source account)
+    │
+    ▼
+Central SNS Topic
+    │
+    ├── Delivery to SQS subscriber fails → SNS delivery status logging
+    │
+    ▼
+Central SQS Queue
+    │
+    ├── Consumer processing fails (3 times) → SQS DLQ (in Shared Services)
+    │
+    ▼
+SQS DLQ
+    │
+    └── CloudWatch alarm → ApproximateNumberOfMessagesVisible &gt; 0 → SNS alert</code></pre></div>
+<p><strong>Configure EventBridge Rule DLQ in Source Accounts:</strong></p>
+<p>→ In each source account → Edit each cross-account EventBridge rule<br>
+→ Target configuration → "Dead-letter queue"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>DLQ</td><td>Create SQS queue in SOURCE account: <code>shopnow-hq-eventbridge-crossaccount-dlq</code></td></tr><tr><td>Retry attempts</td><td>10 (reduced from default 185 — fail fast for cross-account)</td></tr><tr><td>Maximum event age</td><td>6 hours (reduced from default 24 — stale events lose value)</td></tr></tbody></table>
+<p>→ This DLQ captures events that could NOT be delivered to the central SNS/SQS/EventBridge<br>
+→ Monitor this DLQ → if messages appear → cross-account connectivity is broken</p>
+<p><strong>Configure SNS Delivery Status Logging:</strong></p>
+<p>→ SNS → <code>shopnow-central-operations-alerts</code> → "Delivery status logging"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>SQS</td></tr><tr><td>Success sample rate</td><td>10% (log 10% of successful deliveries)</td></tr><tr><td>IAM role for logging</td><td>Create role with <code>logs:CreateLogGroup</code>, <code>logs:CreateLogStream</code>, <code>logs:PutLogEvents</code></td></tr><tr><td>Failure logging</td><td>100% (log ALL failures)</td></tr><tr><td>Log group</td><td><code>/aws/sns/shopnow-central-operations-alerts/sqs</code></td></tr></tbody></table>
+<p>→ CloudWatch Logs now captures every failed SNS → SQS delivery<br>
+→ Critical for debugging cross-account messaging issues</p>
+<hr>
+<h3>STEP 9 — IMPLEMENT CROSS-ACCOUNT SNS SUBSCRIPTION (Reverse Direction)</h3>
+<p>→ Previous steps covered: Source accounts PUBLISH to central topic<br>
+→ But what about: Central account NOTIFYING source accounts?</p>
+<p><strong>Scenario:</strong><br>
+→ Shared Services detects a global incident<br>
+→ Needs to notify ALL regional accounts<br>
+→ Central SNS topic → SQS queues in each regional account</p>
+<p><strong>Step 9a — Create SQS Queue in Regional Account:</strong></p>
+<p>→ Sign into Account <code>222222222222</code> (Europe)<br>
+→ SQS → Create queue: <code>shopnow-eu-global-notifications</code></p>
+<p><strong>SQS Queue Policy:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Allow Central SNS</td><td>Allow</td><td><code>sns.amazonaws.com</code></td><td><code>sqs:SendMessage</code></td><td>Queue ARN</td><td><code>aws:SourceArn = arn:aws:sns:ap-south-1:555555555555:shopnow-global-notifications-topic</code></td></tr></tbody></table>
+<p>→ This allows the central SNS topic to deliver messages to Europe's SQS queue</p>
+<p><strong>Step 9b — Subscribe Regional Queue to Central Topic (Cross-Account Subscription):</strong></p>
+<p>→ Two ways to create cross-account SNS subscriptions:</p>
+<p><strong>Method A — From the subscribing account (requesting):</strong><br>
+→ Sign into Account <code>222222222222</code><br>
+→ SNS → Subscriptions → Create subscription<br>
+→ Topic ARN: <code>arn:aws:sns:ap-south-1:555555555555:shopnow-global-notifications-topic</code><br>
+→ Protocol: SQS<br>
+→ Endpoint: <code>arn:aws:sqs:eu-west-1:222222222222:shopnow-eu-global-notifications</code></p>
+<p>→ This creates a PENDING subscription<br>
+→ The topic owner (Account <code>555555555555</code>) must CONFIRM it<br>
+→ OR the topic policy must allow cross-account subscription</p>
+<p><strong>Method B — From the topic owner account (granting):</strong><br>
+→ Sign into Account <code>555555555555</code><br>
+→ SNS → Select topic → Create subscription<br>
+→ Protocol: SQS<br>
+→ Endpoint: Europe's SQS queue ARN</p>
+<p>→ Topic owner can subscribe external endpoints directly<br>
+→ No confirmation needed when topic owner creates the subscription</p>
+<p><strong>SNS Topic Policy for Cross-Account Subscription:</strong></p>
+<p>→ If using Method A → the central topic policy must allow:</p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Condition</th></tr></thead><tbody><tr><td>Allow Org Subscribe</td><td>Allow</td><td><code>*</code></td><td><code>sns:Subscribe</code></td><td><code>aws:PrincipalOrgID = o-abc123def4</code></td></tr></tbody></table>
+<p>→ This allows any account in the Organization to subscribe to the topic<br>
+→ Combined with the existing Publish permissions → full bi-directional messaging</p>
+<p><strong>Cross-Region Consideration:</strong><br>
+→ Central topic is in <code>ap-south-1</code> (Mumbai)<br>
+→ Europe's SQS queue is in <code>eu-west-1</code> (Ireland)<br>
+→ SNS CAN deliver cross-region to SQS → supported but adds latency<br>
+→ No additional cost for cross-region SNS → SQS delivery (SNS absorbs the transfer)</p>
+<hr>
+<h3>STEP 10 — COMPLETE CROSS-ACCOUNT MESSAGING ARCHITECTURE</h3>
+<p><strong>Summary of All Configurations:</strong></p>
+<p><strong>In Account <code>555555555555</code> (Shared Services):</strong></p>
+<table><thead><tr><th>Resource</th><th>Configuration</th></tr></thead><tbody><tr><td>SNS: <code>shopnow-central-operations-alerts</code></td><td>Topic policy allows Publish from Org accounts + EventBridge service</td></tr><tr><td>SNS: <code>shopnow-global-notifications-topic</code></td><td>Topic policy allows Subscribe from Org accounts</td></tr><tr><td>SQS: <code>shopnow-central-monitoring-queue</code></td><td>Queue policy allows SendMessage from SNS + EventBridge service</td></tr><tr><td>SQS: <code>shopnow-central-incident-queue</code></td><td>Queue policy allows SendMessage from SNS (filtered)</td></tr><tr><td>SQS: <code>shopnow-central-events-dlq</code></td><td>Redrive target for monitoring and incident queues</td></tr><tr><td>EventBridge: <code>shopnow-central-event-bus</code></td><td>Resource policy allows PutEvents from Org accounts</td></tr><tr><td>KMS: <code>shopnow-shared-services-key</code></td><td>Key policy allows SNS and SQS service principals</td></tr></tbody></table>
+<p><strong>In Each Source Account (111, 222, 333, 444):</strong></p>
+<table><thead><tr><th>Resource</th><th>Configuration</th></tr></thead><tbody><tr><td>EventBridge rules</td><td>Target central SNS topic OR central SQS queue OR central event bus</td></tr><tr><td>IAM role for EventBridge</td><td><code>sns:Publish</code> on central topic AND/OR <code>events:PutEvents</code> on central bus</td></tr><tr><td>SQS: EventBridge cross-account DLQ</td><td>Captures failed cross-account deliveries</td></tr><tr><td>SQS: Regional notification queue</td><td>Queue policy allows central SNS topic to SendMessage</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use <code>aws:SourceAccount</code> condition on service principal statements — prevents unauthorized account publishing<br>
+→ Always use <code>aws:PrincipalOrgID</code> condition when accounts are in the same Organization — simplifies policies<br>
+→ Always enable SNS delivery status logging — critical for debugging cross-account delivery failures<br>
+→ Always configure DLQ at EVERY layer — EventBridge rule DLQ + SQS redrive DLQ<br>
+→ Always use message attributes for filtering — enables selective subscription delivery<br>
+→ Always encrypt SNS topics and SQS queues with KMS — add service principals to key policy<br>
+→ Always use raw message delivery for SQS subscriptions — avoids double JSON wrapping<br>
+→ Always use input transformation on EventBridge rules — clean payloads for downstream consumers<br>
+→ Always create dedicated IAM roles for EventBridge cross-account targets — don't reuse application roles<br>
+→ Always test cross-account messaging with a simple test message before building complex flows<br>
+→ Always monitor DLQ queues with CloudWatch alarms — messages in DLQ indicate broken pipelines<br>
+→ Always document the cross-account messaging topology — which accounts publish where and subscribe to what</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use <code>Principal: *</code> without a condition — allows ANY AWS account to publish/send<br>
+→ Never skip <code>aws:SourceAccount</code> or <code>aws:SourceArn</code> conditions on service principal statements<br>
+→ Never allow <code>sns:*</code> or <code>sqs:*</code> in cross-account policies — only grant specific actions (<code>Publish</code>, <code>SendMessage</code>, <code>Subscribe</code>)<br>
+→ Never forget KMS key policy updates when encrypting SNS/SQS — cross-account delivery silently fails<br>
+→ Never use the same SQS queue for both monitoring and incident processing — separate by purpose<br>
+→ Never skip DLQ configuration — cross-account failures are silent without DLQ<br>
+→ Never hardcode account IDs in policies when Organization conditions are available<br>
+→ Never allow cross-account <code>sns:DeleteTopic</code> or <code>sqs:DeleteQueue</code> — only the owning account should manage lifecycle<br>
+→ Never subscribe sensitive queues to broad topics without filter policies — causes noise and potential data exposure<br>
+→ Never assume cross-account SNS → SQS delivery is instant — there can be seconds of latency, more for cross-region<br>
+→ Never forget that SNS → SQS cross-account requires BOTH topic policy (Publish) AND queue policy (SendMessage from SNS)<br>
+→ Never create circular event forwarding — Account A → Central Bus → Rule targets Account A's bus → infinite loop</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Pattern</th><th>Why</th></tr></thead><tbody><tr><td>Simple alert from source to central team</td><td>Pattern 1 — SNS cross-account Publish</td><td>Fan-out to email, SMS, SQS in central account</td></tr><tr><td>High-volume event buffering in central account</td><td>Pattern 2 — SQS cross-account Send</td><td>SQS provides buffering, DLQ, guaranteed delivery</td></tr><tr><td>Complex content-based routing in central account</td><td>Pattern 3 — EventBridge bus-to-bus</td><td>Central bus applies rich pattern matching rules</td></tr><tr><td>Central account notifying regional accounts</td><td>Reverse SNS — central topic, regional SQS subscribers</td><td>Fan-out to multiple accounts simultaneously</td></tr><tr><td>Bi-directional event flow</td><td>Combination of Pattern 3 (inbound) + Reverse SNS (outbound)</td><td>Hub-and-spoke messaging</td></tr><tr><td>Cross-region event flow</td><td>Any pattern — all support cross-region</td><td>SNS/SQS/EventBridge handle cross-region transparently</td></tr><tr><td>Exactly-once processing requirement</td><td>SQS FIFO in central account (direct send)</td><td>FIFO deduplication — but EventBridge doesn't support FIFO targets</td></tr><tr><td>Real-time streaming across accounts</td><td>None of these — use Kinesis cross-account (Project 52 preview)</td><td>Kinesis handles high-throughput ordered streams</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use cross-account SNS/SQS for large data transfer — use S3 cross-account access (Project 39) or replication (Project 30)<br>
+→ Do NOT use cross-account messaging for synchronous request-response — use API Gateway or direct service calls<br>
+→ Do NOT use EventBridge bus-to-bus for millions of events/second — use Kinesis Data Streams<br>
+→ Do NOT use SNS for messages requiring strict ordering — use SQS FIFO with direct cross-account send<br>
+→ Do NOT use cross-account messaging when accounts are not in the same Organization and no trust exists<br>
+→ Do NOT use SNS email subscriptions for high-volume alerts — causes email fatigue and delivery throttling</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — CROSS-ACCOUNT SNS PUBLISH FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EventBridge Rule in Account 111 fires
+</span>        │
+        ▼
+EventBridge assumes HQ-EventBridge-CrossAccount-SNS-Role
+        │
+        ▼
+EventBridge calls SNS:Publish(
+    TopicArn = arn:aws:sns:ap-south-1:555555555555:shopnow-central-operations-alerts
+    Message = transformed event JSON
+    MessageAttributes = {severity: CRITICAL, sourceAccount: 111111111111}
+)
+        │
+        ▼
+SNS receives the Publish request
+        │
+        ├── Authorization Check 1: Topic Policy
+        │     Is events.amazonaws.com allowed to Publish?
+        │     Is aws:SourceAccount = 111111111111 in allowed list?
+        │     → YES ✅
+        │
+        ├── Authorization Check 2: KMS Encryption
+        │     Topic is SSE-KMS encrypted
+        │     SNS calls KMS:GenerateDataKey using service principal
+        │     KMS key policy allows sns.amazonaws.com? → YES ✅
+        │     KMS returns DEK → SNS encrypts message
+        │
+        └── Message stored in SNS internal storage (encrypted)
+                │
+                ▼
+        SNS evaluates ALL subscriptions:
+                │
+                ├── Subscription 1: SQS monitoring queue
+                │     Filter policy: None → DELIVER
+                │     SNS calls SQS:SendMessage(QueueUrl = monitoring queue)
+                │     SQS queue policy allows sns.amazonaws.com? → YES ✅
+                │     SQS encrypts with KMS → message stored in queue
+                │
+                ├── Subscription 2: SQS incident queue  
+                │     Filter policy: severity IN [CRITICAL, HIGH]
+                │     Message attribute severity = CRITICAL → MATCH → DELIVER
+                │     SNS calls SQS:SendMessage(QueueUrl = incident queue)
+                │
+                └── Subscription 3: Email on-call
+                      Filter policy: severity IN [CRITICAL]
+                      Message attribute severity = CRITICAL → MATCH → DELIVER
+                      SNS sends email to oncall@shopnow.com</code></pre></div>
+<hr>
+<h3>MECHANIC 2 — CROSS-ACCOUNT EVENTBRIDGE BUS-TO-BUS FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EventBridge Rule in Account 111 matches an event
+</span>        │
+        ▼
+EventBridge assumes HQ-EventBridge-CrossAccount-Bus-Role
+        │
+        ▼
+EventBridge calls PutEvents(
+    EventBusName = arn:aws:events:ap-south-1:555555555555:event-bus/shopnow-central-event-bus
+    Entries = [{
+        Source: "aws.glue",
+        DetailType: "Glue Job State Change",
+        Detail: {full event JSON},
+        EventBusName: "arn:aws:events:ap-south-1:555555555555:event-bus/shopnow-central-event-bus"
+    }]
+)
+        │
+        ▼
+Central Event Bus (Account 555) receives the event
+        │
+        ├── Resource Policy Check:
+        │     Is the caller (Account 111 role) allowed to PutEvents?
+        │     → Check events:PutEvents permission + PrincipalOrgID condition
+        │     → YES ✅
+        │
+        ├── Event enters the bus
+        │
+        ├── Rules Engine evaluates ALL rules on this bus:
+        │
+        │     Rule 1: detail.state IN [FAILED, TIMEOUT, ERROR]?
+        │       → If YES → SQS incident queue
+        │
+        │     Rule 2: Match all events?
+        │       → YES → SQS monitoring queue
+        │
+        │     Rule 3: source = aws.secretsmanager?
+        │       → If YES → Lambda security processor
+        │
+        │     Rule 4: source = aws.glue AND detail.state = SUCCEEDED AND account = 111?
+        │       → If YES → Forward to Europe's event bus
+        │
+        └── Each matching rule invokes its targets asynchronously</code></pre></div>
+<p><strong>Key Difference from Direct SNS/SQS:</strong><br>
+→ Events retain their FULL original structure on the central bus<br>
+→ Central bus rules can match on ANY field in the event<br>
+→ This enables richer routing logic than SNS message attribute filtering<br>
+→ Central bus can also archive events and replay them (Project 38)</p>
+<hr>
+<h3>MECHANIC 3 — SNS MESSAGE ATTRIBUTE FILTERING INTERNALS</h3>
+<p><strong>How Filter Policies are Evaluated:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message arrives at SNS with attributes:
+</span>  severity = "CRITICAL"
+  sourceAccount = "111111111111"
+  sourceService = "glue"
+        │
+For each subscription:
+        │
+        ├── Subscription 1 (Monitoring Queue):
+        │     Filter policy: {} (empty — no filter)
+        │     Empty filter = match ALL messages
+        │     → DELIVER ✅
+        │
+        ├── Subscription 2 (Incident Queue):
+        │     Filter policy: {"severity": ["CRITICAL", "HIGH"]}
+        │     Check: message.severity ("CRITICAL") IN ["CRITICAL", "HIGH"]?
+        │     → YES → DELIVER ✅
+        │
+        ├── Subscription 3 (Email):
+        │     Filter policy: {"severity": ["CRITICAL"]}
+        │     Check: message.severity ("CRITICAL") IN ["CRITICAL"]?
+        │     → YES → DELIVER ✅
+        │
+        └── Hypothetical Subscription 4 (Info-only queue):
+              Filter policy: {"severity": ["INFO"]}
+              Check: message.severity ("CRITICAL") IN ["INFO"]?
+              → NO → DO NOT DELIVER ❌
+              (Message silently dropped for this subscriber)</code></pre></div>
+<p><strong>Filter Policy Operators:</strong></p>
+<table><thead><tr><th>Operator</th><th>Syntax</th><th>Example</th><th>Matches</th></tr></thead><tbody><tr><td>Exact match</td><td><code>["value"]</code></td><td><code>{"severity": ["CRITICAL"]}</code></td><td>severity = "CRITICAL"</td></tr><tr><td>OR match</td><td><code>["val1", "val2"]</code></td><td><code>{"severity": ["CRITICAL", "HIGH"]}</code></td><td>severity = "CRITICAL" OR "HIGH"</td></tr><tr><td>Prefix match</td><td><code>[{"prefix": "val"}]</code></td><td><code>{"sourceService": [{"prefix": "glue"}]}</code></td><td>sourceService starts with "glue"</td></tr><tr><td>Anything-but</td><td><code>[{"anything-but": "val"}]</code></td><td><code>{"severity": [{"anything-but": "INFO"}]}</code></td><td>severity is NOT "INFO"</td></tr><tr><td>Numeric match</td><td><code>[{"numeric": ["&gt;=", 100]}]</code></td><td><code>{"errorCount": [{"numeric": ["&gt;=", 5]}]}</code></td><td>errorCount &gt;= 5</td></tr><tr><td>Exists</td><td><code>[{"exists": true}]</code></td><td><code>{"errorCode": [{"exists": true}]}</code></td><td>errorCode attribute exists</td></tr><tr><td>AND logic</td><td>Multiple keys</td><td><code>{"severity": ["CRITICAL"], "sourceService": ["glue"]}</code></td><td>BOTH must match</td></tr></tbody></table>
+<p>→ These are evaluated AT THE SNS LEVEL — before delivery<br>
+→ Filtered messages are NOT stored or retried for non-matching subscribers<br>
+→ Cost optimization: Subscribers only receive relevant messages → fewer SQS messages → lower cost</p>
+<hr>
+<h3>MECHANIC 4 — CROSS-ACCOUNT DELIVERY FAILURE HANDLING</h3>
+<p><strong>SNS → Cross-Account SQS Delivery Failure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SNS attempts to deliver to SQS queue in Account 222
+</span>        │
+        ├── Attempt 1: SQS returns AccessDenied
+        │     (Queue policy doesn't allow SNS)
+        │
+        ├── SNS retries with exponential backoff:
+        │     Attempt 2: 1 second later → AccessDenied
+        │     Attempt 3: 2 seconds later → AccessDenied
+        │     Attempt 4: 4 seconds later → AccessDenied
+        │     ... continues for up to 23 days for SQS subscribers
+        │
+        ├── After all retries exhausted:
+        │     If SNS DLQ configured → message sent to DLQ
+        │     If no DLQ → message PERMANENTLY LOST
+        │
+        └── SNS delivery status log records:
+              Status: FAILURE
+              StatusCode: AccessDenied
+              Destination: Queue ARN
+              Timestamp: ...</code></pre></div>
+<p><strong>SNS Retry Policies by Protocol:</strong></p>
+<table><thead><tr><th>Protocol</th><th>Retry Duration</th><th>Retry Pattern</th></tr></thead><tbody><tr><td>SQS</td><td>23 days (100,015 attempts)</td><td>Immediate → exponential backoff → linear</td></tr><tr><td>Lambda</td><td>3 attempts</td><td>Immediate retries</td></tr><tr><td>HTTP/HTTPS</td><td>23 days</td><td>Exponential backoff</td></tr><tr><td>Email</td><td>No retry</td><td>Delivered once or not at all</td></tr><tr><td>SMS</td><td>No retry</td><td>Delivered once or not at all</td></tr></tbody></table>
+<p>→ SQS has the LONGEST retry window — 23 days<br>
+→ This means: If you fix the SQS queue policy within 23 days → queued messages will still be delivered<br>
+→ But relying on this is bad practice — fix immediately and monitor delivery status logs</p>
+<hr>
+<h3>MECHANIC 5 — COST MODEL FOR CROSS-ACCOUNT MESSAGING</h3>
+<table><thead><tr><th>Component</th><th>Cost</th><th>Notes</th></tr></thead><tbody><tr><td>SNS Publish (cross-account)</td><td>$0.50 per million messages</td><td>Same as same-account publishing</td></tr><tr><td>SNS → SQS delivery (cross-account, same region)</td><td>FREE</td><td>No delivery charge</td></tr><tr><td>SNS → SQS delivery (cross-region)</td><td>FREE</td><td>SNS absorbs cross-region transfer</td></tr><tr><td>SQS message storage</td><td>$0.40 per million requests</td><td>Standard SQS pricing</td></tr><tr><td>EventBridge cross-account PutEvents</td><td>$1.00 per million events</td><td>Custom event pricing</td></tr><tr><td>EventBridge rule evaluation</td><td>FREE</td><td>No charge for rule matching</td></tr><tr><td>KMS API calls (encrypt/decrypt)</td><td>$0.03 per 10,000 calls</td><td>Per message encrypted/decrypted</td></tr><tr><td>Data transfer (cross-region)</td><td>Absorbed by service</td><td>SNS/SQS/EventBridge handle cross-region</td></tr></tbody></table>
+<p><strong>ShopNow Cost Estimate:</strong></p>
+<table><thead><tr><th>Item</th><th>Volume</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Cross-account SNS Publish</td><td>~500,000 messages/month</td><td>$0.25</td></tr><tr><td>SQS message processing</td><td>~1,000,000 requests/month</td><td>$0.40</td></tr><tr><td>EventBridge bus-to-bus events</td><td>~200,000 events/month</td><td>$0.20</td></tr><tr><td>KMS API calls</td><td>~2,000,000 calls/month</td><td>$6.00</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~$6.85/month</strong></td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>SNS topic policy missing service principal condition</td><td>ANY account's EventBridge can publish to central topic</td><td><code>events.amazonaws.com</code> allowed without <code>aws:SourceAccount</code> condition</td><td>Add <code>aws:SourceAccount</code> condition listing allowed accounts</td></tr><tr><td>2</td><td>SQS queue policy doesn't allow SNS</td><td>Messages published to SNS but never arrive in SQS</td><td>Queue policy missing <code>sns.amazonaws.com</code> with <code>aws:SourceArn</code> condition</td><td>Add SNS service principal to queue policy</td></tr><tr><td>3</td><td>KMS key doesn't allow SNS/SQS service principals</td><td>Cross-account messages fail with KMS error</td><td>SNS/SQS cannot encrypt/decrypt with the KMS key</td><td>Add <code>sns.amazonaws.com</code> and <code>sqs.amazonaws.com</code> to KMS key policy</td></tr><tr><td>4</td><td>EventBridge rule DLQ not configured</td><td>Cross-account delivery failures silently lost</td><td>No DLQ on EventBridge rule</td><td>Add SQS DLQ to every cross-account EventBridge rule</td></tr><tr><td>5</td><td>SNS delivery status logging not enabled</td><td>Cannot diagnose why messages aren't reaching SQS</td><td>No visibility into SNS delivery attempts</td><td>Enable delivery status logging with 100% failure sample</td></tr><tr><td>6</td><td>Circular event forwarding</td><td>Infinite loop → massive cost → account throttled</td><td>Central bus rule forwards event back to source account → source forwards back</td><td>Add <code>account</code> filter in central bus rules to prevent re-forwarding</td></tr><tr><td>7</td><td>Message attributes not set on Publish</td><td>Filter policies don't match → subscribers don't receive</td><td>EventBridge input transformation doesn't include message attributes</td><td>Configure message attributes in EventBridge target settings</td></tr><tr><td>8</td><td>Raw message delivery not enabled</td><td>SQS consumer receives double-wrapped JSON</td><td>SNS wraps message in envelope → consumer parses incorrectly</td><td>Enable raw message delivery on SQS subscription</td></tr><tr><td>9</td><td>Cross-region subscription latency</td><td>Messages arrive 1-5 seconds late</td><td>Central topic in ap-south-1, subscriber queue in eu-west-1</td><td>Accept latency OR create regional SNS topics</td></tr><tr><td>10</td><td>Organization condition doesn't work</td><td>Policy denies despite correct Org ID</td><td>Accounts not yet in Organization OR using <code>aws:PrincipalOrgID</code> with service principal (doesn't work)</td><td>Verify Organization membership. Use <code>aws:SourceAccount</code> for service principals</td></tr><tr><td>11</td><td>Too many subscriptions on central topic</td><td>Hitting SNS subscription limit</td><td>Default 12.5 million subscriptions per topic (soft limit)</td><td>Well within limits for most use cases</td></tr><tr><td>12</td><td>SQS message size exceeds 256 KB</td><td>Large events fail to deliver</td><td>EventBridge event + SNS envelope exceeds SQS max</td><td>Use claim check pattern — store large payload in S3, reference in message</td></tr><tr><td>13</td><td>IAM role for EventBridge cross-account target missing permissions</td><td>EventBridge rule fires but target delivery fails</td><td>Role doesn't have <code>sns:Publish</code> on cross-account topic ARN</td><td>Add specific cross-account ARN to role's IAM policy</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Message Volume Scaling</strong></p>
+<ul>
+<li>SNS: Virtually unlimited throughput for Standard topics</li>
+<li>SQS: Virtually unlimited throughput for Standard queues (nearly unlimited sends/receives per second)</li>
+<li>EventBridge: 10,000+ events/second default (can increase)</li>
+<li>For millions of events/second → Kinesis Data Streams (Project 52)</li>
+</ul>
+<p>→ <strong>Account Count Scaling</strong></p>
+<ul>
+<li>5 accounts → Individual account IDs in policies (current approach)</li>
+<li>20+ accounts → <code>aws:PrincipalOrgID</code> condition (Step 6)</li>
+<li>100+ accounts → Organizational conditions + SCP governance (Project 54)</li>
+<li>SNS topic policy size limit: 30 KB → can hold ~100 account-specific statements</li>
+<li>With <code>aws:PrincipalOrgID</code> → ONE statement covers unlimited accounts</li>
+</ul>
+<p>→ <strong>Subscription Scaling</strong></p>
+<ul>
+<li>SNS subscriptions per topic: 12.5 million (soft limit)</li>
+<li>SQS queues per account: Unlimited (Standard), 100,000 (FIFO)</li>
+<li>EventBridge rules per bus: 300 (soft limit, can increase to 2,000+)</li>
+</ul>
+<p>→ <strong>Cross-Region Scaling</strong></p>
+<ul>
+<li>SNS → SQS cross-region: Supported, slight latency increase</li>
+<li>EventBridge bus-to-bus cross-region: Supported via rules targeting remote bus ARN</li>
+<li>For low-latency requirements → Deploy regional SNS topics with regional subscribers</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<ul>
+<li>Costs scale linearly with message volume</li>
+<li>KMS costs can become significant at high volume → Consider using SQS SSE-SQS (no KMS) for non-sensitive operational messages</li>
+<li>EventBridge custom events ($1/million) are more expensive than SNS ($0.50/million) → use SNS for simple fan-out, EventBridge for complex routing</li>
+<li>SNS → SQS delivery is FREE → the fan-out pattern is cost-effective</li>
+<li>Archive costs in EventBridge scale with event volume × retention period → set appropriate retention</li>
+</ul>
+<p>→ <strong>Reliability Scaling</strong></p>
+<ul>
+<li>SNS: 4 nines availability (99.99%) — messages durably stored across multiple AZs</li>
+<li>SQS: 4 nines availability — messages replicated across multiple AZs</li>
+<li>EventBridge: 4 nines availability — at-least-once delivery guarantee</li>
+<li>Multi-layer DLQ architecture ensures NO message is silently lost</li>
+<li>SNS retries SQS delivery for up to 23 days — extremely resilient</li>
+<li>For mission-critical messages → Add CloudWatch alarm on DLQ depth → auto-remediation Lambda</li>
+</ul>
+<p>→ <strong>Fan-Out Scaling</strong></p>
+<ul>
+<li>Single SNS Publish → delivered to ALL matching subscribers simultaneously</li>
+<li>1 message × 100 subscribers = 100 deliveries (parallel, not sequential)</li>
+<li>No degradation with increasing subscriber count</li>
+<li>Filter policies reduce unnecessary deliveries → cost savings at scale</li>
+<li>Central EventBridge bus with 50 rules → all evaluated in parallel per event</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the complete cross-account messaging setup:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>Where</th><th>Expected Result</th></tr></thead><tbody><tr><td>Central SNS topic exists</td><td>Account 555 → SNS → Topics</td><td><code>shopnow-central-operations-alerts</code> present</td></tr><tr><td>Topic policy allows source accounts</td><td>Topic → Access policy tab</td><td>Statements for each source account + EventBridge service</td></tr><tr><td>Central SQS queues exist</td><td>Account 555 → SQS → Queues</td><td>Monitoring queue, incident queue, DLQ all present</td></tr><tr><td>Queue policies allow SNS and EventBridge</td><td>Each queue → Access policy tab</td><td>Service principal statements with conditions</td></tr><tr><td>Central event bus exists</td><td>Account 555 → EventBridge → Event buses</td><td><code>shopnow-central-event-bus</code> with resource policy</td></tr><tr><td>KMS key allows service principals</td><td>Account 555 → KMS → Key policy</td><td><code>sns.amazonaws.com</code> and <code>sqs.amazonaws.com</code> listed</td></tr><tr><td>Source account EventBridge rules exist</td><td>Each source account → EventBridge → Rules</td><td>Cross-account target rules present and enabled</td></tr><tr><td>Source account IAM roles for cross-account targets</td><td>Each source account → IAM → Roles</td><td>Roles with <code>sns:Publish</code> or <code>events:PutEvents</code> on central resources</td></tr><tr><td>Source account DLQs configured</td><td>Each source account → SQS → Queues</td><td>Cross-account EventBridge DLQ exists</td></tr><tr><td>SNS subscriptions active</td><td>Account 555 → SNS → Subscriptions</td><td>All subscriptions show "Confirmed" status</td></tr><tr><td>Filter policies configured</td><td>Each subscription → Filter policy</td><td>Correct severity filters on incident queue and email</td></tr><tr><td>Raw message delivery enabled</td><td>SQS subscriptions</td><td>Raw delivery = true</td></tr></tbody></table>
+<p>→ <strong>How to test end-to-end cross-account messaging:</strong></p>
+<table><thead><tr><th>Test #</th><th>Action</th><th>Expected Flow</th><th>Verification</th></tr></thead><tbody><tr><td>1</td><td>Trigger Glue job failure in HQ (Account 111)</td><td>HQ EventBridge → Central SNS → Monitoring SQS + Incident SQS + Email</td><td>Check all three destinations receive the message</td></tr><tr><td>2</td><td>Upload file to Europe S3 (Account 222)</td><td>Europe EventBridge → Central event bus → Monitoring SQS</td><td>Check monitoring queue has the event</td></tr><tr><td>3</td><td>Trigger Secrets Manager rotation failure in US (Account 333)</td><td>US EventBridge → Central event bus → Security Lambda</td><td>Check Lambda CloudWatch logs for event processing</td></tr><tr><td>4</td><td>Publish test message with severity=INFO</td><td>Central SNS → Monitoring SQS only</td><td>Incident queue should NOT receive (filter blocks INFO)</td></tr><tr><td>5</td><td>Publish test message with severity=CRITICAL</td><td>Central SNS → All three destinations</td><td>All subscribers receive (CRITICAL matches all filters)</td></tr><tr><td>6</td><td>Disconnect queue policy temporarily → publish message</td><td>SNS delivery fails → retry → DLQ (after exhaustion)</td><td>SNS delivery status logs show failure</td></tr><tr><td>7</td><td>Send event to central bus from unauthorized account</td><td>Event rejected</td><td>CloudTrail shows AccessDenied for PutEvents</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing cross-account messaging health:</strong></p>
+<table><thead><tr><th>Metric / Signal</th><th>Where</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>SNS <code>NumberOfMessagesPublished</code></td><td>CloudWatch → SNS metrics → Central topic</td><td>Sudden drop to 0 → source accounts stopped publishing</td></tr><tr><td>SNS <code>NumberOfNotificationsFailed</code></td><td>CloudWatch → SNS metrics</td><td>Any value &gt; 0 → delivery issue</td></tr><tr><td>SNS <code>NumberOfNotificationsFilteredOut</code></td><td>CloudWatch → SNS metrics per subscription</td><td>Expected non-zero for filtered subscriptions — validate ratios</td></tr><tr><td>SQS <code>ApproximateNumberOfMessagesVisible</code></td><td>CloudWatch → SQS metrics → Monitoring queue</td><td>Growing backlog → consumer not keeping up</td></tr><tr><td>SQS <code>ApproximateAgeOfOldestMessage</code></td><td>CloudWatch → SQS metrics</td><td>&gt; 1 hour → processing delay</td></tr><tr><td>SQS DLQ <code>ApproximateNumberOfMessagesVisible</code></td><td>CloudWatch → SQS metrics → DLQ</td><td>&gt; 0 → CRITICAL: Processing failures</td></tr><tr><td>EventBridge <code>FailedInvocations</code></td><td>CloudWatch → EventBridge metrics → Cross-account rules</td><td>&gt; 0 → Target delivery failing</td></tr><tr><td>EventBridge <code>TriggeredRules</code> on central bus</td><td>CloudWatch → EventBridge metrics</td><td>Expected volume per account — drop indicates forwarding issue</td></tr><tr><td>Source account EventBridge DLQ depth</td><td>CloudWatch → SQS metrics in each source account</td><td>&gt; 0 → Cross-account delivery broken</td></tr><tr><td>SNS delivery status logs</td><td>CloudWatch Logs → <code>/aws/sns/...</code></td><td>Any FAILURE entries</td></tr></tbody></table>
+<p>→ <strong>Recommended CloudWatch Alarms:</strong></p>
+<table><thead><tr><th>Alarm</th><th>Metric</th><th>Threshold</th><th>Target</th></tr></thead><tbody><tr><td>Central DLQ Not Empty</td><td>DLQ <code>ApproximateNumberOfMessagesVisible</code></td><td>&gt; 0 for 5 minutes</td><td>SNS → DevOps on-call (CRITICAL)</td></tr><tr><td>SNS Delivery Failures</td><td><code>NumberOfNotificationsFailed</code></td><td>&gt; 0 for 5 minutes</td><td>SNS → DevOps on-call</td></tr><tr><td>Source Account DLQ Not Empty</td><td>Each source account DLQ depth</td><td>&gt; 0 for 5 minutes</td><td>SNS → DevOps on-call</td></tr><tr><td>Monitoring Queue Backlog Growing</td><td><code>ApproximateAgeOfOldestMessage</code></td><td>&gt; 3600 seconds (1 hour)</td><td>SNS → DevOps team (WARNING)</td></tr><tr><td>No Events Received (Canary)</td><td>Central bus <code>MatchedEvents</code></td><td>= 0 for 1 hour</td><td>SNS → DevOps team (WARNING) — may indicate all sources stopped</td></tr><tr><td>EventBridge Cross-Account Failures</td><td><code>FailedInvocations</code> on source account rules</td><td>&gt; 0</td><td>SNS → DevOps team</td></tr></tbody></table>
+<p>→ <strong>How to debug cross-account messaging failures:</strong></p>
+<table><thead><tr><th>Symptom</th><th>Debug Path</th><th>Common Resolution</th></tr></thead><tbody><tr><td>Source EventBridge rule fires but central SNS doesn't receive</td><td>Check source account EventBridge DLQ → Check IAM role permissions → Check SNS topic policy</td><td>Fix IAM role <code>sns:Publish</code> permission OR fix topic policy principal</td></tr><tr><td>SNS receives but SQS doesn't</td><td>Check SNS delivery status logs → Check SQS queue policy → Check KMS key policy</td><td>Fix queue policy <code>sqs:SendMessage</code> from <code>sns.amazonaws.com</code> OR fix KMS</td></tr><tr><td>Central event bus receives but rules don't match</td><td>Check event structure on central bus → Test pattern in EventBridge sandbox</td><td>Fix event pattern to match forwarded event structure</td></tr><tr><td>Filter policy blocks unexpected messages</td><td>Check message attributes on published messages → Compare with filter policy</td><td>Fix message attributes in EventBridge input transformation</td></tr><tr><td>Cross-region delivery delayed</td><td>Check SNS delivery status → Verify endpoint region</td><td>Accept inherent cross-region latency OR deploy regional infrastructure</td></tr><tr><td>KMS access denied on encrypted queue</td><td>Check KMS key policy → Verify service principals</td><td>Add <code>sns.amazonaws.com</code> and <code>sqs.amazonaws.com</code> to key policy</td></tr></tbody></table>
+<p>→ <strong>How to present cross-account messaging to stakeholders:</strong></p>
+<table><thead><tr><th>Stakeholder Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"How do events flow between accounts?"</td><td>Show architecture diagram — source accounts → central bus/SNS → targets</td></tr><tr><td>"What happens when delivery fails?"</td><td>Show multi-layer DLQ architecture — EventBridge DLQ + SQS DLQ + SNS delivery logs</td></tr><tr><td>"How do we know it's working?"</td><td>Show CloudWatch dashboard — message counts, delivery rates, DLQ depths</td></tr><tr><td>"Who can publish to the central topic?"</td><td>Show SNS topic policy — only Organization accounts or specific account IDs</td></tr><tr><td>"Can an unauthorized account spam our queues?"</td><td>Show <code>aws:SourceAccount</code> conditions — only allowed accounts accepted</td></tr><tr><td>"Is the data encrypted in transit and at rest?"</td><td>Show KMS encryption on SNS + SQS + TLS enforced for all API calls</td></tr><tr><td>"How much does this cost?"</td><td>Show cost estimate — ~$7/month for operational messaging across 5 accounts</td></tr><tr><td>"Can we add new accounts easily?"</td><td>Show <code>aws:PrincipalOrgID</code> condition — new Organization members automatically allowed</td></tr><tr><td>"Can we replay events that failed?"</td><td>Show EventBridge archive on central bus — replay capability for debugging</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Cross-account messaging follows the SAME dual-authorization model as cross-account S3 access (Project 39) and IAM role assumption (Project 40) — resource policy + IAM policy must BOTH allow<br>
+→ THREE patterns exist for cross-account event flow: SNS Publish, SQS SendMessage, EventBridge bus-to-bus — each has its sweet spot<br>
+→ SNS topic policy and SQS queue policy are RESOURCE-BASED policies — same concept as S3 bucket policy (Project 10) and KMS key policy (Project 36)<br>
+→ Service principals (<code>events.amazonaws.com</code>, <code>sns.amazonaws.com</code>) need SEPARATE policy statements from IAM principals — always add <code>aws:SourceAccount</code> condition<br>
+→ <code>aws:PrincipalOrgID</code> condition simplifies multi-account policies from N statements to ONE — essential for scaling beyond 5 accounts<br>
+→ KMS encryption adds a THIRD authorization layer — service principals must be added to the KMS key policy for encrypted SNS/SQS<br>
+→ Multi-layer DLQ architecture (EventBridge DLQ → SQS redrive DLQ) ensures NO message is silently lost across account boundaries<br>
+→ SNS filter policies enable SELECTIVE fan-out — different subscribers receive different message subsets based on attributes<br>
+→ EventBridge bus-to-bus pattern is the most powerful — central bus applies rich content-based routing to events from ALL accounts<br>
+→ The hub-and-spoke messaging pattern mirrors the hub-and-spoke IAM pattern from Project 40 — Shared Services is the central hub</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 6 introduced SNS topics and subscriptions — now extended cross-account<br>
+→ Project 7 introduced SQS queues and message lifecycle — now receiving cross-account messages<br>
+→ Project 13 introduced SNS → SQS fan-out within one account — now extended across accounts with filter policies<br>
+→ Project 15 introduced S3 → SNS notifications — same service principal pattern (<code>s3.amazonaws.com</code>) now applied to EventBridge (<code>events.amazonaws.com</code>)<br>
+→ Project 20 introduced SQS Dead Letter Queues — now applied at multiple layers of cross-account messaging<br>
+→ Project 36 introduced KMS encryption — key policy now includes SNS/SQS service principals<br>
+→ Project 38 introduced EventBridge rules and event patterns — now applied to central bus for cross-account routing<br>
+→ Project 39 introduced cross-account S3 bucket policy — same resource policy pattern applied to SNS topic policy and SQS queue policy<br>
+→ Project 40 introduced multi-account IAM role architecture — provides the identity layer for cross-account EventBridge rule IAM roles</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 42 (next) will implement cross-account Glue Catalog sharing via Lake Formation — applying the cross-account trust model to DATA CATALOG access<br>
+→ Project 42 uses AWS RAM (Resource Access Manager) which is a different cross-account sharing mechanism than the policy-based approach used here<br>
+→ Project 44 will implement cross-account VPC Peering — network-level cross-account connectivity that COMPLEMENTS the messaging-level connectivity established here<br>
+→ Project 49 will build the complex multi-service pipeline (S3 → EventBridge → Step Functions → Glue → Redshift → SNS) — the cross-account EventBridge patterns from THIS project enable the pipeline to span multiple accounts<br>
+→ Project 54 will formalize <code>aws:PrincipalOrgID</code> into full AWS Organizations governance with SCPs — replacing the manual Organization condition usage from Step 6<br>
+→ Project 60 will use cross-account EventBridge as the central event bus in the Data Mesh architecture — producer accounts publish data events, consumer accounts subscribe through the central bus</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ Cross-account messaging is now operational<br>
+→ Events flow from all 4 regional accounts to the central Shared Services account<br>
+→ Alerts are routed, incidents are queued, security events are processed<br>
+→ But the data engineering lead raises a new challenge:</p>
+<blockquote>
+<p>"Our Europe team needs to run Athena queries on data stored in HQ's S3 bucket.<br>
+In Project 39, we gave them S3 read access via cross-account roles.<br>
+They created LOCAL Glue Catalog tables in their account pointing to HQ's S3 locations.<br>
+But this creates problems:</p>
+<ol>
+<li>When HQ's data schema changes (new column added), Europe's local tables are OUT OF SYNC</li>
+<li>HQ has 200+ Glue Catalog tables — Europe manually recreated 50 of them (incomplete, error-prone)</li>
+<li>HQ's data team carefully manages table metadata, partitions, and statistics — Europe's copies don't have these</li>
+<li>Japan also needs access to 30 of HQ's tables — another manual copy effort</li>
+<li>There's no GOVERNANCE — HQ cannot control WHICH tables each account can see at the column level</li>
+</ol>
+<p>We need HQ to SHARE their Glue Data Catalog with other accounts directly,<br>
+with fine-grained access control at the database, table, and even COLUMN level,<br>
+WITHOUT each account copying catalog definitions manually."</p>
+</blockquote>
+<p>→ This is a DATA CATALOG sharing problem — different from S3 data access (Project 39)<br>
+→ S3 cross-account access lets Europe READ the files<br>
+→ But without shared catalog → Europe doesn't know the TABLE STRUCTURE (schema, partitions, data types)<br>
+→ Lake Formation provides governed cross-account catalog sharing with column-level security</p>
+<p>→ <strong>This is the exact problem Project 42 solves</strong><br>
+→ Project 42 introduces AWS Lake Formation for cross-account Glue Catalog sharing<br>
+→ It uses AWS RAM (Resource Access Manager) for sharing AND Lake Formation permissions for fine-grained access control<br>
+→ This replaces the manual "create local tables" workaround from Project 39 Step 8 with a governed, synchronized, centrally-managed catalog sharing model</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 42: "The Data Mesh Where Teams Shared Catalogs — Cross-Account Glue Catalog Sharing via Lake Formation"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-40.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 41/60</span></div><a class="nav-btn next" href="project-42.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

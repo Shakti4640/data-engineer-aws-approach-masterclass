@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 10: THE PUBLIC BUCKET THAT COST $50,000 — S3 Bucket Policies &amp; Acces — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 10: THE PUBLIC BUCKET THAT COST $50,000 — S3 Bucket Policies &amp; Access Control Lists</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-9) now has:</p>
+<ul>
+<li>S3 bucket for product images (Project 1)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instances in a properly architected VPC (Projects 3, 4, 5)</li>
+<li>SNS topics and SQS queues for messaging (Projects 6, 7)</li>
+<li>CloudWatch monitoring and alerting (Project 8)</li>
+<li>RDS MariaDB in private subnets (Project 9)</li>
+</ul>
+<p>→ Incident 1: ShopNow hired a freelance developer to build a mobile app<br>
+→ The freelancer needed access to product images in S3<br>
+→ <code>priya-dev</code> created an IAM user for the freelancer with <code>s3:GetObject</code> permission<br>
+→ But the freelancer's contract ended 3 months ago → the IAM user was never deleted<br>
+→ The freelancer's access keys were found in a public GitHub repository<br>
+→ A bot discovered the keys → downloaded the ENTIRE bucket contents including internal documents<br>
+→ 50,000 customer records with personal information were exposed<br>
+→ Data breach notification cost + legal fees + reputation damage = ₹50,00,000</p>
+<p>→ Incident 2: A junior developer was testing a static website hosting feature<br>
+→ He enabled "public access" on the PRODUCTION bucket to test<br>
+→ He forgot to disable it after testing<br>
+→ Google indexed the bucket contents → customer invoices appeared in search results<br>
+→ A security researcher found it → posted on Twitter → media picked it up<br>
+→ AWS sent a "Your bucket is public" warning email → nobody read it for 2 weeks</p>
+<p>→ Incident 3: The marketing team uploads product images to the <code>marketing/</code> prefix<br>
+→ Some images were uploaded WITHOUT encryption → violating company policy<br>
+→ The compliance team says: "EVERY object in this bucket MUST be encrypted with KMS"<br>
+→ But IAM policies (Project 2) cannot enforce encryption on uploads — they control WHO can upload, not HOW</p>
+<p>→ Incident 4: ShopNow's partner company "LogiShip" (different AWS account: 987654321098) needs to read shipping labels from ShopNow's S3 bucket<br>
+→ IAM policies are IDENTITY-based — they live in the CALLER'S account<br>
+→ ShopNow cannot attach IAM policies to LogiShip's users<br>
+→ They need a way to grant access FROM THE BUCKET SIDE</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>The bucket itself must enforce security rules — regardless of who accesses it</li>
+<li>ALL uploads must be encrypted — rejected if not</li>
+<li>Specific IP ranges should be blocked at the bucket level</li>
+<li>Cross-account access must be controlled from the bucket</li>
+<li>Public access must be permanently blocked with multiple layers of protection</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a RESOURCE-BASED POLICY problem<br>
+→ AWS has TWO types of policies:</p>
+<table><thead><tr><th>Policy Type</th><th>Attached To</th><th>Controls</th><th>Answers</th></tr></thead><tbody><tr><td>Identity-based (IAM — Project 2)</td><td>User, Group, or Role</td><td>What the IDENTITY can do</td><td>"What can this person do?"</td></tr><tr><td>Resource-based (Bucket Policy)</td><td>The S3 bucket itself</td><td>What the RESOURCE allows</td><td>"Who can access this bucket and how?"</td></tr></tbody></table>
+<p>→ Think of it like a building:</p>
+<ul>
+<li>IAM Policy = Your employee badge (determines which buildings YOU can enter)</li>
+<li>Bucket Policy = Building's guest list (determines who the BUILDING allows in)</li>
+<li>BOTH must agree for access to succeed (with one important exception — cross-account)</li>
+</ul>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ACCESS REQUEST: priya-dev wants to GetObject from shopnow-bucket
+</span>
+EVALUATION:
+┌─────────────────────────┐     ┌─────────────────────────┐
+│   IAM POLICY            │     │   BUCKET POLICY          │
+│   (On priya-dev)        │     │   (On shopnow-bucket)    │
+│                         │     │                         │
+│   Does it ALLOW         │     │   Does it ALLOW          │
+│   s3:GetObject on       │ AND │   priya-dev to           │
+│   this bucket?          │     │   GetObject?             │
+│                         │     │                         │
+└────────────┬────────────┘     └────────────┬────────────┘
+             │                               │
+             └──────────┬────────────────────┘
+                        │
+                        ▼
+              SAME ACCOUNT: Either one allowing is sufficient
+                           (unless explicit deny in either)
+              
+              CROSS-ACCOUNT: BOTH must explicitly allow</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand bucket policy structure</li>
+<li>Step 2 — Understand how IAM policies and bucket policies interact</li>
+<li>Step 3 — Create bucket policies for common scenarios</li>
+<li>Step 4 — Enforce encryption on uploads</li>
+<li>Step 5 — Restrict access by IP address</li>
+<li>Step 6 — Restrict access by VPC endpoint</li>
+<li>Step 7 — Understand Block Public Access settings</li>
+<li>Step 8 — Understand ACLs (legacy) and why to avoid them</li>
+<li>Step 9 — Cross-account access via bucket policy</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND BUCKET POLICY STRUCTURE</h3>
+<p>→ A bucket policy is a JSON document attached directly to an S3 bucket<br>
+→ It uses the SAME policy language as IAM (Project 2) with one key addition: <strong>Principal</strong></p>
+<p>→ S3 Console → Select bucket → "Permissions" tab → "Bucket policy" → "Edit"</p>
+<p><strong>Anatomy of a Bucket Policy:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowWebServerRead",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:role/shopnow-web-server-role"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::shopnow-productimages-prod-aps1/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceVpc": "vpc-0abc123def456"
+        }
+      }
+    }
+  ]
+}</code></pre></div>
+<p><strong>Fields — What's NEW compared to IAM policies (Project 2):</strong></p>
+<table><thead><tr><th>Field</th><th>IAM Policy</th><th>Bucket Policy</th><th>Explanation</th></tr></thead><tbody><tr><td>Version</td><td>Same</td><td>Same</td><td>Always "2012-10-17"</td></tr><tr><td>Statement</td><td>Same</td><td>Same</td><td>Array of permission rules</td></tr><tr><td>Sid</td><td>Same</td><td>Same</td><td>Human-readable statement ID</td></tr><tr><td>Effect</td><td>Same</td><td>Same</td><td>Allow or Deny</td></tr><tr><td><strong>Principal</strong></td><td><strong>NOT present</strong></td><td><strong>REQUIRED</strong></td><td>WHO this statement applies to</td></tr><tr><td>Action</td><td>Same</td><td>Same</td><td>What operations are allowed/denied</td></tr><tr><td>Resource</td><td>Same</td><td>Same</td><td>Which objects/bucket this applies to</td></tr><tr><td>Condition</td><td>Same</td><td>Same</td><td>Additional constraints</td></tr></tbody></table>
+<p>→ The KEY difference: Bucket policies have a <strong>Principal</strong> field<br>
+→ IAM policies don't need Principal because they're attached to the identity (the principal IS the user/role)<br>
+→ Bucket policies need Principal because they're attached to the resource — they must specify WHO</p>
+<hr>
+<p><strong>Principal Types:</strong></p>
+<table><thead><tr><th>Principal Format</th><th>Who It Represents</th><th>Example</th></tr></thead><tbody><tr><td><code>"AWS": "arn:aws:iam::123456789012:root"</code></td><td>Entire AWS account</td><td>Allow any identity in account 123456789012</td></tr><tr><td><code>"AWS": "arn:aws:iam::123456789012:user/priya-dev"</code></td><td>Specific IAM user</td><td>Allow only priya-dev</td></tr><tr><td><code>"AWS": "arn:aws:iam::123456789012:role/web-server-role"</code></td><td>Specific IAM role</td><td>Allow only this role</td></tr><tr><td><code>"AWS": "*"</code></td><td>Any AWS identity</td><td>Allow anyone (DANGEROUS without conditions)</td></tr><tr><td><code>"Service": "s3.amazonaws.com"</code></td><td>AWS S3 service</td><td>Allow S3 replication (Project 30)</td></tr><tr><td><code>"Service": "sns.amazonaws.com"</code></td><td>AWS SNS service</td><td>Already used in Project 6 topic policies</td></tr><tr><td><code>"Service": "cloudwatch.amazonaws.com"</code></td><td>AWS CloudWatch</td><td>Allow CloudWatch to read/write</td></tr><tr><td><code>"*"</code></td><td>ANYONE (including anonymous)</td><td>Public access — extremely dangerous</td></tr></tbody></table>
+<p><strong>CRITICAL: <code>"*"</code> vs <code>"AWS": "*"</code>:</strong></p>
+<table><thead><tr><th>Principal</th><th>Meaning</th><th>Risk Level</th></tr></thead><tbody><tr><td><code>"*"</code></td><td>ANYONE — including unauthenticated users (no AWS account needed)</td><td>EXTREME — public internet access</td></tr><tr><td><code>"AWS": "*"</code></td><td>Any AUTHENTICATED AWS identity (must have an AWS account)</td><td>HIGH — any AWS customer</td></tr></tbody></table>
+<p>→ Using <code>"*"</code> as principal = making the bucket publicly accessible to the entire internet<br>
+→ This is what caused Incident 2 — public access without authentication</p>
+<hr>
+<h3>STEP 2 — HOW IAM POLICIES AND BUCKET POLICIES INTERACT</h3>
+<p>→ This is the MOST important concept in this project<br>
+→ Understanding this prevents 90% of S3 access issues</p>
+<p><strong>SAME-ACCOUNT ACCESS (IAM user in Account A accessing bucket in Account A):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>priya-dev (Account 123456789012) → GetObject → shopnow-bucket (Account 123456789012)
+</span>
+EVALUATION:
+Step 1: Gather ALL applicable policies
+        - IAM policy on priya-dev (identity-based)
+        - Bucket policy on shopnow-bucket (resource-based)
+        - Permission boundary on priya-dev (if set — Project 2)
+
+Step 2: Is there an EXPLICIT DENY in ANY policy?
+        YES → DENIED (game over)
+        NO → Continue
+
+Step 3: Is there an EXPLICIT ALLOW in ANY policy?
+        IAM policy allows? → ALLOWED ✓
+        OR Bucket policy allows? → ALLOWED ✓
+        (Either one is sufficient for same-account)
+
+Step 4: Neither allows? → DENIED (implicit deny)</code></pre></div>
+<p>→ KEY: For same-account access → EITHER the IAM policy OR the bucket policy can grant access<br>
+→ You don't need BOTH to allow — one is enough<br>
+→ But an explicit DENY in either one blocks access regardless</p>
+<p><strong>Example Scenarios (Same Account):</strong></p>
+<table><thead><tr><th>IAM Policy</th><th>Bucket Policy</th><th>Result</th><th>Explanation</th></tr></thead><tbody><tr><td>Allow s3:GetObject</td><td>No bucket policy</td><td>ALLOWED</td><td>IAM allows → sufficient</td></tr><tr><td>No IAM policy for S3</td><td>Allow Principal: priya-dev GetObject</td><td>ALLOWED</td><td>Bucket policy allows → sufficient</td></tr><tr><td>Allow s3:GetObject</td><td>Deny Principal: priya-dev</td><td>DENIED</td><td>Explicit deny in bucket policy wins</td></tr><tr><td>Deny s3:GetObject</td><td>Allow Principal: priya-dev</td><td>DENIED</td><td>Explicit deny in IAM policy wins</td></tr><tr><td>No IAM policy</td><td>No bucket policy</td><td>DENIED</td><td>No allow anywhere → implicit deny</td></tr><tr><td>Allow s3:GetObject</td><td>Allow Principal: priya-dev</td><td>ALLOWED</td><td>Both allow → definitely allowed</td></tr></tbody></table>
+<hr>
+<p><strong>CROSS-ACCOUNT ACCESS (IAM user in Account B accessing bucket in Account A):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>logiship-user (Account 987654321098) → GetObject → shopnow-bucket (Account 123456789012)
+</span>
+EVALUATION:
+Step 1: BOTH must explicitly allow
+        - IAM policy in Account B (on logiship-user): Must allow s3:GetObject on shopnow-bucket
+        AND
+        - Bucket policy in Account A (on shopnow-bucket): Must allow Principal from Account B
+
+Step 2: If EITHER is missing the allow → DENIED
+
+Step 3: Explicit deny in EITHER → DENIED</code></pre></div>
+<p>→ KEY: For cross-account access → BOTH the IAM policy AND the bucket policy must explicitly allow<br>
+→ One is NOT sufficient — you need both sides to agree<br>
+→ This is the fundamental difference from same-account evaluation</p>
+<p><strong>Cross-Account Matrix:</strong></p>
+<table><thead><tr><th>IAM Policy (Account B)</th><th>Bucket Policy (Account A)</th><th>Result</th></tr></thead><tbody><tr><td>Allow s3:GetObject</td><td>Allow Principal: Account B</td><td>ALLOWED ✓</td></tr><tr><td>Allow s3:GetObject</td><td>No bucket policy</td><td>DENIED ✗</td></tr><tr><td>No IAM policy</td><td>Allow Principal: Account B</td><td>DENIED ✗</td></tr><tr><td>Allow s3:GetObject</td><td>Deny Principal: Account B</td><td>DENIED ✗</td></tr><tr><td>No IAM policy</td><td>No bucket policy</td><td>DENIED ✗</td></tr></tbody></table>
+<p>→ This is why LogiShip needs BOTH:</p>
+<ol>
+<li>Their IAM admin creates a policy allowing access to ShopNow's bucket</li>
+<li>ShopNow's bucket policy explicitly allows LogiShip's account<br>
+→ Project 39 covers this in full depth</li>
+</ol>
+<hr>
+<h3>STEP 3 — CREATE BUCKET POLICIES FOR SHOPNOW</h3>
+<hr>
+<p><strong>POLICY 1: Allow Web Server Role to Read All Objects</strong></p>
+<p>→ The EC2 web server (with IAM Role — will be configured in Project 11) needs to read product images</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowWebServerRead
+  Effect: Allow
+  Principal:
+    AWS: arn:aws:iam::123456789012:role/shopnow-web-server-role
+  Action:
+    - s3:GetObject
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/*</code></pre></div>
+<p>→ Only the specific IAM Role can read objects<br>
+→ Not all users — just the web server role<br>
+→ Resource uses <code>/*</code> for object-level access (Project 2 ARN lesson)</p>
+<hr>
+<p><strong>POLICY 2: Allow Finance Team to Read/Write Only invoices/ Prefix</strong></p>
+<p>→ Supplements the IAM policy from Project 2 with bucket-level enforcement</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1:
+</span>  Sid: AllowFinanceListInvoices
+  Effect: Allow
+  Principal:
+    AWS: arn:aws:iam::123456789012:root
+  Action:
+    - s3:ListBucket
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+  Condition:
+    StringLike:
+      s3:prefix:
+        - "invoices/*"
+        - ""
+
+Statement 2:
+  Sid: AllowFinanceReadWriteInvoices
+  Effect: Allow
+  Principal:
+    AWS: arn:aws:iam::123456789012:root
+  Action:
+    - s3:GetObject
+    - s3:PutObject
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/invoices/*</code></pre></div>
+<p>→ Wait — Principal is <code>root</code> (entire account) but IAM policies restrict per-user<br>
+→ This is the LAYERED approach:</p>
+<ul>
+<li>Bucket policy: Allows the account broadly (for invoices prefix)</li>
+<li>IAM policy (Project 2): Restricts specific users to specific prefixes</li>
+<li>BOTH work together — IAM policy is the fine-grained control</li>
+</ul>
+<p>→ Alternatively — you can specify individual user ARNs as principal for even tighter bucket-level control<br>
+→ For most organizations → IAM policies handle per-user restrictions, bucket policies handle broad resource-level rules</p>
+<hr>
+<p><strong>POLICY 3: Explicit Deny — Block Specific IAM User (Terminated Freelancer)</strong></p>
+<p>→ The freelancer's IAM user should have been deleted — but as defense in depth:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: DenyFreelancerAccess
+  Effect: Deny
+  Principal:
+    AWS: arn:aws:iam::123456789012:user/freelancer-dev
+  Action:
+    - s3:*
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/*</code></pre></div>
+<p>→ Even if the freelancer's IAM policy says Allow → the bucket's explicit Deny overrides it<br>
+→ This is defense in depth — even if IAM user deletion is delayed, the bucket is protected<br>
+→ Best practice: Delete the IAM user AND add a bucket policy deny as double protection</p>
+<hr>
+<h3>STEP 4 — ENFORCE ENCRYPTION ON ALL UPLOADS</h3>
+<p>→ This solves Incident 3: Some objects uploaded without encryption</p>
+<p><strong>Policy: Deny Any Upload Without Server-Side Encryption</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1:
+</span>  Sid: DenyUnencryptedUploads
+  Effect: Deny
+  Principal: "*"
+  Action: s3:PutObject
+  Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/*
+  Condition:
+    StringNotEquals:
+      s3:x-amz-server-side-encryption: "aws:kms"
+
+Statement 2:
+  Sid: DenyUploadWithoutEncryptionHeader
+  Effect: Deny
+  Principal: "*"
+  Action: s3:PutObject
+  Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/*
+  Condition:
+    "Null":
+      s3:x-amz-server-side-encryption: "true"</code></pre></div>
+<p><strong>How These Two Statements Work Together:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UPLOAD SCENARIO 1: No encryption header at all
+</span>  → Statement 2: Condition checks if header is NULL → YES → DENY ✗
+
+UPLOAD SCENARIO 2: Encryption header = "AES256" (SSE-S3)
+  → Statement 2: Header is NOT null → Statement 2 doesn't apply
+  → Statement 1: Header value = "AES256" ≠ "aws:kms" → DENY ✗
+  (We require KMS encryption specifically, not just SSE-S3)
+
+UPLOAD SCENARIO 3: Encryption header = "aws:kms"
+  → Statement 2: Header is NOT null → doesn't apply
+  → Statement 1: Header value = "aws:kms" → StringNotEquals fails → Statement doesn't apply
+  → No deny → Upload proceeds ✓</code></pre></div>
+<p>→ This enforces: EVERY upload MUST use KMS encryption<br>
+→ Anyone uploading without encryption → request rejected with "Access Denied"<br>
+→ This applies to ALL principals (including admins) — <code>Principal: "*"</code> in a Deny statement<br>
+→ Even the bucket owner cannot upload unencrypted objects</p>
+<p><strong>Why Deny Instead of Allow:</strong></p>
+<p>→ You CANNOT "require" something with an Allow statement<br>
+→ Allow says: "You may do this" — it doesn't say "You MUST do it this way"<br>
+→ Deny with condition says: "You CANNOT do this UNLESS you meet the condition"<br>
+→ The Deny + condition pattern is how you ENFORCE requirements</p>
+<hr>
+<h3>STEP 5 — RESTRICT ACCESS BY IP ADDRESS</h3>
+<p>→ Block access from specific IP ranges or allow only from known IPs</p>
+<p><strong>Policy: Allow Access Only from Office IP Range</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: DenyAccessFromOutsideOffice
+  Effect: Deny
+  Principal: "*"
+  Action: s3:*
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/*
+  Condition:
+    NotIpAddress:
+      aws:SourceIp:
+        - "203.0.113.0/24"
+        - "198.51.100.0/24"
+    StringNotEquals:
+      aws:PrincipalServiceName: ""</code></pre></div>
+<p>→ <code>NotIpAddress: aws:SourceIp</code> → Deny if the request comes from an IP NOT in the listed ranges<br>
+→ This blocks: Freelancers at home, stolen keys used from random IPs, bots<br>
+→ The <code>StringNotEquals: aws:PrincipalServiceName</code> condition prevents blocking AWS service calls<br>
+→ Without it → S3 replication, CloudTrail logging, and other services would be blocked</p>
+<p><strong>CAUTION: IP-based restrictions and AWS service access:</strong></p>
+<p>→ When AWS services access your bucket (CloudTrail, S3 Replication, Glue, etc.):</p>
+<ul>
+<li>They don't come from your office IP</li>
+<li>They use AWS internal IPs</li>
+<li>IP-based deny would block them</li>
+</ul>
+<p>→ Solution: Add conditions to exclude AWS service principals:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Condition:
+</span>  NotIpAddress:
+    aws:SourceIp: "203.0.113.0/24"
+  StringNotLike:
+    aws:userId:
+      - "AROA*"</code></pre></div>
+<p>→ <code>AROA*</code> is the prefix for role session IDs → this excludes calls made by IAM roles<br>
+→ Alternatively, use <code>aws:ViaAWSService: "true"</code> condition to detect service-to-service calls</p>
+<p>→ IP-based restrictions are COMPLEX — test thoroughly before applying</p>
+<hr>
+<h3>STEP 6 — RESTRICT ACCESS BY VPC ENDPOINT</h3>
+<p>→ A more reliable approach than IP-based restrictions<br>
+→ Instead of trusting IP addresses → trust the VPC endpoint through which the request arrives<br>
+→ VPC Endpoints are covered in Project 27 — this is a preview of the bucket policy side</p>
+<p><strong>Policy: Allow Access Only from Specific VPC</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: DenyAccessFromOutsideVPC
+  Effect: Deny
+  Principal: "*"
+  Action: s3:*
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/*
+  Condition:
+    StringNotEquals:
+      aws:SourceVpc: "vpc-0abc123def456"</code></pre></div>
+<p>→ <code>aws:SourceVpc</code> → the VPC ID from which the request originates<br>
+→ This blocks ALL access that doesn't come through the specified VPC<br>
+→ Even valid IAM credentials from outside the VPC → DENIED</p>
+<p><strong>Or restrict to specific VPC Endpoint:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Condition:
+</span>  StringNotEquals:
+    aws:SourceVpce: "vpce-0abc123def456"</code></pre></div>
+<p>→ <code>aws:SourceVpce</code> → the specific VPC endpoint ID<br>
+→ More granular than VPC-level restriction</p>
+<p><strong>CAUTION with VPC restrictions:</strong></p>
+<p>→ Console access (from your browser) does NOT go through VPC endpoints<br>
+→ If you restrict to VPC only → you CANNOT manage the bucket from the AWS Console<br>
+→ Solution: Add an exception for specific IAM roles used for administration:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: DenyAccessFromOutsideVPCExceptAdmin
+  Effect: Deny
+  Principal: "*"
+  Action: s3:*
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/*
+  Condition:
+    StringNotEquals:
+      aws:SourceVpc: "vpc-0abc123def456"
+    ArnNotLike:
+      aws:PrincipalArn:
+        - "arn:aws:iam::123456789012:role/shopnow-admin-role"</code></pre></div>
+<p>→ This denies non-VPC access EXCEPT when the caller is the admin role<br>
+→ Admin can manage from console → everyone else must go through VPC endpoint</p>
+<hr>
+<h3>STEP 7 — BLOCK PUBLIC ACCESS SETTINGS (DEFENSE IN DEPTH)</h3>
+<p>→ S3 provides FOUR levels of public access blocking<br>
+→ These are OVERRIDES that supersede bucket policies and ACLs</p>
+<p>→ S3 Console → Select bucket → "Permissions" → "Block public access" → "Edit"</p>
+<p><strong>The Four Settings:</strong></p>
+<table><thead><tr><th>#</th><th>Setting</th><th>What It Blocks</th></tr></thead><tbody><tr><td>1</td><td>Block public access granted through NEW ACLs</td><td>Prevents adding ACLs that grant public access</td></tr><tr><td>2</td><td>Block public access granted through ANY ACLs</td><td>Ignores ALL existing and future ACLs that grant public access</td></tr><tr><td>3</td><td>Block public access granted through NEW public bucket policies</td><td>Prevents saving bucket policies that grant public access</td></tr><tr><td>4</td><td>Block public access granted through ANY public bucket or access point policies</td><td>Ignores ALL existing and future policies that grant public access</td></tr></tbody></table>
+<p><strong>How "Block All Public Access" Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCENARIO: Block All Public Access = ON (all 4 settings enabled)
+</span>
+Developer tries to add bucket policy:
+  Principal: "*"
+  Effect: Allow
+  Action: s3:GetObject
+
+Step 1: Developer clicks "Save"
+Step 2: S3 evaluates the policy → detects public access grant
+Step 3: S3 REJECTS the policy change → Error: "Block Public Access settings prevent this"
+Step 4: Policy is NOT saved → bucket remains private
+
+Even if policy was ALREADY present before Block Public Access was enabled:
+Step 1: Block Public Access enabled
+Step 2: Existing public-granting policy is OVERRIDDEN → effectively ignored
+Step 3: Public access requests → DENIED regardless of bucket policy</code></pre></div>
+<p>→ Block Public Access is the NUCLEAR OPTION — it overrides everything<br>
+→ This is what would have prevented Incident 2 — even if the developer enabled public access in the bucket policy, Block Public Access would have rejected it</p>
+<p><strong>Account-Level Block Public Access:</strong></p>
+<p>→ S3 Console → "Block Public Access settings for this account" (left sidebar)<br>
+→ You can enable Block Public Access at the ACCOUNT level<br>
+→ This applies to ALL buckets in the account — overrides individual bucket settings</p>
+<table><thead><tr><th>Level</th><th>Scope</th><th>Override Hierarchy</th></tr></thead><tbody><tr><td>Account-level Block Public Access</td><td>ALL buckets in the account</td><td>Highest priority — overrides bucket-level</td></tr><tr><td>Bucket-level Block Public Access</td><td>This specific bucket</td><td>Overrides bucket policies and ACLs</td></tr><tr><td>Bucket Policy</td><td>This specific bucket</td><td>Can be overridden by Block Public Access</td></tr><tr><td>ACLs</td><td>Specific objects or bucket</td><td>Can be overridden by Block Public Access</td></tr></tbody></table>
+<p>→ For ShopNow → Enable Block Public Access at BOTH account level AND bucket level<br>
+→ Belt AND suspenders approach</p>
+<hr>
+<h3>STEP 8 — UNDERSTAND ACLs (LEGACY) AND WHY TO AVOID THEM</h3>
+<p><strong>What Are ACLs?</strong></p>
+<p>→ ACLs (Access Control Lists) are the ORIGINAL S3 access control mechanism<br>
+→ They predate bucket policies and IAM policies<br>
+→ They are MUCH less flexible than bucket policies</p>
+<p><strong>ACL Grantees:</strong></p>
+<table><thead><tr><th>Grantee</th><th>Meaning</th></tr></thead><tbody><tr><td>Bucket owner</td><td>The AWS account that owns the bucket</td></tr><tr><td>Authenticated users</td><td>ANY authenticated AWS account (DANGEROUS)</td></tr><tr><td>All users (public)</td><td>EVERYONE including anonymous (EXTREMELY DANGEROUS)</td></tr><tr><td>Log delivery</td><td>S3 log delivery service</td></tr><tr><td>Specific AWS account</td><td>Identified by canonical user ID or email</td></tr></tbody></table>
+<p><strong>ACL Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Bucket Level</th><th>Object Level</th></tr></thead><tbody><tr><td>READ</td><td>List objects in bucket</td><td>Read the object data</td></tr><tr><td>WRITE</td><td>Create/delete objects in bucket</td><td>N/A</td></tr><tr><td>READ_ACP</td><td>Read the bucket ACL</td><td>Read the object ACL</td></tr><tr><td>WRITE_ACP</td><td>Modify the bucket ACL</td><td>Modify the object ACL</td></tr><tr><td>FULL_CONTROL</td><td>All of the above</td><td>All of the above</td></tr></tbody></table>
+<p><strong>Why ACLs Are Problematic:</strong></p>
+<table><thead><tr><th>Issue</th><th>Explanation</th></tr></thead><tbody><tr><td>Coarse-grained</td><td>Only 5 permission types — no conditional logic</td></tr><tr><td>Confusing grantees</td><td>"Authenticated users" means ANY AWS account — not "your" users</td></tr><tr><td>Object-level ACLs</td><td>Each object can have its own ACL — impossible to manage at scale</td></tr><tr><td>No conditions</td><td>Cannot restrict by IP, VPC, encryption, time, etc.</td></tr><tr><td>Cross-account confusion</td><td>Objects uploaded by other accounts may be owned by them, not you</td></tr><tr><td>Legacy</td><td>AWS recommends disabling ACLs for all new buckets</td></tr></tbody></table>
+<p><strong>AWS Recommendation: Disable ACLs</strong></p>
+<p>→ S3 Console → Create bucket → Object Ownership → "ACLs disabled (recommended)"<br>
+→ This was already configured in Project 1</p>
+<p>→ When ACLs are disabled:</p>
+<ul>
+<li>The bucket owner owns ALL objects regardless of who uploaded</li>
+<li>ACLs cannot be set on objects or the bucket</li>
+<li>All access control is through IAM policies and bucket policies</li>
+<li>This is the CLEANEST and MOST SECURE approach</li>
+</ul>
+<p><strong>If ACLs Are Still Enabled (Legacy Buckets):</strong></p>
+<p>→ S3 Console → Select bucket → "Permissions" → "Access control list (ACL)"<br>
+→ Verify:</p>
+<ul>
+<li>Bucket owner: FULL_CONTROL (default, cannot remove)</li>
+<li>No other grantees listed</li>
+<li>"All users" (public) and "Authenticated users" should NOT have any permissions</li>
+</ul>
+<p>→ If you find "All users: READ" → the bucket is PUBLIC → remove immediately<br>
+→ Better yet → switch to "ACLs disabled" in Object Ownership settings</p>
+<hr>
+<h3>STEP 9 — CROSS-ACCOUNT ACCESS VIA BUCKET POLICY (Preview for Project 39)</h3>
+<p>→ LogiShip (Account 987654321098) needs to read shipping labels from ShopNow's bucket</p>
+<p><strong>Bucket Policy on ShopNow's Bucket:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowLogiShipRead
+  Effect: Allow
+  Principal:
+    AWS: "arn:aws:iam::987654321098:root"
+  Action:
+    - s3:GetObject
+  Resource:
+    - arn:aws:s3:::shopnow-productimages-prod-aps1/shipping-labels/*
+  Condition:
+    StringEquals:
+      aws:PrincipalOrgID: "o-abc123def4"</code></pre></div>
+<p>→ <code>Principal: Account 987654321098</code> → allows LogiShip's account<br>
+→ <code>Resource: /shipping-labels/*</code> → only the shipping-labels prefix — not the entire bucket<br>
+→ <code>Condition: aws:PrincipalOrgID</code> → only if LogiShip is in the same AWS Organization (Project 54)<br>
+→ Without the org condition → any account you specify can access</p>
+<p><strong>What LogiShip Must Also Do (Their Side):</strong></p>
+<p>→ LogiShip's IAM admin must create an IAM policy for their user:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Effect: Allow
+</span>Action: s3:GetObject
+Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/shipping-labels/*</code></pre></div>
+<p>→ Remember: Cross-account requires BOTH sides (Step 2)<br>
+→ ShopNow's bucket policy allows LogiShip<br>
+→ LogiShip's IAM policy allows their user to access ShopNow's bucket<br>
+→ If either side is missing → access denied</p>
+<p>→ Full cross-account patterns are covered in Project 39</p>
+<hr>
+<h3>STEP 10 — COMPLETE BUCKET POLICY FOR SHOPNOW</h3>
+<p>→ Combining all the policies from Steps 3-6 into a single bucket policy:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "Version": "2012-10-17",
+  "Statement": [
+
+    Statement 1: Allow web server role to read all objects
+    Sid: AllowWebServerRead
+    Effect: Allow
+    Principal: AWS: arn:aws:iam::123456789012:role/shopnow-web-server-role
+    Action: s3:GetObject
+    Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/*
+
+    Statement 2: Deny unencrypted uploads (wrong encryption type)
+    Sid: DenyNonKMSEncryptedUploads
+    Effect: Deny
+    Principal: "*"
+    Action: s3:PutObject
+    Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/*
+    Condition:
+      StringNotEquals:
+        s3:x-amz-server-side-encryption: "aws:kms"
+
+    Statement 3: Deny uploads without any encryption header
+    Sid: DenyUnencryptedUploads
+    Effect: Deny
+    Principal: "*"
+    Action: s3:PutObject
+    Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/*
+    Condition:
+      "Null":
+        s3:x-amz-server-side-encryption: "true"
+
+    Statement 4: Deny HTTP (non-HTTPS) access
+    Sid: DenyInsecureTransport
+    Effect: Deny
+    Principal: "*"
+    Action: s3:*
+    Resource:
+      - arn:aws:s3:::shopnow-productimages-prod-aps1
+      - arn:aws:s3:::shopnow-productimages-prod-aps1/*
+    Condition:
+      Bool:
+        aws:SecureTransport: "false"
+
+    Statement 5: Deny access from terminated freelancer
+    Sid: DenyFreelancerAccess
+    Effect: Deny
+    Principal: AWS: arn:aws:iam::123456789012:user/freelancer-dev
+    Action: s3:*
+    Resource:
+      - arn:aws:s3:::shopnow-productimages-prod-aps1
+      - arn:aws:s3:::shopnow-productimages-prod-aps1/*
+
+    Statement 6: Allow LogiShip to read shipping labels
+    Sid: AllowLogiShipReadShippingLabels
+    Effect: Allow
+    Principal: AWS: arn:aws:iam::987654321098:root
+    Action: s3:GetObject
+    Resource: arn:aws:s3:::shopnow-productimages-prod-aps1/shipping-labels/*
+
+  ]
+}</code></pre></div>
+<p><strong>Statement 4 Explained: Deny HTTP (Enforce HTTPS)</strong></p>
+<p>→ <code>aws:SecureTransport: "false"</code> → true when the request uses HTTP instead of HTTPS<br>
+→ Denying when SecureTransport is false → forces all requests to use HTTPS<br>
+→ This ensures data in transit is ALWAYS encrypted (TLS/SSL)<br>
+→ Combined with KMS encryption on upload → data is encrypted BOTH at rest AND in transit</p>
+<hr>
+<p><strong>IMPORTANT: Bucket Policy Size Limit:</strong></p>
+<table><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody><tr><td>Maximum bucket policy size</td><td>20 KB</td></tr><tr><td>Maximum statements</td><td>No hard limit (but policy size constrains)</td></tr></tbody></table>
+<p>→ 20 KB is substantial but can be reached with many detailed statements<br>
+→ If you hit the limit → consolidate statements, use fewer conditions, or use IAM policies for per-user rules<br>
+→ Bucket policies should handle RESOURCE-level rules (encryption, transport, VPC)<br>
+→ IAM policies should handle IDENTITY-level rules (per-user, per-group permissions)</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable Block Public Access at BOTH account level AND bucket level<br>
+→ Always enforce HTTPS with the <code>aws:SecureTransport</code> condition<br>
+→ Always enforce encryption with Deny + condition pattern on PutObject<br>
+→ Always use specific principals in Allow statements — avoid <code>"*"</code> or <code>"AWS": "*"</code><br>
+→ Always use both bucket ARN and bucket ARN/* in Deny statements (covers both bucket and object operations)<br>
+→ Always add Deny statements for terminated employees as defense in depth<br>
+→ Always disable ACLs on new buckets — use bucket policies and IAM policies instead<br>
+→ Always test bucket policies with a test user before applying to production<br>
+→ Always use the Policy Simulator (IAM Console) to verify combined policy effects<br>
+→ Always include <code>Sid</code> on every statement for debugging and audit<br>
+→ Always version control your bucket policies (store in Git alongside infrastructure code)<br>
+→ Always review bucket policies quarterly for stale principals or overly broad permissions</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use <code>"*"</code> as Principal in an Allow statement without strict conditions<br>
+→ Never use ACLs for new access control — they are legacy and confusing<br>
+→ Never grant "Authenticated users" ACL access — it means ANY AWS customer<br>
+→ Never forget that cross-account access requires BOTH sides to explicitly allow<br>
+→ Never rely solely on IAM policies for sensitive buckets — add bucket policy Deny statements<br>
+→ Never add a bucket policy that contradicts Block Public Access settings — it will be rejected<br>
+→ Never use HTTP for S3 access — always enforce HTTPS via bucket policy<br>
+→ Never leave encryption enforcement to "hope" — use Deny policies to REQUIRE it<br>
+→ Never create bucket policies larger than 20 KB — simplify or split concerns<br>
+→ Never forget to include both <code>arn:aws:s3:::bucket</code> AND <code>arn:aws:s3:::bucket/*</code> in resource<br>
+→ Never assume deleting an IAM user immediately prevents access — add bucket-level deny for safety<br>
+→ Never test bucket policy changes on production first — test on a non-production bucket</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Use Bucket Policy</th><th>Use IAM Policy</th></tr></thead><tbody><tr><td>Enforce encryption on all uploads</td><td>✅ Deny without encryption header</td><td>❌ IAM can't enforce upload conditions</td></tr><tr><td>Enforce HTTPS on all access</td><td>✅ Deny when SecureTransport=false</td><td>❌ IAM can't enforce transport method</td></tr><tr><td>Restrict access to VPC only</td><td>✅ Deny when SourceVpc doesn't match</td><td>❌ IAM can't reference VPC conditions easily</td></tr><tr><td>Block specific IP ranges</td><td>✅ Deny from specific IPs</td><td>❌ Possible but less natural</td></tr><tr><td>Per-user access control</td><td>⚠️ Possible but hard to manage</td><td>✅ IAM policies on users/groups (Project 2)</td></tr><tr><td>Cross-account access</td><td>✅ Must have bucket policy allowing</td><td>✅ Must also have IAM policy in other account</td></tr><tr><td>Grant AWS service access (S3 replication, CloudTrail)</td><td>✅ Service principal in bucket policy</td><td>❌ Services don't have IAM users</td></tr><tr><td>Temporary access for contractors</td><td>❌ Bucket policy is persistent</td><td>✅ IAM user with time-limited credentials</td></tr><tr><td>Block public access as override</td><td>✅ Block Public Access settings</td><td>❌ IAM can't override bucket-level access</td></tr></tbody></table>
+<p><strong>Decision Framework:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Question 1: Does the rule apply to the RESOURCE regardless of who accesses it?
+</span>  YES → Bucket Policy (encryption, HTTPS, VPC, IP restrictions)
+  
+Question 2: Does the rule apply to a specific IDENTITY?
+  YES → IAM Policy (per-user, per-group, per-role permissions)
+  
+Question 3: Does the rule involve cross-account access?
+  YES → BOTH (bucket policy allows the account, IAM policy allows the user)
+  
+Question 4: Does the rule involve AWS service access?
+  YES → Bucket Policy (service principal)
+  
+Best Practice: Use BOTH for defense in depth
+  IAM: Controls what identities CAN do
+  Bucket: Controls what the resource ALLOWS
+  Block Public Access: Prevents accidental public exposure</code></pre></div>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use bucket policies for fine-grained per-user permissions → Use IAM policies (Project 2) + Groups<br>
+→ Do NOT use bucket policies as the ONLY security mechanism → Always combine with IAM policies<br>
+→ Do NOT use ACLs for anything → Use bucket policies instead<br>
+→ Do NOT use bucket policies to replace VPC-level security → VPC endpoints (Project 27) + bucket policy conditions together<br>
+→ Do NOT use bucket policies for temporary access grants → Use IAM policies with time conditions or presigned URLs<br>
+→ Do NOT use bucket policies for complex organizational hierarchies → Use IAM Groups + AWS Organizations SCPs (Project 54)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE COMPLETE S3 ACCESS EVALUATION FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Request arrives (e.g., GetObject)
+</span>        │
+        ▼
+Step 1: AUTHENTICATION
+        │
+        ├── Signed request (SigV4 — Project 2)?
+        │   → Verify signature → Identify IAM principal
+        │
+        ├── Presigned URL?
+        │   → Verify signature + expiration → Identify original signer
+        │
+        └── Anonymous (no signature)?
+            → Principal = anonymous ("*")
+        │
+        ▼
+Step 2: BLOCK PUBLIC ACCESS CHECK
+        │
+        ├── Account-level Block Public Access enabled?
+        │   → Is this a public access request? → DENIED
+        │
+        └── Bucket-level Block Public Access enabled?
+            → Is this a public access request? → DENIED
+        │
+        ▼
+Step 3: GATHER ALL APPLICABLE POLICIES
+        │
+        ├── Identity-based policies (IAM policies on the caller)
+        ├── Resource-based policies (S3 bucket policy)
+        ├── Permission boundaries (if set on the caller — Project 2)
+        ├── Session policies (if using temporary credentials)
+        ├── Service Control Policies (if in AWS Organization — Project 54)
+        └── VPC endpoint policies (if request through VPC endpoint — Project 27)
+        │
+        ▼
+Step 4: EVALUATE — EXPLICIT DENY CHECK
+        │
+        ├── Any policy has an explicit Deny that matches?
+        │   → DENIED (game over — nothing overrides explicit deny)
+        │
+        └── No explicit deny → Continue
+        │
+        ▼
+Step 5: EVALUATE — EXPLICIT ALLOW CHECK
+        │
+        ├── SAME ACCOUNT:
+        │   Any policy (IAM OR bucket) has explicit Allow?
+        │   → Check permission boundary (must also allow)
+        │   → Check SCP (must also allow)
+        │   → If all checks pass → ALLOWED
+        │
+        └── CROSS ACCOUNT:
+            BOTH IAM policy AND bucket policy must explicitly allow
+            → Check permission boundary
+            → Check SCP
+            → If all checks pass → ALLOWED
+        │
+        ▼
+Step 6: NO EXPLICIT ALLOW FOUND
+        → DENIED (implicit deny — default)</code></pre></div>
+<p>→ This flow executes in MILLISECONDS for every single S3 API call<br>
+→ Block Public Access is checked EARLY — before policy evaluation<br>
+→ Explicit Deny is checked BEFORE Allow — deny always wins<br>
+→ The cross-account vs same-account distinction is evaluated at Step 5</p>
+<hr>
+<h3>2 → HOW BLOCK PUBLIC ACCESS WORKS INTERNALLY</h3>
+<p><strong>What S3 Considers "Public":</strong></p>
+<p>→ S3 analyzes your bucket policy and ACLs to determine if they grant public access<br>
+→ "Public" means: access to anyone (Principal <code>"*"</code>) without restrictive conditions</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>POLICY ANALYSIS ENGINE:
+</span>
+Bucket policy statement:
+  Principal: "*"
+  Action: s3:GetObject
+  Condition: None
+
+Analysis: This grants PUBLIC access (unrestricted "*" with no conditions)
+→ If Block Public Access is ON → This policy is BLOCKED
+
+Bucket policy statement:
+  Principal: "*"
+  Action: s3:GetObject
+  Condition:
+    StringEquals:
+      aws:SourceVpc: "vpc-0abc123"
+
+Analysis: This is NOT considered public (restricted by VPC condition)
+→ Block Public Access does NOT block this
+
+Bucket policy statement:
+  Principal: "arn:aws:iam::123456789012:user/priya-dev"
+  Action: s3:GetObject
+
+Analysis: This is NOT public (specific principal, not "*")
+→ Block Public Access does NOT block this</code></pre></div>
+<p><strong>The Analysis Logic:</strong></p>
+<table><thead><tr><th>Principal</th><th>Conditions</th><th>Considered Public?</th><th>Blocked by BPA?</th></tr></thead><tbody><tr><td><code>"*"</code></td><td>None</td><td>YES</td><td>YES</td></tr><tr><td><code>"*"</code></td><td>aws:SourceIp</td><td>Depends on IP range</td><td>Partial</td></tr><tr><td><code>"*"</code></td><td>aws:SourceVpc</td><td>NO (VPC is specific)</td><td>NO</td></tr><tr><td><code>"*"</code></td><td>aws:SourceAccount</td><td>NO (account is specific)</td><td>NO</td></tr><tr><td><code>"AWS": "*"</code></td><td>None</td><td>YES</td><td>YES</td></tr><tr><td>Specific IAM ARN</td><td>Any</td><td>NO</td><td>NO</td></tr><tr><td>Specific account ARN</td><td>Any</td><td>NO</td><td>NO</td></tr></tbody></table>
+<p>→ Block Public Access uses heuristics to determine "public"<br>
+→ VPC-restricted <code>"*"</code> is NOT considered public → allowed even with BPA<br>
+→ Unrestricted <code>"*"</code> IS considered public → blocked by BPA</p>
+<hr>
+<h3>3 → HOW CONDITION KEYS WORK IN S3 BUCKET POLICIES</h3>
+<p><strong>S3-Specific Condition Keys:</strong></p>
+<table><thead><tr><th>Condition Key</th><th>What It Checks</th><th>Example Use</th></tr></thead><tbody><tr><td><code>s3:x-amz-server-side-encryption</code></td><td>Encryption header on upload</td><td>Enforce KMS encryption</td></tr><tr><td><code>s3:x-amz-server-side-encryption-aws-kms-key-id</code></td><td>Specific KMS key used</td><td>Enforce specific key</td></tr><tr><td><code>s3:prefix</code></td><td>Object key prefix being listed</td><td>Restrict listing to specific "folders"</td></tr><tr><td><code>s3:delimiter</code></td><td>Delimiter used in list request</td><td>Control "folder" navigation</td></tr><tr><td><code>s3:max-keys</code></td><td>Maximum objects returned in list</td><td>Prevent large listings</td></tr><tr><td><code>s3:x-amz-acl</code></td><td>ACL being applied to upload</td><td>Deny public-read ACL</td></tr><tr><td><code>s3:x-amz-content-sha256</code></td><td>Content hash</td><td>Integrity verification</td></tr><tr><td><code>s3:x-amz-storage-class</code></td><td>Storage class of uploaded object</td><td>Enforce specific storage class</td></tr><tr><td><code>s3:VersionId</code></td><td>Specific version of object</td><td>Control version-level access</td></tr><tr><td><code>s3:ExistingObjectTag/&lt;key&gt;</code></td><td>Tag on existing object</td><td>Access based on object tags</td></tr><tr><td><code>s3:RequestObjectTag/&lt;key&gt;</code></td><td>Tag being set on upload</td><td>Control which tags can be set</td></tr></tbody></table>
+<p><strong>Global Condition Keys Used in S3:</strong></p>
+<table><thead><tr><th>Condition Key</th><th>What It Checks</th><th>Example Use</th></tr></thead><tbody><tr><td><code>aws:SecureTransport</code></td><td>HTTP (false) or HTTPS (true)</td><td>Enforce HTTPS</td></tr><tr><td><code>aws:SourceIp</code></td><td>Caller's IP address</td><td>IP-based restrictions</td></tr><tr><td><code>aws:SourceVpc</code></td><td>VPC ID of the caller</td><td>VPC-based restrictions</td></tr><tr><td><code>aws:SourceVpce</code></td><td>VPC endpoint ID</td><td>Endpoint-specific restrictions</td></tr><tr><td><code>aws:PrincipalArn</code></td><td>ARN of the calling principal</td><td>Principal-specific exceptions</td></tr><tr><td><code>aws:PrincipalOrgID</code></td><td>AWS Organization ID</td><td>Organization-based access</td></tr><tr><td><code>aws:PrincipalAccount</code></td><td>Account ID of the caller</td><td>Account-based restrictions</td></tr><tr><td><code>aws:CurrentTime</code></td><td>Current timestamp</td><td>Time-based restrictions</td></tr><tr><td><code>aws:EpochTime</code></td><td>Current time in epoch seconds</td><td>Time-based restrictions</td></tr><tr><td><code>aws:MultiFactorAuthPresent</code></td><td>MFA was used</td><td>Require MFA for sensitive operations</td></tr><tr><td><code>aws:MultiFactorAuthAge</code></td><td>Seconds since MFA</td><td>Require recent MFA</td></tr><tr><td><code>aws:PrincipalTag/&lt;key&gt;</code></td><td>Tag on the calling principal</td><td>ABAC — attribute-based access</td></tr><tr><td><code>aws:ResourceTag/&lt;key&gt;</code></td><td>Tag on the resource</td><td>Tag-based access control</td></tr></tbody></table>
+<p>→ These condition keys make bucket policies EXTREMELY powerful<br>
+→ You can create policies like: "Allow access only from VPC, during business hours, with MFA, using HTTPS"</p>
+<hr>
+<h3>4 → HOW POLICY CONFLICTS ARE RESOLVED</h3>
+<p><strong>Scenario: Multiple Statements with Conflicting Effects</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement 1: Allow Principal: priya-dev, Action: s3:*, Resource: bucket/*
+</span>Statement 2: Deny Principal: "*", Action: s3:PutObject, Resource: bucket/* (without encryption)
+
+priya-dev tries to upload without encryption:
+  Statement 1: ALLOW (s3:* includes PutObject, priya-dev matches)
+  Statement 2: DENY (Principal "*" matches everyone, condition met — no encryption)
+  
+  RESULT: DENIED (Explicit Deny wins over Explicit Allow — ALWAYS)</code></pre></div>
+<p><strong>Scenario: Allow in Bucket Policy, Deny in IAM Policy</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Bucket Policy: Allow Principal: priya-dev, Action: s3:GetObject
+</span>IAM Policy on priya-dev: Deny Action: s3:GetObject on this bucket
+
+priya-dev tries to GetObject:
+  Bucket Policy: ALLOW
+  IAM Policy: DENY
+  
+  RESULT: DENIED (Explicit Deny in ANY policy wins)</code></pre></div>
+<p><strong>The Universal Rule (Repeated from Project 2):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPLICIT DENY &gt; EXPLICIT ALLOW &gt; IMPLICIT DENY
+</span>
+1. Any explicit Deny ANYWHERE → DENIED
+2. Any explicit Allow (with no Deny) → ALLOWED (same-account) or requires BOTH (cross-account)
+3. No Allow found → DENIED (implicit deny)</code></pre></div>
+<hr>
+<h3>5 → BUCKET POLICY vs ACL — EVALUATION ORDER</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Request arrives
+</span>        │
+        ▼
+Step 1: Block Public Access evaluated
+        │
+        ▼
+Step 2: Bucket Policy evaluated
+        │
+        ├── Explicit Deny found → DENIED
+        ├── Explicit Allow found → ALLOWED (if no deny elsewhere)
+        └── No match → Continue
+        │
+        ▼
+Step 3: ACLs evaluated (if ACLs are enabled)
+        │
+        ├── ACL grants access → ALLOWED (if no deny from bucket policy)
+        └── No ACL match → Continue
+        │
+        ▼
+Step 4: IAM Policy evaluated (for the calling identity)
+        │
+        ├── Explicit Deny → DENIED
+        ├── Explicit Allow → ALLOWED
+        └── No match → DENIED (implicit deny)</code></pre></div>
+<p>→ In practice, with ACLs disabled (recommended):</p>
+<ul>
+<li>Block Public Access → Bucket Policy → IAM Policy → Decision</li>
+<li>Much simpler evaluation path</li>
+</ul>
+<hr>
+<h3>6 → BUCKET POLICY STORAGE AND PROPAGATION</h3>
+<p>→ Bucket policies are stored as part of the bucket's metadata<br>
+→ When you save a policy:</p>
+<ul>
+<li>S3 validates the JSON syntax</li>
+<li>S3 validates the policy logic (valid principals, valid actions)</li>
+<li>S3 checks against Block Public Access settings</li>
+<li>If valid → policy is stored and becomes effective within seconds</li>
+<li>S3 replicates the policy across its distributed infrastructure</li>
+</ul>
+<p>→ Changes are EVENTUALLY CONSISTENT (usually seconds)<br>
+→ There may be a brief window where old policy is still being served<br>
+→ In practice → changes take effect within 1-5 seconds</p>
+<p>→ Policy validation catches:</p>
+<ul>
+<li>Invalid JSON syntax → error on save</li>
+<li>Invalid principal ARNs → error on save</li>
+<li>Actions that don't exist → error on save</li>
+<li>Resources that don't match the bucket → error on save</li>
+<li>Public access when Block Public Access is on → error on save</li>
+</ul>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Using <code>"*"</code> Principal in Allow without conditions</td><td>Bucket becomes public → data breach</td><td>Always add restrictive conditions or use specific principals</td></tr><tr><td>2</td><td>Forgetting cross-account requires BOTH sides</td><td>Access denied despite bucket policy allowing</td><td>Ensure IAM policy in other account also allows</td></tr><tr><td>3</td><td>Deny policy blocks AWS services</td><td>S3 replication, CloudTrail, Glue stop working</td><td>Add conditions to exclude service principals or ViaAWSService</td></tr><tr><td>4</td><td>Bucket ARN without <code>/*</code> in object operations</td><td><code>s3:GetObject</code> on bucket ARN → Access Denied</td><td>Use <code>bucket/*</code> for object operations, <code>bucket</code> for bucket operations</td></tr><tr><td>5</td><td>Block Public Access blocks intended policy</td><td>Saving bucket policy with <code>"*"</code> fails</td><td>Understand what BPA considers "public" — use conditions to make it non-public</td></tr><tr><td>6</td><td>IP-based deny blocks console access</td><td>Cannot manage bucket from AWS Console</td><td>Add exception for admin roles</td></tr><tr><td>7</td><td>VPC restriction blocks AWS services</td><td>Services that don't go through VPC endpoint are blocked</td><td>Add <code>aws:ViaAWSService</code> condition or service principal exceptions</td></tr><tr><td>8</td><td>ACL grants public-read on individual objects</td><td>Object-level public access even with private bucket policy</td><td>Disable ACLs entirely (Object Ownership = Bucket owner enforced)</td></tr><tr><td>9</td><td>Policy exceeds 20 KB limit</td><td>Cannot save the policy</td><td>Simplify statements, move per-user rules to IAM policies</td></tr><tr><td>10</td><td>Deny with wrong condition logic</td><td>Deny is too broad → locks everyone out including admin</td><td>Test with Policy Simulator, include admin exception</td></tr><tr><td>11</td><td>Encryption deny blocks S3 Replication</td><td>Replication fails because it doesn't set the expected encryption header</td><td>Add exception for S3 replication service principal</td></tr><tr><td>12</td><td>Forgetting <code>aws:SecureTransport</code> deny</td><td>Data transferred over HTTP → visible in transit</td><td>Always add HTTPS enforcement statement</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Policy Complexity Scalability</strong></p>
+<ul>
+<li>Maximum policy size: 20 KB → limits number of statements</li>
+<li>For many principals → use account-level (<code>arn:aws:iam::ACCOUNT:root</code>) instead of per-user</li>
+<li>For many conditions → consolidate with wildcards and prefixes</li>
+<li>For per-user control → use IAM policies (unlimited policies per account)</li>
+<li>For organizational access → use <code>aws:PrincipalOrgID</code> condition (one statement covers all accounts in org)</li>
+</ul>
+<p>→ <strong>Cross-Account Scalability</strong></p>
+<ul>
+<li>Each cross-account principal needs an entry in the bucket policy</li>
+<li>With 50+ partner accounts → policy becomes large</li>
+<li>Solution: Use AWS Organization ID condition → one statement covers all member accounts</li>
+<li>Solution: Use S3 Access Points (each access point has its own policy — 10 KB limit each)</li>
+</ul>
+<p>→ <strong>S3 Access Points (Scalability Solution):</strong></p>
+<ul>
+<li>Create separate access points for different use cases</li>
+<li>Each access point has its own name, policy, and network configuration</li>
+<li>Example: <code>shopnow-bucket-web-ap</code> for web server, <code>shopnow-bucket-logistics-ap</code> for LogiShip</li>
+<li>Each access point can have VPC-only access → no internet access</li>
+<li>Up to 10,000 access points per region per account</li>
+</ul>
+<p>→ <strong>Evaluation Performance</strong></p>
+<ul>
+<li>S3 evaluates policies in milliseconds — no noticeable latency impact</li>
+<li>Complex policies (many conditions) add negligible evaluation time</li>
+<li>S3 handles billions of requests per day with policy evaluation</li>
+</ul>
+<p>→ <strong>Audit Scalability</strong></p>
+<ul>
+<li>CloudTrail logs every S3 API call (who, what, when, from where)</li>
+<li>S3 Server Access Logging provides request-level detail</li>
+<li>For high-volume buckets → CloudTrail logs in S3 → Athena queries (Project 18) for analysis</li>
+<li>IAM Access Analyzer identifies resources shared externally</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify bucket policies are correct:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>View current bucket policy</td><td>S3 Console → Bucket → Permissions → Bucket policy</td></tr><tr><td>Validate policy syntax</td><td>AWS Policy Generator tool or console validation on save</td></tr><tr><td>Test specific access</td><td>IAM Console → Policy Simulator → Select principal + action + resource</td></tr><tr><td>Check Block Public Access</td><td>S3 Console → Bucket → Permissions → Block public access settings</td></tr><tr><td>Check ACL status</td><td>S3 Console → Bucket → Permissions → Object Ownership</td></tr><tr><td>Verify encryption enforcement</td><td>Try uploading without encryption → should get "Access Denied"</td></tr><tr><td>Verify HTTPS enforcement</td><td>Try HTTP request → should get "Access Denied"</td></tr><tr><td>Check cross-account access</td><td>Log into partner account → try accessing the bucket</td></tr></tbody></table>
+<p>→ <strong>How to debug "Access Denied" on S3:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Identify the EXACT operation being denied
+</span>        Error message: "Access Denied" (S3 doesn't tell you WHY — by design)
+        Check CloudTrail for the specific API call and error code
+
+STEP 2: Check IAM policy on the caller
+        IAM Console → Select user/role → Policies → Does it allow the action?
+        Remember: s3:GetObject needs object ARN (bucket/*)
+        s3:ListBucket needs bucket ARN (bucket without /*)
+
+STEP 3: Check bucket policy
+        S3 Console → Bucket → Permissions → Bucket policy
+        Is there an explicit Deny that matches?
+        Is there an Allow for this principal?
+
+STEP 4: Check Block Public Access
+        If the request is from an anonymous user or "public" pattern
+        → Block Public Access may be preventing it
+
+STEP 5: Check ACL (if enabled)
+        S3 Console → Bucket → Permissions → ACL
+        Does the ACL grant or restrict access?
+
+STEP 6: Check VPC endpoint policy (if applicable)
+        If request goes through VPC endpoint → endpoint policy may restrict
+
+STEP 7: Check SCP (if in AWS Organization)
+        SCPs can deny S3 actions at the organization level
+
+STEP 8: Check encryption requirements
+        If uploading → is encryption header present?
+        If bucket policy requires KMS → is the correct header sent?
+
+STEP 9: Check HTTPS requirement
+        If bucket policy requires SecureTransport=true → is request using HTTPS?
+
+STEP 10: Use IAM Access Analyzer
+         S3 Console → Access Analyzer → Analyze → Shows who has access and why</code></pre></div>
+<p>→ <strong>IAM Access Analyzer for S3:</strong></p>
+<p>→ S3 Console → Select bucket → "Access Analyzer" (if enabled)<br>
+→ OR IAM Console → Access Analyzer → Analyzers → Create analyzer</p>
+<p>→ Access Analyzer automatically identifies:</p>
+<ul>
+<li>Buckets accessible from outside your account</li>
+<li>Buckets with public access</li>
+<li>Buckets shared with other accounts</li>
+<li>Overly permissive bucket policies</li>
+</ul>
+<p>→ It provides FINDINGS with:</p>
+<ul>
+<li>Which bucket is shared</li>
+<li>Who has access (account, public, etc.)</li>
+<li>What actions they can perform</li>
+<li>Recommendation to restrict</li>
+</ul>
+<p>→ Essential for continuous security auditing — catches what humans miss</p>
+<p>→ <strong>CloudTrail for S3 Access Auditing:</strong></p>
+<table><thead><tr><th>CloudTrail Event</th><th>When It's Logged</th><th>What It Shows</th></tr></thead><tbody><tr><td>GetBucketPolicy</td><td>Someone reads the bucket policy</td><td>Who viewed the policy</td></tr><tr><td>PutBucketPolicy</td><td>Someone modifies the bucket policy</td><td>Who changed it and the new policy</td></tr><tr><td>GetObject</td><td>Someone downloads an object</td><td>Who, which object, from what IP</td></tr><tr><td>PutObject</td><td>Someone uploads an object</td><td>Who, which object, encryption used</td></tr><tr><td>DeleteObject</td><td>Someone deletes an object</td><td>Who, which object</td></tr><tr><td>GetBucketAcl</td><td>Someone reads the bucket ACL</td><td>Who viewed ACL</td></tr></tbody></table>
+<p>→ S3 data events (GetObject, PutObject) are NOT logged by default → must enable in CloudTrail<br>
+→ CloudTrail → Trails → Select trail → "Data events" → Add S3 → Select bucket<br>
+→ This is essential for compliance and forensic investigation<br>
+→ Detailed in Project 57</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Bucket policies are RESOURCE-BASED policies — they control what the BUCKET allows regardless of who's asking<br>
+→ IAM policies are IDENTITY-BASED policies — they control what the IDENTITY can do regardless of which resource<br>
+→ SAME-ACCOUNT: Either policy allowing is sufficient (unless explicit deny exists)<br>
+→ CROSS-ACCOUNT: BOTH policies must explicitly allow (both sides must agree)<br>
+→ EXPLICIT DENY always wins — in any policy, from any source<br>
+→ Block Public Access is the ultimate safety net — overrides policies and ACLs<br>
+→ ACLs are legacy — disable them and use bucket policies + IAM policies exclusively<br>
+→ Deny + condition pattern ENFORCES requirements (encryption, HTTPS, VPC, IP)<br>
+→ Bucket policies have a 20 KB limit — use IAM for per-user rules, bucket policy for resource-level rules<br>
+→ The Principal field is what makes bucket policies different from IAM policies</p>
+<p>→ Connection to Project 1: The S3 bucket created in Project 1 is now secured with bucket policies</p>
+<ul>
+<li>Block Public Access was configured in Project 1 → now reinforced with bucket policy</li>
+<li>Encryption was set as default in Project 1 → now ENFORCED via bucket policy Deny</li>
+</ul>
+<p>→ Connection to Project 2: IAM policies + bucket policies work TOGETHER</p>
+<ul>
+<li>IAM controls what users CAN do (identity perspective)</li>
+<li>Bucket policy controls what the bucket ALLOWS (resource perspective)</li>
+<li>Policy evaluation logic from Project 2 applies here with the cross-account extension</li>
+</ul>
+<p>→ Connection to Project 5: VPC endpoint conditions restrict access to within the VPC</p>
+<ul>
+<li><code>aws:SourceVpc</code> condition ensures bucket is only accessible from shopnow-prod-vpc</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 11: IAM Roles for EC2 (role-based access to S3 without access keys)</li>
+<li>Project 12: Versioning and Lifecycle Policies (bucket-level configurations)</li>
+<li>Project 15: S3 Event Notifications (requires bucket policy for SNS/SQS publishing)</li>
+<li>Project 27: VPC Endpoints (endpoint policies + bucket policies together)</li>
+<li>Project 30: Cross-Region Replication (requires bucket policy for replication role)</li>
+<li>Project 39: Cross-Account S3 Access (full deep-dive into cross-account patterns)</li>
+<li>Project 47: Lake Formation permissions (layered on top of IAM + bucket policies)</li>
+<li>Project 57: Security audit (CloudTrail + Access Analyzer for S3)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has robust bucket policies protecting their S3 data<br>
+→ But <code>priya-dev</code> raises a concern: "The web server EC2 instance needs to read from S3 and write to SQS"<br>
+→ Currently — she would need to create an IAM user, generate access keys, and put them on the EC2 instance<br>
+→ But Project 2 said: "NEVER put access keys on EC2 instances"<br>
+→ The security consultant agrees: "Access keys are long-lived credentials. If the instance is compromised, the keys are stolen. You need TEMPORARY credentials that auto-rotate."</p>
+<p>→ The solution is IAM ROLES — an identity that EC2 instances ASSUME<br>
+→ The role provides TEMPORARY credentials that are automatically rotated every few hours<br>
+→ No access keys stored on the instance → no keys to steal<br>
+→ The credentials are delivered through Instance Metadata (Project 3 — IMDSv2)</p>
+<p>→ <strong>This is exactly what Project 11 solves</strong><br>
+→ Project 11 introduces IAM Roles for EC2 (Instance Profiles)<br>
+→ It connects IAM (Project 2), EC2 (Project 3), Instance Metadata (Project 3), and S3 access (this project)<br>
+→ It eliminates the need for hardcoded credentials on any AWS resource</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 11: "The EC2 App That Needed S3 Without Hardcoded Keys — IAM Roles for EC2"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-9.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 10/60</span></div><a class="nav-btn next" href="project-11.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

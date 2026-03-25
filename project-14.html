@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 14: THE WEB APP THAT COULDN'T TALK TO ITS DATABASE — EC2 to RDS MariaDB  — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 14: THE WEB APP THAT COULDN'T TALK TO ITS DATABASE — EC2 to RDS MariaDB Private Connectivity</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-13) now has:</p>
+<ul>
+<li>EC2 web servers in public subnets with IAM Roles (Projects 3, 5, 11)</li>
+<li>RDS MariaDB in private data subnets (Project 9)</li>
+<li>Security Groups configured for multi-tier access (Project 4)</li>
+<li>VPC with proper routing and NAT Gateways (Project 5)</li>
+<li>SNS → SQS fan-out for order processing (Project 13)</li>
+</ul>
+<p>→ The web application on EC2 needs to connect to RDS MariaDB for:</p>
+<ul>
+<li>Reading product catalog (SELECT queries)</li>
+<li>Writing new orders (INSERT queries)</li>
+<li>Updating inventory (UPDATE queries)</li>
+<li>Running reports (complex JOINs)</li>
+</ul>
+<p>→ Problem 1: <code>priya-dev</code> configured the application with the RDS IP address<br>
+→ She ran <code>nslookup shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com</code><br>
+→ Got IP: <code>10.0.11.47</code> → hardcoded it in the application config<br>
+→ One month later → AWS performed maintenance → RDS instance moved to a different AZ<br>
+→ New IP: <code>10.0.12.23</code> → application connection broke → 2 hours of downtime<br>
+→ The DNS endpoint auto-updated but the hardcoded IP didn't</p>
+<p>→ Problem 2: The application opens a new database connection for EVERY request<br>
+→ Each HTTP request → new TCP connection → MariaDB authentication → SQL query → close connection<br>
+→ During peak: 500 requests/second → 500 database connections opened and closed per second<br>
+→ Connection overhead: ~50ms per connection establishment<br>
+→ MariaDB <code>max_connections</code> hit (default ~700) → new connections rejected → "Too many connections" error<br>
+→ Application returns 500 errors to customers</p>
+<p>→ Problem 3: The order processor (EC2 in private app subnet) also needs database access<br>
+→ But it uses a DIFFERENT Security Group than the web server<br>
+→ The RDS Security Group only allows <code>shopnow-web-sg</code> → order processor gets "Connection timed out"<br>
+→ Nobody thought to add the order processor's Security Group</p>
+<p>→ Problem 4: Database credentials are stored in a plain text config file on EC2<br>
+→ Username: <code>shopnow_admin</code>, Password: [REDACTED:PASSWORD]!`<br>
+→ The config file is readable by the application user<br>
+→ If the server is compromised → attacker gets database credentials → full database access<br>
+→ The same credentials are used by web servers, order processors, and batch jobs → no isolation</p>
+<p>→ Problem 5: Data travels between EC2 and RDS over the VPC network UNENCRYPTED<br>
+→ The security consultant says: "Even within a VPC, you should encrypt data in transit"<br>
+→ Compliance requires SSL/TLS for all database connections<br>
+→ The team doesn't know how to configure SSL for MariaDB connections</p>
+<p>→ Problem 6: The batch reporting job runs at midnight → executes a massive query for 45 minutes<br>
+→ The query locks tables → web application INSERT queries queue up → customer-facing latency spikes<br>
+→ The team asks: "Can we run reports on a COPY of the database instead of the production primary?"</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>Application must use the DNS endpoint — NEVER hardcode IPs</li>
+<li>Connection pooling must be implemented — stop creating new connections per request</li>
+<li>ALL application tiers must be properly authorized in Security Groups</li>
+<li>Database credentials must NOT be in plain text on servers</li>
+<li>ALL database connections must be encrypted with SSL/TLS</li>
+<li>Reporting must NOT impact production performance</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a DATABASE CONNECTIVITY problem spanning:</p>
+<ul>
+<li>Network layer (VPC routing, Security Groups)</li>
+<li>Application layer (connection strings, pooling, SSL)</li>
+<li>Security layer (credentials management, encryption in transit)</li>
+<li>Performance layer (connection management, read/write separation)</li>
+</ul>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Verify and fix network connectivity (Security Groups, routing)</li>
+<li>Step 2 — Configure the correct connection string using the RDS endpoint</li>
+<li>Step 3 — Understand and configure SSL/TLS for database connections</li>
+<li>Step 4 — Implement connection pooling strategies</li>
+<li>Step 5 — Manage database credentials securely</li>
+<li>Step 6 — Configure multi-application access patterns</li>
+<li>Step 7 — Understand read/write separation (Read Replica preview)</li>
+<li>Step 8 — Monitor and troubleshoot database connectivity</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — VERIFY AND FIX NETWORK CONNECTIVITY</h3>
+<p>→ Before any application configuration → the NETWORK must allow the connection<br>
+→ This is a systematic verification of everything built in Projects 4, 5, and 9</p>
+<p><strong>The Connection Path:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EC2 Web Server (Public Subnet: 10.0.1.0/24)
+</span>    │
+    │ TCP connection to port 3306
+    │
+    ├── Step A: Security Group on EC2 (outbound)
+    │   shopnow-web-sg → Outbound rules
+    │
+    ├── Step B: NACL on public subnet (outbound)
+    │   shopnow-web-nacl → Outbound rules
+    │
+    ├── Step C: Route Table
+    │   Public RT → 10.0.0.0/16 → local (VPC internal routing)
+    │
+    ├── Step D: NACL on private data subnet (inbound)
+    │   shopnow-db-nacl → Inbound rules
+    │
+    ├── Step E: Security Group on RDS (inbound)
+    │   shopnow-db-sg → Inbound rules
+    │
+    └── Step F: RDS instance accepting connections
+        MariaDB listening on port 3306</code></pre></div>
+<p><strong>Verification Checklist:</strong></p>
+<hr>
+<p><strong>CHECK A: EC2 Security Group Outbound</strong></p>
+<p>→ EC2 Console → Select web server → Security tab → Outbound rules</p>
+<table><thead><tr><th>Required Rule</th><th>Protocol</th><th>Port</th><th>Destination</th></tr></thead><tbody><tr><td>MariaDB to database</td><td>TCP</td><td>3306</td><td><code>shopnow-db-sg</code> (SG referencing)</td></tr></tbody></table>
+<p>→ If outbound is "Allow all" (default) → this is already covered<br>
+→ If outbound is RESTRICTED (Project 4 hardened setup) → must explicitly allow port 3306 to <code>shopnow-db-sg</code></p>
+<hr>
+<p><strong>CHECK B: Public Subnet NACL Outbound</strong></p>
+<p>→ VPC Console → Network ACLs → Select <code>shopnow-web-nacl</code> → Outbound rules</p>
+<table><thead><tr><th>Required Rule</th><th>Rule #</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Action</th></tr></thead><tbody><tr><td>MariaDB to DB subnet</td><td>120 (from Project 4)</td><td>TCP</td><td>3306</td><td>10.0.11.0/24 (or 10.0.12.0/24)</td><td>ALLOW</td></tr><tr><td>Ephemeral return ports</td><td>130</td><td>TCP</td><td>1024-65535</td><td>0.0.0.0/0</td><td>ALLOW</td></tr></tbody></table>
+<p>→ NACLs use CIDR blocks — cannot use SG references (Project 4 lesson)<br>
+→ Must allow port 3306 to BOTH private data subnet CIDRs (AZ-a and AZ-b)</p>
+<hr>
+<p><strong>CHECK C: Route Table</strong></p>
+<p>→ VPC Console → Route Tables → Select public subnet's RT</p>
+<table><thead><tr><th>Route</th><th>Target</th></tr></thead><tbody><tr><td>10.0.0.0/16</td><td>local</td></tr></tbody></table>
+<p>→ The <code>local</code> route handles ALL VPC-internal traffic<br>
+→ EC2 (10.0.1.x) to RDS (10.0.11.x) → both in 10.0.0.0/16 → routed locally<br>
+→ No additional routes needed for intra-VPC connectivity<br>
+→ This is AUTOMATIC — no configuration required</p>
+<hr>
+<p><strong>CHECK D: Private Data Subnet NACL Inbound</strong></p>
+<p>→ VPC Console → Network ACLs → Select <code>shopnow-db-nacl</code> → Inbound rules</p>
+<table><thead><tr><th>Required Rule</th><th>Rule #</th><th>Protocol</th><th>Port</th><th>Source</th><th>Action</th></tr></thead><tbody><tr><td>MariaDB from web subnet</td><td>100 (from Project 4)</td><td>TCP</td><td>3306</td><td>10.0.1.0/24</td><td>ALLOW</td></tr><tr><td>MariaDB from app subnet</td><td>105</td><td>TCP</td><td>3306</td><td>10.0.21.0/24</td><td>ALLOW</td></tr><tr><td>Ephemeral return ports</td><td>110</td><td>TCP</td><td>1024-65535</td><td>0.0.0.0/0</td><td>ALLOW</td></tr></tbody></table>
+<p>→ IMPORTANT: Must also allow from app subnet (10.0.21.0/24) for the order processor<br>
+→ This was missing → added as Rule 105</p>
+<p><strong>Also Check Outbound (for return traffic — NACL is stateless, Project 4):</strong></p>
+<table><thead><tr><th>Required Rule</th><th>Rule #</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Action</th></tr></thead><tbody><tr><td>Response to web subnet</td><td>100</td><td>TCP</td><td>1024-65535</td><td>10.0.1.0/24</td><td>ALLOW</td></tr><tr><td>Response to app subnet</td><td>105</td><td>TCP</td><td>1024-65535</td><td>10.0.21.0/24</td><td>ALLOW</td></tr></tbody></table>
+<p>→ Without outbound ephemeral port rules → RDS can receive requests but responses are blocked → connection hangs</p>
+<hr>
+<p><strong>CHECK E: RDS Security Group Inbound (Solving Problem 3)</strong></p>
+<p>→ EC2 Console → Security Groups → Select <code>shopnow-db-sg</code> → Inbound rules</p>
+<p><strong>BEFORE (Only web server allowed):</strong></p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-web-sg</code></td></tr></tbody></table>
+<p><strong>AFTER (Web server AND order processor allowed):</strong></p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Description</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-web-sg</code></td><td>Web tier access</td></tr><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-app-sg</code></td><td>Order processor access</td></tr><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-batch-sg</code></td><td>Batch reporting access</td></tr></tbody></table>
+<p>→ Each application tier has its OWN Security Group<br>
+→ The RDS SG explicitly allows each tier that needs database access<br>
+→ SG referencing (Project 4) means: any instance with these SGs can connect<br>
+→ New instances launched in these SGs → automatically get database access</p>
+<p><strong>Creating Application-Tier Security Groups:</strong></p>
+<table><thead><tr><th>Security Group</th><th>Attached To</th><th>Purpose</th></tr></thead><tbody><tr><td><code>shopnow-web-sg</code></td><td>Web server EC2 instances</td><td>Public-facing HTTP/HTTPS</td></tr><tr><td><code>shopnow-app-sg</code></td><td>Order processor EC2 instances</td><td>Internal processing</td></tr><tr><td><code>shopnow-batch-sg</code></td><td>Batch reporting EC2 instances</td><td>Nighttime reporting</td></tr><tr><td><code>shopnow-db-sg</code></td><td>RDS MariaDB</td><td>Database access control</td></tr></tbody></table>
+<p>→ If the order processor didn't have its own SG → create one:</p>
+<p>→ EC2 Console → Security Groups → "Create security group"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-app-sg</code></td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr></tbody></table>
+<p>Inbound Rules:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Description</th></tr></thead><tbody><tr><td>Custom TCP</td><td>TCP</td><td>8080</td><td><code>shopnow-web-sg</code></td><td>API calls from web tier (if applicable)</td></tr></tbody></table>
+<p>Outbound Rules:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Description</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>shopnow-db-sg</code></td><td>Database access</td></tr><tr><td>HTTPS</td><td>TCP</td><td>443</td><td>0.0.0.0/0</td><td>AWS API calls, updates</td></tr></tbody></table>
+<p>→ Attach <code>shopnow-app-sg</code> to order processor EC2 instances<br>
+→ Add <code>shopnow-app-sg</code> to <code>shopnow-db-sg</code> inbound rules</p>
+<hr>
+<p><strong>CHECK F: RDS Instance Accepting Connections</strong></p>
+<p>→ RDS Console → Select instance → Status: "Available"<br>
+→ If status is "Modifying", "Backing-up", "Rebooting" → connections may be briefly interrupted</p>
+<p><strong>Connectivity Test from EC2:</strong></p>
+<p>→ SSH into the EC2 web server (or use Session Manager — Project 11)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Test 1: DNS Resolution
+</span>  nslookup shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com
+  → Should resolve to a private IP (10.0.11.x or 10.0.12.x)
+  → If fails → VPC DNS resolution not enabled (Project 5)
+
+Test 2: TCP Connectivity
+  telnet shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com 3306
+  → Should show "Connected" (garbled binary = MariaDB greeting)
+  → If "Connection timed out" → Security Group or NACL blocking
+  → If "Connection refused" → RDS not listening or wrong port
+
+Test 3: MariaDB Client Connection
+  mysql -h shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com \
+        -P 3306 \
+        -u shopnow_admin \
+        -p
+  → Enter password → Should see MariaDB prompt
+  → If "Access denied" → wrong username/password
+  → If "Can't connect" → network issue (go back to Tests 1-2)</code></pre></div>
+<hr>
+<h3>STEP 2 — CONFIGURE THE CORRECT CONNECTION STRING</h3>
+<p>→ The application needs a properly formatted connection string</p>
+<p><strong>Connection String Components:</strong></p>
+<table><thead><tr><th>Component</th><th>Value</th><th>Source</th></tr></thead><tbody><tr><td>Host</td><td><code>shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com</code></td><td>RDS Console → Connectivity → Endpoint</td></tr><tr><td>Port</td><td><code>3306</code></td><td>RDS Console → Connectivity → Port</td></tr><tr><td>Database</td><td><code>shopnow</code></td><td>The initial database name (Project 9)</td></tr><tr><td>Username</td><td><code>shopnow_admin</code></td><td>Master username (Project 9)</td></tr><tr><td>Password</td><td>(stored securely — Step 5)</td><td>Master password</td></tr><tr><td>SSL Mode</td><td><code>VERIFY_FULL</code></td><td>Encrypt + verify server certificate</td></tr></tbody></table>
+<p><strong>Connection String Formats by Application Type:</strong></p>
+<table><thead><tr><th>Application Type</th><th>Format</th></tr></thead><tbody><tr><td>JDBC (Java)</td><td><code>jdbc:mariadb://shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com:3306/shopnow?useSSL=true&amp;requireSSL=true&amp;verifyServerCertificate=true</code></td></tr><tr><td>Python (PyMySQL)</td><td>Host, port, user, password, database as separate parameters</td></tr><tr><td>Node.js (mysql2)</td><td><code>{host, port, user, password, database, ssl: {ca: rdsCA}}</code></td></tr><tr><td>PHP (PDO)</td><td><code>mysql:host=endpoint;port=3306;dbname=shopnow</code></td></tr><tr><td>.NET</td><td><code>Server=endpoint;Port=3306;Database=shopnow;Uid=user;Pwd=pass;SslMode=VerifyFull</code></td></tr></tbody></table>
+<p><strong>CRITICAL: Always Use the DNS Endpoint — NEVER Hardcode IPs</strong></p>
+<p>→ The RDS endpoint is a DNS CNAME → resolves to the current private IP<br>
+→ During maintenance, failover, or AZ migration → IP changes → DNS auto-updates<br>
+→ Applications using the endpoint → automatically follow the IP change<br>
+→ Applications using hardcoded IPs → break on every infrastructure event</p>
+<p><strong>DNS TTL (Time-To-Live):</strong></p>
+<p>→ RDS endpoint DNS has a TTL of typically 5 seconds<br>
+→ This means: After a failover, DNS resolves to the new IP within ~5 seconds<br>
+→ Application must: Close stale connections → reconnect → DNS gives new IP<br>
+→ Connection pooling libraries handle this automatically (Step 4)</p>
+<hr>
+<h3>STEP 3 — CONFIGURE SSL/TLS FOR DATABASE CONNECTIONS</h3>
+<p>→ By default → EC2 to RDS traffic is UNENCRYPTED within the VPC<br>
+→ The VPC provides network isolation (Project 5) but NOT encryption<br>
+→ For compliance → enable SSL/TLS encryption in transit</p>
+<p><strong>RDS SSL Architecture:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EC2 Application                                    RDS MariaDB
+</span>┌──────────────┐                                  ┌──────────────┐
+│              │    TLS 1.2 Encrypted Tunnel       │              │
+│  MariaDB     │◄────────────────────────────────►│  MariaDB     │
+│  Client      │    Certificate verified           │  Server      │
+│              │    Data encrypted in transit       │              │
+│  Trusts:     │                                  │  Presents:   │
+│  RDS CA Cert │                                  │  Server Cert │
+└──────────────┘                                  └──────────────┘</code></pre></div>
+<p><strong>Step 3a: Download the RDS CA Certificate</strong></p>
+<p>→ AWS provides a Certificate Authority (CA) certificate that signs all RDS server certificates<br>
+→ Download from: <code>https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem</code><br>
+→ This bundle contains ALL RDS CA certificates for ALL regions<br>
+→ Alternatively, download region-specific: <code>https://truststore.pki.rds.amazonaws.com/ap-south-1/ap-south-1-bundle.pem</code></p>
+<p>→ Place the certificate on the EC2 instance: <code>/opt/shopnow/certs/rds-combined-ca-bundle.pem</code><br>
+→ Set permissions: Read-only by application user</p>
+<p><strong>Step 3b: Configure the Application to Use SSL</strong></p>
+<p><strong>SSL Mode Options:</strong></p>
+<table><thead><tr><th>SSL Mode</th><th>Encryption</th><th>Server Certificate Verified</th><th>Client Certificate Required</th><th>Security Level</th></tr></thead><tbody><tr><td>DISABLED</td><td>No</td><td>No</td><td>No</td><td>NONE — plain text</td></tr><tr><td>PREFERRED</td><td>Yes (if server supports)</td><td>No</td><td>No</td><td>LOW — falls back to unencrypted</td></tr><tr><td>REQUIRED</td><td>Yes (mandatory)</td><td>No</td><td>No</td><td>MEDIUM — encrypted but no server verification</td></tr><tr><td>VERIFY_CA</td><td>Yes</td><td>Yes (CA trusted)</td><td>No</td><td>HIGH — encrypted + server authenticated</td></tr><tr><td>VERIFY_FULL</td><td>Yes</td><td>Yes (CA + hostname match)</td><td>No</td><td>HIGHEST — full verification</td></tr></tbody></table>
+<p>→ For ShopNow production → Use <code>VERIFY_FULL</code><br>
+→ This ensures:</p>
+<ol>
+<li>Connection is encrypted (TLS 1.2+)</li>
+<li>Server certificate is signed by a trusted CA (RDS CA)</li>
+<li>Server hostname matches the certificate's Common Name</li>
+<li>Prevents man-in-the-middle attacks</li>
+</ol>
+<p><strong>Step 3c: Enforce SSL at the Database Level</strong></p>
+<p>→ By default → RDS MariaDB ALLOWS both SSL and non-SSL connections<br>
+→ To REQUIRE SSL for all connections → modify the RDS parameter group (Project 9)</p>
+<p><strong>Parameter Group Change:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Default</th><th>New Value</th><th>Effect</th></tr></thead><tbody><tr><td><code>require_secure_transport</code></td><td>OFF</td><td>ON</td><td>ALL connections MUST use SSL — non-SSL rejected</td></tr></tbody></table>
+<p>→ RDS Console → Parameter groups → Select <code>shopnow-mariadb-params</code> → Edit<br>
+→ Set <code>require_secure_transport</code> = ON<br>
+→ This is a DYNAMIC parameter → takes effect immediately (no reboot needed)</p>
+<p>→ After this change:</p>
+<ul>
+<li>Application connecting with SSL → works ✓</li>
+<li>Application connecting without SSL → "Access denied" error ✗</li>
+<li>Any client without SSL certificate → rejected ✗</li>
+</ul>
+<p><strong>Alternatively: Per-User SSL Enforcement:</strong></p>
+<p>→ Instead of requiring SSL for ALL connections → require for specific users:</p>
+<code>SQL: ALTER USER 'shopnow_admin'@'%' REQUIRE SSL;</code>
+<p>→ Only <code>shopnow_admin</code> requires SSL → other users can connect without SSL<br>
+→ This is more granular but harder to manage</p>
+<p>→ For ShopNow → Use the parameter group approach (enforce for ALL connections)</p>
+<hr>
+<h3>STEP 4 — CONNECTION POOLING STRATEGIES</h3>
+<p>→ This solves Problem 2: Opening new connections per request</p>
+<p><strong>Why Connection Pooling Matters:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT POOLING:
+</span>Request 1 → Open Connection (50ms) → Query (5ms) → Close Connection (10ms) = 65ms
+Request 2 → Open Connection (50ms) → Query (5ms) → Close Connection (10ms) = 65ms
+Request 3 → Open Connection (50ms) → Query (5ms) → Close Connection (10ms) = 65ms
+
+500 requests/sec → 500 × 50ms = 25,000ms of connection overhead per second
+500 simultaneous connections → hits max_connections → errors
+
+WITH POOLING:
+Startup → Open 20 connections → Keep them alive in pool
+Request 1 → Borrow connection from pool (0ms) → Query (5ms) → Return to pool (0ms) = 5ms
+Request 2 → Borrow connection from pool (0ms) → Query (5ms) → Return to pool (0ms) = 5ms
+Request 3 → Borrow connection from pool (0ms) → Query (5ms) → Return to pool (0ms) = 5ms
+
+500 requests/sec → 20 pooled connections handle them all
+Connection overhead: ZERO (connections already established)</code></pre></div>
+<p><strong>Connection Pool Configuration Parameters:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Recommended Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Minimum pool size</td><td>5</td><td>Keep at least 5 connections alive even when idle</td></tr><tr><td>Maximum pool size</td><td>20</td><td>Never exceed 20 connections from this application</td></tr><tr><td>Connection timeout</td><td>30 seconds</td><td>Wait max 30s for an available connection from pool</td></tr><tr><td>Idle timeout</td><td>300 seconds (5 minutes)</td><td>Close idle connections after 5 minutes</td></tr><tr><td>Max lifetime</td><td>1800 seconds (30 minutes)</td><td>Force-close and recreate connections every 30 minutes</td></tr><tr><td>Validation query</td><td><code>SELECT 1</code></td><td>Verify connection is alive before using</td></tr><tr><td>Validation interval</td><td>30 seconds</td><td>Check connection health every 30 seconds</td></tr></tbody></table>
+<p><strong>Why Max Lifetime Matters:</strong></p>
+<p>→ RDS MariaDB has <code>wait_timeout</code> = 300 seconds (set in Project 9)<br>
+→ If a pooled connection is idle for &gt; 300 seconds → MariaDB closes it server-side<br>
+→ But the pool doesn't know → next use of that connection → "MySQL has gone away" error<br>
+→ Setting max lifetime &lt; wait_timeout prevents this → pool recreates connections before server closes them<br>
+→ Also handles: DNS changes during failover → new connections go to new IP</p>
+<p><strong>Connection Pool Sizing Formula:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Pool Size = (Number of concurrent requests) × (Average query time) / (1 second)
+</span>
+ShopNow:
+  Peak concurrent requests: 100
+  Average query time: 50ms (0.05 seconds)
+  Pool size = 100 × 0.05 = 5 connections
+
+  But add buffer for:
+  - Slow queries during peak
+  - Connection validation overhead
+  - Burst handling
+
+  Recommended: 15-20 connections per application instance</code></pre></div>
+<p><strong>Multi-Instance Pool Management:</strong></p>
+<p>→ ShopNow has 5 web server EC2 instances behind a load balancer<br>
+→ Each instance has its own connection pool: 20 connections each<br>
+→ Total database connections: 5 × 20 = 100 connections to RDS</p>
+<p>→ Plus order processor (2 instances × 10 connections): 20 connections<br>
+→ Plus batch reporting (1 instance × 5 connections): 5 connections<br>
+→ Total: 100 + 20 + 5 = 125 concurrent connections</p>
+<p>→ MariaDB max_connections = 700 (for db.r6g.large — Project 9)<br>
+→ 125 / 700 = 18% utilization → comfortable headroom</p>
+<p><strong>Connection Budget Planning:</strong></p>
+<table><thead><tr><th>Application Tier</th><th>Instances</th><th>Pool Size Each</th><th>Total Connections</th></tr></thead><tbody><tr><td>Web servers</td><td>5</td><td>20</td><td>100</td></tr><tr><td>Order processors</td><td>2</td><td>10</td><td>20</td></tr><tr><td>Batch reporting</td><td>1</td><td>5</td><td>5</td></tr><tr><td>Admin/monitoring</td><td>1</td><td>2</td><td>2</td></tr><tr><td><strong>Total</strong></td><td></td><td></td><td><strong>127</strong></td></tr><tr><td><strong>RDS max_connections</strong></td><td></td><td></td><td><strong>700</strong></td></tr><tr><td><strong>Utilization</strong></td><td></td><td></td><td><strong>18%</strong></td></tr></tbody></table>
+<p>→ Rule of thumb: Total pool connections should be &lt; 50% of max_connections<br>
+→ Leave 50% headroom for: spikes, monitoring tools, manual DBA connections, AWS internal operations</p>
+<hr>
+<p><strong>RDS Proxy (Managed Connection Pooling):</strong></p>
+<p>→ For more advanced scenarios → AWS RDS Proxy manages connection pooling as a SERVICE</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT RDS Proxy:
+</span>  EC2-1 (20 connections) ─┐
+  EC2-2 (20 connections) ─┤
+  EC2-3 (20 connections) ─┼──► RDS MariaDB (60 connections)
+  EC2-4 (20 connections) ─┤
+  EC2-5 (20 connections) ─┘
+  Total: 100 connections to database
+
+WITH RDS Proxy:
+  EC2-1 (20 connections) ─┐
+  EC2-2 (20 connections) ─┤
+  EC2-3 (20 connections) ─┼──► RDS Proxy (100 app connections → 20 DB connections) ──► RDS MariaDB
+  EC2-4 (20 connections) ─┤
+  EC2-5 (20 connections) ─┘
+  Total: Only 20 connections to database (RDS Proxy multiplexes)</code></pre></div>
+<p>→ RDS Proxy sits between applications and the database<br>
+→ It maintains a SHARED pool of database connections<br>
+→ 100 application connections are multiplexed onto ~20 actual database connections<br>
+→ Reduces database connection overhead by 80%+</p>
+<p><strong>RDS Proxy Benefits:</strong></p>
+<table><thead><tr><th>Benefit</th><th>Explanation</th></tr></thead><tbody><tr><td>Connection multiplexing</td><td>Fewer actual database connections</td></tr><tr><td>Faster failover</td><td>Proxy handles reconnection transparently (~1-2 seconds vs ~30-60 seconds)</td></tr><tr><td>IAM authentication</td><td>Applications authenticate to Proxy via IAM — no database passwords</td></tr><tr><td>Secrets Manager integration</td><td>Proxy reads database credentials from Secrets Manager</td></tr><tr><td>Connection draining</td><td>Graceful handling during failovers</td></tr></tbody></table>
+<p><strong>RDS Proxy Configuration:</strong></p>
+<p>→ RDS Console → "Proxies" → "Create proxy"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Proxy identifier</td><td><code>shopnow-db-proxy</code></td></tr><tr><td>Engine family</td><td>MariaDB</td></tr><tr><td>RDS DB instance</td><td>shopnow-prod-mariadb</td></tr><tr><td>Connection pool max connections</td><td>50% of max_connections</td></tr><tr><td>IAM authentication</td><td>Required</td></tr><tr><td>Secrets Manager secret</td><td>(created in Step 5)</td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnets</td><td>Private data subnets (same as RDS)</td></tr><tr><td>Security Group</td><td>New SG allowing port 3306 from app SGs</td></tr></tbody></table>
+<p>→ Proxy endpoint: <code>shopnow-db-proxy.proxy-cdefghijklmn.ap-south-1.rds.amazonaws.com</code><br>
+→ Applications connect to the PROXY endpoint instead of the RDS endpoint<br>
+→ Proxy handles all connection management, failover, and authentication</p>
+<p>→ RDS Proxy costs: ~$0.015 per vCPU per hour of the proxy instance<br>
+→ For ShopNow → consider if the connection management benefits justify the cost<br>
+→ Most beneficial for: Lambda (Project 45 — Lambda in VPC), high-connection workloads, fast failover requirements</p>
+<hr>
+<h3>STEP 5 — MANAGE DATABASE CREDENTIALS SECURELY</h3>
+<p>→ This solves Problem 4: Plain text credentials on servers<br>
+→ Full deep dive in Project 37 — this is the connectivity-focused preview</p>
+<p><strong>Option 1: AWS Secrets Manager (Recommended)</strong></p>
+<p>→ Secrets Manager Console → "Store a new secret"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Secret type</td><td>Credentials for Amazon RDS database</td></tr><tr><td>Username</td><td>shopnow_admin</td></tr><tr><td>Password</td><td>(strong random password)</td></tr><tr><td>Encryption key</td><td>aws/secretsmanager (default)</td></tr><tr><td>Database</td><td>shopnow-prod-mariadb</td></tr></tbody></table>
+<p>→ Secret name: <code>shopnow/prod/mariadb/admin</code><br>
+→ Secret ARN: <code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/admin-AbCdEf</code></p>
+<p><strong>How Application Reads Credentials:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application startup:
+</span>  1. EC2 IAM Role (Project 11) has permission: secretsmanager:GetSecretValue
+  2. Application calls Secrets Manager API: GetSecretValue(SecretId="shopnow/prod/mariadb/admin")
+  3. Secrets Manager returns: {"username": "shopnow_admin", "password": "..."}
+  4. Application uses these credentials for database connection pool
+  5. Credentials are cached in memory — NOT written to disk
+
+Credential rotation:
+  1. Secrets Manager automatically rotates password every 30 days
+  2. Lambda rotation function: Changes password in RDS → updates secret
+  3. Application's connection pool max lifetime (30 min) → new connections get new password
+  4. Old connections continue working until they expire → graceful transition</code></pre></div>
+<p><strong>IAM Role Permission for Secrets Manager:</strong></p>
+<p>→ Add to <code>shopnow-web-server-role</code> (Project 11):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowReadDatabaseSecret
+  Effect: Allow
+  Action:
+    - secretsmanager:GetSecretValue
+  Resource:
+    - arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/admin-*</code></pre></div>
+<p>→ The <code>-*</code> at the end matches the random suffix Secrets Manager adds to the ARN<br>
+→ This allows the web server role to read ONLY this specific secret</p>
+<hr>
+<p><strong>Option 2: IAM Database Authentication (No Passwords At All)</strong></p>
+<p>→ RDS MariaDB supports IAM authentication → no passwords needed<br>
+→ The EC2 IAM Role generates a temporary authentication TOKEN<br>
+→ This token is used instead of a password</p>
+<p><strong>How It Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: EC2 IAM Role has permission: rds-db:connect
+</span>Step 2: Application calls RDS: generate-db-auth-token
+        → Returns a temporary token (valid for 15 minutes)
+Step 3: Application connects to RDS using:
+        Username: shopnow_app_user (IAM-authenticated DB user)
+        Password: (the temporary token)
+Step 4: RDS validates the token against IAM
+        → Connection established
+
+Token rotation:
+  Tokens expire after 15 minutes
+  Application requests new token before expiry
+  No password storage needed — ANYWHERE</code></pre></div>
+<p><strong>IAM DB Auth Configuration:</strong></p>
+<p>→ Step 1: Enable IAM authentication on RDS (already done in Project 9, Step 4i)</p>
+<p>→ Step 2: Create a database user linked to IAM</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SQL: CREATE USER 'shopnow_app_user'@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS';
+</span>SQL: GRANT SELECT, INSERT, UPDATE ON shopnow.* TO 'shopnow_app_user'@'%';</code></pre></div>
+<p>→ Step 3: Add IAM permission to the EC2 role</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowRDSIAMAuth
+  Effect: Allow
+  Action:
+    - rds-db:connect
+  Resource:
+    - arn:aws:rds-db:ap-south-1:123456789012:dbuser:dbi-resource-id/shopnow_app_user</code></pre></div>
+<p>→ <code>dbi-resource-id</code> is the DBI resource ID from RDS Console → Instance → Configuration → Resource ID</p>
+<p><strong>IAM DB Auth Limitations:</strong></p>
+<table><thead><tr><th>Limitation</th><th>Detail</th></tr></thead><tbody><tr><td>Max connections per second</td><td>200 new IAM-authenticated connections/second (per instance)</td></tr><tr><td>Token validity</td><td>15 minutes</td></tr><tr><td>SSL required</td><td>IAM auth ALWAYS requires SSL — cannot use without encryption</td></tr><tr><td>Not for master user</td><td>Cannot use IAM auth for the master/admin user</td></tr><tr><td>Supported engines</td><td>MySQL, MariaDB, PostgreSQL (not Oracle, SQL Server)</td></tr></tbody></table>
+<p>→ For ShopNow with 500 requests/sec → connection pooling makes this work<br>
+→ Pool creates ~20 connections at startup → 20 IAM auth requests (not 500)<br>
+→ Pool reuses connections → minimal new IAM auth requests during operation</p>
+<p><strong>Decision: Secrets Manager vs IAM DB Auth:</strong></p>
+<table><thead><tr><th>Factor</th><th>Secrets Manager</th><th>IAM DB Auth</th></tr></thead><tbody><tr><td>Credential type</td><td>Username + password (stored in Secrets Manager)</td><td>Temporary token (generated per connection)</td></tr><tr><td>Credential location</td><td>Secrets Manager service (not on disk)</td><td>Generated at runtime (not stored anywhere)</td></tr><tr><td>Rotation</td><td>Automatic (Lambda-based, configurable interval)</td><td>Built-in (tokens expire every 15 minutes)</td></tr><tr><td>Connection limit</td><td>No auth-specific limit</td><td>200 new auth connections/second</td></tr><tr><td>Complexity</td><td>Moderate (Secrets Manager setup)</td><td>Higher (IAM policy + DB user + token generation)</td></tr><tr><td>Works with connection pool</td><td>Yes</td><td>Yes (but pool must refresh tokens)</td></tr><tr><td>Master user support</td><td>Yes</td><td>No</td></tr><tr><td>Best for</td><td>Most production applications</td><td>High-security, zero-password-storage requirement</td></tr></tbody></table>
+<p>→ For ShopNow → Start with Secrets Manager (simpler) → migrate to IAM DB Auth later if needed<br>
+→ Full Secrets Manager setup in Project 37</p>
+<hr>
+<h3>STEP 6 — CONFIGURE MULTI-APPLICATION ACCESS PATTERNS</h3>
+<p>→ ShopNow has THREE applications accessing the same database:</p>
+<ol>
+<li>Web servers (read-heavy: product catalog, write: orders)</li>
+<li>Order processors (write-heavy: inventory updates, order status)</li>
+<li>Batch reporting (read-only: complex analytical queries)</li>
+</ol>
+<p><strong>Best Practice: Separate Database Users Per Application</strong></p>
+<table><thead><tr><th>Application</th><th>DB Username</th><th>Permissions</th><th>Why</th></tr></thead><tbody><tr><td>Web servers</td><td><code>shopnow_web_user</code></td><td>SELECT, INSERT on all tables</td><td>Needs to read products and create orders</td></tr><tr><td>Order processors</td><td><code>shopnow_processor_user</code></td><td>SELECT, INSERT, UPDATE on orders, inventory</td><td>Needs to update order status and inventory</td></tr><tr><td>Batch reporting</td><td><code>shopnow_reporting_user</code></td><td>SELECT ONLY on all tables</td><td>Read-only — cannot modify data</td></tr><tr><td>DBA/Admin</td><td><code>shopnow_admin</code></td><td>ALL PRIVILEGES</td><td>Database administration only</td></tr></tbody></table>
+<p><strong>Creating Separate Users (SQL — run as admin):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User 1: Web server
+</span>  CREATE USER 'shopnow_web_user'@'10.0.1.%' IDENTIFIED BY '(password)';
+  GRANT SELECT ON shopnow.products TO 'shopnow_web_user'@'10.0.1.%';
+  GRANT SELECT ON shopnow.categories TO 'shopnow_web_user'@'10.0.1.%';
+  GRANT SELECT, INSERT ON shopnow.orders TO 'shopnow_web_user'@'10.0.1.%';
+  GRANT SELECT, INSERT ON shopnow.order_items TO 'shopnow_web_user'@'10.0.1.%';
+
+User 2: Order processor
+  CREATE USER 'shopnow_processor_user'@'10.0.21.%' IDENTIFIED BY '(password)';
+  GRANT SELECT, INSERT, UPDATE ON shopnow.orders TO 'shopnow_processor_user'@'10.0.21.%';
+  GRANT SELECT, UPDATE ON shopnow.inventory TO 'shopnow_processor_user'@'10.0.21.%';
+  GRANT SELECT ON shopnow.products TO 'shopnow_processor_user'@'10.0.21.%';
+
+User 3: Batch reporting
+  CREATE USER 'shopnow_reporting_user'@'10.0.%.%' IDENTIFIED BY '(password)';
+  GRANT SELECT ON shopnow.* TO 'shopnow_reporting_user'@'10.0.%.%';</code></pre></div>
+<p><strong>Why Separate Users:</strong></p>
+<table><thead><tr><th>Benefit</th><th>Explanation</th></tr></thead><tbody><tr><td>Least privilege</td><td>Web user can't UPDATE, processor can't DROP tables</td></tr><tr><td>Audit trail</td><td>Slow query log shows WHICH user ran WHICH query</td></tr><tr><td>Connection tracking</td><td><code>SHOW PROCESSLIST</code> shows connections by user</td></tr><tr><td>Security isolation</td><td>Compromised web server → attacker gets SELECT/INSERT only, not DROP/ALTER</td></tr><tr><td>Credential rotation</td><td>Rotate each user's password independently</td></tr><tr><td>IP restriction</td><td><code>@'10.0.1.%'</code> limits web user to only web subnet IPs</td></tr></tbody></table>
+<p><strong>Each User Gets Its Own Secret in Secrets Manager:</strong></p>
+<table><thead><tr><th>Secret Name</th><th>DB User</th><th>Used By</th></tr></thead><tbody><tr><td><code>shopnow/prod/mariadb/web</code></td><td>shopnow_web_user</td><td>Web server EC2 instances</td></tr><tr><td><code>shopnow/prod/mariadb/processor</code></td><td>shopnow_processor_user</td><td>Order processor EC2 instances</td></tr><tr><td><code>shopnow/prod/mariadb/reporting</code></td><td>shopnow_reporting_user</td><td>Batch reporting EC2 instances</td></tr><tr><td><code>shopnow/prod/mariadb/admin</code></td><td>shopnow_admin</td><td>DBA access only</td></tr></tbody></table>
+<p><strong>Each IAM Role Gets Access to Its Own Secret:</strong></p>
+<table><thead><tr><th>IAM Role</th><th>Secret Access</th></tr></thead><tbody><tr><td>shopnow-web-server-role</td><td>shopnow/prod/mariadb/web</td></tr><tr><td>shopnow-order-processor-role</td><td>shopnow/prod/mariadb/processor</td></tr><tr><td>shopnow-batch-reporting-role</td><td>shopnow/prod/mariadb/reporting</td></tr></tbody></table>
+<p>→ Web server role CANNOT read the processor's secret → isolation<br>
+→ Processor role CANNOT read the admin secret → isolation</p>
+<hr>
+<h3>STEP 7 — READ/WRITE SEPARATION (READ REPLICA PREVIEW)</h3>
+<p>→ This solves Problem 6: Batch reporting impacts production<br>
+→ Full Read Replica setup in Project 29 — this is the connectivity pattern preview</p>
+<p><strong>The Problem:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT (Single Instance):
+</span>  Web servers (read/write) ──────► RDS Primary
+  Order processors (read/write) ─► RDS Primary
+  Batch reporting (read-only) ───► RDS Primary ← Locks tables during report queries
+                                                  ← Web app INSERT queries wait
+                                                  ← Customer experience degrades</code></pre></div>
+<p><strong>The Solution (Read Replica):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FUTURE (With Read Replica — Project 29):
+</span>  Web servers (read/write) ──────► RDS Primary (writer endpoint)
+  Order processors (read/write) ─► RDS Primary (writer endpoint)
+  Batch reporting (read-only) ───► RDS Read Replica (reader endpoint)
+                                   ← Separate instance
+                                   ← No impact on primary
+                                   ← Data is ~seconds behind (async replication)</code></pre></div>
+<p><strong>How Application Handles Two Endpoints:</strong></p>
+<table><thead><tr><th>Operation</th><th>Endpoint</th><th>Why</th></tr></thead><tbody><tr><td>INSERT, UPDATE, DELETE</td><td>Primary endpoint</td><td>Writes MUST go to primary</td></tr><tr><td>SELECT (real-time critical)</td><td>Primary endpoint</td><td>Needs latest data</td></tr><tr><td>SELECT (reporting, analytics)</td><td>Read Replica endpoint</td><td>Slight lag acceptable, offloads primary</td></tr><tr><td>SELECT (product catalog browsing)</td><td>Read Replica endpoint</td><td>Catalog data doesn't change per-second</td></tr></tbody></table>
+<p>→ The application must be aware of TWO endpoints:</p>
+<ul>
+<li>Writer endpoint: <code>shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com</code></li>
+<li>Reader endpoint: <code>shopnow-prod-mariadb-replica.cdefghijklmn.ap-south-1.rds.amazonaws.com</code></li>
+</ul>
+<p>→ Application-level read/write splitting:</p>
+<ul>
+<li>Write operations → writer connection pool</li>
+<li>Read operations → reader connection pool</li>
+<li>Batch reporting → ONLY uses reader connection pool</li>
+</ul>
+<p>→ Detailed Read Replica creation and configuration in Project 29</p>
+<hr>
+<h3>STEP 8 — MONITOR AND TROUBLESHOOT DATABASE CONNECTIVITY</h3>
+<p><strong>CloudWatch Metrics to Monitor (Project 8 Extension):</strong></p>
+<table><thead><tr><th>Metric</th><th>Alarm Threshold</th><th>What It Indicates</th></tr></thead><tbody><tr><td>DatabaseConnections</td><td>&gt; 80% of max_connections</td><td>Connection pool leak or undersized max_connections</td></tr><tr><td>CPUUtilization</td><td>&gt; 80% for 3/5 periods</td><td>Slow queries or insufficient instance size</td></tr><tr><td>ReadLatency</td><td>&gt; 20ms average</td><td>Storage I/O bottleneck or lock contention</td></tr><tr><td>WriteLatency</td><td>&gt; 20ms average</td><td>Storage I/O bottleneck</td></tr><tr><td>FreeableMemory</td><td>&lt; 500 MB</td><td>Buffer pool pressure → more disk I/O</td></tr><tr><td>SwapUsage</td><td>&gt; 0 bytes</td><td>Memory exhaustion → severe performance impact</td></tr><tr><td>DiskQueueDepth</td><td>&gt; 10</td><td>Storage subsystem overwhelmed</td></tr><tr><td>AbortedClients</td><td>Increasing trend</td><td>Application not properly closing connections</td></tr><tr><td>AbortedConnects</td><td>Increasing trend</td><td>Authentication failures or network issues</td></tr></tbody></table>
+<p><strong>New Metrics to Add to Dashboard (Project 8):</strong></p>
+<p>→ CloudWatch Console → Dashboard → <code>shopnow-production-overview</code> → Add widgets</p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Type</th></tr></thead><tbody><tr><td>DB Connections</td><td>DatabaseConnections</td><td>Line graph with threshold at max_connections × 0.8</td></tr><tr><td>DB CPU</td><td>CPUUtilization (RDS namespace)</td><td>Line graph with threshold at 80%</td></tr><tr><td>DB Free Storage</td><td>FreeStorageSpace</td><td>Number (current value)</td></tr><tr><td>DB Read/Write Latency</td><td>ReadLatency + WriteLatency</td><td>Stacked area</td></tr><tr><td>DB Freeable Memory</td><td>FreeableMemory</td><td>Line graph with threshold at 500 MB</td></tr></tbody></table>
+<p><strong>RDS Enhanced Monitoring (Project 9 Reference):</strong></p>
+<p>→ RDS Console → Select instance → Monitoring → "Enhanced monitoring" tab<br>
+→ Shows: OS-level metrics including per-process CPU and memory<br>
+→ Identify: Which MariaDB threads are consuming the most resources</p>
+<p><strong>Performance Insights (Project 9 Reference):</strong></p>
+<p>→ RDS Console → Select instance → "Performance Insights"<br>
+→ Shows: Database load over time, top SQL queries by load<br>
+→ Identify: Which specific query is causing high CPU or lock waits</p>
+<p><strong>Connection-Specific Troubleshooting:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PROBLEM: "Too many connections" error
+</span>DIAGNOSIS:
+  1. Check CloudWatch: DatabaseConnections metric → is it near max_connections?
+  2. SQL: SHOW PROCESSLIST → identify connections by user/host
+  3. Are all expected applications using connection pooling?
+  4. Is any application leaking connections (opening but not closing)?
+  5. Is connection pool max size too large across all applications?
+SOLUTION:
+  - Implement/fix connection pooling in application
+  - Reduce pool max size per application
+  - Increase max_connections in parameter group (if instance memory allows)
+  - Scale up instance class for more memory → supports more connections
+  - Consider RDS Proxy for connection multiplexing
+
+PROBLEM: "MySQL has gone away" error
+DIAGNOSIS:
+  1. Connection was idle longer than wait_timeout (300 seconds)
+  2. Connection pool kept stale connection → tried to reuse → server had closed it
+SOLUTION:
+  - Set pool max lifetime &lt; wait_timeout (e.g., 250 seconds)
+  - Enable connection validation (SELECT 1 before use)
+  - Set validation interval to 30 seconds
+
+PROBLEM: "Connection timed out" (new connections fail)
+DIAGNOSIS:
+  1. Security Group not allowing source → Check shopnow-db-sg inbound
+  2. NACL blocking → Check db subnet NACL (stateless — check BOTH directions)
+  3. RDS instance in different VPC → Verify VPC matches
+  4. RDS instance stopped/rebooting → Check RDS status
+  5. DNS not resolving → Check VPC DNS settings (Project 5)
+SOLUTION:
+  - Follow the 6-step network verification (Step 1 of this project)
+
+PROBLEM: "Access denied for user" (authentication failure)
+DIAGNOSIS:
+  1. Wrong username or password
+  2. User doesn't exist or wrong host pattern
+  3. SSL required but client not using SSL
+  4. IAM auth token expired (if using IAM DB auth)
+SOLUTION:
+  - Verify credentials in Secrets Manager
+  - Check user's host pattern: 'user'@'10.0.1.%' vs 'user'@'%'
+  - Ensure SSL is configured if require_secure_transport = ON
+  - Refresh IAM auth token if using IAM DB auth
+
+PROBLEM: Queries are slow (latency spikes)
+DIAGNOSIS:
+  1. Check Performance Insights → identify slow SQL
+  2. Check CloudWatch → CPU, ReadLatency, WriteLatency, DiskQueueDepth
+  3. Check Enhanced Monitoring → memory pressure, swap usage
+  4. Check slow query log → queries exceeding long_query_time
+  5. Check lock waits → batch reporting locking tables
+SOLUTION:
+  - Optimize slow queries (add indexes, rewrite queries)
+  - Move read-only workloads to Read Replica (Project 29)
+  - Scale up instance class
+  - Increase IOPS (gp3 → io2 if needed)</code></pre></div>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use the RDS DNS endpoint — NEVER hardcode IP addresses<br>
+→ Always use connection pooling — NEVER create a new connection per request<br>
+→ Always encrypt connections with SSL/TLS — set <code>require_secure_transport = ON</code><br>
+→ Always create separate database users per application tier with least-privilege grants<br>
+→ Always store credentials in Secrets Manager — NEVER in config files on servers<br>
+→ Always configure Security Groups for ALL application tiers that need database access<br>
+→ Always verify both NACL directions (stateless) when troubleshooting connectivity<br>
+→ Always set connection pool max lifetime LESS than MariaDB wait_timeout<br>
+→ Always enable connection validation in the pool to detect stale connections<br>
+→ Always monitor DatabaseConnections metric — approaching max_connections causes outages<br>
+→ Always plan connection budgets across all applications before deploying<br>
+→ Always use Performance Insights to identify slow queries before they become outages<br>
+→ Always test connectivity from each application tier before deploying application code</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never hardcode the RDS IP address — it changes during maintenance and failover<br>
+→ Never open a new database connection for every HTTP request — connection overhead is expensive<br>
+→ Never use the same database user for all applications — no isolation, no audit trail<br>
+→ Never store database credentials in plain text config files — use Secrets Manager<br>
+→ Never use the master/admin user for application connections — create dedicated users<br>
+→ Never skip SSL/TLS for database connections — even within a VPC<br>
+→ Never set connection pool max size larger than needed — wastes database connections<br>
+→ Never forget to add new application SGs to the RDS Security Group — connections will time out<br>
+→ Never ignore the slow query log — it's your primary performance optimization tool<br>
+→ Never run heavy reporting queries on the production primary — use Read Replicas (Project 29)<br>
+→ Never set wait_timeout too low — connections drop unexpectedly<br>
+→ Never set wait_timeout too high — idle connections waste resources</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>Standard application → database connectivity</td><td>Direct connection with pool + SSL + Secrets Manager</td></tr><tr><td>Many applications, high connection count</td><td>RDS Proxy for connection multiplexing</td></tr><tr><td>Lambda → database connectivity</td><td>RDS Proxy (essential — Lambda creates many short-lived connections)</td></tr><tr><td>Read-heavy workload</td><td>Read Replica for read operations (Project 29)</td></tr><tr><td>Zero-password security requirement</td><td>IAM Database Authentication</td></tr><tr><td>Automated credential rotation</td><td>Secrets Manager with rotation Lambda</td></tr><tr><td>Cross-VPC database access</td><td>VPC Peering (Project 44) or Transit Gateway (Project 50)</td></tr><tr><td>Cross-account database access</td><td>VPC Peering + Security Groups or Secrets Manager cross-account</td></tr><tr><td>Connection from outside AWS (developer laptop)</td><td>VPN + private DNS or SSH tunnel through bastion</td></tr><tr><td>Database connectivity monitoring</td><td>CloudWatch + Enhanced Monitoring + Performance Insights</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use direct EC2 → RDS connectivity when Lambda is the consumer → Use RDS Proxy<br>
+→ Do NOT use RDS Proxy when you have &lt; 50 total connections → Direct connection pool is simpler and cheaper<br>
+→ Do NOT use IAM DB Auth when you need &gt; 200 new connections/second → Use Secrets Manager instead<br>
+→ Do NOT use the primary endpoint for reporting queries → Use Read Replica<br>
+→ Do NOT use public RDS access from developer laptops → Use VPN or SSH tunnel through bastion</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE COMPLETE CONNECTION ESTABLISHMENT FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application on EC2 requests a database connection from the pool
+</span>        │
+        ▼
+Step 1: Connection pool checks for available idle connection
+        │
+        ├── Idle connection available → Validate it (SELECT 1)
+        │   ├── Valid → Return to application (0ms overhead)
+        │   └── Invalid (stale) → Discard → Create new (below)
+        │
+        └── No idle connection available → Create new connection
+        │
+        ▼
+Step 2: Read credentials from Secrets Manager (or cache)
+        IAM Role → secretsmanager:GetSecretValue → Returns username/password
+        (Cached in memory for ~1 hour)
+        │
+        ▼
+Step 3: DNS resolution
+        Resolve: shopnow-prod-mariadb.cdefghijklmn.ap-south-1.rds.amazonaws.com
+        VPC DNS (10.0.0.2) → Returns: 10.0.11.47
+        DNS TTL: ~5 seconds (cached by OS resolver)
+        │
+        ▼
+Step 4: TCP three-way handshake
+        EC2 (10.0.1.50) → SYN → RDS (10.0.11.47:3306)
+        │
+        ├── Packet leaves EC2 ENI → Security Group outbound: ALLOW ✓
+        ├── Packet enters public subnet NACL outbound: ALLOW ✓
+        ├── VPC Router: 10.0.11.47 matches 10.0.0.0/16 → local route
+        ├── Packet enters private data subnet NACL inbound: ALLOW ✓
+        ├── Packet reaches RDS ENI → Security Group inbound: Source SG matches → ALLOW ✓
+        └── TCP handshake completes (~1-2ms within same AZ, ~2-5ms cross-AZ)
+        │
+        ▼
+Step 5: TLS handshake (if SSL enabled)
+        Client Hello → Server Hello + Certificate → Key Exchange → Finished
+        RDS presents its server certificate (signed by RDS CA)
+        Client verifies certificate against downloaded CA bundle
+        TLS 1.2 session established (~5-10ms)
+        │
+        ▼
+Step 6: MariaDB authentication
+        Client sends: username + password (encrypted via TLS)
+        MariaDB validates credentials → checks user privileges → checks host pattern
+        Authentication successful → MariaDB sends OK packet
+        (~2-5ms)
+        │
+        ▼
+Step 7: Connection established
+        Total time: ~10-20ms (within same AZ) or ~15-30ms (cross-AZ)
+        Connection returned to application
+        │
+        ▼
+Step 8: Application sends SQL query over the established connection
+        Query → Execute → Return results
+        Connection stays open in pool for reuse</code></pre></div>
+<hr>
+<h3>2 → HOW RDS PROXY MULTIPLEXING WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT PROXY:
+</span>  App Connection 1 ──────────► DB Connection 1 (dedicated)
+  App Connection 2 ──────────► DB Connection 2 (dedicated)
+  App Connection 3 ──────────► DB Connection 3 (dedicated)
+  ...
+  App Connection 100 ────────► DB Connection 100 (dedicated)
+  
+  100 app connections = 100 DB connections
+
+WITH PROXY:
+  App Connection 1 ─┐
+  App Connection 2 ─┤         ┌──► DB Connection 1
+  App Connection 3 ─┤  PROXY  ├──► DB Connection 2
+  ...               ├────────►├──► DB Connection 3
+  App Connection 98 ─┤         ├──► ...
+  App Connection 99 ─┤         └──► DB Connection 20
+  App Connection 100 ┘
+  
+  100 app connections = 20 DB connections (5:1 multiplexing)</code></pre></div>
+<p><strong>How Multiplexing Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>App Connection 1 sends query: SELECT * FROM products WHERE id=1
+</span>        │
+        ▼
+Proxy receives query
+        │
+        ▼
+Proxy checks: Is App Connection 1 in a transaction?
+        │
+        ├── NO (simple query) → Use ANY available DB connection from pool
+        │   Proxy borrows DB Connection 3 (currently idle)
+        │   Sends query on DB Connection 3
+        │   Returns result to App Connection 1
+        │   Returns DB Connection 3 to proxy's pool
+        │
+        └── YES (in transaction) → Must use the SAME DB connection for entire transaction
+            Proxy "pins" App Connection 1 to DB Connection 5
+            All queries in this transaction go through DB Connection 5
+            After COMMIT/ROLLBACK → unpin → DB Connection 5 returns to pool</code></pre></div>
+<p>→ Simple queries (no transaction) → proxy can multiplex aggressively<br>
+→ Transactions → proxy must pin the connection → less multiplexing<br>
+→ Applications with many short, non-transactional queries benefit most from proxy</p>
+<hr>
+<h3>3 → HOW DNS FAILOVER WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>NORMAL OPERATION:
+</span>  RDS Primary in AZ-a → IP: 10.0.11.47
+  DNS: shopnow-prod-mariadb.xxx.rds.amazonaws.com → 10.0.11.47
+
+FAILOVER TRIGGERED (Primary AZ-a fails):
+  
+  Time 0s:   Failure detected
+  Time 10s:  RDS promotes standby in AZ-b to primary
+  Time 30s:  New primary ready → IP: 10.0.12.23
+  Time 31s:  RDS updates DNS: endpoint → 10.0.12.23
+  Time 36s:  DNS TTL expires (5 seconds) → clients resolve new IP
+  
+  Application behavior:
+  Time 0-36s: Active connections fail → "MySQL has gone away"
+  Time 36s+:  Connection pool detects failures → closes stale connections
+              Pool creates new connections → DNS resolves to 10.0.12.23
+              New connections go to new primary in AZ-b
+              Application resumes normal operation
+
+WITH RDS PROXY:
+  Time 0s:   Failure detected
+  Time 1-2s: Proxy detects failure → holds incoming queries
+  Time 10s:  New primary ready
+  Time 11s:  Proxy establishes connections to new primary
+  Time 12s:  Proxy resumes processing held queries
+  
+  Application sees: ~10 second pause, then normal operation
+  NO connection errors → proxy absorbed the failover transparently</code></pre></div>
+<p>→ Without proxy: ~30-60 seconds of connection errors during failover<br>
+→ With proxy: ~10-15 seconds of query delay, no connection errors<br>
+→ This is why RDS Proxy is valuable for production applications</p>
+<hr>
+<h3>4 → CROSS-AZ CONNECTIVITY LATENCY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SAME AZ (EC2 in ap-south-1a, RDS in ap-south-1a):
+</span>  Network latency: ~0.5-1ms
+  Connection establishment: ~10-15ms (TCP + TLS + auth)
+  Query round-trip: ~1-5ms + query execution time
+
+CROSS-AZ (EC2 in ap-south-1a, RDS in ap-south-1b):
+  Network latency: ~1-3ms
+  Connection establishment: ~15-25ms (TCP + TLS + auth)
+  Query round-trip: ~2-6ms + query execution time
+  Data transfer cost: ~$0.01/GB each direction
+
+SAME REGION, DIFFERENT VPC (via VPC Peering — Project 44):
+  Network latency: ~1-5ms (similar to cross-AZ)
+  Additional: VPC Peering route must exist</code></pre></div>
+<p>→ Cross-AZ adds ~1-3ms per query round-trip<br>
+→ For latency-sensitive applications → place EC2 and RDS in the same AZ<br>
+→ BUT: Same AZ = single point of failure → cross-AZ is better for availability<br>
+→ Trade-off: Latency (same AZ) vs Availability (cross-AZ)</p>
+<p>→ For ShopNow: Cross-AZ is acceptable — 2ms extra per query is negligible<br>
+→ Multi-AZ RDS (Project 29) provides automatic failover → availability is critical</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Hardcoded IP instead of DNS endpoint</td><td>Connection breaks during maintenance/failover</td><td>Always use RDS endpoint hostname</td></tr><tr><td>2</td><td>No connection pooling</td><td>"Too many connections" during peak traffic</td><td>Implement connection pooling with appropriate max size</td></tr><tr><td>3</td><td>Pool max lifetime &gt; wait_timeout</td><td>"MySQL has gone away" errors</td><td>Set pool max lifetime &lt; RDS wait_timeout</td></tr><tr><td>4</td><td>Missing SG rule for new application tier</td><td>"Connection timed out" for new application</td><td>Add new app SG to shopnow-db-sg inbound before deploying</td></tr><tr><td>5</td><td>Plain text credentials on EC2</td><td>Server compromise → database compromise</td><td>Use Secrets Manager or IAM DB Authentication</td></tr><tr><td>6</td><td>Same DB user for all applications</td><td>No audit trail, no privilege isolation</td><td>Create separate users per application tier</td></tr><tr><td>7</td><td>No SSL/TLS for database connections</td><td>Data visible in transit within VPC</td><td>Enable SSL + set require_secure_transport = ON</td></tr><tr><td>8</td><td>NACL blocking return traffic (stateless)</td><td>Connections hang — request sent but response blocked</td><td>Verify NACL outbound ephemeral ports on DB subnet</td></tr><tr><td>9</td><td>Running reports on primary</td><td>Table locks slow down application queries</td><td>Use Read Replica for reporting (Project 29)</td></tr><tr><td>10</td><td>Connection pool too large across all apps</td><td>Exceeds max_connections → all apps get errors</td><td>Plan connection budget: total pools &lt; 50% of max_connections</td></tr><tr><td>11</td><td>Not validating connections in pool</td><td>Stale connections returned to app → intermittent errors</td><td>Enable validation query (SELECT 1) with 30-second interval</td></tr><tr><td>12</td><td>Forgetting cross-AZ data transfer costs</td><td>Unexpected bill for high-traffic cross-AZ database queries</td><td>Monitor cross-AZ data transfer or co-locate in same AZ</td></tr><tr><td>13</td><td>DNS caching too long in application</td><td>After failover, app still resolves old IP for minutes</td><td>Use JVM flag for short DNS TTL or rely on OS resolver</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Connection Scalability</strong></p>
+<ul>
+<li>db.r6g.large: ~700 max_connections (formula-based on memory)</li>
+<li>db.r6g.xlarge: ~1,400 max_connections</li>
+<li>db.r6g.2xlarge: ~2,800 max_connections</li>
+<li>Each instance class doubling → doubles max_connections</li>
+<li>For extreme connection counts → RDS Proxy multiplexes (100 app → 20 DB)</li>
+</ul>
+<p>→ <strong>Application Tier Scalability</strong></p>
+<ul>
+<li>Auto Scaling (Project 33) adds more EC2 instances → more pool connections</li>
+<li>Must ensure total pool connections across all instances &lt; max_connections</li>
+<li>Solution: Set per-instance pool max lower as instance count grows</li>
+<li>Or use RDS Proxy → pool size is managed centrally</li>
+</ul>
+<p>→ <strong>Read Scalability</strong></p>
+<ul>
+<li>Up to 5 Read Replicas for MariaDB (15 for Aurora)</li>
+<li>Each replica handles read traffic independently</li>
+<li>Application routes reads to replicas → primary handles only writes</li>
+<li>Read Replicas can be in different AZs or regions</li>
+</ul>
+<p>→ <strong>Security Scalability</strong></p>
+<ul>
+<li>SG referencing scales automatically with Auto Scaling</li>
+<li>New instances get the app SG → automatically authorized for DB access</li>
+<li>Secrets Manager handles credential rotation for all applications</li>
+<li>IAM DB Auth eliminates password management entirely</li>
+</ul>
+<p>→ <strong>Multi-Region Scalability</strong></p>
+<ul>
+<li>Cross-region Read Replicas for global read access (Project 55)</li>
+<li>RDS endpoint in each region for local latency</li>
+<li>Write traffic still goes to primary region → replication lag applies</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify connectivity is correct:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>DNS resolves</td><td>From EC2: <code>nslookup {RDS endpoint}</code> → returns private IP</td></tr><tr><td>TCP connects</td><td>From EC2: <code>telnet {RDS endpoint} 3306</code> → "Connected"</td></tr><tr><td>MariaDB authenticates</td><td>From EC2: <code>mysql -h {endpoint} -u {user} -p</code> → MariaDB prompt</td></tr><tr><td>SSL is active</td><td>In MariaDB: <code>SHOW STATUS LIKE 'Ssl_cipher'</code> → shows cipher name (not empty)</td></tr><tr><td>Correct user connected</td><td>In MariaDB: <code>SELECT CURRENT_USER()</code> → shows expected username</td></tr><tr><td>Connection count healthy</td><td>CloudWatch: DatabaseConnections &lt; 80% of max_connections</td></tr><tr><td>No stale connections</td><td>In MariaDB: <code>SHOW PROCESSLIST</code> → no very old sleeping connections</td></tr><tr><td>Pool functioning</td><td>Application metrics: connection pool utilization, wait time, creation rate</td></tr></tbody></table>
+<p>→ <strong>How to debug connectivity issues systematically:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Layer 1: NETWORK (Can packets reach RDS?)
+</span>  → DNS resolution: nslookup endpoint
+  → TCP connectivity: telnet endpoint 3306
+  → If fails → Check: SG, NACL, route tables, VPC (Steps in Step 1)
+
+Layer 2: AUTHENTICATION (Can user log in?)
+  → MariaDB client: mysql -h endpoint -u user -p
+  → If "Access denied" → Check: username, password, host pattern, SSL requirement
+
+Layer 3: AUTHORIZATION (Can user execute queries?)
+  → Run test query: SELECT 1
+  → If permission error → Check: GRANT statements for the user
+
+Layer 4: APPLICATION (Can the app connect?)
+  → Check connection string format
+  → Check connection pool configuration
+  → Check SSL certificate path
+  → Check credential retrieval (Secrets Manager)
+
+Layer 5: PERFORMANCE (Is the connection usable?)
+  → Check query latency
+  → Check connection pool metrics
+  → Check RDS CloudWatch metrics</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ EC2 to RDS connectivity requires BOTH network-level (SG, NACL, routing) AND application-level (connection string, SSL, pooling) configuration<br>
+→ ALWAYS use the RDS DNS endpoint — NEVER hardcode IP addresses — DNS enables transparent failover<br>
+→ Connection pooling is MANDATORY for production — creating connections per request causes "Too many connections"<br>
+→ SSL/TLS encryption in transit is a compliance requirement — enforce with <code>require_secure_transport = ON</code><br>
+→ Separate database users per application tier provides: least privilege, audit trail, security isolation<br>
+→ Credentials must NEVER be in plain text files — use Secrets Manager or IAM DB Authentication<br>
+→ Security Groups must explicitly allow EVERY application tier — missing SG rules cause silent timeouts<br>
+→ NACLs are stateless — must allow BOTH directions including ephemeral ports (Project 4 critical lesson)<br>
+→ Connection pool max lifetime must be LESS than MariaDB wait_timeout — prevents "MySQL has gone away"<br>
+→ RDS Proxy is the advanced solution for high-connection environments and Lambda connectivity</p>
+<p>→ Connection to Project 4: Security Group referencing enables multi-tier database access</p>
+<ul>
+<li>Each app tier SG is referenced in the RDS SG → clean, scalable access control</li>
+<li>NACLs require CIDR-based rules and bidirectional configuration (stateless)</li>
+</ul>
+<p>→ Connection to Project 5: VPC routing handles intra-VPC traffic automatically via <code>local</code> route</p>
+<ul>
+<li>No special routing needed for EC2 → RDS within the same VPC</li>
+</ul>
+<p>→ Connection to Project 9: RDS configuration (endpoint, parameter group, encryption) is the server side</p>
+<ul>
+<li>This project focuses on the CLIENT side (application connection patterns)</li>
+</ul>
+<p>→ Connection to Project 11: IAM Roles provide access to Secrets Manager for credential retrieval</p>
+<ul>
+<li>Role also enables IAM DB Authentication as an alternative to passwords</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 24: Glue JDBC connection to MariaDB (same connectivity patterns for ETL)</li>
+<li>Project 29: Multi-AZ + Read Replicas (read/write separation)</li>
+<li>Project 35: Athena Federated Query to RDS (Lambda connector connects to RDS)</li>
+<li>Project 37: Secrets Manager deep dive (credential rotation for database)</li>
+<li>Project 43: Redshift to MariaDB sync via Glue (JDBC sink)</li>
+<li>Project 45: Lambda in VPC accessing RDS (RDS Proxy essential)</li>
+<li>Project 48: Redshift Federated Query to RDS MariaDB</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has reliable, secure, pooled connections from all application tiers to RDS MariaDB<br>
+→ But the marketing team comes back with a request:</p>
+<ul>
+<li>"When we upload new product images to S3, the catalog team has to manually check S3 and process them"</li>
+<li>"Sometimes images sit in S3 for 3 days before anyone notices"</li>
+<li>"We want AUTOMATIC notifications when files are uploaded"</li>
+<li>"And we want the image processing pipeline to START automatically"</li>
+</ul>
+<p>→ They need S3 to TRIGGER actions when objects are created, modified, or deleted<br>
+→ S3 should notify SNS topics (Project 6) → which fan out to SQS queues (Project 13) → which trigger consumers<br>
+→ The complete event chain: File uploaded to S3 → S3 detects the event → S3 publishes to SNS → SNS fans out to SQS → Consumers process</p>
+<p>→ But there's a configuration challenge:</p>
+<ul>
+<li>S3 needs PERMISSION to publish to the SNS topic (topic access policy)</li>
+<li>S3 needs PERMISSION to send to SQS directly (queue access policy)</li>
+<li>Events need to be filtered by prefix and suffix (only <code>.jpg</code> files in <code>products/</code>)</li>
+<li>Multiple event types need different routing (PUT events vs DELETE events)</li>
+</ul>
+<p>→ <strong>This is exactly what Project 15 solves</strong><br>
+→ Project 15 introduces S3 Event Notifications<br>
+→ It configures S3 to automatically publish events to SNS topics and SQS queues<br>
+→ It builds on S3 (Project 1), SNS (Project 6), SQS (Project 7), bucket policies (Project 10), and the fan-out pattern (Project 13)<br>
+→ It creates the foundation for event-driven data processing pipelines used in Projects 25, 34, and 49</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 15: "The Data Team That Wanted Real-Time Upload Alerts — S3 Event Notifications to SNS"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-13.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 14/60</span></div><a class="nav-btn next" href="project-15.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

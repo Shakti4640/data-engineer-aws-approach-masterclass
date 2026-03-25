@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 8: THE SERVER THAT CRASHED AT 3 AM — CloudWatch Alarms &amp; Basic Monit — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 8: THE SERVER THAT CRASHED AT 3 AM — CloudWatch Alarms &amp; Basic Monitoring</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-7) now has:</p>
+<ul>
+<li>S3 bucket for product images (Project 1)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instances in a properly architected VPC (Projects 3, 4, 5)</li>
+<li>SNS topics for notifications (Project 6)</li>
+<li>SQS queues buffering order processing (Project 7)</li>
+</ul>
+<p>→ Incident 1: Friday 3:17 AM — the web server EC2 instance CPU hit 100%<br>
+→ A runaway process consumed all CPU → application became unresponsive<br>
+→ Customers got timeout errors for 4 hours until <code>priya-dev</code> woke up at 7 AM and checked<br>
+→ Nobody knew because nobody was watching</p>
+<p>→ Incident 2: Monday — the EBS root volume on the web server reached 98% full<br>
+→ Application logs kept growing → no log rotation configured<br>
+→ The application couldn't write temp files → started throwing errors<br>
+→ The team only noticed when customers reported "Internal Server Error"<br>
+→ By then, the volume was 100% full → couldn't even SSH in to fix it</p>
+<p>→ Incident 3: During the flash sale — the SQS queue (Project 7) backed up to 15,000 messages<br>
+→ The order processor couldn't keep up → oldest message was 3 hours old<br>
+→ Customers placed orders → heard nothing for hours → called support in panic<br>
+→ Nobody monitored the queue depth → the problem compounded silently</p>
+<p>→ Incident 4: The RDS MariaDB database (coming in Project 9) CPU spiked to 95%<br>
+→ Slow queries were running during peak hours<br>
+→ The web app started timing out on database calls<br>
+→ Nobody noticed the database was the bottleneck until full application failure</p>
+<p>→ The CTO is furious: "We have a web server, a queue, and soon a database — but ZERO visibility into any of them. I want:</p>
+<ul>
+<li>A DASHBOARD showing health of everything at a glance</li>
+<li>AUTOMATIC ALARMS when anything goes wrong</li>
+<li>NOTIFICATIONS sent to the team within 60 seconds of a problem</li>
+<li>HISTORICAL DATA so we can see trends and predict problems before they happen"</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a MONITORING and ALERTING problem<br>
+→ AWS CloudWatch is the unified monitoring service for ALL AWS resources</p>
+<p>→ CloudWatch has FOUR core capabilities:</p>
+<table><thead><tr><th>Capability</th><th>What It Does</th><th>Analogy</th></tr></thead><tbody><tr><td>Metrics</td><td>Collects numerical data points over time</td><td>Thermometer readings every 5 minutes</td></tr><tr><td>Alarms</td><td>Evaluates metrics against thresholds → triggers actions</td><td>Thermostat that rings bell when too hot</td></tr><tr><td>Dashboards</td><td>Visual display of metrics in charts</td><td>Control room with screens</td></tr><tr><td>Logs</td><td>Collects and stores log data (Project 19 deep-dive)</td><td>Filing cabinet of event records</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand CloudWatch Metrics (what data is collected)</li>
+<li>Step 2 — Understand Namespaces, Dimensions, and Periods</li>
+<li>Step 3 — Understand Basic vs Detailed Monitoring</li>
+<li>Step 4 — Create CloudWatch Alarms with SNS integration</li>
+<li>Step 5 — Understand Alarm States and Evaluation Logic</li>
+<li>Step 6 — Create alarms for EC2, SQS, and S3</li>
+<li>Step 7 — Build a CloudWatch Dashboard</li>
+<li>Step 8 — Understand composite alarms</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND CLOUDWATCH METRICS</h3>
+<p>→ A METRIC is a time-ordered set of data points<br>
+→ Think of it as: a measurement taken at regular intervals</p>
+<p><strong>Anatomy of a Metric:</strong></p>
+<table><thead><tr><th>Component</th><th>Example</th><th>Explanation</th></tr></thead><tbody><tr><td>Namespace</td><td><code>AWS/EC2</code></td><td>The service that owns the metric</td></tr><tr><td>Metric Name</td><td><code>CPUUtilization</code></td><td>What is being measured</td></tr><tr><td>Dimensions</td><td><code>InstanceId: i-0abc123</code></td><td>Which specific resource</td></tr><tr><td>Value</td><td><code>78.5</code></td><td>The actual measurement</td></tr><tr><td>Unit</td><td><code>Percent</code></td><td>Unit of measurement</td></tr><tr><td>Timestamp</td><td><code>2025-01-15T03:17:00Z</code></td><td>When it was measured</td></tr></tbody></table>
+<p><strong>Example Data Points for CPUUtilization:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Namespace: AWS/EC2
+</span>Metric: CPUUtilization
+Dimension: InstanceId = i-0abc123def456
+
+Time                    Value (%)
+2025-01-15 03:00:00     12.3
+2025-01-15 03:05:00     15.7
+2025-01-15 03:10:00     45.2
+2025-01-15 03:15:00     89.1
+2025-01-15 03:17:00     100.0  ← CPU spike!
+2025-01-15 03:20:00     100.0
+2025-01-15 03:25:00     100.0</code></pre></div>
+<p>→ Each row is a DATA POINT<br>
+→ Data points are collected at regular intervals (period)<br>
+→ CloudWatch stores these data points and makes them queryable</p>
+<hr>
+<p><strong>AWS Services That Automatically Publish Metrics:</strong></p>
+<p>→ Most AWS services publish metrics to CloudWatch WITHOUT any configuration</p>
+<table><thead><tr><th>Service</th><th>Namespace</th><th>Key Metrics</th><th>Auto-Published?</th></tr></thead><tbody><tr><td>EC2</td><td><code>AWS/EC2</code></td><td>CPUUtilization, NetworkIn/Out, StatusCheckFailed</td><td>YES (basic monitoring)</td></tr><tr><td>SQS</td><td><code>AWS/SQS</code></td><td>ApproximateNumberOfMessagesVisible, ApproximateAgeOfOldestMessage</td><td>YES</td></tr><tr><td>SNS</td><td><code>AWS/SNS</code></td><td>NumberOfMessagesPublished, NumberOfNotificationsDelivered</td><td>YES</td></tr><tr><td>S3</td><td><code>AWS/S3</code></td><td>BucketSizeBytes, NumberOfObjects</td><td>YES (daily only)</td></tr><tr><td>RDS</td><td><code>AWS/RDS</code></td><td>CPUUtilization, DatabaseConnections, FreeStorageSpace</td><td>YES</td></tr><tr><td>Redshift</td><td><code>AWS/Redshift</code></td><td>CPUUtilization, PercentageDiskSpaceUsed, DatabaseConnections</td><td>YES</td></tr><tr><td>Lambda</td><td><code>AWS/Lambda</code></td><td>Invocations, Duration, Errors, Throttles</td><td>YES</td></tr><tr><td>EBS</td><td><code>AWS/EBS</code></td><td>VolumeReadOps, VolumeWriteOps, VolumeQueueLength</td><td>YES</td></tr><tr><td>NAT Gateway</td><td><code>AWS/NATGateway</code></td><td>BytesInFromSource, BytesOutToDestination, ErrorPortAllocation</td><td>YES</td></tr></tbody></table>
+<p>→ These are called BUILT-IN metrics — they exist automatically when you create the resource<br>
+→ No agent installation, no configuration, no extra cost (basic monitoring)</p>
+<p><strong>Metrics NOT Available by Default:</strong></p>
+<table><thead><tr><th>Metric</th><th>Why Not Available</th><th>Solution</th></tr></thead><tbody><tr><td>Memory utilization</td><td>EC2 hypervisor cannot see inside the guest OS</td><td>CloudWatch Agent (Project 19)</td></tr><tr><td>Disk utilization</td><td>EC2 hypervisor cannot see filesystem</td><td>CloudWatch Agent (Project 19)</td></tr><tr><td>Application-level metrics (request count, error rate)</td><td>Custom to your application</td><td>Custom Metrics via PutMetricData API</td></tr><tr><td>Process-level CPU/memory</td><td>Not exposed by hypervisor</td><td>CloudWatch Agent</td></tr></tbody></table>
+<p>→ CRITICAL UNDERSTANDING: CloudWatch basic monitoring sees EC2 from the OUTSIDE (hypervisor level)<br>
+→ It CANNOT see INSIDE the guest OS<br>
+→ CPU utilization is visible because the hypervisor allocates CPU<br>
+→ Memory and disk are NOT visible because they're internal to the guest OS<br>
+→ This is why ShopNow's disk-full incident wasn't detected — no disk metric existed</p>
+<p>→ The CloudWatch Agent (Project 19) runs INSIDE the EC2 instance → publishes memory, disk, and custom metrics</p>
+<hr>
+<h3>STEP 2 — UNDERSTAND NAMESPACES, DIMENSIONS, AND PERIODS</h3>
+<hr>
+<p><strong>NAMESPACES:</strong></p>
+<p>→ A namespace is a CONTAINER for metrics — groups metrics by source<br>
+→ Format: <code>AWS/{ServiceName}</code> for AWS services</p>
+<table><thead><tr><th>Namespace</th><th>Source</th></tr></thead><tbody><tr><td><code>AWS/EC2</code></td><td>EC2 instances</td></tr><tr><td><code>AWS/SQS</code></td><td>SQS queues</td></tr><tr><td><code>AWS/SNS</code></td><td>SNS topics</td></tr><tr><td><code>AWS/RDS</code></td><td>RDS databases</td></tr><tr><td><code>AWS/S3</code></td><td>S3 buckets</td></tr><tr><td><code>AWS/Redshift</code></td><td>Redshift clusters</td></tr><tr><td><code>Custom/ShopNow</code></td><td>Your custom application metrics</td></tr></tbody></table>
+<p>→ Custom namespaces: You choose the name (convention: <code>Custom/{AppName}</code>)<br>
+→ Namespaces prevent metric name collisions (both EC2 and RDS have <code>CPUUtilization</code> but in different namespaces)</p>
+<hr>
+<p><strong>DIMENSIONS:</strong></p>
+<p>→ Dimensions are KEY-VALUE pairs that IDENTIFY which specific resource the metric belongs to<br>
+→ Think of dimensions as FILTERS</p>
+<table><thead><tr><th>Namespace</th><th>Metric</th><th>Dimensions</th><th>What It Identifies</th></tr></thead><tbody><tr><td>AWS/EC2</td><td>CPUUtilization</td><td>InstanceId: i-0abc123</td><td>CPU of THIS specific instance</td></tr><tr><td>AWS/EC2</td><td>CPUUtilization</td><td>AutoScalingGroupName: shopnow-web-asg</td><td>AVERAGE CPU across all instances in the ASG</td></tr><tr><td>AWS/SQS</td><td>ApproximateNumberOfMessagesVisible</td><td>QueueName: shopnow-orders.fifo</td><td>Messages in THIS specific queue</td></tr><tr><td>AWS/RDS</td><td>CPUUtilization</td><td>DBInstanceIdentifier: shopnow-db</td><td>CPU of THIS specific database</td></tr><tr><td>AWS/S3</td><td>BucketSizeBytes</td><td>BucketName: shopnow-productimages-prod-aps1, StorageType: StandardStorage</td><td>Size of THIS bucket in Standard storage</td></tr></tbody></table>
+<p>→ A single metric name (e.g., CPUUtilization) with DIFFERENT dimensions = DIFFERENT metric streams<br>
+→ <code>CPUUtilization</code> for instance A is a completely separate data stream from <code>CPUUtilization</code> for instance B<br>
+→ When creating alarms → you MUST specify the correct dimensions to monitor the right resource</p>
+<p><strong>Dimension Combinations:</strong></p>
+<p>→ EC2 publishes CPUUtilization with multiple dimension sets:</p>
+<ul>
+<li>Per instance: <code>{InstanceId: i-0abc123}</code></li>
+<li>Per Auto Scaling Group: <code>{AutoScalingGroupName: shopnow-web-asg}</code></li>
+<li>Per Image (AMI): <code>{ImageId: ami-0abc123}</code></li>
+<li>Per Instance Type: <code>{InstanceType: t3.micro}</code></li>
+</ul>
+<p>→ This allows you to create alarms at different granularities:</p>
+<ul>
+<li>"Alert if THIS instance CPU &gt; 90%" (instance dimension)</li>
+<li>"Alert if AVERAGE CPU across the ASG &gt; 80%" (ASG dimension)</li>
+</ul>
+<hr>
+<p><strong>PERIODS:</strong></p>
+<p>→ The time interval over which a data point is aggregated<br>
+→ Minimum: 1 second (high-resolution custom metrics)<br>
+→ Standard: 60 seconds (1 minute) or 300 seconds (5 minutes)</p>
+<table><thead><tr><th>Monitoring Type</th><th>Period</th><th>Cost</th><th>Available For</th></tr></thead><tbody><tr><td>Basic Monitoring</td><td>300 seconds (5 minutes)</td><td>Free</td><td>EC2 (default)</td></tr><tr><td>Detailed Monitoring</td><td>60 seconds (1 minute)</td><td>$3.50/instance/month</td><td>EC2 (must enable)</td></tr><tr><td>High Resolution</td><td>1 second</td><td>Custom metric pricing</td><td>Custom metrics only</td></tr></tbody></table>
+<p>→ Basic monitoring: Data point every 5 minutes → coarse-grained<br>
+→ Detailed monitoring: Data point every 1 minute → fine-grained<br>
+→ For production EC2 instances → enable Detailed Monitoring (catches spikes faster)</p>
+<hr>
+<h3>STEP 3 — BASIC vs DETAILED MONITORING</h3>
+<p><strong>Basic Monitoring (Default for EC2):</strong></p>
+<p>→ Data points every 5 MINUTES<br>
+→ FREE — no extra cost<br>
+→ Sufficient for development/testing</p>
+<p><strong>Problem with 5-minute intervals:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Time 03:00 — CPU: 12% (data point published)
+</span>Time 03:01 — CPU spikes to 100% (NOT recorded yet)
+Time 03:02 — CPU: 100% (NOT recorded yet)
+Time 03:03 — CPU: 100% (NOT recorded yet)
+Time 03:04 — CPU: 100% (NOT recorded yet)
+Time 03:05 — CPU: 100% (data point published — AVERAGE of last 5 min = ~82%)
+
+CloudWatch sees: 12% at 03:00, 82% at 03:05
+Reality: CPU was 100% for 4 minutes before CloudWatch noticed</code></pre></div>
+<p>→ A 4-minute outage could be missed or delayed in detection</p>
+<p><strong>Detailed Monitoring (Must Enable):</strong></p>
+<p>→ Data points every 1 MINUTE<br>
+→ Costs ~$3.50 per instance per month<br>
+→ Catches problems 5x faster</p>
+<p><strong>How to Enable:</strong></p>
+<p>→ During EC2 launch: Advanced details → Detailed monitoring: Enable<br>
+→ After launch: EC2 Console → Select instance → Actions → Monitor and troubleshoot → Manage detailed monitoring → Enable</p>
+<p>→ For ShopNow production instances → ALWAYS enable Detailed Monitoring<br>
+→ For dev/test → Basic Monitoring is acceptable</p>
+<hr>
+<h3>STEP 4 — CREATE CLOUDWATCH ALARMS</h3>
+<p>→ An alarm WATCHES a metric and TRIGGERS actions when the metric crosses a threshold</p>
+<p>→ CloudWatch Console → "Alarms" → "All alarms" → "Create alarm"</p>
+<hr>
+<p><strong>ALARM 1: EC2 CPU Utilization &gt; 90%</strong></p>
+<p><strong>Step 4a: Select Metric</strong></p>
+<p>→ Click "Select metric"<br>
+→ Browse: EC2 → Per-Instance Metrics<br>
+→ Find: <code>InstanceId: i-0abc123</code> + <code>CPUUtilization</code><br>
+→ Click "Select metric"</p>
+<p><strong>Step 4b: Metric Configuration</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Metric name</td><td>CPUUtilization</td><td>What we're watching</td></tr><tr><td>InstanceId</td><td>i-0abc123</td><td>Which instance (dimension)</td></tr><tr><td>Statistic</td><td>Average</td><td>How to aggregate data points within each period</td></tr><tr><td>Period</td><td>300 seconds (5 minutes)</td><td>Evaluation window size</td></tr></tbody></table>
+<p><strong>Understanding Statistics:</strong></p>
+<p>→ Within each period, multiple data points may exist (especially with detailed monitoring)<br>
+→ The STATISTIC determines how those data points are aggregated into a single value</p>
+<table><thead><tr><th>Statistic</th><th>What It Computes</th><th>Best For</th></tr></thead><tbody><tr><td>Average</td><td>Mean of all data points in the period</td><td>CPU utilization, queue depth (typical state)</td></tr><tr><td>Sum</td><td>Total of all data points</td><td>Request count, error count (total volume)</td></tr><tr><td>Minimum</td><td>Lowest data point</td><td>Finding if a metric EVER dropped (e.g., healthy host count)</td></tr><tr><td>Maximum</td><td>Highest data point</td><td>Finding if a metric EVER spiked (e.g., latency)</td></tr><tr><td>p99</td><td>99th percentile</td><td>Latency monitoring — "what's the worst 1% experiencing?"</td></tr><tr><td>p95</td><td>95th percentile</td><td>Latency monitoring — "what's the worst 5% experiencing?"</td></tr><tr><td>SampleCount</td><td>Number of data points</td><td>Checking if data is being reported</td></tr></tbody></table>
+<p>→ For CPU → Average makes sense (overall utilization)<br>
+→ For latency → p99 is better (catches tail latency that Average hides)<br>
+→ For error counts → Sum makes sense (total errors in the period)</p>
+<p><strong>Step 4c: Conditions (Threshold)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Threshold type</td><td>Static</td><td>Fixed threshold value (vs Anomaly Detection)</td></tr><tr><td>Whenever CPUUtilization is...</td><td>Greater than</td><td>Direction of breach</td></tr><tr><td>...than</td><td>90</td><td>Threshold value (percent)</td></tr><tr><td>Datapoints to alarm</td><td>3 out of 5</td><td>How many periods must breach before alarm triggers</td></tr></tbody></table>
+<p><strong>Understanding "Datapoints to Alarm" (M out of N):</strong></p>
+<p>→ This prevents false alarms from brief spikes<br>
+→ "3 out of 5" means: Look at the last 5 evaluation periods → alarm ONLY if 3 or more breached the threshold</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Period 1: CPU 45% → Below threshold ✓
+</span>Period 2: CPU 92% → ABOVE threshold ✗
+Period 3: CPU 88% → Below threshold ✓
+Period 4: CPU 95% → ABOVE threshold ✗
+Period 5: CPU 91% → ABOVE threshold ✗
+
+Breaching periods: 3 out of 5 → ALARM TRIGGERED 🚨
+
+Compare with:
+Period 1: CPU 45% → Below ✓
+Period 2: CPU 92% → ABOVE ✗
+Period 3: CPU 88% → Below ✓
+Period 4: CPU 65% → Below ✓
+Period 5: CPU 91% → ABOVE ✗
+
+Breaching periods: 2 out of 5 → NOT triggered (need 3)</code></pre></div>
+<p>→ "1 out of 1" = Most sensitive — triggers on single breach (may cause alert fatigue)<br>
+→ "3 out of 3" = Conservative — requires 3 consecutive breaches (may delay detection)<br>
+→ "3 out of 5" = Balanced — allows 2 non-breaching periods (handles intermittent spikes)</p>
+<p><strong>Step 4d: Actions (What to Do When Alarm Triggers)</strong></p>
+<p><strong>Notification Actions:</strong></p>
+<table><thead><tr><th>Alarm State Trigger</th><th>Action</th><th>Target</th></tr></thead><tbody><tr><td>In alarm</td><td>Send notification to SNS topic</td><td><code>shopnow-ops-alerts</code> (Project 6)</td></tr><tr><td>OK (recovered)</td><td>Send notification to SNS topic</td><td><code>shopnow-ops-alerts</code></td></tr><tr><td>Insufficient data</td><td>Send notification to SNS topic</td><td><code>shopnow-ops-alerts</code></td></tr></tbody></table>
+<p>→ "In alarm" → SNS notification → ops team gets email/SMS (Project 6 subscription)<br>
+→ "OK" → SNS notification → ops team knows the problem is resolved<br>
+→ "Insufficient data" → SNS notification → means CloudWatch isn't receiving data (instance may be down)</p>
+<p><strong>EC2 Actions (Specific to EC2 alarms):</strong></p>
+<table><thead><tr><th>Action</th><th>What It Does</th><th>Use Case</th></tr></thead><tbody><tr><td>Stop instance</td><td>Sends stop command to EC2</td><td>Stop idle dev instances to save cost</td></tr><tr><td>Terminate instance</td><td>Destroys the instance</td><td>Terminate compromised instances automatically</td></tr><tr><td>Reboot instance</td><td>Restarts the instance</td><td>Auto-recover from hung OS</td></tr><tr><td>Recover instance</td><td>Moves instance to new host</td><td>Auto-recover from hardware failure</td></tr></tbody></table>
+<p>→ The "Recover" action is CRITICAL for production:</p>
+<ul>
+<li>If the underlying hardware fails → instance is migrated to healthy hardware</li>
+<li>Same private IP, same Elastic IP, same EBS volumes</li>
+<li>Requires: EBS-backed instance (not instance store), single ENI, within account limits</li>
+</ul>
+<p><strong>Auto Scaling Actions:</strong></p>
+<table><thead><tr><th>Action</th><th>What It Does</th></tr></thead><tbody><tr><td>Add to Auto Scaling policy</td><td>Triggers scale-out (add instances) or scale-in (remove instances)</td></tr></tbody></table>
+<p>→ This connects to Project 33 (Auto Scaling)</p>
+<p><strong>Step 4e: Name and Description</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Alarm name</td><td><code>shopnow-web-01-cpu-high</code></td></tr><tr><td>Alarm description</td><td>"Web server CPU &gt; 90% for 3 out of 5 periods (15 minutes). Investigate runaway processes."</td></tr></tbody></table>
+<p>→ Click "Create alarm"</p>
+<hr>
+<p><strong>ALARM 2: SQS Queue Depth &gt; 5,000 Messages</strong></p>
+<p>→ "Create alarm" → Select metric</p>
+<p>→ Browse: SQS → Queue Metrics<br>
+→ Find: <code>QueueName: shopnow-orders.fifo</code> + <code>ApproximateNumberOfMessagesVisible</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>ApproximateNumberOfMessagesVisible</td></tr><tr><td>QueueName</td><td>shopnow-orders.fifo</td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Threshold</td><td>Greater than 5,000</td></tr><tr><td>Datapoints to alarm</td><td>3 out of 5</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td><code>shopnow-orders-queue-depth-high</code></td></tr></tbody></table>
+<p>→ Why Maximum instead of Average?<br>
+→ Queue depth can spike and recover quickly<br>
+→ Maximum catches the peak → Average might hide it<br>
+→ If the maximum was &gt; 5,000 in 3 out of 5 minutes → something is seriously wrong</p>
+<hr>
+<p><strong>ALARM 3: SQS Oldest Message Age &gt; 300 Seconds</strong></p>
+<p>→ "Create alarm" → Select metric</p>
+<p>→ Browse: SQS → Queue Metrics<br>
+→ Find: <code>QueueName: shopnow-orders.fifo</code> + <code>ApproximateAgeOfOldestMessage</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>ApproximateAgeOfOldestMessage</td></tr><tr><td>QueueName</td><td>shopnow-orders.fifo</td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Threshold</td><td>Greater than 300 (seconds = 5 minutes)</td></tr><tr><td>Datapoints to alarm</td><td>2 out of 3</td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>Alarm name</td><td><code>shopnow-orders-message-age-high</code></td></tr></tbody></table>
+<p>→ If the oldest message has been waiting &gt; 5 minutes → consumers are not keeping up<br>
+→ This is often an earlier warning sign than queue depth (detects slowdowns before backlogs build)</p>
+<hr>
+<p><strong>ALARM 4: EC2 Status Check Failed</strong></p>
+<p>→ "Create alarm" → Select metric</p>
+<p>→ Browse: EC2 → Per-Instance Metrics<br>
+→ Find: <code>InstanceId: i-0abc123</code> + <code>StatusCheckFailed</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>StatusCheckFailed</td></tr><tr><td>InstanceId</td><td>i-0abc123</td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>60 seconds</td></tr><tr><td>Threshold</td><td>Greater than or equal to 1</td></tr><tr><td>Datapoints to alarm</td><td>2 out of 3</td></tr><tr><td>Notification action</td><td>SNS: shopnow-ops-alerts</td></tr><tr><td>EC2 action</td><td>Recover this instance</td></tr><tr><td>Alarm name</td><td><code>shopnow-web-01-status-check-failed</code></td></tr></tbody></table>
+<p><strong>Understanding StatusCheckFailed:</strong></p>
+<table><thead><tr><th>Metric</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>StatusCheckFailed</td><td>0</td><td>Both system and instance checks passing → healthy</td></tr><tr><td>StatusCheckFailed</td><td>1</td><td>At least one check failing → unhealthy</td></tr><tr><td>StatusCheckFailed_System</td><td>1</td><td>AWS infrastructure issue → auto-recover helps</td></tr><tr><td>StatusCheckFailed_Instance</td><td>1</td><td>Guest OS issue → reboot or investigate</td></tr></tbody></table>
+<p>→ This alarm: If status check fails for 2 out of 3 minutes → auto-recover the instance AND notify ops<br>
+→ The recovery action moves the instance to new hardware (if system check failed)<br>
+→ The notification ensures ops team knows it happened</p>
+<hr>
+<p><strong>ALARM 5: SNS Topic — No Messages Published (Dead Pipeline Detection)</strong></p>
+<p>→ "Create alarm" → Select metric</p>
+<p>→ Browse: SNS → Topic Metrics<br>
+→ Find: <code>TopicName: shopnow-ops-alerts</code> + <code>NumberOfMessagesPublished</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td>NumberOfMessagesPublished</td></tr><tr><td>TopicName</td><td>shopnow-ops-alerts</td></tr><tr><td>Statistic</td><td>Sum</td></tr><tr><td>Period</td><td>3600 seconds (1 hour)</td></tr><tr><td>Threshold</td><td>Less than 1</td></tr><tr><td>Datapoints to alarm</td><td>1 out of 1</td></tr><tr><td>Action</td><td>SNS: (DIFFERENT topic — can't alert on itself!)</td></tr><tr><td>Alarm name</td><td><code>shopnow-ops-alerts-no-activity</code></td></tr></tbody></table>
+<p>→ CRITICAL: This alarm detects if the alerting system itself is dead<br>
+→ If no messages published to the ops alert topic for 1 hour → something may be broken<br>
+→ BUT — you can't send this alarm TO the same topic you're monitoring<br>
+→ Use a DIFFERENT topic or a direct email subscription for this meta-alarm<br>
+→ This is "monitoring the monitoring" — essential for production</p>
+<hr>
+<h3>STEP 5 — UNDERSTAND ALARM STATES AND EVALUATION LOGIC</h3>
+<p><strong>Three Alarm States:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────┐    Threshold    ┌─────────────┐
+</span>│             │    Breached      │             │
+│     OK      │───────────────►│    ALARM     │
+│             │                 │             │
+│  (Metric is │◄───────────────│  (Metric is │
+│   within    │    Threshold    │   beyond    │
+│   limits)   │    Recovered    │   limits)   │
+│             │                 │             │
+└──────┬──────┘                 └──────┬──────┘
+       │                               │
+       │    No Data                     │    No Data
+       │                               │
+       ▼                               ▼
+┌─────────────────────────────────────────────┐
+│           INSUFFICIENT_DATA                  │
+│                                             │
+│  (Not enough data points to evaluate)       │
+│  (Instance stopped? Metric not published?)  │
+│                                             │
+└─────────────────────────────────────────────┘</code></pre></div>
+<table><thead><tr><th>State</th><th>Meaning</th><th>Color in Console</th></tr></thead><tbody><tr><td>OK</td><td>Metric is within acceptable range</td><td>Green</td></tr><tr><td>ALARM</td><td>Metric has breached the threshold</td><td>Red</td></tr><tr><td>INSUFFICIENT_DATA</td><td>Not enough data to evaluate</td><td>Grey</td></tr></tbody></table>
+<p><strong>When Does INSUFFICIENT_DATA Occur?</strong></p>
+<table><thead><tr><th>Cause</th><th>Example</th></tr></thead><tbody><tr><td>Alarm just created</td><td>Not enough data points collected yet</td></tr><tr><td>Instance stopped</td><td>No CPU metrics being published</td></tr><tr><td>Metric reporting gap</td><td>CloudWatch Agent crashed → no custom metrics</td></tr><tr><td>Wrong dimension</td><td>Alarm references non-existent instance ID</td></tr></tbody></table>
+<p>→ INSUFFICIENT_DATA is often more concerning than ALARM<br>
+→ ALARM means something is wrong but you KNOW about it<br>
+→ INSUFFICIENT_DATA means you're BLIND — you don't know the state</p>
+<p><strong>How to Handle Missing Data:</strong></p>
+<p>→ During alarm creation → "Missing data treatment" setting:</p>
+<table><thead><tr><th>Option</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>Treat missing data as missing</td><td>Don't change alarm state — maintain current state</td><td>Default — conservative</td></tr><tr><td>Treat missing data as breaching</td><td>Consider missing = threshold breached → may trigger alarm</td><td>Instance monitoring (if no data, instance may be down)</td></tr><tr><td>Treat missing data as not breaching</td><td>Consider missing = within threshold → alarm goes to OK</td><td>Batch job metrics (no data between runs is normal)</td></tr><tr><td>Treat missing data as ignore</td><td>Skip evaluation — maintain current state</td><td>Same as "missing" but explicitly stated</td></tr></tbody></table>
+<p>→ For EC2 CPU alarm → "Treat missing data as breaching"</p>
+<ul>
+<li>If instance is dead → no CPU data → we WANT an alarm<br>
+→ For batch job metrics → "Treat missing data as not breaching"</li>
+<li>No data between job runs is normal → don't alarm</li>
+</ul>
+<hr>
+<p><strong>Evaluation Logic Deep Dive:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Alarm Configuration:
+</span>  Metric: CPUUtilization
+  Threshold: &gt; 90%
+  Datapoints to alarm: 3 out of 5
+  Period: 300 seconds (5 minutes)
+  Missing data treatment: Treat as missing
+
+Evaluation Window = 5 periods × 300 seconds = 25 minutes
+
+Timeline:
+Period 1 (03:00): CPU 45% → NOT breaching
+Period 2 (03:05): CPU 92% → BREACHING
+Period 3 (03:10): (missing)  → Treated as MISSING (skipped)
+Period 4 (03:15): CPU 95% → BREACHING
+Period 5 (03:20): CPU 91% → BREACHING
+
+Evaluation: Out of 5 periods, 3 are breaching, 1 is not, 1 is missing
+Missing is skipped → 3 out of 4 evaluated → 3 breaching
+3 &gt;= 3 required → ALARM STATE TRIGGERED 🚨</code></pre></div>
+<p>→ When missing data is treated as "missing" → it's excluded from the count<br>
+→ The evaluation becomes: "3 out of 4 evaluated" instead of "3 out of 5"<br>
+→ If ALL periods are missing → alarm goes to INSUFFICIENT_DATA</p>
+<hr>
+<h3>STEP 6 — COMPLETE ALARM SET FOR SHOPNOW</h3>
+<p><strong>Summary of All Alarms:</strong></p>
+<table><thead><tr><th>#</th><th>Alarm Name</th><th>Metric</th><th>Namespace</th><th>Threshold</th><th>Datapoints</th><th>Action</th></tr></thead><tbody><tr><td>1</td><td>shopnow-web-01-cpu-high</td><td>CPUUtilization</td><td>AWS/EC2</td><td>&gt; 90%</td><td>3/5 × 5min</td><td>SNS: ops-alerts</td></tr><tr><td>2</td><td>shopnow-orders-queue-depth-high</td><td>ApproximateNumberOfMessagesVisible</td><td>AWS/SQS</td><td>&gt; 5,000</td><td>3/5 × 1min</td><td>SNS: ops-alerts</td></tr><tr><td>3</td><td>shopnow-orders-message-age-high</td><td>ApproximateAgeOfOldestMessage</td><td>AWS/SQS</td><td>&gt; 300s</td><td>2/3 × 1min</td><td>SNS: ops-alerts</td></tr><tr><td>4</td><td>shopnow-web-01-status-check</td><td>StatusCheckFailed</td><td>AWS/EC2</td><td>&gt;= 1</td><td>2/3 × 1min</td><td>SNS: ops-alerts + EC2 Recover</td></tr><tr><td>5</td><td>shopnow-web-01-network-out-low</td><td>NetworkOut</td><td>AWS/EC2</td><td>&lt; 1000 bytes</td><td>3/3 × 5min</td><td>SNS: ops-alerts</td></tr><tr><td>6</td><td>shopnow-s3-4xx-errors</td><td>4xxErrors</td><td>AWS/S3</td><td>&gt; 100</td><td>2/3 × 5min</td><td>SNS: ops-alerts</td></tr><tr><td>7</td><td>shopnow-ebs-queue-length</td><td>VolumeQueueLength</td><td>AWS/EBS</td><td>&gt; 10</td><td>3/5 × 1min</td><td>SNS: ops-alerts</td></tr><tr><td>8</td><td>shopnow-nat-gw-error-port</td><td>ErrorPortAllocation</td><td>AWS/NATGateway</td><td>&gt; 0</td><td>1/1 × 5min</td><td>SNS: ops-alerts</td></tr></tbody></table>
+<p><strong>Alarm 5 Explained: NetworkOut Low</strong><br>
+→ If web server stops sending data → it may have crashed or network is down<br>
+→ A healthy web server always sends SOME response data<br>
+→ If NetworkOut &lt; 1,000 bytes for 15 minutes (3 × 5min) → web server is not serving traffic</p>
+<p><strong>Alarm 6 Explained: S3 4xx Errors</strong><br>
+→ S3 request metrics require enabling "Request metrics" on the bucket<br>
+→ S3 Console → Bucket → Metrics → "Request metrics" → Create filter (or monitor entire bucket)<br>
+→ 4xx errors indicate: Access Denied, Not Found, Bad Request<br>
+→ A spike in 4xx might mean a misconfigured application or permission issue</p>
+<p><strong>Alarm 7 Explained: EBS Queue Length</strong><br>
+→ VolumeQueueLength = number of I/O operations waiting in queue for the EBS volume<br>
+→ High queue length → disk is bottlenecked → application is waiting for disk<br>
+→ Normal: 0-1 → Warning: 5-10 → Critical: &gt; 10</p>
+<p><strong>Alarm 8 Explained: NAT Gateway Port Allocation Error</strong><br>
+→ From Project 5 — NAT Gateway has ~55,000 ports per destination<br>
+→ If all ports exhausted → ErrorPortAllocation &gt; 0 → connections fail<br>
+→ Even 1 error means you're hitting limits → need more NAT Gateways or EIPs</p>
+<hr>
+<h3>STEP 7 — BUILD A CLOUDWATCH DASHBOARD</h3>
+<p>→ CloudWatch Console → "Dashboards" → "Create dashboard"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Dashboard name</td><td><code>shopnow-production-overview</code></td></tr></tbody></table>
+<p>→ A dashboard is a collection of WIDGETS displaying metrics visually</p>
+<p><strong>Widget Types:</strong></p>
+<table><thead><tr><th>Widget Type</th><th>What It Shows</th><th>Best For</th></tr></thead><tbody><tr><td>Line graph</td><td>Metric over time (time series)</td><td>CPU, memory, latency trends</td></tr><tr><td>Stacked area</td><td>Multiple metrics over time (stacked)</td><td>Breakdown by instance, by queue</td></tr><tr><td>Number</td><td>Current single value</td><td>Current queue depth, current CPU</td></tr><tr><td>Gauge</td><td>Current value with thresholds</td><td>Quick health check (green/yellow/red)</td></tr><tr><td>Bar chart</td><td>Metric comparison</td><td>Compare across instances</td></tr><tr><td>Pie chart</td><td>Proportion breakdown</td><td>Traffic distribution</td></tr><tr><td>Text</td><td>Markdown text</td><td>Dashboard instructions, links</td></tr><tr><td>Alarm status</td><td>Visual alarm states</td><td>All alarms at a glance</td></tr><tr><td>Log table</td><td>Recent log entries</td><td>Error log monitoring</td></tr><tr><td>Explorer</td><td>Auto-discover resources</td><td>Large-scale fleet monitoring</td></tr></tbody></table>
+<hr>
+<p><strong>Dashboard Layout for ShopNow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Row 1: OVERVIEW
+</span>┌─────────────────────┬─────────────────────┬─────────────────────┐
+│ Alarm Status Widget │ Active Alarms       │ Text Widget         │
+│ Shows all 8 alarms  │ Count of ALARM      │ "ShopNow Production │
+│ Green/Red/Grey      │ state alarms        │  Dashboard"         │
+│                     │ (Number widget)     │  Last updated: auto │
+└─────────────────────┴─────────────────────┴─────────────────────┘
+
+Row 2: EC2 WEB SERVER
+┌─────────────────────────────────┬─────────────────────────────────┐
+│ CPUUtilization (Line Graph)     │ NetworkIn / NetworkOut           │
+│ shopnow-web-01                  │ (Stacked Area)                  │
+│ Time range: Last 3 hours        │ Time range: Last 3 hours        │
+│ Threshold line at 90%           │                                 │
+└─────────────────────────────────┴─────────────────────────────────┘
+
+Row 3: SQS QUEUE
+┌─────────────────────────────────┬─────────────────────────────────┐
+│ Messages Visible (Line Graph)   │ Oldest Message Age              │
+│ shopnow-orders.fifo             │ (Number Widget — current value) │
+│ Threshold line at 5,000         │ Show in seconds                 │
+│                                 │ Red if &gt; 300s                   │
+└─────────────────────────────────┴─────────────────────────────────┘
+
+Row 4: EBS VOLUME
+┌─────────────────────────────────┬─────────────────────────────────┐
+│ VolumeReadOps / VolumeWriteOps  │ VolumeQueueLength               │
+│ (Stacked Area)                  │ (Line Graph)                    │
+│                                 │ Threshold line at 10            │
+└─────────────────────────────────┴─────────────────────────────────┘</code></pre></div>
+<p><strong>Adding a Widget:</strong></p>
+<p>→ Click "Add widget" → Select "Line" → Click "Configure"<br>
+→ Browse: EC2 → Per-Instance Metrics → Select CPUUtilization for i-0abc123<br>
+→ Set: Period = 1 minute, Statistic = Average<br>
+→ Click "Create widget"</p>
+<p><strong>Adding Threshold Line to Graph:</strong></p>
+<p>→ Click on the widget → "Edit" → "Graph options" tab<br>
+→ "Add horizontal annotation"<br>
+→ Value: 90, Label: "Alarm threshold", Color: Red<br>
+→ This draws a red line at 90% making it easy to see when CPU approaches danger</p>
+<p><strong>Dashboard Time Controls:</strong></p>
+<table><thead><tr><th>Feature</th><th>How</th></tr></thead><tbody><tr><td>Relative time range</td><td>"Last 1 hour", "Last 3 hours", "Last 1 day", "Last 1 week"</td></tr><tr><td>Absolute time range</td><td>Pick specific start and end date/time</td></tr><tr><td>Auto-refresh</td><td>10 seconds, 1 minute, 5 minutes, 15 minutes</td></tr><tr><td>Zoom</td><td>Click and drag on any graph to zoom into a time range</td></tr></tbody></table>
+<p>→ Set auto-refresh to 1 minute for production monitoring<br>
+→ Dashboard URL can be bookmarked and shared with the team<br>
+→ Display on a wall-mounted TV in the operations room</p>
+<p><strong>Dashboard Sharing:</strong></p>
+<table><thead><tr><th>Method</th><th>Who Can See</th></tr></thead><tbody><tr><td>Same AWS account users</td><td>Anyone with <code>cloudwatch:GetDashboard</code> IAM permission</td></tr><tr><td>CloudWatch sharing</td><td>Share publicly via signed URL (read-only)</td></tr><tr><td>Cross-account</td><td>Via CloudWatch cross-account observability (Project 60)</td></tr></tbody></table>
+<hr>
+<h3>STEP 8 — COMPOSITE ALARMS</h3>
+<p>→ Individual alarms can be noisy<br>
+→ A composite alarm combines MULTIPLE alarms with AND/OR logic</p>
+<p><strong>Problem:</strong><br>
+→ CPU spikes briefly during deployments → triggers alarm → false alert<br>
+→ But CPU spike + queue depth spike = REAL problem<br>
+→ We want to alert ONLY when BOTH conditions are true simultaneously</p>
+<p><strong>Creating a Composite Alarm:</strong></p>
+<p>→ CloudWatch Console → Alarms → "Create alarm" → "Create composite alarm"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Alarm rule</td><td>ALARM("shopnow-web-01-cpu-high") AND ALARM("shopnow-orders-queue-depth-high")</td></tr><tr><td>Alarm name</td><td><code>shopnow-critical-overload</code></td></tr><tr><td>Action</td><td>SNS: shopnow-ops-alerts</td></tr></tbody></table>
+<p><strong>Alarm Rule Syntax:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ALARM("alarm-name")        → True when the named alarm is in ALARM state
+</span>OK("alarm-name")           → True when the named alarm is in OK state
+INSUFFICIENT_DATA("alarm") → True when in INSUFFICIENT_DATA state
+
+Operators: AND, OR, NOT, parentheses for grouping</code></pre></div>
+<p><strong>Examples:</strong></p>
+<table><thead><tr><th>Rule</th><th>Meaning</th></tr></thead><tbody><tr><td><code>ALARM("cpu-high") AND ALARM("queue-deep")</code></td><td>Both must be alarming</td></tr><tr><td><code>ALARM("cpu-high") OR ALARM("memory-high")</code></td><td>Either one alarming triggers composite</td></tr><tr><td><code>ALARM("cpu-high") AND NOT ALARM("deployment-in-progress")</code></td><td>CPU high but NOT during deployment</td></tr><tr><td><code>ALARM("a") AND (ALARM("b") OR ALARM("c"))</code></td><td>A must be alarming AND either B or C</td></tr></tbody></table>
+<p>→ Composite alarms REDUCE alert fatigue by requiring multiple conditions<br>
+→ They make alerts more ACTIONABLE — if composite triggers, it's definitely a real issue</p>
+<p><strong>Suppressor Alarm:</strong></p>
+<p>→ A special feature of composite alarms<br>
+→ When the suppressor alarm is in ALARM state → the composite alarm actions are SUPPRESSED</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Suppressor alarm</td><td><code>shopnow-maintenance-window</code></td></tr><tr><td>Wait period</td><td>60 seconds</td></tr></tbody></table>
+<p>→ During maintenance → set <code>shopnow-maintenance-window</code> to ALARM state<br>
+→ All composite alarms with this suppressor → won't trigger notifications<br>
+→ After maintenance → set suppressor back to OK → normal alerting resumes</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always create alarms for critical metrics: CPU, status checks, queue depth, error rates<br>
+→ Always use "Datapoints to alarm" (M out of N) to prevent false alarms from brief spikes<br>
+→ Always configure BOTH "In alarm" AND "OK" notifications — know when problems START and RESOLVE<br>
+→ Always use appropriate statistics: Average for utilization, Sum for counts, Maximum for peaks<br>
+→ Always enable Detailed Monitoring for production EC2 instances (1-minute resolution)<br>
+→ Always set meaningful alarm names with resource identifier included<br>
+→ Always add descriptive alarm descriptions with remediation steps<br>
+→ Always configure "Missing data treatment" appropriately per metric type<br>
+→ Always create a production dashboard with all critical metrics on one screen<br>
+→ Always use composite alarms to reduce alert fatigue<br>
+→ Always monitor the monitoring — ensure alarms themselves are working<br>
+→ Always connect alarms to SNS topics (Project 6) for multi-channel notification<br>
+→ Always tag alarms for organizational tracking</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never rely solely on basic monitoring (5-minute) for production — use detailed monitoring<br>
+→ Never set "1 out of 1" datapoints for volatile metrics — creates alert fatigue<br>
+→ Never forget to configure "OK" actions — you need to know when problems resolve<br>
+→ Never use only email for critical alerts — add SMS for on-call (Project 6)<br>
+→ Never create alarms without descriptive names — debugging at 3 AM with "Alarm-1" is useless<br>
+→ Never ignore INSUFFICIENT_DATA state — it often means the resource is unreachable<br>
+→ Never set thresholds too aggressively — 80% CPU is normal for some workloads<br>
+→ Never create dozens of individual alarms without composite alarms — alert fatigue kills response time<br>
+→ Never monitor only infrastructure metrics — also monitor business metrics (order count, error rate)<br>
+→ Never forget that memory and disk metrics require CloudWatch Agent (Project 19) — not available by default<br>
+→ Never assume all metrics are free — custom metrics and detailed monitoring have costs<br>
+→ Never create alarms for metrics you won't act on — every alarm should have a runbook</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>CloudWatch Solution</th></tr></thead><tbody><tr><td>Track CPU/network over time</td><td>Metrics → Line graph on dashboard</td></tr><tr><td>Alert when CPU exceeds threshold</td><td>Alarm with static threshold → SNS notification</td></tr><tr><td>Alert only when multiple things are wrong</td><td>Composite alarm (AND logic)</td></tr><tr><td>Auto-recover failed EC2 instance</td><td>Alarm → EC2 Recovery action</td></tr><tr><td>Scale instances based on load</td><td>Alarm → Auto Scaling action (Project 33)</td></tr><tr><td>Monitor queue depth</td><td>SQS metric alarm</td></tr><tr><td>Track application-specific metrics</td><td>Custom metrics via PutMetricData or CloudWatch Agent</td></tr><tr><td>Visualize all metrics on one screen</td><td>CloudWatch Dashboard</td></tr><tr><td>Detect anomalous behavior without fixed threshold</td><td>Anomaly Detection alarm</td></tr><tr><td>Suppress alerts during maintenance</td><td>Composite alarm with suppressor</td></tr></tbody></table>
+<p><strong>Static Threshold vs Anomaly Detection:</strong></p>
+<table><thead><tr><th>Approach</th><th>How It Works</th><th>Best For</th></tr></thead><tbody><tr><td>Static threshold</td><td>"Alert if CPU &gt; 90%"</td><td>Known, fixed limits</td></tr><tr><td>Anomaly Detection</td><td>ML model learns normal pattern → alerts on deviation</td><td>Metrics with daily/weekly patterns (traffic varies by time of day)</td></tr></tbody></table>
+<p>→ Anomaly Detection: CloudWatch builds a model of expected metric behavior<br>
+→ Example: Traffic is normally low at 3 AM and high at 3 PM<br>
+→ If traffic is unusually HIGH at 3 AM → anomaly → alarm<br>
+→ With static threshold → 3 AM traffic would be "normal" (below threshold) but actually abnormal for that time</p>
+<p><strong>Configuring Anomaly Detection:</strong></p>
+<p>→ When creating alarm → Threshold type: "Anomaly detection"<br>
+→ CloudWatch uses 2 weeks of historical data to build the model<br>
+→ "Band" width controls sensitivity (1 = very sensitive, 10 = less sensitive)<br>
+→ Good for: Request counts, latency, traffic patterns<br>
+→ Not good for: Brand new metrics with no history</p>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use CloudWatch alarms for complex event routing → Use EventBridge (Project 38)<br>
+→ Do NOT use CloudWatch for log analysis → Use CloudWatch Logs Insights (Project 19) or Athena (Project 18)<br>
+→ Do NOT use CloudWatch for application tracing (request flow across services) → Use AWS X-Ray<br>
+→ Do NOT use CloudWatch for uptime monitoring from external perspective → Use Route 53 Health Checks or third-party (Pingdom, Datadog)<br>
+→ Do NOT use CloudWatch for cost monitoring → Use AWS Cost Explorer and Budgets (Project 56)<br>
+→ Do NOT use CloudWatch for security event monitoring → Use GuardDuty, Security Hub (Project 57)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → HOW METRICS ARE COLLECTED AND STORED</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>AWS SERVICE (e.g., EC2)
+</span>        │
+        │  Every 5 min (basic) or 1 min (detailed):
+        │  Publishes metric data point to CloudWatch
+        │
+        ▼
+CLOUDWATCH METRICS SERVICE
+        │
+        ├── Receives data point:
+        │   Namespace: AWS/EC2
+        │   MetricName: CPUUtilization
+        │   Dimensions: {InstanceId: i-0abc123}
+        │   Value: 78.5
+        │   Timestamp: 2025-01-15T03:17:00Z
+        │   Unit: Percent
+        │
+        ├── Stores in TIME SERIES DATABASE
+        │   (Distributed across multiple AZs)
+        │
+        └── Data retention:
+            1-second resolution: 3 hours
+            60-second resolution: 15 days
+            300-second (5-min) resolution: 63 days
+            3600-second (1-hour) resolution: 455 days (15 months)</code></pre></div>
+<p><strong>Data Retention — CRITICAL to understand:</strong></p>
+<table><thead><tr><th>Original Resolution</th><th>Kept For</th><th>Then Aggregated To</th><th>Kept For</th></tr></thead><tbody><tr><td>1 second (high-resolution)</td><td>3 hours</td><td>60 seconds</td><td>15 days</td></tr><tr><td>60 seconds (detailed/standard)</td><td>15 days</td><td>5 minutes</td><td>63 days</td></tr><tr><td>5 minutes</td><td>63 days</td><td>1 hour</td><td>455 days</td></tr></tbody></table>
+<p>→ After 15 days → 1-minute data points are AGGREGATED into 5-minute summaries<br>
+→ You LOSE the 1-minute granularity after 15 days<br>
+→ After 63 days → 5-minute data is aggregated into 1-hour summaries<br>
+→ After 455 days → data is DELETED</p>
+<p>→ This means: If you're investigating an incident from 2 months ago → you only have 5-minute granularity<br>
+→ For long-term storage → export metrics to S3 (via Metric Stream or GetMetricData API)</p>
+<hr>
+<h3>2 → HOW ALARM EVALUATION WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Alarm: shopnow-web-01-cpu-high
+</span>  Metric: CPUUtilization, InstanceId: i-0abc123
+  Period: 300 seconds
+  Statistic: Average
+  Threshold: &gt; 90
+  Datapoints to alarm: 3 out of 5
+
+EVALUATION CYCLE (runs every Period = 300 seconds):
+
+Time 03:25:00 — Evaluation triggered
+        │
+        ▼
+Step 1: Retrieve last 5 data points (evaluation range)
+        │
+        ├── 03:05 → Average CPU: 45.2%
+        ├── 03:10 → Average CPU: 89.1%
+        ├── 03:15 → Average CPU: 95.3%
+        ├── 03:20 → Average CPU: 92.7%
+        └── 03:25 → Average CPU: 91.5%
+        │
+        ▼
+Step 2: Compare each to threshold (&gt; 90)
+        │
+        ├── 03:05: 45.2% → NOT breaching
+        ├── 03:10: 89.1% → NOT breaching
+        ├── 03:15: 95.3% → BREACHING ✗
+        ├── 03:20: 92.7% → BREACHING ✗
+        └── 03:25: 91.5% → BREACHING ✗
+        │
+        ▼
+Step 3: Count breaching data points: 3
+        Required: 3 out of 5
+        3 &gt;= 3 → THRESHOLD MET
+        │
+        ▼
+Step 4: Check current alarm state
+        │
+        ├── If currently OK → Change to ALARM → Execute ALARM actions
+        │   → Send SNS notification: "ALARM: shopnow-web-01-cpu-high"
+        │   → Execute EC2 actions (if configured)
+        │
+        └── If already ALARM → No state change → No re-notification
+            (Unless "Actions enabled" is set to trigger on every evaluation)
+        │
+        ▼
+Step 5: Record state change in alarm history
+        Visible in: CloudWatch Console → Alarms → Select alarm → History tab</code></pre></div>
+<p>→ Alarms evaluate on a FIXED schedule (every Period)<br>
+→ They do NOT evaluate continuously — there's a delay up to one full period<br>
+→ With 5-minute periods → alarm may take up to 5 minutes to detect a breach</p>
+<hr>
+<h3>3 → HOW ALARM ACTIONS WORK</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Alarm transitions to ALARM state
+</span>        │
+        ▼
+Step 1: Check "Actions enabled" setting
+        │
+        ├── Disabled → No actions taken (useful during maintenance)
+        │
+        └── Enabled → Proceed to execute actions
+        │
+        ▼
+Step 2: Execute notification actions
+        │
+        ├── SNS Publish: CloudWatch publishes to the configured SNS topic
+        │   Message includes: alarm name, state, reason, timestamp, metric data
+        │   SNS then fans out to subscribers (Project 6)
+        │
+        └── Multiple SNS topics can be targeted (one alarm → multiple topics)
+        │
+        ▼
+Step 3: Execute service-specific actions
+        │
+        ├── EC2: Stop/Terminate/Reboot/Recover (API call to EC2)
+        ├── Auto Scaling: Execute scaling policy (API call to Auto Scaling)
+        └── Systems Manager: Run automation document (API call to SSM)</code></pre></div>
+<p><strong>SNS Message Format from CloudWatch Alarm:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "AlarmName": "shopnow-web-01-cpu-high",
+  "AlarmDescription": "Web server CPU &gt; 90% for 3/5 periods",
+  "AWSAccountId": "123456789012",
+  "NewStateValue": "ALARM",
+  "NewStateReason": "Threshold Crossed: 3 out of the last 5 datapoints [95.3, 92.7, 91.5, 89.1, 45.2] were greater than the threshold (90.0)",
+  "StateChangeTime": "2025-01-15T03:25:00.000+0000",
+  "Region": "ap-south-1",
+  "AlarmArn": "arn:aws:cloudwatch:ap-south-1:123456789012:alarm:shopnow-web-01-cpu-high",
+  "OldStateValue": "OK",
+  "Trigger": {
+    "MetricName": "CPUUtilization",
+    "Namespace": "AWS/EC2",
+    "StatisticType": "Statistic",
+    "Statistic": "AVERAGE",
+    "Unit": null,
+    "Dimensions": [
+      {"value": "i-0abc123", "name": "InstanceId"}
+    ],
+    "Period": 300,
+    "EvaluationPeriods": 5,
+    "DatapointsToAlarm": 3,
+    "ComparisonOperator": "GreaterThanThreshold",
+    "Threshold": 90.0,
+    "TreatMissingData": "breaching"
+  }
+}</code></pre></div>
+<p>→ This JSON is what email subscribers receive (formatted as text)<br>
+→ This JSON is what SQS/Lambda subscribers receive (for programmatic processing)<br>
+→ The <code>NewStateReason</code> field shows the EXACT data points that triggered the alarm → invaluable for debugging</p>
+<hr>
+<h3>4 → HOW CUSTOM METRICS WORK</h3>
+<p>→ You can publish your OWN metrics to CloudWatch<br>
+→ Using the PutMetricData API</p>
+<p><strong>Custom Metric Example for ShopNow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Namespace: Custom/ShopNow
+</span>MetricName: OrderProcessingTime
+Dimensions:
+  - Name: OrderType, Value: flash-sale
+Value: 2.5
+Unit: Seconds
+Timestamp: 2025-01-15T14:30:00Z</code></pre></div>
+<p>→ This creates a custom metric tracking how long order processing takes<br>
+→ You can create alarms on custom metrics just like AWS metrics<br>
+→ Custom metric cost: $0.30 per metric per month (first 10 metrics free)</p>
+<p><strong>Custom Metric Resolution:</strong></p>
+<table><thead><tr><th>Resolution</th><th>PutMetricData StorageResolution</th><th>Cost</th><th>Data Granularity</th></tr></thead><tbody><tr><td>Standard</td><td>60 seconds (default)</td><td>$0.30/metric/month</td><td>1-minute minimum period</td></tr><tr><td>High Resolution</td><td>1 second</td><td>$0.30/metric/month (same) but more data points</td><td>1-second minimum period</td></tr></tbody></table>
+<p>→ High-resolution metrics are useful for latency-sensitive applications<br>
+→ Can create 10-second alarms on high-resolution metrics</p>
+<hr>
+<h3>5 → CLOUDWATCH PRICING MODEL</h3>
+<table><thead><tr><th>Component</th><th>Cost</th></tr></thead><tbody><tr><td>Basic monitoring (5-min EC2)</td><td>Free</td></tr><tr><td>Detailed monitoring (1-min EC2)</td><td>$3.50/instance/month (first 7 free)</td></tr><tr><td>Custom metrics</td><td>$0.30/metric/month (first 10 free)</td></tr><tr><td>Alarms (standard)</td><td>$0.10/alarm/month (first 10 free)</td></tr><tr><td>Alarms (high-resolution)</td><td>$0.30/alarm/month</td></tr><tr><td>Alarms (composite)</td><td>$0.50/alarm/month</td></tr><tr><td>Alarms (anomaly detection)</td><td>$3.00/alarm/month</td></tr><tr><td>Dashboard</td><td>$3.00/dashboard/month (first 3 free)</td></tr><tr><td>API calls (GetMetricData)</td><td>$0.01/1,000 metrics requested</td></tr><tr><td>Metric Stream</td><td>$0.003/1,000 metric updates</td></tr></tbody></table>
+<p>→ For ShopNow (small scale): ~$5-10/month for basic monitoring setup<br>
+→ Free tier covers: 10 alarms + 10 custom metrics + 3 dashboards + basic monitoring</p>
+<hr>
+<h3>6 → CLOUDWATCH LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>Alarms per account per region</td><td>5,000</td></tr><tr><td>Metrics per PutMetricData call</td><td>1,000</td></tr><tr><td>Dimensions per metric</td><td>30</td></tr><tr><td>Dashboard widgets</td><td>500 per dashboard</td></tr><tr><td>Metric data retention</td><td>15 months (with decreasing resolution)</td></tr><tr><td>Custom metric namespaces</td><td>Unlimited</td></tr><tr><td>Composite alarm children</td><td>100 child alarms</td></tr><tr><td>SNS topics per alarm action</td><td>5</td></tr><tr><td>Evaluation periods maximum</td><td>1 day (86,400 seconds)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Assuming memory/disk metrics exist by default</td><td>Alarm on non-existent metric → INSUFFICIENT_DATA forever</td><td>Install CloudWatch Agent for OS-level metrics (Project 19)</td></tr><tr><td>2</td><td>Setting "1 out of 1" for volatile metrics</td><td>Every brief spike triggers alarm → alert fatigue → team ignores all alarms</td><td>Use "3 out of 5" or similar for volatile metrics</td></tr><tr><td>3</td><td>Not configuring "OK" notification</td><td>Team never knows when problem resolves → keeps investigating resolved issues</td><td>Always add "OK" action to SNS topic</td></tr><tr><td>4</td><td>Wrong statistic for metric type</td><td>Average hides spikes, Sum doesn't make sense for percentages</td><td>Average for utilization, Sum for counts, Maximum for peaks, p99 for latency</td></tr><tr><td>5</td><td>Alarm on wrong dimension</td><td>Alarm watches aggregate when you want per-instance</td><td>Always verify dimension matches the specific resource</td></tr><tr><td>6</td><td>Missing data treated as "not breaching" for critical metrics</td><td>Instance dies → no data → alarm stays OK → nobody knows</td><td>Use "breaching" treatment for instance health metrics</td></tr><tr><td>7</td><td>Too many alarms → all going to one SNS topic</td><td>Ops team receives 50 emails/hour → ignores all of them</td><td>Use filter policies (Project 6), composite alarms, and severity-based routing</td></tr><tr><td>8</td><td>Alarms created but actions disabled</td><td>Alarm transitions to ALARM but nobody is notified</td><td>Verify "Actions enabled" is ON for all production alarms</td></tr><tr><td>9</td><td>Dashboard not auto-refreshing</td><td>Team looks at stale data → thinks everything is fine</td><td>Set auto-refresh to 1 minute on production dashboards</td></tr><tr><td>10</td><td>Monitoring only AWS metrics, not application metrics</td><td>Infrastructure is healthy but application is returning errors</td><td>Publish custom metrics for application health (error rate, latency, success rate)</td></tr><tr><td>11</td><td>Forgot SNS topic access policy for CloudWatch</td><td>Alarm triggers but SNS rejects the publish → silent failure</td><td>Add CloudWatch service principal to topic access policy (Project 6 Step 6)</td></tr><tr><td>12</td><td>Metric resolution mismatch with alarm period</td><td>5-minute metric with 1-minute alarm period → INSUFFICIENT_DATA</td><td>Alarm period must be &gt;= metric resolution</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Metric Scalability</strong></p>
+<ul>
+<li>CloudWatch handles billions of data points across millions of metrics</li>
+<li>No provisioning needed — fully managed</li>
+<li>Custom metrics scale to thousands per account</li>
+<li>For very high cardinality → use Embedded Metric Format (EMF) in logs → extracted as metrics automatically</li>
+</ul>
+<p>→ <strong>Alarm Scalability</strong></p>
+<ul>
+<li>5,000 alarms per region per account (can request increase)</li>
+<li>For large fleets → use composite alarms to reduce individual alarm count</li>
+<li>For dynamic infrastructure (Auto Scaling) → create/delete alarms programmatically</li>
+<li>Consider: Alarm per instance vs alarm per Auto Scaling Group
+<ul>
+<li>Per instance: More granular but more alarms to manage</li>
+<li>Per ASG: Fewer alarms but less granular</li>
+</ul>
+</li>
+</ul>
+<p>→ <strong>Dashboard Scalability</strong></p>
+<ul>
+<li>500 widgets per dashboard</li>
+<li>Multiple dashboards for different teams/purposes</li>
+<li>Cross-account dashboards for centralized monitoring (Project 60)</li>
+<li>For very large fleets → use CloudWatch Explorer (auto-discovers resources)</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Costs scale linearly with: number of metrics, alarms, dashboard count</li>
+<li>Optimization: Use metric math to derive metrics instead of publishing redundant custom metrics</li>
+<li>Optimization: Disable detailed monitoring on non-production instances</li>
+<li>Optimization: Use CloudWatch Metric Streams to export to third-party tools (Datadog, Grafana) instead of duplicating monitoring</li>
+</ul>
+<p>→ <strong>Multi-Region / Multi-Account Scalability</strong></p>
+<ul>
+<li>CloudWatch is REGIONAL — each region has its own metrics and alarms</li>
+<li>Cross-region dashboards: Can add metrics from other regions to a single dashboard</li>
+<li>Cross-account observability: CloudWatch supports sharing metrics across accounts (Project 60)</li>
+<li>For enterprise: Centralized monitoring account with cross-account access</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify alarms are working correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Alarm exists</td><td>CloudWatch Console → Alarms → Verify alarm listed</td></tr><tr><td>Alarm state is correct</td><td>Alarms → State column: OK / ALARM / INSUFFICIENT_DATA</td></tr><tr><td>Alarm threshold correct</td><td>Select alarm → Details tab → Verify threshold and conditions</td></tr><tr><td>Alarm actions correct</td><td>Select alarm → Actions tab → Verify SNS topic ARN</td></tr><tr><td>Actions enabled</td><td>Select alarm → "Actions enabled" = Yes</td></tr><tr><td>SNS topic receiving</td><td>After alarm triggers → check email/SMS → verify receipt</td></tr><tr><td>Alarm history</td><td>Select alarm → History tab → Shows all state transitions with timestamps and reasons</td></tr></tbody></table>
+<p>→ <strong>How to test an alarm WITHOUT waiting for a real incident:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Method 1: Use set-alarm-state CLI command
+</span>  → Manually force alarm to ALARM state
+  → CloudWatch Console → Select alarm → Actions → "Set alarm state" → ALARM
+  → Triggers all configured actions → verifies end-to-end notification
+  → NOTE: This is temporary — alarm will re-evaluate on next cycle
+
+Method 2: Stress test the resource
+  → Run a CPU stress tool on EC2 → CPU spikes → alarm triggers naturally
+  → This tests the full path: metric → alarm → action
+
+Method 3: Check alarm evaluation in history
+  → Select alarm → History tab → Look for "Alarm updated" and "State change" entries
+  → Shows exactly which data points were evaluated and why the state changed</code></pre></div>
+<p>→ <strong>How to debug "alarm didn't fire when it should have":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Check alarm state
+</span>        Is it in OK, ALARM, or INSUFFICIENT_DATA?
+
+STEP 2: Check alarm history
+        Did it evaluate? What data points did it see?
+
+STEP 3: Check metric data
+        CloudWatch → Metrics → Find the metric → Graph it
+        Did the metric actually breach the threshold?
+
+STEP 4: Check statistic and period
+        Are you using Average when Maximum would catch the spike?
+        Is the period appropriate for the metric resolution?
+
+STEP 5: Check "Datapoints to alarm"
+        Did enough consecutive/near-consecutive breaches occur?
+        "3 out of 5" requires 3 breaching — 2 breaches won't trigger
+
+STEP 6: Check "Missing data treatment"
+        If data points are missing — how are they treated?
+        Missing treated as "not breaching" could prevent alarm
+
+STEP 7: Check dimension
+        Is the alarm watching the RIGHT resource?
+        Wrong InstanceId → watching a different server
+
+STEP 8: Check actions
+        Is "Actions enabled" = Yes?
+        Is the SNS topic ARN correct?
+        Does CloudWatch have permission to publish to the SNS topic?
+        (Topic access policy must allow cloudwatch.amazonaws.com — Project 6)</code></pre></div>
+<p>→ <strong>Metric Math for Derived Metrics:</strong></p>
+<p>→ CloudWatch supports mathematical expressions on metrics<br>
+→ Useful for: error rates, ratios, derived metrics</p>
+<table><thead><tr><th>Expression</th><th>Meaning</th></tr></thead><tbody><tr><td><code>m1 / m2 * 100</code></td><td>Error rate percentage (errors / total requests × 100)</td></tr><tr><td><code>m1 + m2</code></td><td>Combined metric (e.g., read IOPS + write IOPS)</td></tr><tr><td><code>ANOMALY_DETECTION_BAND(m1, 2)</code></td><td>Anomaly detection with 2-standard-deviation band</td></tr><tr><td><code>METRICS("AWS/EC2") WHERE InstanceId LIKE 'shopnow'</code></td><td>Search expression for multiple instances</td></tr><tr><td><code>IF(m1 &gt; 90, 1, 0)</code></td><td>Binary metric: 1 if CPU &gt; 90%, else 0</td></tr><tr><td><code>FILL(m1, 0)</code></td><td>Replace missing data with 0</td></tr></tbody></table>
+<p>→ Create alarms on metric math expressions — not just raw metrics<br>
+→ Example: Alarm when error_rate (errors / total × 100) &gt; 5%</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ CloudWatch is the CENTRAL nervous system of AWS — it sees everything, alerts on anything<br>
+→ Metrics are the raw data — collected automatically for most AWS services<br>
+→ Alarms are the intelligence — they evaluate metrics against thresholds and trigger actions<br>
+→ Dashboards are the visibility — they display everything on one screen<br>
+→ The "M out of N" evaluation pattern prevents false alarms while catching real problems<br>
+→ INSUFFICIENT_DATA is often MORE dangerous than ALARM — it means you're blind<br>
+→ Memory and disk metrics require CloudWatch Agent — they don't exist by default<br>
+→ Composite alarms combine multiple signals to reduce noise and increase confidence</p>
+<p>→ Connection to Project 6: Alarms send notifications through SNS topics → email/SMS to ops team</p>
+<ul>
+<li>CloudWatch ALARM → sns:Publish → SNS Topic → Subscribers (email, SMS)</li>
+<li>Topic access policy must allow <code>cloudwatch.amazonaws.com</code> to publish</li>
+</ul>
+<p>→ Connection to Project 7: SQS queue metrics (depth, age) are monitored by CloudWatch alarms</p>
+<ul>
+<li>If queue backs up → alarm fires → ops team notified → scale consumers</li>
+</ul>
+<p>→ Connection to Project 3: EC2 instance metrics (CPU, status checks) are the primary monitoring targets</p>
+<ul>
+<li>Auto-recovery action can heal failed instances automatically</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 9: RDS MariaDB monitoring (CPU, connections, storage)</li>
+<li>Project 16: Redshift cluster monitoring (disk usage, query performance)</li>
+<li>Project 19: CloudWatch Agent for memory/disk metrics + CloudWatch Logs</li>
+<li>Project 33: Auto Scaling triggered by CloudWatch alarms</li>
+<li>Project 49: Pipeline monitoring with alarms on each stage</li>
+<li>Project 60: Cross-account observability with centralized CloudWatch</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has monitoring and alerting for their EC2 and SQS infrastructure<br>
+→ But the CTO says: "We're still running MariaDB on an EC2 instance"<br>
+→ This means:</p>
+<ul>
+<li>ShopNow is responsible for database patching, backups, replication, failover</li>
+<li>When the database EC2 instance crashes → manual recovery → hours of downtime</li>
+<li>No automated backups → if the EBS volume fails, all data is lost</li>
+<li>No read replicas → database is a single point of failure</li>
+<li>The DBA resigned last month → nobody knows how to maintain MariaDB properly</li>
+</ul>
+<p>→ The CTO asks: "Isn't there a way to get a database WITHOUT managing the server?"</p>
+<p>→ <strong>This is exactly what Project 9 solves</strong><br>
+→ Project 9 introduces RDS (Relational Database Service) with MariaDB engine<br>
+→ AWS manages: patching, backups, replication, failover, monitoring<br>
+→ ShopNow manages: schema design, queries, application connection<br>
+→ It uses the VPC private subnets (Project 5), Security Groups (Project 4), and CloudWatch monitoring (this project)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 9: "The E-Commerce App That Needed a Database — RDS MariaDB Instance Setup"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-7.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 8/60</span></div><a class="nav-btn next" href="project-9.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

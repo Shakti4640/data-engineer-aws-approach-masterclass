@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 7: THE ORDERS THAT DISAPPEARED DURING PEAK HOURS — SQS Queue &amp; Messa — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 7: THE ORDERS THAT DISAPPEARED DURING PEAK HOURS — SQS Queue &amp; Message Lifecycle</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-6) is growing rapidly<br>
+→ They launched a flash sale — "60% off on all electronics for 2 hours"<br>
+→ Within 15 minutes — 5,000 orders flooded in simultaneously<br>
+→ The order processing system runs on a single EC2 instance (Project 3)<br>
+→ It can process 10 orders per second → needs 500 seconds (8+ minutes) for 5,000 orders<br>
+→ But orders arrive at 300+ per second during peak</p>
+<p>→ Problem 1: The web application calls the order processor SYNCHRONOUSLY<br>
+→ Web app sends order → waits for processor to finish → then responds to customer<br>
+→ When processor is overwhelmed → web app times out → customer sees "Error 504"<br>
+→ Customer tries again → creates DUPLICATE orders → inventory becomes incorrect</p>
+<p>→ Problem 2: At 11:32 AM the order processor CRASHES (out of memory)<br>
+→ 2,847 orders were "in flight" — they hadn't been processed yet<br>
+→ The web app had already told customers "Order placed successfully"<br>
+→ But those 2,847 orders were in the processor's memory → LOST when it crashed<br>
+→ No way to recover them → customers paid but never received products<br>
+→ Customer support receives 2,847 angry calls</p>
+<p>→ Problem 3: After restarting the processor → it starts processing NEW orders<br>
+→ The 2,847 lost orders are gone forever — nobody even knows WHICH orders were lost<br>
+→ No audit trail, no recovery mechanism</p>
+<p>→ Problem 4: During non-peak hours → the processor sits idle consuming resources<br>
+→ During peak → it's completely overwhelmed<br>
+→ There's no way to absorb traffic spikes without losing messages</p>
+<p>→ The CTO demands: "We need a system where:</p>
+<ul>
+<li>Orders are NEVER lost — even if the processor crashes</li>
+<li>The web app responds IMMEDIATELY — doesn't wait for processing</li>
+<li>Orders WAIT in a queue if the processor is busy</li>
+<li>When processor restarts — it picks up unprocessed orders automatically</li>
+<li>During peak — orders queue up safely instead of being dropped"</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ This is a MESSAGE QUEUING problem<br>
+→ The solution pattern: ASYNCHRONOUS DECOUPLING</p>
+<p><strong>Synchronous (Current — Broken):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Customer → Web App → Order Processor → Database
+</span>                     ↑
+           Web app WAITS here
+           If processor is slow/dead → customer gets error</code></pre></div>
+<p><strong>Asynchronous (Solution — Queue-Based):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Customer → Web App → SQS QUEUE → Order Processor → Database
+</span>                  ↑              ↑
+           Web app puts          Processor reads
+           message in queue      messages at its
+           → responds            own pace
+           immediately</code></pre></div>
+<p>→ The QUEUE is the buffer between producer (web app) and consumer (processor)<br>
+→ Think of it like a restaurant kitchen:</p>
+<ul>
+<li>Waiter (web app) takes order → puts ticket on the order rail (queue) → goes back to customer</li>
+<li>Chef (processor) picks tickets from the rail at their own speed</li>
+<li>If the chef is busy → tickets queue up on the rail → none are lost</li>
+<li>If the chef goes home → tickets stay on the rail → next chef picks them up</li>
+</ul>
+<p>→ AWS SQS (Simple Queue Service) is purpose-built for this pattern</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand SQS queue types (Standard vs FIFO)</li>
+<li>Step 2 — Create an SQS queue</li>
+<li>Step 3 — Understand the message lifecycle</li>
+<li>Step 4 — Understand visibility timeout (the most critical concept)</li>
+<li>Step 5 — Understand polling (short vs long)</li>
+<li>Step 6 — Configure message retention and delivery delay</li>
+<li>Step 7 — Understand message attributes</li>
+<li>Step 8 — Configure queue access policies</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND STANDARD vs FIFO QUEUES</h3>
+<p>→ SQS offers TWO fundamentally different queue types<br>
+→ Choosing wrong = architectural problems later</p>
+<table><thead><tr><th>Feature</th><th>Standard Queue</th><th>FIFO Queue</th></tr></thead><tbody><tr><td>Message ordering</td><td>BEST-EFFORT ordering (mostly ordered, not guaranteed)</td><td>STRICT first-in-first-out ordering</td></tr><tr><td>Delivery guarantee</td><td>AT-LEAST-ONCE (message may be delivered more than once)</td><td>EXACTLY-ONCE processing (within deduplication window)</td></tr><tr><td>Throughput</td><td>Nearly UNLIMITED (thousands of messages/second)</td><td>300 messages/second (3,000 with batching)</td></tr><tr><td>Deduplication</td><td>No built-in deduplication</td><td>Built-in 5-minute deduplication window</td></tr><tr><td>Use case</td><td>High throughput, order not critical</td><td>Order matters, no duplicates allowed</td></tr><tr><td>Naming</td><td>Any name</td><td>MUST end with <code>.fifo</code> suffix</td></tr></tbody></table>
+<p><strong>Which Should ShopNow Use?</strong></p>
+<p>→ Analysis:</p>
+<table><thead><tr><th>Requirement</th><th>Standard</th><th>FIFO</th></tr></thead><tbody><tr><td>Orders processed in exact sequence?</td><td>Not critical — Order #1001 can process before #1000</td><td>Would guarantee sequence</td></tr><tr><td>Duplicate processing acceptable?</td><td>DANGEROUS — customer charged twice</td><td>Prevents duplicates</td></tr><tr><td>Volume: 5,000+ orders in minutes</td><td>Handles easily</td><td>300/sec might be borderline</td></tr><tr><td>Cost sensitivity</td><td>Cheaper</td><td>~25% more expensive</td></tr></tbody></table>
+<p>→ Decision: FIFO Queue<br>
+→ Reason: Duplicate orders are UNACCEPTABLE (customer charged twice)<br>
+→ The throughput limit (300/sec, 3,000 with batching) is sufficient for ShopNow's volume<br>
+→ If throughput were an issue → Standard Queue with APPLICATION-LEVEL deduplication</p>
+<p><strong>When to Use Standard:</strong><br>
+→ Log processing — duplicates are harmless, order doesn't matter<br>
+→ Fan-out processing — SNS → SQS where throughput matters most<br>
+→ Thumbnail generation — processing image twice is wasteful but not dangerous</p>
+<p><strong>When to Use FIFO:</strong><br>
+→ Financial transactions — duplicate charges are unacceptable<br>
+→ Order processing — sequence and uniqueness matter<br>
+→ Inventory updates — out-of-order updates corrupt stock counts</p>
+<hr>
+<h3>STEP 2 — CREATE THE SQS QUEUE</h3>
+<p>→ SQS Console → "Create queue"</p>
+<p><strong>Basic Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Type</td><td>FIFO</td><td>Exactly-once, ordered processing</td></tr><tr><td>Name</td><td><code>shopnow-orders.fifo</code></td><td>MUST end with <code>.fifo</code> for FIFO queues</td></tr></tbody></table>
+<hr>
+<p><strong>Configuration Settings:</strong></p>
+<p><strong>Setting 1: Visibility Timeout</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Range</th></tr></thead><tbody><tr><td>Visibility timeout</td><td>60 seconds</td><td>0 seconds to 12 hours</td></tr></tbody></table>
+<p>→ This is the MOST IMPORTANT setting in SQS — explained deeply in Step 4<br>
+→ Quick summary: After a consumer reads a message → the message becomes INVISIBLE to other consumers for this duration<br>
+→ If the consumer processes and deletes the message within this time → done<br>
+→ If the consumer CRASHES before deleting → message becomes visible again → another consumer picks it up<br>
+→ Set this to: slightly MORE than your average processing time<br>
+→ ShopNow order processing takes ~30 seconds → set visibility timeout to 60 seconds (2x buffer)</p>
+<hr>
+<p><strong>Setting 2: Message Retention Period</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Range</th></tr></thead><tbody><tr><td>Message retention period</td><td>7 days</td><td>1 minute to 14 days</td></tr></tbody></table>
+<p>→ How long SQS keeps an unprocessed message before AUTOMATICALLY deleting it<br>
+→ If nobody processes the message within 7 days → SQS deletes it permanently<br>
+→ ShopNow: 7 days is generous — if an order isn't processed in 7 days, something is seriously wrong<br>
+→ The retention period is a SAFETY NET, not a normal operating parameter</p>
+<hr>
+<p><strong>Setting 3: Delivery Delay</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Range</th></tr></thead><tbody><tr><td>Delivery delay</td><td>0 seconds</td><td>0 seconds to 15 minutes</td></tr></tbody></table>
+<p>→ When a message is sent to the queue → it's INVISIBLE for this delay period<br>
+→ Useful when: Consumer needs time to prepare before processing<br>
+→ Example: Send "file uploaded" → delay 30 seconds → consumer reads → by then file is fully available<br>
+→ ShopNow: 0 seconds — orders should be processed immediately</p>
+<hr>
+<p><strong>Setting 4: Maximum Message Size</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Range</th></tr></thead><tbody><tr><td>Maximum message size</td><td>256 KB</td><td>1 KB to 256 KB</td></tr></tbody></table>
+<p>→ Same as SNS (Project 6) — 256 KB maximum<br>
+→ For larger payloads → use the "claim check" pattern:</p>
+<ul>
+<li>Store full order data in S3 (Project 1) or DynamoDB</li>
+<li>Send only the S3 key or order ID in the SQS message</li>
+<li>Consumer reads message → retrieves full data from S3/DynamoDB<br>
+→ ShopNow order messages are typically 1-5 KB → well within limit</li>
+</ul>
+<hr>
+<p><strong>Setting 5: Receive Message Wait Time (Long Polling)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Range</th></tr></thead><tbody><tr><td>Receive message wait time</td><td>20 seconds</td><td>0 to 20 seconds</td></tr></tbody></table>
+<p>→ Explained in Step 5 — this enables LONG POLLING<br>
+→ 0 = Short polling (returns immediately, even if empty → wasteful)<br>
+→ 1-20 = Long polling (waits up to N seconds for messages → efficient)<br>
+→ Always use 20 seconds for production queues</p>
+<hr>
+<p><strong>FIFO-Specific Settings:</strong></p>
+<p><strong>Setting 6: Content-Based Deduplication</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Content-based deduplication</td><td>Enable</td></tr></tbody></table>
+<p>→ When enabled → SQS generates a deduplication ID by hashing the message body<br>
+→ If two messages with IDENTICAL bodies are sent within 5 minutes → second is treated as duplicate → discarded<br>
+→ Without this → you must provide a <code>MessageDeduplicationId</code> with every send</p>
+<p>→ ShopNow: Enable — if the web app accidentally sends the same order twice (customer double-clicked), SQS catches it</p>
+<p><strong>Setting 7: High Throughput FIFO</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>FIFO throughput limit</td><td>Per message group ID</td></tr></tbody></table>
+<p>→ When set to "Per message group ID" → each message group can handle 300 msg/sec independently<br>
+→ Total queue throughput = 300 × number of message groups<br>
+→ ShopNow can use customer_id as message group → orders for different customers process in parallel<br>
+→ Orders for the SAME customer process in sequence (FIFO within group)</p>
+<hr>
+<p><strong>Encryption Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Server-side encryption</td><td>Enabled</td><td>Encrypt messages at rest</td></tr><tr><td>Encryption key type</td><td>Amazon SQS key (SSE-SQS)</td><td>Free, AWS managed — simplest option</td></tr></tbody></table>
+<p>→ Alternative: SSE-KMS (Customer managed key) — for cross-account access or audit trail needs (Project 36)<br>
+→ SSE-SQS is sufficient for single-account use cases</p>
+<hr>
+<p><strong>Access Policy:</strong></p>
+<p>→ Default: Only the queue owner can send/receive messages<br>
+→ We'll configure cross-service access in Step 8</p>
+<p>→ Click "Create queue"</p>
+<p><strong>Queue ARN and URL:</strong></p>
+<p>→ After creation, two identifiers are generated:</p>
+<table><thead><tr><th>Identifier</th><th>Format</th><th>Used For</th></tr></thead><tbody><tr><td>Queue URL</td><td><code>https://sqs.ap-south-1.amazonaws.com/123456789012/shopnow-orders.fifo</code></td><td>Sending and receiving messages (API operations)</td></tr><tr><td>Queue ARN</td><td><code>arn:aws:sqs:ap-south-1:123456789012:shopnow-orders.fifo</code></td><td>IAM policies, access policies, resource references</td></tr></tbody></table>
+<p>→ The Queue URL is used in API calls (SendMessage, ReceiveMessage, DeleteMessage)<br>
+→ The Queue ARN is used in IAM policies and resource-based policies<br>
+→ Unlike SNS topics that use ARN everywhere → SQS operations use the URL</p>
+<hr>
+<h3>STEP 3 — UNDERSTAND THE MESSAGE LIFECYCLE</h3>
+<p>→ This is the complete journey of a message through SQS</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PHASE 1: MESSAGE SENT
+</span>──────────────────────
+Producer sends message → SQS stores it redundantly across multiple AZs
+Message state: AVAILABLE (visible in queue)
+
+         ┌──────────────────────────────────────────────────────┐
+         │                    SQS QUEUE                         │
+         │                                                      │
+         │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │
+         │   │ Msg 1   │ │ Msg 2   │ │ Msg 3   │ │ Msg 4   │  │
+Producer─┼──►│AVAILABLE│ │AVAILABLE│ │AVAILABLE│ │AVAILABLE│  │
+         │   └─────────┘ └─────────┘ └─────────┘ └─────────┘  │
+         │                                                      │
+         └──────────────────────────────────────────────────────┘
+
+PHASE 2: MESSAGE RECEIVED (BY CONSUMER)
+────────────────────────────────────────
+Consumer calls ReceiveMessage → SQS returns Msg 1
+Msg 1 state changes: AVAILABLE → IN-FLIGHT (invisible to other consumers)
+Visibility timeout countdown STARTS
+
+         ┌──────────────────────────────────────────────────────┐
+         │                    SQS QUEUE                         │
+         │                                                      │
+         │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │
+Consumer◄┼───│IN-FLIGHT│ │AVAILABLE│ │AVAILABLE│ │AVAILABLE│  │
+         │   │(60s tmr)│ └─────────┘ └─────────┘ └─────────┘  │
+         │   └─────────┘                                        │
+         │                                                      │
+         └──────────────────────────────────────────────────────┘
+
+PHASE 3A: SUCCESSFUL PROCESSING
+────────────────────────────────
+Consumer processes Msg 1 → calls DeleteMessage with receipt handle
+Msg 1 is PERMANENTLY removed from queue
+
+         ┌──────────────────────────────────────────────────────┐
+         │                    SQS QUEUE                         │
+         │                                                      │
+Consumer │   ┌─────────┐ ┌─────────┐ ┌─────────┐              │
+ says:   │   │ Msg 2   │ │ Msg 3   │ │ Msg 4   │              │
+"Delete" │   │AVAILABLE│ │AVAILABLE│ │AVAILABLE│              │
+         │   └─────────┘ └─────────┘ └─────────┘              │
+         │                                                      │
+         │   Msg 1: GONE PERMANENTLY ✓                         │
+         └──────────────────────────────────────────────────────┘
+
+PHASE 3B: FAILED PROCESSING (Consumer crashes)
+───────────────────────────────────────────────
+Consumer crashes → never calls DeleteMessage
+Visibility timeout expires (60 seconds)
+Msg 1 state changes: IN-FLIGHT → AVAILABLE (visible again)
+ANOTHER consumer (or same consumer after restart) picks it up
+
+         ┌──────────────────────────────────────────────────────┐
+         │                    SQS QUEUE                         │
+         │                                                      │
+Consumer │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │
+crashed! │   │ Msg 1   │ │ Msg 2   │ │ Msg 3   │ │ Msg 4   │  │
+         │   │AVAILABLE│ │AVAILABLE│ │AVAILABLE│ │AVAILABLE│  │
+         │   │(RETRY!) │ └─────────┘ └─────────┘ └─────────┘  │
+         │   └─────────┘                                        │
+         │                                                      │
+         │   Msg 1 is BACK — not lost! ✓                       │
+         └──────────────────────────────────────────────────────┘
+
+PHASE 4: MESSAGE EXPIRATION
+────────────────────────────
+If message sits in queue for longer than retention period (7 days)
+→ SQS automatically deletes it → LOST
+This should NEVER happen in normal operations — it means something is broken</code></pre></div>
+<p><strong>The Three Critical API Calls:</strong></p>
+<table><thead><tr><th>API Call</th><th>Who Calls It</th><th>What It Does</th></tr></thead><tbody><tr><td>SendMessage</td><td>Producer (web app)</td><td>Puts a message into the queue</td></tr><tr><td>ReceiveMessage</td><td>Consumer (processor)</td><td>Reads message(s) from the queue — starts visibility timeout</td></tr><tr><td>DeleteMessage</td><td>Consumer (processor)</td><td>Permanently removes a successfully processed message</td></tr></tbody></table>
+<p>→ The consumer MUST explicitly call DeleteMessage after successful processing<br>
+→ If it doesn't → the message comes back (visibility timeout expires) → gets processed AGAIN<br>
+→ This is the AT-LEAST-ONCE delivery guarantee in Standard queues<br>
+→ In FIFO queues → deduplication prevents re-processing within the 5-minute window</p>
+<hr>
+<h3>STEP 4 — VISIBILITY TIMEOUT DEEP DIVE</h3>
+<p>→ This is the MOST MISUNDERSTOOD concept in SQS<br>
+→ Getting it wrong causes either duplicate processing or lost messages</p>
+<p><strong>What Is Visibility Timeout?</strong></p>
+<p>→ When Consumer A reads a message → the message becomes INVISIBLE to Consumer B, C, D<br>
+→ This prevents multiple consumers from processing the SAME message simultaneously<br>
+→ The invisibility lasts for the configured visibility timeout duration</p>
+<p><strong>Visual Timeline:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Time 0s:     Consumer A reads Msg 1 → Msg 1 becomes invisible
+</span>             Visibility timeout starts: 60 seconds
+             
+Time 0-30s:  Consumer A is processing Msg 1
+             Consumer B calls ReceiveMessage → does NOT get Msg 1 (invisible)
+             Consumer B gets Msg 2 instead
+             
+Time 30s:    Consumer A finishes → calls DeleteMessage → Msg 1 GONE ✓
+             (Happy path — processed and deleted within timeout)
+
+ALTERNATIVE SCENARIO:
+
+Time 0s:     Consumer A reads Msg 1 → invisible for 60s
+Time 45s:    Consumer A CRASHES
+Time 60s:    Visibility timeout EXPIRES → Msg 1 becomes VISIBLE again
+Time 61s:    Consumer B reads Msg 1 → processes it → deletes it ✓
+             (Recovery path — message NOT lost despite crash)
+
+PROBLEMATIC SCENARIO:
+
+Time 0s:     Consumer A reads Msg 1 → invisible for 60s
+Time 55s:    Consumer A is STILL processing (slow processing)
+Time 60s:    Visibility timeout EXPIRES → Msg 1 becomes VISIBLE again
+Time 61s:    Consumer B reads Msg 1 → starts processing
+Time 65s:    Consumer A finishes → deletes Msg 1
+Time 90s:    Consumer B finishes → tries to delete → message already gone
+             RESULT: Msg 1 processed TWICE → customer charged twice! 💥</code></pre></div>
+<p><strong>How to Set Visibility Timeout Correctly:</strong></p>
+<table><thead><tr><th>Processing Time</th><th>Recommended Visibility Timeout</th><th>Why</th></tr></thead><tbody><tr><td>5 seconds</td><td>30 seconds</td><td>6x buffer for occasional slow processing</td></tr><tr><td>30 seconds</td><td>90 seconds</td><td>3x buffer</td></tr><tr><td>5 minutes</td><td>15 minutes</td><td>3x buffer</td></tr><tr><td>Unknown/variable</td><td>Use ChangeMessageVisibility API</td><td>Extend timeout dynamically during processing</td></tr></tbody></table>
+<p>→ Rule of thumb: Visibility timeout = 3-6x average processing time<br>
+→ Too short → messages reappear → duplicate processing<br>
+→ Too long → crashed messages take forever to become available again → processing delay</p>
+<p><strong>ChangeMessageVisibility — Dynamic Extension:</strong></p>
+<p>→ If the consumer realizes processing will take longer than expected:<br>
+→ Call <code>ChangeMessageVisibility</code> BEFORE the timeout expires<br>
+→ This RESETS the visibility timeout to a new duration<br>
+→ The consumer can keep extending as needed (heartbeat pattern)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Time 0s:     Consumer reads message (visibility = 60s)
+</span>Time 45s:    Consumer still processing → calls ChangeMessageVisibility(120s)
+             Timeout now: 120 seconds from NOW (not from original read)
+Time 150s:   Consumer finishes → deletes message ✓</code></pre></div>
+<p>→ This is the RECOMMENDED pattern for variable-duration processing<br>
+→ Consumer sends "heartbeat" extensions every N seconds while still processing</p>
+<hr>
+<h3>STEP 5 — SHORT POLLING vs LONG POLLING</h3>
+<p>→ Polling is HOW the consumer retrieves messages from the queue<br>
+→ SQS is a PULL-based system — consumer ASKS for messages (unlike SNS which PUSHES)</p>
+<p><strong>Short Polling (Default if receive wait time = 0):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer: "Any messages?"
+</span>SQS: Checks a SUBSET of servers → "No" (even if messages exist on other servers)
+Consumer: "Any messages?"
+SQS: Checks another subset → "No"
+Consumer: "Any messages?"
+SQS: Checks another subset → "Here's one message"
+
+Problem: Multiple empty responses → wasted API calls → wasted money
+Problem: Messages on unchecked servers → temporary invisibility → delay</code></pre></div>
+<p>→ Short polling queries only a SUBSET of SQS servers<br>
+→ May return empty response even when messages exist<br>
+→ Results in unnecessary API calls and costs</p>
+<p><strong>Long Polling (receive wait time = 1-20 seconds):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer: "Any messages? I'll wait up to 20 seconds"
+</span>SQS: Queries ALL servers → waits → message arrives at second 3
+SQS: "Here's a message" (returns after 3 seconds)
+
+If no message arrives within 20 seconds:
+SQS: "No messages" (returns after 20 seconds)</code></pre></div>
+<p>→ Long polling queries ALL SQS servers<br>
+→ Waits until a message arrives OR the wait time expires<br>
+→ Reduces empty responses → fewer API calls → lower cost<br>
+→ Returns messages faster (as soon as one is available)</p>
+<p><strong>Comparison:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Short Polling</th><th>Long Polling</th></tr></thead><tbody><tr><td>Wait time setting</td><td>0 seconds</td><td>1-20 seconds</td></tr><tr><td>Servers queried</td><td>Subset</td><td>ALL</td></tr><tr><td>Empty responses</td><td>Frequent</td><td>Rare (only if truly empty for full wait period)</td></tr><tr><td>API cost</td><td>Higher (many calls)</td><td>Lower (fewer calls)</td></tr><tr><td>Latency to get message</td><td>May miss messages temporarily</td><td>Gets messages as soon as available</td></tr><tr><td>CPU usage on consumer</td><td>Higher (constant polling loop)</td><td>Lower (waits between polls)</td></tr></tbody></table>
+<p>→ ALWAYS use Long Polling (20 seconds) for production<br>
+→ There is NO downside to long polling — it's strictly better<br>
+→ The only exception: If you need to check multiple queues rapidly and can't wait 20 seconds per queue</p>
+<p><strong>How to Configure:</strong></p>
+<p>→ Queue-level: Set "Receive message wait time" to 20 seconds during queue creation<br>
+→ This applies to ALL ReceiveMessage calls on this queue<br>
+→ Per-request: Consumer can override by specifying <code>WaitTimeSeconds</code> in the API call<br>
+→ Per-request setting overrides queue-level setting</p>
+<hr>
+<h3>STEP 6 — MESSAGE ATTRIBUTES AND MESSAGE BODY</h3>
+<p><strong>Message Body:</strong><br>
+→ The actual content of the message — up to 256 KB<br>
+→ Can be any format: JSON, XML, plain text, base64-encoded binary</p>
+<p><strong>ShopNow Order Message Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "order_id": "ORD-2025-00001",
+  "customer_id": "CUST-5678",
+  "items": [
+    {"product_id": "PROD-001", "quantity": 2, "price": 999.00},
+    {"product_id": "PROD-042", "quantity": 1, "price": 2499.00}
+  ],
+  "total": 4497.00,
+  "payment_status": "CAPTURED",
+  "timestamp": "2025-01-15T14:30:00Z"
+}</code></pre></div>
+<p><strong>Message Attributes:</strong><br>
+→ Metadata about the message — NOT part of the message body<br>
+→ Up to 10 attributes per message<br>
+→ Used for filtering, routing, and processing decisions WITHOUT parsing the body</p>
+<table><thead><tr><th>Attribute Name</th><th>Type</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>order_type</td><td>String</td><td>flash-sale</td><td>Route to flash-sale processor</td></tr><tr><td>priority</td><td>Number</td><td>1</td><td>Process high-priority orders first</td></tr><tr><td>region</td><td>String</td><td>south-india</td><td>Route to regional warehouse</td></tr></tbody></table>
+<p><strong>System-Level Message Attributes (Auto-Added by SQS):</strong></p>
+<table><thead><tr><th>Attribute</th><th>What It Contains</th></tr></thead><tbody><tr><td>MessageId</td><td>Unique ID assigned by SQS (e.g., <code>a1b2c3d4-...</code>)</td></tr><tr><td>ReceiptHandle</td><td>Unique handle needed to delete or change visibility of message</td></tr><tr><td>MD5OfBody</td><td>Hash of message body for integrity verification</td></tr><tr><td>SenderId</td><td>AWS account ID or IAM ARN of sender</td></tr><tr><td>SentTimestamp</td><td>When the message was sent (epoch milliseconds)</td></tr><tr><td>ApproximateReceiveCount</td><td>How many times this message has been received (read)</td></tr><tr><td>ApproximateFirstReceiveTimestamp</td><td>When message was first received by any consumer</td></tr><tr><td>SequenceNumber</td><td>FIFO only — the order sequence number</td></tr><tr><td>MessageGroupId</td><td>FIFO only — which message group this belongs to</td></tr><tr><td>MessageDeduplicationId</td><td>FIFO only — deduplication identifier</td></tr></tbody></table>
+<p><strong>ApproximateReceiveCount — Critical for Dead Letter Queues:</strong><br>
+→ Every time a consumer reads the message → this count increments<br>
+→ If count &gt; threshold → message has been read many times but never deleted → it's a "poison pill"<br>
+→ SQS can automatically move such messages to a Dead Letter Queue (Project 20)</p>
+<hr>
+<h3>STEP 7 — FIFO-SPECIFIC CONCEPTS</h3>
+<p><strong>Message Group ID:</strong></p>
+<p>→ FIFO queues guarantee ordering WITHIN a message group<br>
+→ Messages in DIFFERENT groups can be processed in parallel</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Message Group: "CUST-5678"
+</span>  → Order A (sent first)
+  → Order B (sent second)
+  → Order C (sent third)
+  → MUST be processed: A → B → C (in order)
+
+Message Group: "CUST-9012"
+  → Order X (sent first)
+  → Order Y (sent second)
+  → MUST be processed: X → Y (in order)
+
+But Order A and Order X can be processed SIMULTANEOUSLY
+(different groups = independent ordering)</code></pre></div>
+<p>→ ShopNow: Use <code>customer_id</code> as Message Group ID<br>
+→ Orders for the same customer process in sequence (prevent inventory conflicts)<br>
+→ Orders for different customers process in parallel (maximize throughput)</p>
+<p><strong>Choosing Message Group ID:</strong></p>
+<table><thead><tr><th>Strategy</th><th>Group ID</th><th>Ordering Guarantee</th><th>Throughput</th></tr></thead><tbody><tr><td>Single group for everything</td><td>"all-orders"</td><td>ALL orders in strict sequence</td><td>LOW (300 msg/sec max)</td></tr><tr><td>Per customer</td><td>customer_id</td><td>Per-customer ordering</td><td>HIGH (300 × num_customers)</td></tr><tr><td>Per product</td><td>product_id</td><td>Per-product ordering</td><td>HIGH (300 × num_products)</td></tr><tr><td>Per region</td><td>region_id</td><td>Per-region ordering</td><td>MEDIUM (300 × num_regions)</td></tr></tbody></table>
+<p>→ Single group = safest ordering but lowest throughput<br>
+→ Per customer = best balance for ShopNow</p>
+<p><strong>Message Deduplication ID:</strong></p>
+<p>→ Prevents the same message from being enqueued twice within 5 minutes<br>
+→ Two options:</p>
+<table><thead><tr><th>Method</th><th>How It Works</th></tr></thead><tbody><tr><td>Content-based deduplication (enabled in Step 2)</td><td>SQS hashes the message body → if identical body sent within 5 minutes → second message discarded</td></tr><tr><td>Explicit deduplication ID</td><td>Producer provides <code>MessageDeduplicationId</code> parameter → SQS checks if this ID was used in last 5 minutes</td></tr></tbody></table>
+<p>→ Content-based: Simple but only catches IDENTICAL bodies<br>
+→ Explicit ID: More control — use <code>order_id</code> as deduplication ID</p>
+<p><strong>Example:</strong><br>
+→ Customer double-clicks "Place Order"<br>
+→ Web app sends same order message twice in 1 second<br>
+→ Both messages have <code>order_id: ORD-2025-00001</code> in the body<br>
+→ Content-based deduplication: Body hash is identical → second message DISCARDED<br>
+→ Or explicit: Both have <code>MessageDeduplicationId: ORD-2025-00001</code> → second DISCARDED</p>
+<hr>
+<h3>STEP 8 — QUEUE ACCESS POLICY</h3>
+<p>→ Controls WHO can send to and receive from the queue<br>
+→ Similar concept to SNS topic access policy (Project 6)</p>
+<p><strong>Default Policy:</strong><br>
+→ Only the queue owner (your AWS account) can send/receive</p>
+<p><strong>Allowing SNS to Send Messages to This Queue:</strong></p>
+<p>→ This is needed for the SNS → SQS fan-out pattern (Project 13)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowSNSToSendMessage
+  Effect: Allow
+  Principal:
+    Service: sns.amazonaws.com
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-orders.fifo
+  Condition:
+    ArnEquals:
+      aws:SourceArn: arn:aws:sns:ap-south-1:123456789012:shopnow-s3-events</code></pre></div>
+<p>→ Only the specific SNS topic can send to this queue<br>
+→ Condition prevents any other SNS topic from publishing here</p>
+<p><strong>Allowing Another AWS Account to Send Messages:</strong></p>
+<p>→ Preview for cross-account patterns (Project 41)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowCrossAccountSend
+  Effect: Allow
+  Principal:
+    AWS: "arn:aws:iam::987654321098:root"
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-orders.fifo</code></pre></div>
+<p><strong>Allowing S3 Events to Send to SQS Directly:</strong></p>
+<p>→ S3 can send event notifications directly to SQS (alternative to S3 → SNS → SQS)</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Statement:
+</span>  Sid: AllowS3ToSendMessage
+  Effect: Allow
+  Principal:
+    Service: s3.amazonaws.com
+  Action: sqs:SendMessage
+  Resource: arn:aws:sqs:ap-south-1:123456789012:shopnow-orders.fifo
+  Condition:
+    ArnLike:
+      aws:SourceArn: arn:aws:s3:::shopnow-productimages-prod-aps1
+    StringEquals:
+      aws:SourceAccount: "123456789012"</code></pre></div>
+<p>→ Same pattern as SNS topic access policy (Project 6) — service principal + conditions</p>
+<hr>
+<h3>STEP 9 — SENDING AND RECEIVING MESSAGES (OPERATIONAL FLOW)</h3>
+<p><strong>Sending a Message (Producer — Web App):</strong></p>
+<p>→ SQS Console → Select queue → "Send and receive messages" → "Send message"</p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Message body</td><td><code>{"order_id": "ORD-2025-00001", "customer_id": "CUST-5678", ...}</code></td></tr><tr><td>Message group ID</td><td>CUST-5678</td></tr><tr><td>Message deduplication ID</td><td>ORD-2025-00001 (or auto-generated from body hash)</td></tr><tr><td>Delivery delay</td><td>0 seconds (or override per-message)</td></tr></tbody></table>
+<p><strong>Message Attributes (optional):</strong></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Value</th></tr></thead><tbody><tr><td>order_type</td><td>String</td><td>flash-sale</td></tr><tr><td>priority</td><td>Number</td><td>1</td></tr></tbody></table>
+<p>→ Click "Send message"<br>
+→ Returns: MessageId, SequenceNumber (FIFO), MD5 hash</p>
+<hr>
+<p><strong>Receiving a Message (Consumer — Order Processor):</strong></p>
+<p>→ SQS Console → Select queue → "Send and receive messages" → "Poll for messages"</p>
+<p>→ SQS returns:</p>
+<table><thead><tr><th>Field</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Message body</td><td><code>{"order_id": "ORD-2025-00001", ...}</code></td><td>The actual message</td></tr><tr><td>Receipt handle</td><td><code>AQEBzVn5...</code> (long unique string)</td><td>REQUIRED for delete/change visibility</td></tr><tr><td>Message ID</td><td><code>a1b2c3d4-...</code></td><td>Unique identifier</td></tr><tr><td>Approximate receive count</td><td>1</td><td>First time this message has been read</td></tr><tr><td>Sent timestamp</td><td>1705312200000</td><td>When it was sent</td></tr></tbody></table>
+<p>→ Receipt Handle is CRITICAL:</p>
+<ul>
+<li>It's unique to THIS specific receive action</li>
+<li>You MUST use it to delete the message or change its visibility</li>
+<li>It's different each time the same message is received</li>
+<li>It EXPIRES when the visibility timeout expires</li>
+<li>After expiry → the receipt handle becomes INVALID → must receive the message again to get a new one</li>
+</ul>
+<hr>
+<p><strong>Deleting a Message (After Successful Processing):</strong></p>
+<p>→ Consumer processes the order successfully<br>
+→ Consumer calls DeleteMessage with the receipt handle<br>
+→ Message is PERMANENTLY removed from the queue</p>
+<p><strong>If Consumer Doesn't Delete:</strong><br>
+→ Visibility timeout expires → message becomes visible again<br>
+→ Another consumer (or same consumer) receives it again<br>
+→ ApproximateReceiveCount increments<br>
+→ This cycle continues until:</p>
+<ul>
+<li>Message is successfully processed and deleted</li>
+<li>Message reaches the Dead Letter Queue threshold (Project 20)</li>
+<li>Message retention period expires (7 days) → auto-deleted</li>
+</ul>
+<hr>
+<h3>STEP 10 — UNDERSTANDING QUEUE METRICS</h3>
+<p>→ SQS Console → Select queue → "Monitoring" tab</p>
+<p><strong>Key Metrics:</strong></p>
+<table><thead><tr><th>Metric</th><th>What It Means</th><th>Healthy Value</th></tr></thead><tbody><tr><td>ApproximateNumberOfMessagesVisible</td><td>Messages available to be read</td><td>Low (consumers are keeping up)</td></tr><tr><td>ApproximateNumberOfMessagesNotVisible</td><td>Messages currently being processed (in-flight)</td><td>Proportional to consumer count</td></tr><tr><td>ApproximateNumberOfMessagesDelayed</td><td>Messages waiting for delivery delay to expire</td><td>0 (if delay = 0)</td></tr><tr><td>NumberOfMessagesSent</td><td>Messages added to queue per period</td><td>Reflects producer activity</td></tr><tr><td>NumberOfMessagesReceived</td><td>Messages read by consumers per period</td><td>Reflects consumer activity</td></tr><tr><td>NumberOfMessagesDeleted</td><td>Messages deleted (successfully processed) per period</td><td>Should closely match NumberOfMessagesReceived</td></tr><tr><td>ApproximateAgeOfOldestMessage</td><td>How long the oldest message has been in queue</td><td>Low (minutes) — if hours/days, consumers can't keep up</td></tr><tr><td>SentMessageSize</td><td>Average size of messages sent</td><td>Within 256 KB limit</td></tr></tbody></table>
+<p><strong>ALARM THRESHOLDS for ShopNow (Reference Project 8):</strong></p>
+<table><thead><tr><th>Metric</th><th>Alarm If</th><th>Meaning</th></tr></thead><tbody><tr><td>ApproximateNumberOfMessagesVisible</td><td>&gt; 1,000 for 5 minutes</td><td>Consumer is falling behind — scale up</td></tr><tr><td>ApproximateAgeOfOldestMessage</td><td>&gt; 300 seconds (5 minutes)</td><td>Processing is too slow</td></tr><tr><td>NumberOfMessagesDeleted</td><td>= 0 for 10 minutes</td><td>Consumer might be dead</td></tr></tbody></table>
+<p>→ These metrics connect directly to CloudWatch alarms (Project 8) → which send to SNS (Project 6) → which alert the ops team</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use FIFO queues when message ordering or deduplication matters<br>
+→ Always use Long Polling (receive wait time = 20 seconds) — reduces cost and improves responsiveness<br>
+→ Always set visibility timeout to 3-6x your average processing time<br>
+→ Always delete messages AFTER successful processing — never before<br>
+→ Always use the ChangeMessageVisibility API for variable-duration processing (heartbeat pattern)<br>
+→ Always encrypt queues with at minimum SSE-SQS<br>
+→ Always monitor ApproximateAgeOfOldestMessage — growing age means consumers can't keep up<br>
+→ Always use meaningful Message Group IDs in FIFO queues — they determine parallelism<br>
+→ Always use the claim-check pattern for large payloads (store data in S3, send reference in SQS)<br>
+→ Always add queue access policy conditions (SourceArn, SourceAccount) when allowing services to send<br>
+→ Always configure Dead Letter Queues for poison messages (Project 20)<br>
+→ Always tag queues with Name, Environment, Owner, Application</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use Short Polling in production — wastes API calls and money<br>
+→ Never set visibility timeout too short — causes duplicate processing<br>
+→ Never set visibility timeout too long — delayed recovery when consumers crash<br>
+→ Never forget to delete messages after processing — they'll come back and be processed again<br>
+→ Never use a single Message Group ID for all messages in FIFO — creates a bottleneck (300 msg/sec for everything)<br>
+→ Never rely on message retention period as a normal operating parameter — it's a safety net<br>
+→ Never store sensitive data in messages without encryption<br>
+→ Never assume Standard queue ordering is guaranteed — it's best-effort only<br>
+→ Never put large payloads directly in the message — use claim-check pattern for &gt; 50 KB<br>
+→ Never forget that FIFO queue names MUST end with <code>.fifo</code> — the API will reject the request otherwise<br>
+→ Never ignore the ApproximateReceiveCount — high counts indicate processing failures<br>
+→ Never assume SQS is a database — it's a transient message buffer, not permanent storage</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>SQS Solution</th></tr></thead><tbody><tr><td>Decouple web app from backend processing</td><td>Standard or FIFO queue between them</td></tr><tr><td>Order processing where duplicates are dangerous</td><td>FIFO queue with deduplication</td></tr><tr><td>Log processing where throughput matters most</td><td>Standard queue (unlimited throughput)</td></tr><tr><td>Buffer traffic spikes</td><td>Queue absorbs burst → consumer processes at steady rate</td></tr><tr><td>Work distribution across multiple processors</td><td>Multiple consumers reading from same queue</td></tr><tr><td>Retry failed processing automatically</td><td>Visibility timeout returns message → consumer retries</td></tr><tr><td>Capture unprocessable messages</td><td>Dead Letter Queue (Project 20)</td></tr><tr><td>One event → multiple processing pipelines</td><td>SNS → SQS fan-out (Project 13)</td></tr><tr><td>Batch processing — collect then process</td><td>Consumer reads up to 10 messages per ReceiveMessage call</td></tr></tbody></table>
+<p><strong>SQS vs SNS Decision Matrix:</strong></p>
+<table><thead><tr><th>Need</th><th>Use SQS</th><th>Use SNS</th></tr></thead><tbody><tr><td>Store message until consumer is ready</td><td>✅</td><td>❌ (SNS delivers immediately)</td></tr><tr><td>Multiple consumers process same message</td><td>❌ (one consumer deletes it)</td><td>✅ (fan-out to all subscribers)</td></tr><tr><td>Push notification to humans (email/SMS)</td><td>❌</td><td>✅</td></tr><tr><td>Pull-based processing at consumer's pace</td><td>✅</td><td>❌ (push-based)</td></tr><tr><td>Guaranteed message retention</td><td>✅ (up to 14 days)</td><td>❌ (no retention — deliver or lose)</td></tr><tr><td>Message ordering</td><td>✅ (FIFO queues)</td><td>✅ (FIFO topics, limited)</td></tr><tr><td>Deduplication</td><td>✅ (FIFO queues)</td><td>✅ (FIFO topics)</td></tr></tbody></table>
+<p>→ SNS and SQS are COMPLEMENTARY — not competing<br>
+→ The most powerful pattern: SNS for fan-out → SQS for buffering (Project 13)</p>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use SQS for real-time streaming → Use Kinesis (Project 52) — SQS has per-message overhead<br>
+→ Do NOT use SQS for pub/sub fan-out (one message → many consumers) → Use SNS → SQS (Project 13)<br>
+→ Do NOT use SQS as a database → Messages are transient, not permanent storage<br>
+→ Do NOT use SQS for human notifications → Use SNS (Project 6) for email/SMS<br>
+→ Do NOT use SQS for complex event routing → Use EventBridge (Project 38)<br>
+→ Do NOT use SQS for workflow orchestration → Use Step Functions (Project 32)<br>
+→ Do NOT use SQS for very large messages (&gt; 256 KB) directly → Use SQS Extended Client Library with S3<br>
+→ Do NOT use SQS when you need instant push delivery → SQS is pull-based, consumer must poll</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → SQS DISTRIBUTED ARCHITECTURE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────────────────────────────┐
+</span>│                    SQS SERVICE (Regional)                       │
+│                                                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
+│  │  SQS Server  │  │  SQS Server  │  │  SQS Server  │         │
+│  │  (AZ-a)      │  │  (AZ-b)      │  │  (AZ-c)      │         │
+│  │              │  │              │  │              │         │
+│  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │         │
+│  │  │Messages│  │  │  │Messages│  │  │  │Messages│  │         │
+│  │  │Replica │  │  │  │Replica │  │  │  │Replica │  │         │
+│  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │         │
+│  │              │  │              │  │              │         │
+│  └──────────────┘  └──────────────┘  └──────────────┘         │
+│                                                                │
+│  Messages are REPLICATED across multiple AZs                    │
+│  SendMessage returns ONLY after message is stored redundantly   │
+│  If one AZ fails → messages survive on other AZs               │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ SQS is a distributed system — no single server holds all messages<br>
+→ Messages are replicated across multiple AZs for durability<br>
+→ SendMessage API returns success ONLY after redundant storage is confirmed</p>
+<hr>
+<h3>2 → WHAT HAPPENS DURING SendMessage</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Producer calls SendMessage
+</span>        │
+        ▼
+Step 1: SQS authenticates request (IAM — Project 2)
+        │
+        ▼
+Step 2: SQS checks queue access policy
+        Does caller have sqs:SendMessage permission?
+        │
+        ▼
+Step 3: FIFO checks (if FIFO queue):
+        │
+        ├── Check MessageDeduplicationId
+        │   Has this ID been used in the last 5 minutes?
+        │   ├── YES → Message is a DUPLICATE → Return success but don't store
+        │   └── NO → Proceed
+        │
+        └── Record MessageGroupId for ordering
+        │
+        ▼
+Step 4: Message stored redundantly across multiple AZs
+        │
+        ▼
+Step 5: If delivery delay &gt; 0 → message marked as DELAYED
+        Timer starts → message becomes visible after delay expires
+        │
+        ▼
+Step 6: Return to producer:
+        - MessageId (unique identifier)
+        - MD5OfMessageBody (integrity check)
+        - SequenceNumber (FIFO only)</code></pre></div>
+<hr>
+<h3>3 → WHAT HAPPENS DURING ReceiveMessage</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer calls ReceiveMessage (WaitTimeSeconds=20)
+</span>        │
+        ▼
+Step 1: SQS authenticates request
+        │
+        ▼
+Step 2: Long polling begins
+        SQS queries ALL servers hosting this queue
+        │
+        ├── Messages available → Return immediately (up to MaxNumberOfMessages)
+        │
+        └── No messages → Wait up to 20 seconds
+            │
+            ├── Message arrives during wait → Return it
+            │
+            └── 20 seconds pass → Return empty response
+        │
+        ▼
+Step 3: For each returned message:
+        │
+        ├── Mark message as IN-FLIGHT (invisible)
+        ├── Start visibility timeout countdown
+        ├── Generate unique ReceiptHandle
+        ├── Increment ApproximateReceiveCount
+        └── Record ApproximateFirstReceiveTimestamp (if first time)
+        │
+        ▼
+Step 4: Return to consumer:
+        - Message body
+        - Message attributes
+        - Receipt handle
+        - System attributes (MessageId, receive count, timestamps)</code></pre></div>
+<p><strong>MaxNumberOfMessages:</strong></p>
+<p>→ Consumer can request up to 10 messages per ReceiveMessage call<br>
+→ SQS returns UP TO that many (may return fewer)<br>
+→ Batch receiving is more efficient than one-at-a-time</p>
+<hr>
+<h3>4 → WHAT HAPPENS DURING DeleteMessage</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Consumer calls DeleteMessage(ReceiptHandle)
+</span>        │
+        ▼
+Step 1: SQS validates the receipt handle
+        │
+        ├── Receipt handle valid and not expired → Proceed
+        │
+        └── Receipt handle invalid or expired → Error
+            (Message may have become visible again → new receipt handle needed)
+        │
+        ▼
+Step 2: Message removed from ALL replicas across AZs
+        │
+        ▼
+Step 3: Return success to consumer
+        Message is PERMANENTLY gone — cannot be recovered</code></pre></div>
+<hr>
+<h3>5 → HOW FIFO ORDERING WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FIFO Queue with Message Group ID "CUST-5678":
+</span>
+Messages in group (in order):
+  Msg-A (Seq: 1) → Msg-B (Seq: 2) → Msg-C (Seq: 3)
+
+Consumer calls ReceiveMessage:
+  → Returns Msg-A (Seq: 1)
+  → Msg-B and Msg-C are BLOCKED for this group
+  → They will NOT be returned until Msg-A is deleted or visibility expires
+
+Consumer deletes Msg-A:
+  → Msg-B becomes available
+  → Consumer calls ReceiveMessage → Returns Msg-B
+  
+This guarantees: A before B before C (FIFO within group)
+
+SIMULTANEOUSLY:
+  Message Group "CUST-9012":
+  Msg-X (Seq: 4) → Msg-Y (Seq: 5)
+  
+  A different consumer can receive Msg-X while first consumer has Msg-A
+  Different groups are INDEPENDENT</code></pre></div>
+<p>→ FIFO ordering is enforced per MESSAGE GROUP, not per queue<br>
+→ The queue blocks subsequent messages in the SAME group until current message is processed<br>
+→ Different groups can be processed concurrently by different consumers<br>
+→ This is why choosing the right Message Group ID is critical for throughput</p>
+<hr>
+<h3>6 → HOW STANDARD QUEUE "AT-LEAST-ONCE" WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Standard Queue — Message stored on servers S1, S2, S3 (replicas)
+</span>
+Consumer A reads from S1 → Gets Msg-1 → S1 marks it invisible
+Consumer B reads from S2 → S2 hasn't received the "invisible" signal yet
+                           → S2 returns Msg-1 to Consumer B too!
+
+Result: Both Consumer A and Consumer B process Msg-1
+This is the "at-least-once" delivery behavior
+
+FIFO queues PREVENT this by:
+  → Centralizing visibility tracking
+  → Using sequence numbers for ordering
+  → Ensuring only ONE consumer gets each message
+  → This is why FIFO has lower throughput (more coordination needed)</code></pre></div>
+<p>→ Standard queues trade consistency for throughput<br>
+→ FIFO queues trade throughput for consistency<br>
+→ This is a fundamental distributed systems tradeoff</p>
+<hr>
+<h3>7 → SQS PRICING MODEL</h3>
+<table><thead><tr><th>Component</th><th>Standard Queue</th><th>FIFO Queue</th></tr></thead><tbody><tr><td>First 1 million requests/month</td><td>Free</td><td>Free</td></tr><tr><td>Per million requests after</td><td>$0.40</td><td>$0.50</td></tr><tr><td>Data transfer IN</td><td>Free</td><td>Free</td></tr><tr><td>Data transfer OUT (same region to AWS services)</td><td>Free</td><td>Free</td></tr><tr><td>Data transfer OUT to internet</td><td>Standard rates</td><td>Standard rates</td></tr></tbody></table>
+<p><strong>What Counts as a "Request":</strong></p>
+<table><thead><tr><th>API Call</th><th>Requests Counted</th></tr></thead><tbody><tr><td>SendMessage (1 message)</td><td>1 request</td></tr><tr><td>SendMessageBatch (10 messages)</td><td>1 request</td></tr><tr><td>ReceiveMessage (returns 5 messages)</td><td>1 request</td></tr><tr><td>DeleteMessage (1 message)</td><td>1 request</td></tr><tr><td>DeleteMessageBatch (10 messages)</td><td>1 request</td></tr><tr><td>ChangeMessageVisibility</td><td>1 request</td></tr></tbody></table>
+<p>→ BATCH operations are KEY to reducing costs<br>
+→ Sending 10 messages individually = 10 requests<br>
+→ Sending 10 messages in a batch = 1 request → 10x cheaper<br>
+→ Same for delete: batch delete 10 = 1 request</p>
+<p><strong>64 KB Billing Chunks:</strong></p>
+<p>→ Each request is billed per 64 KB chunk<br>
+→ A 256 KB message counts as 4 requests (256 / 64 = 4)<br>
+→ A 1 KB message counts as 1 request<br>
+→ This is another reason to keep messages small (claim-check pattern)</p>
+<hr>
+<h3>8 → SQS LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Limit</th></tr></thead><tbody><tr><td>Message size</td><td>256 KB</td></tr><tr><td>Message retention</td><td>1 minute to 14 days</td></tr><tr><td>Visibility timeout</td><td>0 seconds to 12 hours</td></tr><tr><td>Delivery delay</td><td>0 seconds to 15 minutes</td></tr><tr><td>Messages per queue</td><td>Unlimited</td></tr><tr><td>Queues per account per region</td><td>Unlimited</td></tr><tr><td>In-flight messages (Standard)</td><td>120,000 per queue</td></tr><tr><td>In-flight messages (FIFO)</td><td>20,000 per queue</td></tr><tr><td>Batch size</td><td>10 messages per batch operation</td></tr><tr><td>Long poll wait time</td><td>0 to 20 seconds</td></tr><tr><td>Message attributes per message</td><td>10</td></tr><tr><td>FIFO throughput per message group</td><td>300 msg/sec (3,000 with batching)</td></tr></tbody></table>
+<p>→ In-flight limit is important: 120,000 for Standard, 20,000 for FIFO<br>
+→ In-flight = messages that have been received but not yet deleted or timed out<br>
+→ If you hit this limit → ReceiveMessage returns <code>OverLimit</code> error → consumers can't read more</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Visibility timeout too short</td><td>Messages reappear → processed twice → duplicate orders</td><td>Set timeout to 3-6x average processing time</td></tr><tr><td>2</td><td>Visibility timeout too long</td><td>Crashed consumer's messages take hours to reappear → processing delayed</td><td>Balance: not too short, not too long + use ChangeMessageVisibility</td></tr><tr><td>3</td><td>Forgetting to delete messages</td><td>Messages come back indefinitely → infinite processing loop</td><td>Always delete after successful processing</td></tr><tr><td>4</td><td>Using Short Polling</td><td>Frequent empty responses → high API costs → missed messages temporarily</td><td>Always use Long Polling (20 seconds)</td></tr><tr><td>5</td><td>Single Message Group ID in FIFO</td><td>Entire queue limited to 300 msg/sec</td><td>Use granular group IDs (customer_id, order_type)</td></tr><tr><td>6</td><td>Not monitoring queue depth</td><td>Messages pile up → consumers can't keep up → customers wait hours</td><td>Set CloudWatch alarms on ApproximateNumberOfMessagesVisible and ApproximateAgeOfOldestMessage</td></tr><tr><td>7</td><td>Storing large payloads in messages</td><td>Hit 256 KB limit → SendMessage fails</td><td>Use claim-check pattern (S3 reference)</td></tr><tr><td>8</td><td>Not using batch operations</td><td>10x more API calls → 10x more cost</td><td>Batch send, batch receive, batch delete</td></tr><tr><td>9</td><td>Standard queue expecting exact-once</td><td>Message processed twice → data corruption</td><td>Use FIFO queue or implement idempotent consumers</td></tr><tr><td>10</td><td>Consumer reading but not processing fast enough</td><td>In-flight limit reached (120K/20K) → ReceiveMessage errors</td><td>Scale consumers horizontally, increase processing speed</td></tr><tr><td>11</td><td>FIFO queue without <code>.fifo</code> suffix</td><td>CreateQueue API returns error — confusing for beginners</td><td>Always append <code>.fifo</code> to FIFO queue names</td></tr><tr><td>12</td><td>Not configuring DLQ</td><td>Poison messages cycle forever → waste resources</td><td>Always configure DLQ (Project 20)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Throughput Scalability</strong></p>
+<ul>
+<li>Standard queues: Nearly unlimited throughput → scales automatically</li>
+<li>FIFO queues: 300 msg/sec per group → scale by using more message groups</li>
+<li>Batch operations: 10 messages per batch → effective 3,000 msg/sec per FIFO group</li>
+<li>Multiple queues: Distribute workload across queues for extreme throughput</li>
+</ul>
+<p>→ <strong>Consumer Scalability</strong></p>
+<ul>
+<li>Multiple consumers can read from the same queue simultaneously</li>
+<li>Each consumer gets different messages (SQS ensures this via visibility timeout)</li>
+<li>Add more consumers to process faster → horizontal scaling</li>
+<li>For FIFO: Multiple consumers can process different message groups in parallel</li>
+<li>Auto Scaling consumers based on queue depth (ApproximateNumberOfMessagesVisible)</li>
+</ul>
+<p>→ <strong>Storage Scalability</strong></p>
+<ul>
+<li>No limit on number of messages in a queue</li>
+<li>Messages are distributed across SQS infrastructure</li>
+<li>No provisioning needed — queue grows and shrinks automatically</li>
+<li>Retention up to 14 days for buffering extended outages</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Costs scale linearly with request count</li>
+<li>Batch operations reduce costs by up to 10x</li>
+<li>Long polling reduces unnecessary requests</li>
+<li>First million requests/month are free → small workloads are essentially free</li>
+</ul>
+<p>→ <strong>Multi-Consumer Patterns</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Pattern 1: Competing Consumers (Work Distribution)
+</span>─────────────────────────────────────────────────
+  Queue → Consumer A gets Msg 1
+       → Consumer B gets Msg 2
+       → Consumer C gets Msg 3
+  Each message processed by ONE consumer
+  Used for: parallel processing, load distribution
+
+Pattern 2: Fan-Out (via SNS → Multiple SQS Queues)
+──────────────────────────────────────────────────
+  SNS Topic → SQS Queue A → Consumer A (image resize)
+           → SQS Queue B → Consumer B (catalog update)
+           → SQS Queue C → Consumer C (analytics)
+  Each message processed by ALL consumers
+  Used for: multiple processing pipelines (Project 13)</code></pre></div>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify SQS is working correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Queue exists</td><td>SQS Console → Queues → Verify queue listed</td></tr><tr><td>Queue type correct</td><td>Queue details → Type: Standard or FIFO</td></tr><tr><td>Settings correct</td><td>Queue details → Configuration tab → Verify all settings</td></tr><tr><td>Access policy correct</td><td>Queue → Access policy tab → Verify JSON</td></tr><tr><td>Messages being sent</td><td>Monitoring tab → NumberOfMessagesSent &gt; 0</td></tr><tr><td>Messages being processed</td><td>Monitoring tab → NumberOfMessagesReceived &gt; 0</td></tr><tr><td>Messages being deleted</td><td>Monitoring tab → NumberOfMessagesDeleted &gt; 0</td></tr><tr><td>Queue not backing up</td><td>Monitoring tab → ApproximateNumberOfMessagesVisible staying low</td></tr><tr><td>No stuck messages</td><td>Monitoring tab → ApproximateAgeOfOldestMessage staying low</td></tr></tbody></table>
+<p>→ <strong>How to debug "messages not being received":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Are messages in the queue?
+</span>        SQS Console → Queue → Messages available &gt; 0?
+        If 0 → Producer isn't sending → Check producer
+
+STEP 2: Is consumer polling correctly?
+        Check consumer logs → Is ReceiveMessage being called?
+        Is WaitTimeSeconds &gt; 0 (long polling)?
+
+STEP 3: Are messages invisible (in-flight)?
+        Messages not visible ≠ empty queue
+        Check "Messages in flight" count
+        If high → consumers are reading but not deleting
+
+STEP 4: Check visibility timeout
+        If too short → messages keep reappearing → ApproximateReceiveCount grows
+        If too long → messages stuck invisible → appear "lost"
+
+STEP 5: Check access policy
+        Does consumer have sqs:ReceiveMessage and sqs:DeleteMessage permissions?
+        Check both IAM policy AND queue access policy
+
+STEP 6: Check encryption
+        If using SSE-KMS → consumer needs kms:Decrypt permission on the key
+
+STEP 7: Check FIFO ordering
+        If FIFO → is another message in the same group currently in-flight?
+        That blocks subsequent messages in the group
+
+STEP 8: Check in-flight limit
+        Standard: 120,000 limit → OverLimit error if exceeded
+        FIFO: 20,000 limit → OverLimit error if exceeded</code></pre></div>
+<p>→ <strong>Console Testing:</strong></p>
+<p>→ SQS Console → Select queue → "Send and receive messages"<br>
+→ Send a test message → immediately poll → verify you receive it<br>
+→ Delete it → verify queue is empty<br>
+→ This confirms the queue is working end-to-end</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ SQS is the DECOUPLING backbone of AWS — it puts a buffer between producers and consumers<br>
+→ The visibility timeout is the core mechanism — it enables "at-least-once" delivery without message loss<br>
+→ The consumer lifecycle is: Receive → Process → Delete (ALWAYS delete after success)<br>
+→ Standard queues trade consistency for throughput (at-least-once, best-effort ordering)<br>
+→ FIFO queues trade throughput for consistency (exactly-once, strict ordering)<br>
+→ Long polling (20 seconds) is ALWAYS better than short polling<br>
+→ Message Group IDs in FIFO determine parallelism — choose wisely for throughput<br>
+→ SQS is PULL-based (consumer asks for messages) vs SNS which is PUSH-based (Project 6)</p>
+<p>→ Connection to Project 6: SNS pushes notifications → SQS buffers for processing</p>
+<ul>
+<li>SNS says "here's a message — deal with it NOW"</li>
+<li>SQS says "here's a message — deal with it WHEN YOU'RE READY"</li>
+<li>Together (Project 13) they form the most powerful messaging pattern in AWS</li>
+</ul>
+<p>→ Connection to Project 2: IAM policies control who can send/receive (<code>sqs:SendMessage</code>, <code>sqs:ReceiveMessage</code>, <code>sqs:DeleteMessage</code>)<br>
+→ Connection to Project 1: Large message payloads stored in S3, SQS holds reference (claim-check)<br>
+→ Connection to Project 5: SQS is a managed service — no VPC/subnet/SG needed (accessed via API endpoints)</p>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 8: CloudWatch alarms monitoring queue depth</li>
+<li>Project 13: SNS → SQS fan-out pattern (one event → multiple queues)</li>
+<li>Project 20: Dead Letter Queue configuration (handling poison messages)</li>
+<li>Project 26: SQS → Lambda event-driven processing pipeline</li>
+<li>Project 41: Cross-account SNS → SQS notification</li>
+<li>Project 49: Complex multi-service pipeline with SQS buffering</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has SQS queues buffering their order processing<br>
+→ But the CTO asks: "How do we know when the queue is backing up?"<br>
+→ Last week — the queue had 10,000 messages and nobody noticed for 6 hours<br>
+→ The web server's disk filled up at 3 AM and nobody was alerted<br>
+→ The database CPU hit 99% during the flash sale — nobody saw it until customers complained</p>
+<p>→ They need AUTOMATED MONITORING that:</p>
+<ul>
+<li>Watches metrics (CPU, disk, queue depth, error rates) 24/7</li>
+<li>Triggers ALARMS when thresholds are breached</li>
+<li>Sends NOTIFICATIONS through SNS (Project 6) to the ops team</li>
+<li>Works without anyone manually checking dashboards</li>
+</ul>
+<p>→ <strong>This is exactly what Project 8 solves</strong><br>
+→ Project 8 introduces CloudWatch Alarms &amp; Basic Monitoring<br>
+→ It connects to EC2 metrics (Project 3), SQS metrics (this project), and SNS notifications (Project 6)<br>
+→ It creates the automated alerting pipeline: Metric breach → CloudWatch Alarm → SNS Topic → Email/SMS</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 8: "The Server That Crashed at 3 AM — CloudWatch Alarms &amp; Basic Monitoring"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-6.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 7/60</span></div><a class="nav-btn next" href="project-8.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

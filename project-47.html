@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 47: THE ORGANIZATION THAT NEEDED GOVERNED DATA ACCESS — Data Lake with L — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 47: THE ORGANIZATION THAT NEEDED GOVERNED DATA ACCESS — Data Lake with Lake Formation Permissions</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's data lake is operational and growing<br>
+→ Data flows: MariaDB → Glue ETL with bookmarks (Project 46) → S3 Parquet → Glue Catalog (Project 17) → Athena (Project 18)<br>
+→ The data lake now contains:</p>
+<table><thead><tr><th>Glue Database</th><th>Table</th><th>Columns</th><th>Records</th><th>Sensitivity</th></tr></thead><tbody><tr><td>fraud_db</td><td>transactions</td><td>transaction_id, customer_id, amount, credit_card_number, merchant, city, country, risk_score, created_at</td><td>3.6M</td><td>HIGH — contains PII (credit card numbers)</td></tr><tr><td>fraud_db</td><td>customers</td><td>customer_id, full_name, email, phone, ssn_last4, address, region, tier</td><td>500K</td><td>HIGH — contains PII (SSN, email, phone)</td></tr><tr><td>fraud_db</td><td>merchants</td><td>merchant_id, merchant_name, category, city, country, risk_rating</td><td>50K</td><td>LOW — no PII</td></tr><tr><td>fraud_db</td><td>daily_aggregates</td><td>date, region, total_transactions, total_amount, avg_risk_score</td><td>365</td><td>LOW — aggregated, no PII</td></tr><tr><td>fraud_db</td><td>model_scores</td><td>transaction_id, model_version, score, threshold, decision, scored_at</td><td>3.6M</td><td>MEDIUM — model outputs</td></tr></tbody></table>
+<p>→ The organization has these user groups needing different access levels:</p>
+<table><thead><tr><th>User Group</th><th>AWS Account</th><th>What They Need</th><th>What They Should NOT See</th></tr></thead><tbody><tr><td>Fraud Analysts (Senior)</td><td>Account B (222222222222)</td><td>All tables, all columns</td><td>Nothing restricted</td></tr><tr><td>Fraud Analysts (Junior)</td><td>Account B (222222222222)</td><td>transactions + merchants — but NOT credit_card_number column</td><td>credit_card_number, ssn_last4, email, phone</td></tr><tr><td>Data Scientists</td><td>Account B (222222222222)</td><td>model_scores + transactions (without PII) + customers (without PII)</td><td>credit_card_number, ssn_last4, email, phone</td></tr><tr><td>Business Analysts</td><td>Account B (222222222222)</td><td>daily_aggregates + merchants ONLY</td><td>All raw transaction/customer data</td></tr><tr><td>External Auditor</td><td>Account D (444444444444)</td><td>daily_aggregates ONLY — read-only — cross-account</td><td>Everything except daily_aggregates</td></tr><tr><td>Platform Admins</td><td>Account B (222222222222)</td><td>Full access to manage catalog, create tables, run crawlers</td><td>— (full access)</td></tr></tbody></table>
+<p><strong>The Current Problem:</strong></p>
+<p>→ Today, access is controlled through IAM policies (from Project 2)<br>
+→ IAM can control:</p>
+<ul>
+<li>✅ "Can this user use Athena?" → <code>athena:StartQueryExecution</code></li>
+<li>✅ "Can this user access this S3 bucket?" → <code>s3:GetObject</code> on bucket ARN</li>
+<li>✅ "Can this user access the Glue Catalog?" → <code>glue:GetTable</code> on database ARN</li>
+</ul>
+<p>→ IAM CANNOT control:</p>
+<ul>
+<li>❌ "Can this user access TABLE X but not TABLE Y within the same database?"</li>
+<li>❌ "Can this user see columns A, B, C but not column D within the same table?"</li>
+<li>❌ "Can this user see rows WHERE region = 'APAC' but not rows WHERE region = 'EU'?"</li>
+</ul>
+<p>→ The compliance officer says: "Either everyone sees everything or nobody sees anything — that's not governance, that's a liability"<br>
+→ The CISO says: "PCI-DSS requires credit card data access to be restricted to authorized personnel only — column-level control is mandatory"<br>
+→ The auditor says: "I need access from MY AWS account to ONLY the aggregate table — nothing else"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the governance gap</p>
+<p><strong>IAM Alone (What We Have):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>IAM Policy → Controls SERVICE-level access
+</span>    ├── Can user call Athena? YES/NO
+    ├── Can user access S3 bucket? YES/NO
+    └── Can user access Glue database? YES/NO
+    
+    CANNOT answer:
+    ├── Can user access TABLE X within database? ???
+    ├── Can user see COLUMN Y within table? ???
+    └── Can user see ROWS matching condition Z? ???</code></pre></div>
+<p><strong>Lake Formation (What We Need):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lake Formation → Controls DATA-level access
+</span>    ├── Database-level: Can user access this database? YES/NO
+    ├── Table-level: Can user access this table? YES/NO
+    ├── Column-level: Can user see these specific columns? YES/NO (Include or Exclude)
+    ├── Row-level: Can user see rows matching this filter? YES/NO
+    └── Cross-account: Can external account access this specific table? YES/NO</code></pre></div>
+<p>→ Lake Formation sits ON TOP of IAM — it does NOT replace IAM<br>
+→ Both IAM AND Lake Formation must allow access for the request to succeed<br>
+→ Lake Formation adds a FINER grain of control that IAM alone cannot provide</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand the Lake Formation permission model</li>
+<li>Step 2 — Register the S3 data location with Lake Formation</li>
+<li>Step 3 — Set up Lake Formation Admins</li>
+<li>Step 4 — Convert from IAM-only to Lake Formation permission model</li>
+<li>Step 5 — Grant database-level permissions</li>
+<li>Step 6 — Grant table-level permissions</li>
+<li>Step 7 — Grant column-level permissions (include/exclude)</li>
+<li>Step 8 — Configure row-level security with data filters</li>
+<li>Step 9 — Configure Tag-Based Access Control (TBAC) for scalable governance</li>
+<li>Step 10 — Configure cross-account access for the external auditor</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND THE LAKE FORMATION PERMISSION MODEL</h3>
+<p><strong>The Two Permission Models in AWS:</strong></p>
+<table><thead><tr><th>Model</th><th>How It Works</th><th>Granularity</th><th>Default State</th></tr></thead><tbody><tr><td>IAM-Only (Legacy)</td><td>Access controlled entirely through IAM policies + S3 bucket policies + Glue resource policies</td><td>Service and resource level</td><td>This is the DEFAULT for all new AWS accounts</td></tr><tr><td>Lake Formation + IAM (Modern)</td><td>IAM controls service access + Lake Formation controls data access</td><td>Database, table, column, row level</td><td>Must be explicitly enabled</td></tr></tbody></table>
+<p><strong>The Critical Concept — IAMAllowedPrincipals:</strong></p>
+<p>→ When you first create a Glue database/table → Lake Formation automatically grants a SUPER permission to a special group called <code>IAMAllowedPrincipals</code><br>
+→ This group means: "Anyone whose IAM policy allows Glue access can access this table"<br>
+→ This is why Lake Formation appears to do nothing by default — it's passing everything through to IAM</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Default State (New Account):
+</span>    Glue Table: transactions
+    Lake Formation Permission: IAMAllowedPrincipals → ALL access
+    Effect: Anyone with IAM glue:GetTable permission → Full access to table
+    
+    Lake Formation is PRESENT but TRANSPARENT — IAM controls everything</code></pre></div>
+<p>→ To activate Lake Formation governance → You must REMOVE the IAMAllowedPrincipals permission<br>
+→ Once removed → ONLY explicit Lake Formation grants allow access<br>
+→ This is the "switch" from IAM-only to Lake Formation governance</p>
+<hr>
+<h3>STEP 2 — CONFIGURE LAKE FORMATION ADMINISTRATORS</h3>
+<p>→ Navigate to AWS Lake Formation Console → Administrative roles and tasks → Data lake administrators</p>
+<p><strong>Setting: Data Lake Administrators</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Add administrator</td><td>IAM User or Role ARN for Platform Admin</td><td>This user/role gets GOD-MODE over all Lake Formation resources</td></tr></tbody></table>
+<p>→ Add the Platform Admin IAM role: <code>arn:aws:iam::222222222222:role/PlatformAdminRole</code><br>
+→ Click "Save"</p>
+<p><strong>What Data Lake Admin Can Do:</strong></p>
+<table><thead><tr><th>Capability</th><th>Regular User</th><th>Data Lake Admin</th></tr></thead><tbody><tr><td>Create databases in Glue Catalog</td><td>Only if granted</td><td>✅ Always</td></tr><tr><td>Create tables in any database</td><td>Only if granted</td><td>✅ Always</td></tr><tr><td>Grant permissions to other users</td><td>Only if granted with "Grantable" flag</td><td>✅ Always — can grant anything</td></tr><tr><td>Revoke permissions from other users</td><td>Only if granted</td><td>✅ Always</td></tr><tr><td>Register S3 data locations</td><td>❌ No</td><td>✅ Yes</td></tr><tr><td>View all permissions across all users</td><td>❌ No</td><td>✅ Yes — full audit visibility</td></tr><tr><td>Change Lake Formation settings</td><td>❌ No</td><td>✅ Yes</td></tr></tbody></table>
+<p>→ Data Lake Admin is analogous to a "database superuser" — use sparingly<br>
+→ Assign to a ROLE, not an individual user — roles survive employee turnover</p>
+<hr>
+<h3>STEP 3 — REGISTER S3 DATA LOCATIONS WITH LAKE FORMATION</h3>
+<p><strong>Why Registration is Needed:</strong></p>
+<p>→ Lake Formation needs to know WHICH S3 paths it governs<br>
+→ Without registration → Lake Formation cannot enforce permissions on the underlying S3 data<br>
+→ Registration tells Lake Formation: "You are responsible for controlling access to data at this S3 path"</p>
+<p>→ Navigate to Lake Formation Console → Data lake locations → Register location</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Amazon S3 path</td><td><code>s3://payscale-curated/fraud-transactions/</code></td><td>The S3 path where Parquet files live</td></tr><tr><td>IAM Role</td><td><code>AWSServiceRoleF[REDACTED:AWS_ACCESS_KEY]ess</code> (or custom role)</td><td>Lake Formation uses this role to access S3 on behalf of users</td></tr></tbody></table>
+<p><strong>The IAM Role for Data Access:</strong></p>
+<p>→ Lake Formation needs an IAM role that has S3 read/write access to the registered path<br>
+→ Option 1: Use the service-linked role (auto-created): <code>AWSServiceRoleF[REDACTED:AWS_ACCESS_KEY]ess</code><br>
+→ Option 2: Create a custom role with specific S3 permissions</p>
+<p><strong>Custom Role Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::payscale-curated/*</code></td><td>Read data files</td></tr><tr><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::payscale-curated/*</code></td><td>Write data files (for governed tables)</td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::payscale-curated</code></td><td>List objects in bucket</td></tr><tr><td><code>s3:GetBucketLocation</code></td><td><code>arn:aws:s3:::payscale-curated</code></td><td>Determine bucket region</td></tr></tbody></table>
+<p><strong>Trust Policy:</strong></p>
+<code>Trusted Entity: lakeformation.amazonaws.com</code>
+<p>→ This allows the Lake Formation SERVICE to assume this role</p>
+<p><strong>Register Multiple Paths:</strong></p>
+<table><thead><tr><th>S3 Path</th><th>IAM Role</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3://payscale-curated/fraud-transactions/</code> [REDACTED:AWS_ACCESS_KEY]essRole</td><td>Transaction data</td><td></td></tr><tr><td><code>s3://payscale-curated/customers/</code> [REDACTED:AWS_ACCESS_KEY]essRole</td><td>Customer data</td><td></td></tr><tr><td><code>s3://payscale-curated/merchants/</code> [REDACTED:AWS_ACCESS_KEY]essRole</td><td>Merchant data</td><td></td></tr><tr><td><code>s3://payscale-curated/daily-aggregates/</code> [REDACTED:AWS_ACCESS_KEY]essRole</td><td>Aggregate data</td><td></td></tr><tr><td><code>s3://payscale-curated/model-scores/</code> [REDACTED:AWS_ACCESS_KEY]essRole</td><td>Model score data</td><td></td></tr></tbody></table>
+<p>→ Each path can have a DIFFERENT IAM role if needed (for different encryption keys, different S3 policies, etc.)<br>
+→ For PayScale → one role covers all paths</p>
+<hr>
+<h3>STEP 4 — REVOKE IAMAllowedPrincipals (THE CRITICAL SWITCH)</h3>
+<p><strong>This is the single most important step — and the most dangerous if done incorrectly</strong></p>
+<p>→ Navigate to Lake Formation Console → Data lake permissions</p>
+<p><strong>Option A — Revoke Per-Database (Surgical):</strong></p>
+<p>→ Select the permission entry for <code>IAMAllowedPrincipals</code> on database <code>fraud_db</code><br>
+→ Click "Revoke"<br>
+→ Confirm</p>
+<p><strong>What this does:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE Revocation:
+</span>    IAMAllowedPrincipals → ALL on fraud_db → ALL tables
+    Effect: Anyone with IAM Glue permissions → Full access
+
+AFTER Revocation:
+    No default permission exists
+    Effect: NOBODY can access fraud_db unless explicitly granted by Lake Formation
+    
+    ⚠️ This IMMEDIATELY breaks access for everyone who was relying on IAM-only</code></pre></div>
+<p><strong>Option B — Change Default Settings (Global):</strong></p>
+<p>→ Navigate to Lake Formation Console → Settings (under Administration)<br>
+→ Uncheck: "Use only IAM access control for new databases"<br>
+→ Uncheck: "Use only IAM access control for new tables in new databases"</p>
+<table><thead><tr><th>Setting</th><th>Default (Checked)</th><th>Recommended (Unchecked)</th></tr></thead><tbody><tr><td>Use only IAM access control for new databases</td><td>IAMAllowedPrincipals auto-granted on new databases</td><td>New databases require explicit Lake Formation grants</td></tr><tr><td>Use only IAM access control for new tables</td><td>IAMAllowedPrincipals auto-granted on new tables</td><td>New tables require explicit Lake Formation grants</td></tr></tbody></table>
+<p>→ This affects FUTURE databases/tables — existing ones retain IAMAllowedPrincipals until manually revoked</p>
+<p><strong>THE DANGER:</strong><br>
+→ If you revoke IAMAllowedPrincipals BEFORE granting explicit permissions → ALL users lose access IMMEDIATELY<br>
+→ Glue jobs fail, Athena queries fail, Redshift Spectrum fails<br>
+→ This is the #1 Lake Formation deployment failure</p>
+<p><strong>SAFE MIGRATION ORDER:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 4a: Grant explicit Lake Formation permissions to ALL current users (Steps 5-8)
+</span>Step 4b: VERIFY all users can access through Lake Formation grants
+Step 4c: THEN revoke IAMAllowedPrincipals
+Step 4d: VERIFY nothing broke
+
+→ Grant FIRST → Verify → THEN Revoke → Verify again
+→ NEVER Revoke first</code></pre></div>
+<hr>
+<h3>STEP 5 — GRANT DATABASE-LEVEL PERMISSIONS</h3>
+<p>→ Navigate to Lake Formation Console → Data lake permissions → Grant</p>
+<p><strong>Grant 1: Platform Admin — Full Database Access</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>PlatformAdminRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code></td></tr><tr><td>Database permissions</td><td>✅ Create table, ✅ Describe, ✅ Alter, ✅ Drop</td></tr><tr><td>Grantable permissions</td><td>✅ All (so admin can grant to others)</td></tr></tbody></table>
+<p><strong>Understanding "Grantable" Permissions:</strong></p>
+<p>→ "Grantable" means: "This principal can GRANT these same permissions to other principals"<br>
+→ It's the Lake Formation equivalent of <code>WITH GRANT OPTION</code> in SQL databases</p>
+<table><thead><tr><th>Permission</th><th>Without Grantable</th><th>With Grantable</th></tr></thead><tbody><tr><td>Describe on fraud_db</td><td>User can see the database</td><td>User can see the database AND grant Describe to others</td></tr><tr><td>Create table on fraud_db</td><td>User can create tables</td><td>User can create tables AND grant Create Table to others</td></tr></tbody></table>
+<p>→ Only grant "Grantable" to trusted administrators — never to end users</p>
+<p><strong>Grant 2: Glue ETL Service Role — Database Access for Crawlers/Jobs</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>GlueETLServiceRole</code> (from Project 17, 21)</td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code></td></tr><tr><td>Database permissions</td><td>✅ Create table, ✅ Describe, ✅ Alter</td></tr><tr><td>Grantable permissions</td><td>❌ None</td></tr></tbody></table>
+<p>→ The Glue service role needs database access to create/update tables during Crawler runs<br>
+→ Without this → Crawlers fail with "Access Denied" after IAMAllowedPrincipals is revoked</p>
+<hr>
+<h3>STEP 6 — GRANT TABLE-LEVEL PERMISSIONS</h3>
+<p>→ Navigate to Lake Formation Console → Data lake permissions → Grant</p>
+<p><strong>Grant 3: Senior Fraud Analysts — All Tables, All Columns</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>SeniorFraudAnalystRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: ALL TABLES</td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr><tr><td>Grantable permissions</td><td>❌ None</td></tr></tbody></table>
+<p>→ "Select" = Can query data via Athena/Redshift Spectrum<br>
+→ "Describe" = Can see table metadata (column names, types, partitions)<br>
+→ ALL TABLES = Includes current and future tables in this database</p>
+<p><strong>Grant 4: Business Analysts — Only Specific Tables</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>BusinessAnalystRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: <code>daily_aggregates</code></td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr><tr><td>Grantable permissions</td><td>❌ None</td></tr></tbody></table>
+<p>→ Repeat for <code>merchants</code> table:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>BusinessAnalystRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: <code>merchants</code></td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr><tr><td>Grantable permissions</td><td>❌ None</td></tr></tbody></table>
+<p>→ Business Analysts now have access to ONLY <code>daily_aggregates</code> and <code>merchants</code><br>
+→ If they try to query <code>transactions</code> in Athena → "Access Denied"<br>
+→ The <code>transactions</code> table won't even appear in their Athena table list</p>
+<p><strong>Understanding Table Permission Types:</strong></p>
+<table><thead><tr><th>Permission</th><th>What It Allows</th></tr></thead><tbody><tr><td>Select</td><td>Read data (query via Athena, Redshift Spectrum)</td></tr><tr><td>Describe</td><td>View table metadata (columns, types, location)</td></tr><tr><td>Alter</td><td>Modify table properties (schema changes, location changes)</td></tr><tr><td>Drop</td><td>Delete the table from the catalog</td></tr><tr><td>Insert</td><td>Write data to the table (for governed tables)</td></tr><tr><td>Delete</td><td>Delete data from the table (for governed tables)</td></tr></tbody></table>
+<p>→ For read-only analysts → Select + Describe only<br>
+→ For ETL roles → Select + Describe + Insert + Alter<br>
+→ For admin roles → All permissions</p>
+<hr>
+<h3>STEP 7 — GRANT COLUMN-LEVEL PERMISSIONS (INCLUDE / EXCLUDE)</h3>
+<p><strong>This is where Lake Formation shines — the capability IAM cannot provide</strong></p>
+<p>→ Navigate to Lake Formation Console → Data lake permissions → Grant</p>
+<p><strong>Grant 5: Junior Fraud Analysts — transactions table WITHOUT credit_card_number</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>JuniorFraudAnalystRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: <code>transactions</code></td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr><tr><td>Data permissions</td><td>Column-based access</td></tr></tbody></table>
+<p><strong>Column-Based Access — Two Modes:</strong></p>
+<table><thead><tr><th>Mode</th><th>How It Works</th><th>Best For</th></tr></thead><tbody><tr><td>Include columns</td><td>Specify WHICH columns the user CAN see — everything else is hidden</td><td>Tables with few safe columns, many sensitive ones</td></tr><tr><td>Exclude columns</td><td>Specify WHICH columns the user CANNOT see — everything else is visible</td><td>Tables with few sensitive columns, many safe ones</td></tr></tbody></table>
+<p><strong>For PayScale's transactions table (9 columns, 1 sensitive):</strong><br>
+→ Use EXCLUDE mode — simpler to specify 1 excluded column than 8 included columns</p>
+<table><thead><tr><th>Column Permission Mode</th><th>Excluded Columns</th></tr></thead><tbody><tr><td>Exclude columns</td><td><code>credit_card_number</code></td></tr></tbody></table>
+<p>→ Click Grant</p>
+<p><strong>Result:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Junior Fraud Analyst queries Athena:
+</span>    SELECT * FROM fraud_db.transactions LIMIT 10;
+
+Columns Returned:
+    ✅ transaction_id
+    ✅ customer_id
+    ✅ amount
+    ❌ credit_card_number → NOT RETURNED — column doesn't appear in results
+    ✅ merchant
+    ✅ city
+    ✅ country
+    ✅ risk_score
+    ✅ created_at</code></pre></div>
+<p>→ The column is not just hidden — it's as if it DOESN'T EXIST for this user<br>
+→ <code>SELECT credit_card_number FROM transactions</code> → Error: Column not found<br>
+→ <code>SELECT * FROM transactions</code> → Returns 8 columns instead of 9</p>
+<p><strong>Grant 6: Data Scientists — transactions + customers WITHOUT PII columns</strong></p>
+<table><thead><tr><th>Table</th><th>Excluded Columns</th></tr></thead><tbody><tr><td>transactions</td><td><code>credit_card_number</code></td></tr><tr><td>customers</td><td><code>ssn_last4</code>, <code>email</code>, <code>phone</code>, <code>full_name</code></td></tr><tr><td>model_scores</td><td>(no exclusions — full access)</td></tr><tr><td>merchants</td><td>(no exclusions — full access)</td></tr></tbody></table>
+<p>→ Create separate Grant entries for each table with appropriate column exclusions</p>
+<p><strong>Grant 7: Data Scientists — customers table with column exclusions</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>DataScientistRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: <code>customers</code></td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr><tr><td>Data permissions</td><td>Exclude columns: <code>ssn_last4</code>, <code>email</code>, <code>phone</code>, <code>full_name</code></td></tr></tbody></table>
+<p>→ Data Scientists can see: customer_id, address, region, tier<br>
+→ Data Scientists CANNOT see: ssn_last4, email, phone, full_name</p>
+<hr>
+<h3>STEP 8 — CONFIGURE ROW-LEVEL SECURITY WITH DATA FILTERS</h3>
+<p><strong>Scenario: Junior Fraud Analysts should only see transactions from their assigned region (APAC)</strong></p>
+<p>→ Navigate to Lake Formation Console → Data filters → Create data filter</p>
+<p><strong>Data Filter 1: APAC Region Filter</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Data filter name</td><td><code>apac-transactions-filter</code></td><td>Descriptive name</td></tr><tr><td>Target database</td><td><code>fraud_db</code></td><td>The database containing the table</td></tr><tr><td>Target table</td><td><code>transactions</code></td><td>The table to filter</td></tr><tr><td>Column-level access</td><td>Exclude columns: <code>credit_card_number</code></td><td>Combine column + row filtering</td></tr><tr><td>Row filter expression</td><td><code>country IN ('IN', 'SG', 'JP', 'AU', 'NZ')</code></td><td>Only APAC country records visible</td></tr></tbody></table>
+<p>→ Click Create</p>
+<p><strong>Data Filter 2: EU Region Filter</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Data filter name</td><td><code>eu-transactions-filter</code></td></tr><tr><td>Target database</td><td><code>fraud_db</code></td></tr><tr><td>Target table</td><td><code>transactions</code></td></tr><tr><td>Column-level access</td><td>Exclude columns: <code>credit_card_number</code></td></tr><tr><td>Row filter expression</td><td><code>country IN ('DE', 'FR', 'GB', 'IT', 'ES', 'NL')</code></td></tr></tbody></table>
+<p>→ Click Create</p>
+<p><strong>Apply Data Filter to Permission Grant:</strong></p>
+<p>→ Navigate to Data lake permissions → Grant</p>
+<p><strong>Grant 8: APAC Junior Analyst — Filtered Access</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>JuniorAnalystAPACRole</code></td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: <code>transactions</code></td></tr><tr><td>Data permissions</td><td>Data filter: <code>apac-transactions-filter</code></td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr></tbody></table>
+<p><strong>Result:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>APAC Junior Analyst queries Athena:
+</span>    SELECT * FROM fraud_db.transactions WHERE country = 'DE';
+
+Result: 0 rows returned (German transactions are filtered out)
+
+    SELECT * FROM fraud_db.transactions WHERE country = 'IN';
+
+Result: Returns Indian transactions ✅ (APAC country allowed)
+    Columns: All EXCEPT credit_card_number</code></pre></div>
+<p>→ The row filter is applied TRANSPARENTLY — the user doesn't know it exists<br>
+→ The user cannot see, bypass, or disable the filter<br>
+→ Even <code>SELECT COUNT(*) FROM transactions</code> returns only the APAC count</p>
+<p><strong>How Row Filters Work Internally:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User Query: SELECT * FROM transactions WHERE amount &gt; 1000
+</span>
+Lake Formation Injects Filter:
+    SELECT * FROM transactions 
+    WHERE (country IN ('IN','SG','JP','AU','NZ'))   ← Row filter (injected)
+    AND (amount &gt; 1000)                               ← User's filter (preserved)
+    
+    Columns returned: All EXCEPT credit_card_number   ← Column filter (applied)</code></pre></div>
+<p>→ Lake Formation modifies the query plan BEFORE it reaches Athena/Redshift Spectrum<br>
+→ The modification is invisible to the user<br>
+→ The query results appear as if the filtered-out rows simply don't exist</p>
+<hr>
+<h3>STEP 9 — CONFIGURE TAG-BASED ACCESS CONTROL (TBAC)</h3>
+<p><strong>The Scalability Problem with Named Resource Grants:</strong></p>
+<p>→ PayScale has 5 tables → 6 user groups → ~15 individual grant entries<br>
+→ What if PayScale grows to 50 tables and 20 user groups?<br>
+→ 50 × 20 = potentially 1,000 individual grants → Unmanageable</p>
+<p><strong>Tag-Based Access Control (TBAC) Solution:</strong></p>
+<p>→ Instead of granting access per-table per-user → assign TAGS to tables and users<br>
+→ Create a POLICY that says: "If user has tag X, they can access tables with tag X"</p>
+<hr>
+<p><strong>Step 9a — Create LF-Tags</strong></p>
+<p>→ Navigate to Lake Formation Console → LF-Tags → Add LF-Tag</p>
+<table><thead><tr><th>Tag Key</th><th>Permitted Values</th><th>Purpose</th></tr></thead><tbody><tr><td><code>sensitivity</code></td><td><code>public</code>, <code>internal</code>, <code>confidential</code>, <code>restricted</code></td><td>Data classification</td></tr><tr><td><code>domain</code></td><td><code>fraud</code>, <code>customer</code>, <code>merchant</code>, <code>analytics</code></td><td>Business domain</td></tr><tr><td><code>access_level</code></td><td><code>full</code>, <code>analyst</code>, <code>viewer</code>, <code>auditor</code></td><td>User access tier</td></tr></tbody></table>
+<hr>
+<p><strong>Step 9b — Assign Tags to Tables</strong></p>
+<p>→ Navigate to Lake Formation Console → LF-Tags → Tag assignments → Assign new tag</p>
+<table><thead><tr><th>Resource</th><th>sensitivity</th><th>domain</th></tr></thead><tbody><tr><td>fraud_db.transactions</td><td><code>confidential</code></td><td><code>fraud</code></td></tr><tr><td>fraud_db.customers</td><td><code>restricted</code></td><td><code>customer</code></td></tr><tr><td>fraud_db.merchants</td><td><code>public</code></td><td><code>merchant</code></td></tr><tr><td>fraud_db.daily_aggregates</td><td><code>public</code></td><td><code>analytics</code></td></tr><tr><td>fraud_db.model_scores</td><td><code>internal</code></td><td><code>fraud</code></td></tr></tbody></table>
+<p>→ Tags can also be assigned at COLUMN level:</p>
+<table><thead><tr><th>Resource</th><th>Column</th><th>sensitivity</th></tr></thead><tbody><tr><td>fraud_db.transactions</td><td>credit_card_number</td><td><code>restricted</code></td></tr><tr><td>fraud_db.customers</td><td>ssn_last4</td><td><code>restricted</code></td></tr><tr><td>fraud_db.customers</td><td>email</td><td><code>confidential</code></td></tr><tr><td>fraud_db.customers</td><td>phone</td><td><code>confidential</code></td></tr></tbody></table>
+<hr>
+<p><strong>Step 9c — Create Tag-Based Permission Grants</strong></p>
+<p>→ Navigate to Lake Formation Console → Data lake permissions → Grant</p>
+<p><strong>Grant 9: Business Analysts — Access to "public" sensitivity data</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>BusinessAnalystRole</code></td></tr><tr><td>LF-Tags</td><td>Tag key: <code>sensitivity</code>, Tag values: <code>public</code></td></tr><tr><td>Permissions</td><td>✅ Select, ✅ Describe</td></tr></tbody></table>
+<p><strong>Effect:</strong><br>
+→ BusinessAnalystRole automatically gets access to ANY table tagged <code>sensitivity=public</code><br>
+→ Currently: <code>merchants</code> and <code>daily_aggregates</code><br>
+→ If a NEW table is created and tagged <code>sensitivity=public</code> → Business Analysts AUTOMATICALLY get access<br>
+→ No new grant needed — the tag does the work</p>
+<p><strong>Grant 10: Senior Analysts — Access to all sensitivity levels</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>SeniorFraudAnalystRole</code></td></tr><tr><td>LF-Tags</td><td>Tag key: <code>sensitivity</code>, Tag values: <code>public</code>, <code>internal</code>, <code>confidential</code>, <code>restricted</code></td></tr><tr><td>Permissions</td><td>✅ Select, ✅ Describe</td></tr></tbody></table>
+<p><strong>Grant 11: Data Scientists — Access to internal + public, exclude restricted columns</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>DataScientistRole</code></td></tr><tr><td>LF-Tags</td><td>Tag key: <code>sensitivity</code>, Tag values: <code>public</code>, <code>internal</code>, <code>confidential</code></td></tr><tr><td>Permissions</td><td>✅ Select, ✅ Describe</td></tr></tbody></table>
+<p>→ Tables tagged <code>restricted</code> → NOT accessible (customers table)<br>
+→ Columns tagged <code>restricted</code> → NOT visible (credit_card_number, ssn_last4)<br>
+→ But wait — the customers TABLE is tagged <code>restricted</code> so Data Scientists cannot access it at all<br>
+→ To give them access to customers WITHOUT restricted columns → Use combination of table-level tag + column-level tag exclusion</p>
+<p><strong>TBAC vs Named Resource Grants — Decision Matrix:</strong></p>
+<table><thead><tr><th>Factor</th><th>Named Resource Grants</th><th>Tag-Based Access Control</th></tr></thead><tbody><tr><td>Number of tables</td><td>&lt; 20</td><td>20+</td></tr><tr><td>Number of user groups</td><td>&lt; 10</td><td>10+</td></tr><tr><td>Frequency of new tables</td><td>Rare</td><td>Frequent</td></tr><tr><td>Governance complexity</td><td>Low</td><td>High</td></tr><tr><td>Setup effort</td><td>Low (per-table grants)</td><td>Higher (tag taxonomy design)</td></tr><tr><td>Maintenance effort</td><td>High (new grant per new table)</td><td>Low (tag new table → auto-access)</td></tr><tr><td>Audit clarity</td><td>Clear (explicit grants per resource)</td><td>Clear (tag-based policies)</td></tr></tbody></table>
+<p>→ PayScale with 5 tables → Named Resource Grants are fine (Steps 5-8)<br>
+→ PayScale growing to 50+ tables → Migrate to TBAC (Step 9)<br>
+→ Both can coexist — use Named Grants for exceptions, TBAC for bulk</p>
+<hr>
+<h3>STEP 10 — CONFIGURE CROSS-ACCOUNT ACCESS FOR EXTERNAL AUDITOR</h3>
+<p><strong>Scenario: External Auditor in Account D (444444444444) needs read-only access to <code>daily_aggregates</code> ONLY</strong></p>
+<p>→ This builds on cross-account concepts from Project 42<br>
+→ Two methods exist:</p>
+<table><thead><tr><th>Method</th><th>How It Works</th><th>Best For</th></tr></thead><tbody><tr><td>Lake Formation Cross-Account Grant</td><td>Direct grant to external account — uses Resource Access Manager (RAM)</td><td>Simple, few tables shared</td></tr><tr><td>Glue Catalog Resource Policy</td><td>JSON policy on the Glue Catalog allowing cross-account access</td><td>Programmatic, complex conditions</td></tr></tbody></table>
+<p><strong>Method: Lake Formation Cross-Account Grant (Recommended)</strong></p>
+<hr>
+<p><strong>Step 10a — Grant Permission to External Account</strong></p>
+<p>→ Navigate to Lake Formation Console (Account B) → Data lake permissions → Grant</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>External accounts</td></tr><tr><td>AWS account ID</td><td><code>444444444444</code> (Auditor's account)</td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>fraud_db</code>, Table: <code>daily_aggregates</code></td></tr><tr><td>Table permissions</td><td>✅ Select, ✅ Describe</td></tr><tr><td>Grantable permissions</td><td>❌ None</td></tr></tbody></table>
+<p>→ Click Grant</p>
+<p><strong>What happens behind the scenes:</strong><br>
+→ Lake Formation sends an invitation to Account D via AWS Resource Access Manager (RAM)<br>
+→ Account D must ACCEPT the RAM invitation (similar to VPC Peering acceptance from Project 44)</p>
+<hr>
+<p><strong>Step 10b — Accept RAM Invitation (Account D)</strong></p>
+<p>→ Navigate to AWS RAM Console (Account D) → Resource shares → Pending<br>
+→ Accept the invitation from Account B</p>
+<hr>
+<p><strong>Step 10c — Create Resource Link (Account D)</strong></p>
+<p>→ After accepting → Account D can see Account B's shared table<br>
+→ But Athena in Account D cannot directly query Account B's table<br>
+→ Account D must create a RESOURCE LINK — a pointer to Account B's table</p>
+<p>→ Navigate to Glue Console (Account D) → Databases → Create database</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Database name</td><td><code>shared_payscale</code></td></tr></tbody></table>
+<p>→ Navigate to Glue Console (Account D) → Tables → Create resource link</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Resource link name</td><td><code>daily_aggregates_link</code></td></tr><tr><td>Database</td><td><code>shared_payscale</code> (Account D's database)</td></tr><tr><td>Shared table's database</td><td><code>fraud_db</code> (Account B's database)</td></tr><tr><td>Shared table's name</td><td><code>daily_aggregates</code></td></tr><tr><td>Shared table's owner ID</td><td><code>222222222222</code> (Account B)</td></tr></tbody></table>
+<hr>
+<p><strong>Step 10d — Grant Lake Formation Permission on Resource Link (Account D)</strong></p>
+<p>→ Account D's Data Lake Admin must grant permission to the Auditor IAM role ON the resource link</p>
+<p>→ Navigate to Lake Formation Console (Account D) → Grant</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Principal type</td><td>IAM users and roles</td></tr><tr><td>IAM users and roles</td><td><code>AuditorRole</code> (in Account D)</td></tr><tr><td>Named Data Catalog resources</td><td>Database: <code>shared_payscale</code>, Table: <code>daily_aggregates_link</code></td></tr><tr><td>Resource link permissions</td><td>✅ Describe</td></tr><tr><td>Table permissions (on target)</td><td>✅ Select, ✅ Describe</td></tr></tbody></table>
+<hr>
+<p><strong>Step 10e — Auditor Queries Data</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Auditor in Account D uses Athena:
+</span>    SELECT * FROM shared_payscale.daily_aggregates_link LIMIT 10;
+
+Result: Returns daily aggregate data from Account B's S3 ✅
+
+    SELECT * FROM shared_payscale.transactions;
+    
+Result: ERROR — table does not exist (not shared) ✅ (security working)</code></pre></div>
+<p><strong>Complete Cross-Account Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account D (Auditor)                         Account B (Data Owner)
+</span>    |                                           |
+    | Athena Query on resource link              |
+    | daily_aggregates_link                      |
+    |                                           |
+    ↓                                           |
+    Lake Formation (Account D)                  |
+    Checks: AuditorRole has Select              |
+    on daily_aggregates_link? ✅                |
+    |                                           |
+    ↓                                           |
+    Follows resource link to ──────────────→    Lake Formation (Account B)
+                                                Checks: Account D has Select
+                                                on daily_aggregates? ✅
+                                                |
+                                                ↓
+                                                S3: s3://payscale-curated/daily-aggregates/
+                                                Data returned to Account D ✅</code></pre></div>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always designate a Data Lake Administrator ROLE (not user) before any Lake Formation configuration<br>
+→ Always register S3 data locations BEFORE granting table-level permissions<br>
+→ Always grant explicit permissions BEFORE revoking IAMAllowedPrincipals — grant first, revoke second<br>
+→ Always test permission grants with actual Athena queries from the target user's session<br>
+→ Always use EXCLUDE columns for tables with few sensitive columns (simpler, auto-includes new columns)<br>
+→ Always use INCLUDE columns for tables with few safe columns (more restrictive, new columns are hidden by default)<br>
+→ Always design a tag taxonomy BEFORE implementing TBAC — retrofitting tags is painful<br>
+→ Always document the complete permission matrix: WHO has access to WHAT at which level<br>
+→ Always use resource links for cross-account sharing — direct table references don't work in Athena<br>
+→ Always grant permissions to IAM ROLES not individual IAM users — roles survive employee changes<br>
+→ Always keep the Glue ETL service role's permissions updated — Crawlers and Jobs need Lake Formation grants too<br>
+→ Always verify that both IAM AND Lake Formation allow the action — both must permit for access to succeed</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never revoke IAMAllowedPrincipals before granting explicit Lake Formation permissions — causes immediate access loss for ALL users<br>
+→ Never make individual IAM users Data Lake Administrators — use roles<br>
+→ Never grant "Grantable" permissions to end users — they could escalate access for themselves or others<br>
+→ Never forget to grant permissions to the Glue ETL service role — Crawlers and Jobs will fail silently<br>
+→ Never mix TBAC and Named Resource grants for the same table without understanding precedence — both are evaluated, most permissive wins<br>
+→ Never assume column exclusion on a table applies to future columns — EXCLUDE mode auto-includes new columns (potential security gap)<br>
+→ Never forget the resource link step for cross-account access — without it, Athena in the consumer account cannot query<br>
+→ Never skip the RAM acceptance step — the sharing won't work until accepted<br>
+→ Never use Lake Formation for S3 paths that aren't registered — permissions won't be enforced<br>
+→ Never assume row-level filters prevent data inference — aggregation queries (COUNT, SUM) on filtered data may still reveal patterns<br>
+→ Never change Lake Formation settings during business hours without testing — one wrong revocation breaks all queries</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE LAKE FORMATION</h2>
+<table><thead><tr><th>Scenario</th><th>Use Lake Formation?</th><th>Why</th></tr></thead><tbody><tr><td>Multiple teams need different table access within same database</td><td>✅ Yes</td><td>Table-level grants</td></tr><tr><td>PII columns must be hidden from certain users</td><td>✅ Yes</td><td>Column-level exclusion</td></tr><tr><td>Regional teams should only see their region's data</td><td>✅ Yes</td><td>Row-level data filters</td></tr><tr><td>Cross-account data sharing with fine-grained control</td><td>✅ Yes</td><td>Cross-account grants with resource links</td></tr><tr><td>Only one team uses the data lake — no access differentiation needed</td><td>❌ No</td><td>IAM alone is sufficient</td></tr><tr><td>All users need identical full access</td><td>❌ No</td><td>IAM alone is simpler</td></tr><tr><td>Data is in DynamoDB or other non-S3/Glue services</td><td>❌ No</td><td>Lake Formation governs Glue Catalog + S3 only</td></tr><tr><td>Need to control API-level access (who can call Athena)</td><td>❌ No</td><td>IAM handles service-level access</td></tr><tr><td>Growing number of tables + user groups</td><td>✅ Yes</td><td>TBAC scales governance automatically</td></tr><tr><td>Compliance requires audit trail of data access permissions</td><td>✅ Yes</td><td>Lake Formation provides centralized permission view</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE LAKE FORMATION</h2>
+<p>→ When you have a single team with uniform access needs → IAM is simpler and sufficient<br>
+→ When your data is not in S3 + Glue Catalog → Lake Formation doesn't govern RDS, DynamoDB, etc. directly<br>
+→ When you need real-time row-level security for application-level queries → Application-layer authorization is more appropriate<br>
+→ When your organization has &lt; 3 distinct access roles → Overhead of Lake Formation exceeds benefit<br>
+→ When you need encryption-based access control → KMS key policies (from Project 36) handle this<br>
+→ When data sharing is purely at the S3 bucket level → Cross-account bucket policies (from Project 39) are simpler</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → THE DUAL AUTHORIZATION MODEL</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User makes request (e.g., Athena query on fraud_db.transactions)
+</span>    |
+    ↓
+LAYER 1: IAM Evaluation
+    |
+    ├── Does the user's IAM policy allow athena:StartQueryExecution? 
+    |   → NO → ACCESS DENIED (never reaches Lake Formation)
+    |   → YES → Continue
+    |
+    ├── Does the user's IAM policy allow glue:GetTable on fraud_db?
+    |   → NO → ACCESS DENIED
+    |   → YES → Continue
+    |
+    ├── Does the user's IAM policy allow s3:GetObject on the bucket?
+    |   → With Lake Formation: NOT NEEDED — Lake Formation handles S3 access
+    |   → Without Lake Formation: NEEDED — IAM must allow S3 access
+    |
+    ↓
+LAYER 2: Lake Formation Evaluation
+    |
+    ├── Does the user have Lake Formation SELECT on fraud_db.transactions?
+    |   → NO → ACCESS DENIED
+    |   → YES → Continue
+    |
+    ├── Does the user have column-level access to requested columns?
+    |   → Excluded columns removed from query plan
+    |
+    ├── Does a data filter (row-level) exist for this user + table?
+    |   → YES → Filter injected into query plan
+    |
+    ↓
+ACCESS GRANTED — Query executes with column/row restrictions applied</code></pre></div>
+<p><strong>Key Insight — S3 Permission Delegation:</strong><br>
+→ When Lake Formation is active → Users do NOT need direct S3 access<br>
+→ Lake Formation uses ITS OWN registered IAM role to access S3 on behalf of the user<br>
+→ This is called "credential vending"<br>
+→ Lake Formation generates temporary S3 credentials scoped to ONLY the permitted data</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT Lake Formation:
+</span>    User → IAM (Athena + Glue + S3 permissions) → S3
+    User needs: s3:GetObject on the actual data paths
+
+WITH Lake Formation:
+    User → IAM (Athena + Glue permissions only) → Lake Formation → S3
+    User does NOT need: s3:GetObject
+    Lake Formation's role provides S3 access</code></pre></div>
+<p>→ This is a major security improvement — users never directly touch S3<br>
+→ Even if a user discovers the S3 path — they cannot access it without Lake Formation's credential vending</p>
+<hr>
+<h3>2 → HOW COLUMN-LEVEL FILTERING WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User Query: SELECT * FROM transactions
+</span>
+Lake Formation Permission: EXCLUDE credit_card_number
+
+Internal Query Rewrite:
+    SELECT transaction_id, customer_id, amount, merchant, city, country, 
+           risk_score, created_at 
+    FROM transactions
+
+→ The * is EXPANDED to only permitted columns
+→ The excluded column is removed from the column list BEFORE the query engine processes it
+→ Athena's query plan never sees the excluded column
+→ The Parquet file reader in S3 uses column projection to skip reading excluded columns
+→ This means: excluded columns are not just hidden — they are never READ from storage
+→ Performance benefit: Less data scanned = lower Athena cost (Athena charges per TB scanned)</code></pre></div>
+<hr>
+<h3>3 → HOW ROW-LEVEL FILTERING WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User Query: SELECT * FROM transactions WHERE amount &gt; 1000
+</span>
+Data Filter: country IN ('IN', 'SG', 'JP', 'AU', 'NZ')
+
+Internal Query Rewrite:
+    SELECT transaction_id, customer_id, amount, merchant, city, country,
+           risk_score, created_at
+    FROM transactions
+    WHERE (country IN ('IN', 'SG', 'JP', 'AU', 'NZ'))    ← INJECTED by Lake Formation
+      AND (amount &gt; 1000)                                   ← Original user filter
+
+→ Lake Formation's row filter is injected as an AND condition
+→ The user's filter is preserved
+→ Both must be true for a row to be returned
+→ If the table is partitioned by country (from Project 25)
+  → Athena uses partition pruning → Only reads APAC partitions
+  → Double efficiency: Less partitions scanned + row filter applied</code></pre></div>
+<p><strong>Row Filter Limitations:</strong></p>
+<table><thead><tr><th>Supported</th><th>Not Supported</th></tr></thead><tbody><tr><td>Simple comparisons (=, &gt;, &lt;, IN, BETWEEN)</td><td>Subqueries in filter expression</td></tr><tr><td>AND/OR combinations</td><td>JOINs in filter expression</td></tr><tr><td>String functions (LIKE, starts_with)</td><td>Aggregate functions (COUNT, SUM)</td></tr><tr><td>Column references from the same table</td><td>References to other tables</td></tr><tr><td>NULL checks (IS NULL, IS NOT NULL)</td><td>User-defined functions</td></tr></tbody></table>
+<hr>
+<h3>4 → HOW TAG-BASED ACCESS CONTROL RESOLVES</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>User: DataScientistRole
+</span>    Tags: sensitivity IN (public, internal, confidential)
+
+Table: fraud_db.transactions
+    Tags: sensitivity = confidential
+
+Column: transactions.credit_card_number
+    Tags: sensitivity = restricted
+
+Resolution:
+    1. Table tag: confidential → User has confidential → TABLE ACCESS GRANTED ✅
+    2. Column tag: restricted → User does NOT have restricted → COLUMN ACCESS DENIED ❌
+    3. Other columns: Inherit table tag (confidential) → User has confidential → GRANTED ✅
+
+Result: DataScientist can query transactions table, all columns EXCEPT credit_card_number</code></pre></div>
+<p><strong>Tag Resolution Rules:</strong></p>
+<table><thead><tr><th>Rule</th><th>Behavior</th></tr></thead><tbody><tr><td>Column with explicit tag</td><td>Column's own tag is evaluated (overrides table tag)</td></tr><tr><td>Column without explicit tag</td><td>Inherits the table's tag</td></tr><tr><td>Table with explicit tag</td><td>Table's own tag is evaluated (overrides database tag)</td></tr><tr><td>Table without explicit tag</td><td>Inherits the database's tag</td></tr><tr><td>Multiple tags on same resource</td><td>ALL tag conditions must be satisfied (AND logic)</td></tr><tr><td>No matching tag grant exists</td><td>ACCESS DENIED</td></tr></tbody></table>
+<hr>
+<h3>5 → HOW CROSS-ACCOUNT SHARING WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account B (Producer)                          Account D (Consumer)
+</span>    |                                              |
+    | Lake Formation Grant to Account D            |
+    | on daily_aggregates                          |
+    |                                              |
+    ↓                                              |
+    AWS RAM creates resource share ────────────→  RAM invitation appears
+    |                                              |
+    |                                         Accepted ✅
+    |                                              |
+    |                                         Resource Link created
+    |                                         (daily_aggregates_link)
+    |                                              |
+    |                                         Lake Formation grant
+    |                                         to AuditorRole on link
+    |                                              |
+    |                                              ↓
+    |                                         Athena query on link
+    |                                              |
+    |                                              ↓
+    |                                         Lake Formation (Account D)
+    |                                         Validates: AuditorRole
+    |                                         has Select on link? ✅
+    |                                              |
+    ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ←|
+    |                                              |
+    Lake Formation (Account B)                     |
+    Validates: Account D has                       |
+    Select on daily_aggregates? ✅                 |
+    |                                              |
+    ↓                                              |
+    S3 (Account B)                                 |
+    Lake Formation's IAM role                      |
+    reads Parquet data                             |
+    |                                              |
+    Data returned ──────────────────────────────→  Athena results in Account D</code></pre></div>
+<p>→ Data NEVER leaves Account B's S3 — only query results are returned<br>
+→ Account D never gets direct S3 access — Lake Formation mediates everything<br>
+→ Account B retains full control — can revoke access instantly<br>
+→ If Account B revokes → Account D's next query fails immediately</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Revoked IAMAllowedPrincipals before granting explicit permissions</td><td>ALL users get "Access Denied" on ALL tables</td><td>No explicit Lake Formation grants exist</td><td>Grant permissions first, then revoke IAMAllowedPrincipals</td></tr><tr><td>2</td><td>Glue Crawler fails after enabling Lake Formation</td><td>Crawler returns "Access Denied" on database/table creation</td><td>Glue service role missing Lake Formation grants</td><td>Grant Create Table + Alter to Glue role on the database</td></tr><tr><td>3</td><td>Athena query returns 0 columns</td><td>Column-level permission uses INCLUDE with no columns specified</td><td>Empty include list = no columns visible</td><td>Use EXCLUDE mode or specify columns in include list</td></tr><tr><td>4</td><td>New column added to table is visible to restricted users</td><td>EXCLUDE mode auto-includes new columns</td><td>Exclude only blocks listed columns — new ones are permitted</td><td>Add new sensitive columns to exclusion list OR use INCLUDE mode for strict control</td></tr><tr><td>5</td><td>Cross-account user cannot query shared table</td><td>"Table not found" in Athena</td><td>Missing resource link in consumer account</td><td>Create resource link pointing to shared table</td></tr><tr><td>6</td><td>Cross-account sharing invitation not visible</td><td>RAM console shows no pending invitations</td><td>RAM sharing not enabled for the organization or wrong account ID</td><td>Verify account ID and RAM settings</td></tr><tr><td>7</td><td>User has IAM permission but Lake Formation denies</td><td>"Insufficient Lake Formation permissions"</td><td>IAM allows Glue access but no Lake Formation grant exists</td><td>Create explicit Lake Formation grant for the user/role</td></tr><tr><td>8</td><td>TBAC grant not working for new table</td><td>New table tagged correctly but user cannot access</td><td>Tag assignment happened after TBAC grant — timing issue</td><td>Verify tag is assigned → Verify TBAC grant covers the tag value</td></tr><tr><td>9</td><td>Row filter not applying</td><td>User sees ALL rows instead of filtered subset</td><td>Data filter not associated with the permission grant correctly</td><td>Re-create grant with explicit data filter selection</td></tr><tr><td>10</td><td>Performance degradation after enabling Lake Formation</td><td>Queries slower than before</td><td>Lake Formation credential vending adds overhead per query</td><td>Normal — minor overhead (&lt; 1 second) — optimize query patterns instead</td></tr><tr><td>11</td><td>User can see table in Glue but not query in Athena</td><td>"Access Denied" on SELECT but Describe works</td><td>User has Describe permission but not Select</td><td>Add Select permission</td></tr><tr><td>12</td><td>Lake Formation permissions conflict with S3 bucket policy</td><td>Unexpected "Access Denied" even with Lake Formation grant</td><td>S3 bucket policy explicitly denies the Lake Formation role</td><td>Update S3 bucket policy to allow Lake Formation's registered role</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Permission Scalability</strong></p>
+<table><thead><tr><th>Governance Approach</th><th>10 Tables × 5 Roles</th><th>50 Tables × 20 Roles</th><th>200 Tables × 50 Roles</th></tr></thead><tbody><tr><td>Named Resource Grants</td><td>50 grants — manageable</td><td>1,000 grants — painful</td><td>10,000 grants — impossible</td></tr><tr><td>Tag-Based Access Control</td><td>5 tag grants — easy</td><td>5-10 tag grants — easy</td><td>5-10 tag grants — STILL easy</td></tr></tbody></table>
+<p>→ TBAC scales LINEARLY with the number of DISTINCT access patterns, not with the number of tables × roles<br>
+→ For organizations with &gt; 20 tables → TBAC is essential</p>
+<p>→ <strong>Table/Database Scalability</strong></p>
+<ul>
+<li>Lake Formation supports thousands of databases and tables per account</li>
+<li>No practical limit on permission entries</li>
+<li>Glue Data Catalog limit: 1,000,000 tables per account (soft limit)</li>
+</ul>
+<p>→ <strong>Cross-Account Scalability</strong></p>
+<ul>
+<li>Lake Formation supports sharing with up to 12 AWS accounts per resource share</li>
+<li>For more accounts → Use AWS Organizations integration</li>
+<li>Can share with an entire OU (Organizational Unit) instead of individual accounts</li>
+</ul>
+<p>→ <strong>Query Performance Scalability</strong></p>
+<ul>
+<li>Column-level exclusion → Athena reads fewer columns → LESS data scanned → CHEAPER</li>
+<li>Row-level filtering → Athena applies partition pruning + row filter → LESS data scanned → CHEAPER</li>
+<li>Lake Formation governance actually IMPROVES cost efficiency for restricted users</li>
+</ul>
+<p>→ <strong>Audit Scalability</strong></p>
+<ul>
+<li>CloudTrail logs all Lake Formation API calls (Grant, Revoke, GetPermissions)</li>
+<li>For large organizations → Ship CloudTrail to S3 → Query with Athena (from Project 18)</li>
+<li>Lake Formation Console → Permissions page shows all grants in one view</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify permissions are correctly configured:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected Result</th></tr></thead><tbody><tr><td>Database visible to user</td><td>User opens Athena → Database dropdown</td><td>Only permitted databases appear</td></tr><tr><td>Table visible to user</td><td>User selects database → Tables list</td><td>Only permitted tables appear</td></tr><tr><td>Columns visible to user</td><td>User runs <code>SELECT * FROM table LIMIT 1</code></td><td>Only permitted columns returned</td></tr><tr><td>Rows filtered correctly</td><td>User runs <code>SELECT DISTINCT country FROM table</code></td><td>Only permitted country values appear</td></tr><tr><td>Cross-account access works</td><td>Consumer account runs query on resource link</td><td>Data returned from producer account</td></tr><tr><td>Denied access returns error</td><td>User queries restricted table</td><td>"Access Denied" or table not visible</td></tr></tbody></table>
+<p>→ <strong>How to audit all permissions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Lake Formation Console → Data lake permissions
+</span>    → Filter by Principal: [Select IAM role]
+    → View ALL grants for that principal across all databases/tables
+    
+    OR
+    
+    → Filter by Database: fraud_db
+    → View ALL principals with access to this database and its tables</code></pre></div>
+<p>→ <strong>How to monitor access patterns:</strong></p>
+<table><thead><tr><th>Audit Need</th><th>Solution</th><th>Where</th></tr></thead><tbody><tr><td>Who accessed which table?</td><td>CloudTrail → Filter by Lake Formation events</td><td>CloudTrail Console or S3 logs</td></tr><tr><td>What queries were run?</td><td>Athena Query History → Filter by user</td><td>Athena Console → Query history</td></tr><tr><td>Was sensitive data accessed?</td><td>CloudTrail + Athena → Join Lake Formation events with Athena queries</td><td>Custom Athena query on CloudTrail logs</td></tr><tr><td>Permission changes over time</td><td>CloudTrail → Filter by GrantPermissions/RevokePermissions</td><td>CloudTrail Console</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Lake Formation adds DATA-LEVEL governance on top of IAM's SERVICE-LEVEL access control<br>
+→ IAM answers: "Can this user call Athena?" → Lake Formation answers: "Can this user see THIS table's THIS column's THIS row?"<br>
+→ The IAMAllowedPrincipals removal is the critical switch — grant first, revoke second, NEVER the reverse<br>
+→ Column-level security uses INCLUDE (whitelist) or EXCLUDE (blacklist) modes — choose based on sensitivity ratio<br>
+→ Row-level security uses data filters with SQL-like expressions injected transparently into queries<br>
+→ Tag-Based Access Control (TBAC) scales governance from 10 tables to 10,000 tables without linear grant explosion<br>
+→ Cross-account sharing requires THREE steps: Lake Formation grant → RAM acceptance → Resource link creation<br>
+→ Lake Formation credential vending eliminates the need for users to have direct S3 access — major security improvement<br>
+→ Connection to previous projects:</p>
+<ul>
+<li>Glue Data Catalog (Project 17) — Lake Formation governs the catalog</li>
+<li>Athena (Project 18) — Lake Formation filters Athena query results</li>
+<li>KMS encryption (Project 36) — encryption at rest complements Lake Formation's access control</li>
+<li>Cross-account Glue Catalog sharing (Project 42) — Lake Formation enhances with fine-grained control</li>
+<li>Glue Job Bookmarks (Project 46) — Glue ETL roles need Lake Formation grants after IAMAllowedPrincipals removal<br>
+→ Connection to next projects:</li>
+<li>Redshift Federated Query (Project 48) needs understanding of how Redshift accesses external catalogs governed by Lake Formation</li>
+<li>The full enterprise data lake (Project 51) combines ALL of these governance patterns at scale</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale's data lake now has fine-grained governance<br>
+→ Analysts query S3 data through Athena with column and row-level security<br>
+→ But the Redshift data warehouse team has a different need<br>
+→ They have historical transaction data in Redshift (from Project 16, 22)<br>
+→ They need to JOIN warehouse data with LIVE operational data in MariaDB (from Project 9)<br>
+→ Currently → They export MariaDB data to S3 (Project 24) → Load into Redshift (Project 22) → Then join<br>
+→ This process has a 24-hour delay — the MariaDB export runs nightly<br>
+→ The fraud team says: "We need to join Redshift's historical patterns with MariaDB's LIVE transaction status — in real-time, in a single query"<br>
+→ They don't want to move data — they want Redshift to QUERY MariaDB directly</p>
+<p>→ <strong>This is the exact problem Project 48 solves</strong><br>
+→ Project 48 introduces Redshift Federated Query — the ability for Redshift to query external databases (MariaDB, PostgreSQL) in real-time without data movement<br>
+→ It uses Secrets Manager (from Project 37) for credentials and IAM roles for authorization<br>
+→ It enables live JOINs between warehouse tables and operational database tables in a single SQL statement</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 48: "The Redshift Cluster That Needed Live Operational Data — Redshift Federated Query to RDS MariaDB"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-46.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 47/60</span></div><a class="nav-btn next" href="project-48.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

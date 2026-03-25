@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 23: THE ANALYTICS EXPORT NOBODY COULD AUTOMATE — Redshift UNLOAD to S3 — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 23: THE ANALYTICS EXPORT NOBODY COULD AUTOMATE — Redshift UNLOAD to S3</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's Redshift cluster (Project 16) is now loaded with optimized data via COPY (Project 22)<br>
+→ The warehouse contains orders, customers, products, and clickstream data<br>
+→ Analysts run complex queries daily — joins, window functions, aggregations<br>
+→ But now multiple teams need query RESULTS outside of Redshift:</p>
+<p>→ <strong>Problem 1: Marketing Team — External Partner Export</strong></p>
+<ul>
+<li>Marketing runs a customer segmentation query in Redshift</li>
+<li>Result: 2 million rows identifying high-value customers with purchase patterns</li>
+<li>They need this as a CSV file in S3 to share with an external advertising platform</li>
+<li>Currently: An analyst runs the query → copies results from Query Editor → pastes into Excel → uploads to S3</li>
+<li>This manual process takes 45 minutes and fails for results &gt; 100,000 rows (browser memory limit)</li>
+</ul>
+<p>→ <strong>Problem 2: Finance Team — Monthly Archive</strong></p>
+<ul>
+<li>Finance needs monthly revenue aggregations exported to S3 for long-term archival (7 years — compliance)</li>
+<li>Result: Aggregated revenue by region, product category, and payment method per month</li>
+<li>Currently: No export process exists — data lives only in Redshift</li>
+<li>If the Redshift cluster is decommissioned or resized → historical aggregations are lost</li>
+</ul>
+<p>→ <strong>Problem 3: Data Science Team — ML Training Data</strong></p>
+<ul>
+<li>Data scientists need feature-engineered data from Redshift for ML model training in SageMaker</li>
+<li>Result: 50 million rows with 30 computed features (rolling averages, ratios, ranks)</li>
+<li>They need this in Parquet format in S3 (SageMaker reads from S3)</li>
+<li>Currently: They query Redshift from a notebook → download results → re-upload to S3</li>
+<li>This fails for 50M rows — the notebook runs out of memory</li>
+</ul>
+<p>→ <strong>Problem 4: Data Lake Feedback Loop</strong></p>
+<ul>
+<li>The data engineering team wants to write Redshift-computed aggregations BACK to the data lake in S3</li>
+<li>These aggregations become the "curated" layer (referenced in Project 21's data lake zones)</li>
+<li>Other teams query these curated datasets via Athena (Project 18) without needing Redshift access</li>
+<li>Currently: No mechanism to push data from Redshift to S3</li>
+</ul>
+<p>→ <strong>Common Thread Across All Problems:</strong></p>
+<ul>
+<li>Extracting large result sets from Redshift to S3</li>
+<li>Manual methods don't scale beyond a few thousand rows</li>
+<li>Different teams need different formats (CSV, Parquet)</li>
+<li>Some need partitioned output, some need single files</li>
+<li>All need automation — not manual analyst effort</li>
+</ul>
+<p>→ The data engineering lead says: "We need the reverse of COPY — a way to parallel-export query results from Redshift to S3"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand why naive export methods fail</p>
+<table><thead><tr><th>Method</th><th>Mechanism</th><th>Limit</th><th>Problem</th></tr></thead><tbody><tr><td>Query Editor copy-paste</td><td>Browser clipboard</td><td>~100K rows</td><td>Browser crashes on large results</td></tr><tr><td>Application SELECT → write to file → upload S3</td><td>Single connection, row-by-row</td><td>~1M rows</td><td>Memory exhaustion, hours of runtime</td></tr><tr><td>JDBC fetch → Python script → S3 upload</td><td>Single thread pull</td><td>~5M rows</td><td>Extremely slow, single-threaded bottleneck</td></tr><tr><td><strong>UNLOAD command</strong></td><td><strong>All compute nodes write to S3 in PARALLEL</strong></td><td><strong>Billions of rows</strong></td><td><strong>None — purpose-built for this</strong></td></tr></tbody></table>
+<p>→ UNLOAD is the mirror image of COPY (Project 22):</p>
+<ul>
+<li>COPY: S3 → Parallel Read → Compute Nodes → Redshift Tables</li>
+<li>UNLOAD: Redshift Query → Compute Nodes → Parallel Write → S3</li>
+</ul>
+<p>→ Just as COPY leverages all compute nodes to READ from S3<br>
+→ UNLOAD leverages all compute nodes to WRITE to S3</p>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand UNLOAD architecture (how parallel writes work)</li>
+<li>Step 2 — Configure IAM Role for Redshift to WRITE to S3 (extends Project 22 role)</li>
+<li>Step 3 — Execute basic UNLOAD for each use case</li>
+<li>Step 4 — Configure format options (CSV, Parquet, JSON)</li>
+<li>Step 5 — Configure partitioning for data lake integration</li>
+<li>Step 6 — Configure compression and encryption</li>
+<li>Step 7 — Handle overwrite and append scenarios</li>
+<li>Step 8 — Verify output and integrate with downstream services</li>
+<li>Step 9 — Automate UNLOAD operations</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND UNLOAD ARCHITECTURE</h3>
+<p>→ When UNLOAD executes, this is what happens internally:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UNLOAD command received by Leader Node
+</span>       ↓
+Leader parses the embedded SELECT query
+       ↓
+Leader creates a distributed execution plan for the query
+       ↓
+Compute nodes execute the query in parallel
+  ├── Node 1: Processes its portion of the data
+  ├── Node 2: Processes its portion of the data
+  └── Node 3: Processes its portion of the data
+       ↓
+Each node's results are formatted (CSV/Parquet/JSON)
+       ↓
+Each node writes its results DIRECTLY to S3
+  ├── Node 1 → s3://bucket/prefix/0000_part_00
+  ├── Node 1 → s3://bucket/prefix/0001_part_00
+  ├── Node 2 → s3://bucket/prefix/0000_part_01
+  ├── Node 2 → s3://bucket/prefix/0001_part_01
+  └── Node 3 → s3://bucket/prefix/0000_part_02
+       ↓
+Leader confirms all writes complete
+       ↓
+UNLOAD returns success with row count</code></pre></div>
+<p>→ Key insight: Each compute node writes its own files to S3 simultaneously<br>
+→ A 4-node cluster writes 4+ files in parallel → massive throughput<br>
+→ Each slice within each node can write its own file → even more parallelism</p>
+<p><strong>Default output file naming:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://bucket/prefix/
+</span>  ├── 0000_part_00.csv       (Slice 0, Part 0)
+  ├── 0001_part_00.csv       (Slice 0, Part 1)
+  ├── 0000_part_01.csv       (Slice 1, Part 0)
+  ├── 0001_part_01.csv       (Slice 1, Part 1)
+  ├── 0000_part_02.csv       (Slice 2, Part 0)
+  └── 0001_part_02.csv       (Slice 2, Part 1)</code></pre></div>
+<p>→ File count = number of slices × number of parts per slice<br>
+→ Typical: 4-16 files for a small-medium cluster<br>
+→ You can control this with the PARALLEL parameter (Step 3)</p>
+<hr>
+<h3>STEP 2 — CONFIGURE IAM ROLE FOR S3 WRITE ACCESS</h3>
+<p>→ In Project 22, we created <code>Redshift-S3-ReadOnly-Role</code> with <code>s3:GetObject</code><br>
+→ For UNLOAD, Redshift needs WRITE permissions to S3</p>
+<p><strong>Option A: Extend existing role (Recommended)</strong><br>
+→ Navigate to IAM → Roles → <code>Redshift-S3-ReadOnly-Role</code><br>
+→ Rename to <code>Redshift-S3-ReadWrite-Role</code> (or create new policy on same role)</p>
+<p><strong>Add S3 Write Policy:</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>s3:PutObject</code>, <code>s3:GetBucketLocation</code>, <code>s3:ListBucket</code></td></tr><tr><td>Resource (objects)</td><td><code>arn:aws:s3:::shopnow-data-lake/exports/*</code>, <code>arn:aws:s3:::shopnow-data-lake/curated/*</code></td></tr><tr><td>Resource (bucket)</td><td><code>arn:aws:s3:::shopnow-data-lake</code></td></tr></tbody></table>
+<p>→ Why separate prefixes?</p>
+<ul>
+<li><code>/exports/</code> — for team-specific exports (marketing CSV, finance archives)</li>
+<li><code>/curated/</code> — for data lake curated layer (query results that become data lake tables)</li>
+<li>Never give Redshift write access to <code>/raw/</code> or <code>/transformed/</code> — those are managed by Glue (Project 21)</li>
+</ul>
+<p><strong>Option B: Separate role for UNLOAD</strong><br>
+→ Some organizations prefer separate roles for read vs write<br>
+→ Create <code>Redshift-S3-Export-Role</code> with only write permissions<br>
+→ Associate BOTH roles with the Redshift cluster (up to 10 roles per cluster — Project 22 Step 3)<br>
+→ Specify the export role in the UNLOAD command</p>
+<p><strong>Additional permission for encrypted exports (KMS):</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td></tr><tr><td>Action</td><td><code>kms:GenerateDataKey</code>, <code>kms:Encrypt</code></td></tr><tr><td>Resource</td><td><code>arn:aws:kms:ap-south-1:123456789012:key/your-kms-key-id</code></td></tr></tbody></table>
+<p>→ Required only if using SSE-KMS encryption on exported files (Step 6)<br>
+→ KMS deep dive in Project 36</p>
+<hr>
+<h3>STEP 3 — SOLVE PROBLEM 1: MARKETING CSV EXPORT</h3>
+<p>→ Marketing needs: Customer segmentation results as CSV in S3</p>
+<p><strong>UNLOAD Configuration:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>SELECT query</td><td>Complex segmentation query joining orders + customers</td><td>The query whose results we're exporting</td></tr><tr><td>S3 destination</td><td><code>'s3://shopnow-data-lake/exports/marketing/customer-segments/2025-01-15/'</code></td><td>Target S3 path</td></tr><tr><td>IAM Role</td><td><code>'arn:aws:iam::123456789012:role/Redshift-S3-ReadWrite-Role'</code></td><td>Or <code>default</code></td></tr><tr><td>FORMAT</td><td>CSV</td><td>Marketing needs CSV for external platform</td></tr><tr><td>HEADER</td><td>—</td><td>Include column names as first row</td></tr><tr><td>DELIMITER</td><td><code>','</code></td><td>Standard comma delimiter</td></tr><tr><td>PARALLEL</td><td>OFF</td><td>Single file output (marketing needs one file, not 8)</td></tr><tr><td>ALLOWOVERWRITE</td><td>—</td><td>Overwrite if file exists from previous run</td></tr></tbody></table>
+<hr>
+<p><strong>Understanding PARALLEL ON vs OFF:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th><th>Output Files</th><th>Speed</th><th>Use Case</th></tr></thead><tbody><tr><td>PARALLEL ON (default)</td><td>Each slice writes its own file</td><td>Multiple files (4-16+)</td><td>Fastest</td><td>Data lake integration, Athena, Glue</td></tr><tr><td>PARALLEL OFF</td><td>All results funneled through leader → single file</td><td>1 file</td><td>Slower</td><td>External sharing, human-readable exports</td></tr></tbody></table>
+<p>→ PARALLEL OFF tradeoffs:</p>
+<ul>
+<li>Single file is convenient for sharing</li>
+<li>But ALL data routes through the Leader Node → bottleneck</li>
+<li>For 2 million rows → acceptable (minutes)</li>
+<li>For 50 million rows → very slow (use PARALLEL ON instead)</li>
+</ul>
+<p>→ Marketing export (2M rows): <strong>PARALLEL OFF</strong> → single CSV file for easy sharing<br>
+→ Data science export (50M rows): <strong>PARALLEL ON</strong> → fast export, multiple files</p>
+<hr>
+<p><strong>Output in S3 after UNLOAD (PARALLEL OFF):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/exports/marketing/customer-segments/2025-01-15/
+</span>  └── 000.csv       (single file with all 2M rows)</code></pre></div>
+<p>→ File includes header row: <code>customer_id,customer_name,segment,lifetime_value,purchase_frequency,...</code><br>
+→ Marketing can share this S3 URL (with presigned URL or cross-account access — Project 39)</p>
+<hr>
+<h3>STEP 4 — SOLVE PROBLEM 2: FINANCE MONTHLY ARCHIVE</h3>
+<p>→ Finance needs: Monthly revenue aggregations as compressed CSV, retained for 7 years</p>
+<p><strong>UNLOAD Configuration:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>SELECT query</td><td>Monthly aggregation: SUM revenue GROUP BY region, category, payment_method, month</td><td>Aggregated results</td></tr><tr><td>S3 destination</td><td><code>'s3://shopnow-data-lake/exports/finance/monthly-revenue/2025/01/'</code></td><td>Year/month organized path</td></tr><tr><td>FORMAT</td><td>CSV</td><td>Finance team uses Excel/Google Sheets</td></tr><tr><td>HEADER</td><td>—</td><td>Include headers</td></tr><tr><td>DELIMITER</td><td><code>','</code></td><td>Standard CSV</td></tr><tr><td>PARALLEL</td><td>OFF</td><td>Single file per month (small result set — ~1000 rows)</td></tr><tr><td>ALLOWOVERWRITE</td><td>—</td><td>Rerun if corrections needed</td></tr><tr><td>GZIP</td><td>—</td><td>Compress output for storage efficiency</td></tr><tr><td>ENCRYPTED</td><td>—</td><td>Server-side encryption (SSE-S3 or SSE-KMS)</td></tr></tbody></table>
+<p><strong>Output in S3:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/exports/finance/monthly-revenue/2025/01/
+</span>  └── 000.csv.gz       (compressed single file)</code></pre></div>
+<p>→ For 7-year retention → configure S3 Lifecycle Policy (Project 12 concept):</p>
+<ul>
+<li>0-90 days: S3 Standard (active access)</li>
+<li>90-365 days: S3 Standard-IA (infrequent access)</li>
+<li>365+ days: S3 Glacier Instant Retrieval (archive)</li>
+<li>2555 days (7 years): Expire (delete)</li>
+</ul>
+<p>→ This lifecycle policy on the <code>/exports/finance/</code> prefix ensures compliance WITHOUT manual management</p>
+<hr>
+<h3>STEP 5 — SOLVE PROBLEM 3: DATA SCIENCE PARQUET EXPORT</h3>
+<p>→ Data science needs: 50M rows of feature-engineered data in Parquet format</p>
+<p><strong>UNLOAD Configuration:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>SELECT query</td><td>Complex feature engineering: window functions, rolling averages, ranks across 50M rows</td><td>ML training features</td></tr><tr><td>S3 destination</td><td><code>'s3://shopnow-data-lake/exports/datascience/customer-features/v3/'</code></td><td>Versioned path</td></tr><tr><td>FORMAT</td><td>PARQUET</td><td>SageMaker and Spark read Parquet natively</td></tr><tr><td>PARALLEL</td><td>ON</td><td>50M rows — need maximum parallelism</td></tr><tr><td>ALLOWOVERWRITE</td><td>—</td><td>Rerun with updated features</td></tr><tr><td>MAXFILESIZE</td><td><code>256 MB</code></td><td>Control individual file size</td></tr></tbody></table>
+<p>→ Why Parquet for data science?</p>
+<ul>
+<li>SageMaker reads Parquet natively from S3</li>
+<li>Columnar format — training pipeline may only need subset of 30 features</li>
+<li>Compressed — 50M rows × 30 columns as CSV = ~15 GB → Parquet = ~3 GB</li>
+<li>Schema embedded — no need for separate schema file</li>
+</ul>
+<p><strong>Output in S3 (PARALLEL ON):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/exports/datascience/customer-features/v3/
+</span>  ├── 0000_part_00.parquet
+  ├── 0001_part_00.parquet
+  ├── 0000_part_01.parquet
+  ├── 0001_part_01.parquet
+  ├── 0000_part_02.parquet
+  ├── 0001_part_02.parquet
+  ├── 0000_part_03.parquet
+  └── 0001_part_03.parquet    (8 files, ~375 MB each)</code></pre></div>
+<p>→ SageMaker training job reads all 8 files in parallel → fast data loading for training</p>
+<hr>
+<p><strong>Understanding MAXFILESIZE:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>Not specified</td><td>Default ~6.2 GB max per file</td><td>Large exports</td></tr><tr><td><code>256 MB</code></td><td>Each file capped at 256 MB</td><td>Optimal for Athena (Project 18 guidance: 64-256 MB)</td></tr><tr><td><code>64 MB</code></td><td>Each file capped at 64 MB</td><td>Many small files — more parallelism for downstream</td></tr><tr><td><code>1 GB</code></td><td>Each file capped at 1 GB</td><td>Fewer files, less S3 LIST overhead</td></tr></tbody></table>
+<p>→ For data lake integration (Athena/Glue downstream): <strong>256 MB</strong> is optimal<br>
+→ For external sharing: Not relevant — PARALLEL OFF creates single file<br>
+→ MAXFILESIZE only applies when PARALLEL is ON</p>
+<hr>
+<h3>STEP 6 — SOLVE PROBLEM 4: CURATED DATA LAKE LAYER</h3>
+<p>→ Data engineering needs: Redshift-computed aggregations written back to S3 data lake as curated layer</p>
+<p><strong>UNLOAD Configuration for Daily Revenue Summary:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>SELECT query</td><td>Daily revenue by category, region, customer segment</td><td>Curated aggregation</td></tr><tr><td>S3 destination</td><td><code>'s3://shopnow-data-lake/curated/daily-revenue-summary/'</code></td><td>Curated zone</td></tr><tr><td>FORMAT</td><td>PARQUET</td><td>Data lake standard format (Project 21)</td></tr><tr><td>PARALLEL</td><td>ON</td><td>Multiple files for Athena parallelism</td></tr><tr><td>MAXFILESIZE</td><td><code>128 MB</code></td><td>Optimal for Athena</td></tr><tr><td>PARTITION BY</td><td>(<code>year</code>, <code>month</code>)</td><td>Hive-style partitioned output</td></tr><tr><td>ALLOWOVERWRITE</td><td>—</td><td>Rerun for corrections</td></tr></tbody></table>
+<hr>
+<p><strong>PARTITION BY — The Power Feature for Data Lake Integration:</strong></p>
+<p>→ UNLOAD can create Hive-style partitioned output — just like Glue ETL (Project 21)</p>
+<p>→ When PARTITION BY (<code>year</code>, <code>month</code>) is specified:</p>
+<p><strong>Output in S3:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>s3://shopnow-data-lake/curated/daily-revenue-summary/
+</span>  ├── year=2024/
+  │     ├── month=01/
+  │     │     ├── 0000_part_00.parquet
+  │     │     └── 0001_part_00.parquet
+  │     ├── month=02/
+  │     │     ├── 0000_part_00.parquet
+  │     │     └── 0001_part_00.parquet
+  │     └── ...
+  ├── year=2025/
+  │     ├── month=01/
+  │     │     ├── 0000_part_00.parquet
+  │     │     └── 0001_part_00.parquet
+  │     └── ...
+  └── ...</code></pre></div>
+<p>→ This output is DIRECTLY queryable by Athena (Project 18)<br>
+→ Run a Glue Crawler (Project 17) on this path → Catalog table is created with partitions<br>
+→ Athena queries with <code>WHERE year = 2025 AND month = 1</code> → partition pruning works</p>
+<p><strong>PARTITION BY rules:</strong></p>
+<table><thead><tr><th>Rule</th><th>Details</th></tr></thead><tbody><tr><td>Partition columns must be in the SELECT query</td><td>They are extracted from the result set</td></tr><tr><td>Partition columns are NOT included in the Parquet file data</td><td>They exist only in the S3 path</td></tr><tr><td>Column order matters</td><td>PARTITION BY (year, month) → <code>year=X/month=Y/</code> path nesting</td></tr><tr><td>Maximum partition columns</td><td>No hard limit — but keep to 2-3 for manageability</td></tr><tr><td>Partition values with special characters</td><td>URL-encoded automatically</td></tr><tr><td>NULL partition values</td><td>Creates <code>year=__HIVE_DEFAULT_PARTITION__/</code> (avoid — filter NULLs in query)</td></tr></tbody></table>
+<p>→ PARTITION BY + Parquet format + UNLOAD = Redshift becomes a data lake WRITER<br>
+→ This completes the bidirectional flow:</p>
+<ul>
+<li>S3 → COPY → Redshift (Project 22)</li>
+<li>Redshift → UNLOAD → S3 (this project)</li>
+</ul>
+<hr>
+<h3>STEP 7 — COMPRESSION OPTIONS</h3>
+<table><thead><tr><th>Parameter</th><th>Output</th><th>Compression</th><th>Compatible With</th></tr></thead><tbody><tr><td>(none)</td><td>Uncompressed</td><td>1x</td><td>Everything</td></tr><tr><td>GZIP</td><td><code>.gz</code> extension added</td><td>~5-8x</td><td>CSV, JSON — Athena reads .gz natively</td></tr><tr><td>BZIP2</td><td><code>.bz2</code> extension added</td><td>~8-10x</td><td>CSV — slower but smaller</td></tr><tr><td>ZSTD</td><td><code>.zst</code> extension added</td><td>~5-7x</td><td>CSV — fast and compact</td></tr><tr><td>PARQUET (Snappy built-in)</td><td><code>.parquet</code> with Snappy</td><td>~3-5x</td><td>Parquet format always uses Snappy compression internally</td></tr></tbody></table>
+<p><strong>Decision matrix:</strong></p>
+<table><thead><tr><th>Export Purpose</th><th>Format</th><th>Compression</th><th>Rationale</th></tr></thead><tbody><tr><td>External partner (human-readable)</td><td>CSV</td><td>GZIP</td><td>Small files, universally readable</td></tr><tr><td>Long-term archive</td><td>CSV</td><td>GZIP or BZIP2</td><td>Maximum compression for storage savings</td></tr><tr><td>Data lake / Athena</td><td>Parquet</td><td>Built-in Snappy</td><td>Columnar + compressed — optimal for analytics</td></tr><tr><td>Data science / ML</td><td>Parquet</td><td>Built-in Snappy</td><td>Native format for Spark, SageMaker</td></tr><tr><td>Quick debugging / inspection</td><td>CSV</td><td>None</td><td>Human-readable without decompression</td></tr></tbody></table>
+<p>→ For Parquet format → compression is NOT a separate parameter<br>
+→ Parquet UNLOAD always uses Snappy compression internally<br>
+→ You cannot choose GZIP compression with Parquet output in UNLOAD</p>
+<hr>
+<h3>STEP 8 — ENCRYPTION OPTIONS</h3>
+<p>→ Connects to Project 36 (KMS) — but basic settings are configurable now</p>
+<p><strong>Option 1: SSE-S3 (Default — Amazon S3 Managed Keys)</strong><br>
+→ If the destination S3 bucket has default encryption enabled (Project 1 — Step 7)<br>
+→ UNLOAD files are automatically encrypted with SSE-S3<br>
+→ No additional UNLOAD parameter needed</p>
+<p><strong>Option 2: SSE-KMS (AWS KMS Managed Keys)</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>KMS_KEY_ID</td><td><code>'arn:aws:kms:ap-south-1:123456789012:key/your-key-id'</code></td><td>Specific KMS key for encryption</td></tr></tbody></table>
+<p>→ Requires IAM Role to have <code>kms:GenerateDataKey</code> permission (Step 2)<br>
+→ Provides audit trail via CloudTrail — who decrypted which files<br>
+→ Required for compliance-sensitive exports (finance archives)</p>
+<p><strong>Option 3: Client-Side Encryption (CSE)</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>ENCRYPTED</td><td>—</td><td>Enable client-side encryption</td></tr><tr><td>MASTER_SYMMETRIC_KEY</td><td><code>'base64-encoded-key'</code></td><td>Your own encryption key</td></tr></tbody></table>
+<p>→ Redshift encrypts data BEFORE sending to S3<br>
+→ S3 receives already-encrypted data<br>
+→ Only someone with the master key can decrypt<br>
+→ Rarely used — SSE-KMS is preferred for most use cases</p>
+<p><strong>ShopNow encryption decisions:</strong></p>
+<table><thead><tr><th>Export</th><th>Encryption</th><th>Why</th></tr></thead><tbody><tr><td>Marketing segments</td><td>SSE-S3</td><td>Standard protection — data is not ultra-sensitive</td></tr><tr><td>Finance archives</td><td>SSE-KMS</td><td>Compliance requires audit trail on data access</td></tr><tr><td>Data science features</td><td>SSE-S3</td><td>Internal use, standard protection</td></tr><tr><td>Curated data lake</td><td>SSE-KMS</td><td>Central data lake policy requires KMS</td></tr></tbody></table>
+<hr>
+<h3>STEP 9 — HANDLE OVERWRITE AND APPEND SCENARIOS</h3>
+<p>→ Critical: By default, UNLOAD REFUSES to write to a path that already contains files</p>
+<p><strong>ALLOWOVERWRITE Parameter:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th></tr></thead><tbody><tr><td>Without ALLOWOVERWRITE</td><td>UNLOAD fails if ANY file exists at the target path</td></tr><tr><td>With ALLOWOVERWRITE</td><td>UNLOAD overwrites existing files with same names</td></tr></tbody></table>
+<p>→ Important nuance: ALLOWOVERWRITE overwrites files with matching names<br>
+→ If previous run created files <code>0000_part_00</code> through <code>0007_part_03</code> (8 files)<br>
+→ And new run creates only <code>0000_part_00</code> through <code>0003_part_01</code> (4 files)<br>
+→ Files <code>0004_part_02</code> through <code>0007_part_03</code> from the PREVIOUS run STILL EXIST<br>
+→ You now have STALE data mixed with fresh data</p>
+<p><strong>Safe overwrite pattern:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Delete all existing files in the target path
+</span>Step 2: Run UNLOAD with ALLOWOVERWRITE
+Step 3: Verify output</code></pre></div>
+<p>→ Or use date-based paths that are unique per run:</p>
+<ul>
+<li><code>s3://bucket/exports/marketing/segments/run_date=2025-01-15/</code></li>
+<li>Each run writes to a new path → no overwrite concern</li>
+<li>Old runs are preserved for comparison/audit</li>
+</ul>
+<p><strong>CLEANPATH Parameter (Newer Redshift versions):</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th></tr></thead><tbody><tr><td>CLEANPATH</td><td>Deletes ALL existing files in the target path BEFORE writing</td></tr></tbody></table>
+<p>→ This is the safest option for "replace all" semantics<br>
+→ Atomically cleans old files and writes new ones<br>
+→ Preferred over manual delete + ALLOWOVERWRITE</p>
+<p><strong>Append pattern (adding to existing data):</strong><br>
+→ Use different prefixes per run:</p>
+<ul>
+<li>Run 1: <code>s3://bucket/curated/daily-summary/run=2025-01-15/</code></li>
+<li>Run 2: <code>s3://bucket/curated/daily-summary/run=2025-01-16/</code><br>
+→ Downstream consumers (Athena, Glue) read ALL prefixes as a single dataset</li>
+</ul>
+<hr>
+<h3>STEP 10 — ADDITIONAL UNLOAD PARAMETERS</h3>
+<p><strong>ADDQUOTES:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>Without ADDQUOTES</td><td>Values written as-is</td><td>Simple data without commas in values</td></tr><tr><td>With ADDQUOTES</td><td>All values wrapped in double quotes</td><td>Data containing commas, newlines, or special characters</td></tr></tbody></table>
+<p>→ For CSV exports with text fields → ALWAYS use ADDQUOTES<br>
+→ A customer name like <code>Smith, John</code> without quotes breaks CSV parsing</p>
+<p><strong>NULL AS:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th></tr></thead><tbody><tr><td>Default</td><td>NULL values exported as empty string</td></tr><tr><td>NULL AS <code>'\\N'</code></td><td>NULL values exported as <code>\N</code> (Hive convention)</td></tr><tr><td>NULL AS <code>'NULL'</code></td><td>NULL values exported as literal text <code>NULL</code></td></tr></tbody></table>
+<p>→ For data lake integration → NULL AS <code>''</code> (empty string) is standard<br>
+→ For external systems → depends on the receiving system's expectations</p>
+<p><strong>ESCAPE:</strong></p>
+<table><thead><tr><th>Setting</th><th>Behavior</th></tr></thead><tbody><tr><td>Without ESCAPE</td><td>Special characters written as-is</td></tr><tr><td>With ESCAPE</td><td>Backslash placed before special characters (newline, tab, backslash)</td></tr></tbody></table>
+<p>→ For CSV with text fields that may contain newlines → use ESCAPE</p>
+<p><strong>FORMAT AS JSON:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>FORMAT</td><td>JSON</td><td>Each row becomes a JSON object</td></tr></tbody></table>
+<p>→ Output example: <code>{"customer_id": "CUST-1234", "segment": "high_value", "lifetime_value": 5678.90}</code><br>
+→ One JSON object per line (JSON Lines format)<br>
+→ Useful for APIs or systems that consume JSON</p>
+<p><strong>Complete Parameter Reference:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Applies To</th><th>Purpose</th></tr></thead><tbody><tr><td>FORMAT CSV</td><td>CSV output</td><td>Comma-separated format</td></tr><tr><td>FORMAT PARQUET</td><td>Parquet output</td><td>Columnar binary format</td></tr><tr><td>FORMAT JSON</td><td>JSON output</td><td>JSON Lines format</td></tr><tr><td>HEADER</td><td>CSV only</td><td>Include column names in first row</td></tr><tr><td>DELIMITER</td><td>CSV only</td><td>Custom delimiter (default pipe `</td></tr><tr><td>PARALLEL ON/OFF</td><td>All formats</td><td>Multi-file vs single-file output</td></tr><tr><td>MAXFILESIZE</td><td>PARALLEL ON only</td><td>Maximum file size per output file</td></tr><tr><td>PARTITION BY</td><td>All formats</td><td>Hive-style partitioned output</td></tr><tr><td>ALLOWOVERWRITE</td><td>All formats</td><td>Allow writing to existing path</td></tr><tr><td>CLEANPATH</td><td>All formats</td><td>Delete existing files before writing</td></tr><tr><td>GZIP/BZIP2/ZSTD</td><td>CSV/JSON only</td><td>Compression</td></tr><tr><td>ADDQUOTES</td><td>CSV only</td><td>Quote all values</td></tr><tr><td>ESCAPE</td><td>CSV only</td><td>Escape special characters</td></tr><tr><td>NULL AS</td><td>CSV only</td><td>Custom NULL representation</td></tr><tr><td>ENCRYPTED</td><td>All formats</td><td>Enable encryption</td></tr><tr><td>KMS_KEY_ID</td><td>All formats</td><td>Specify KMS key for SSE-KMS</td></tr><tr><td>MANIFEST</td><td>All formats</td><td>Generate manifest file listing output files</td></tr><tr><td>REGION</td><td>All formats</td><td>S3 bucket region (if different from Redshift)</td></tr></tbody></table>
+<hr>
+<h3>STEP 11 — MANIFEST FILE GENERATION</h3>
+<p>→ UNLOAD can generate a manifest file listing all output files</p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>MANIFEST</td><td>—</td><td>Generate manifest JSON file</td></tr><tr><td>MANIFEST VERBOSE</td><td>—</td><td>Generate manifest with file sizes and row counts</td></tr></tbody></table>
+<p><strong>Manifest output (standard):</strong></p>
+<p>→ File: <code>s3://bucket/prefix/manifest</code></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td><code>entries[].url</code></td><td>S3 path of each output file</td></tr></tbody></table>
+<p><strong>Manifest output (VERBOSE):</strong></p>
+<p>→ File: <code>s3://bucket/prefix/manifest</code></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td><code>entries[].url</code></td><td>S3 path of each output file</td></tr><tr><td><code>entries[].meta.content_length</code></td><td>File size in bytes</td></tr><tr><td><code>entries[].meta.record_count</code></td><td>Number of rows in the file</td></tr><tr><td><code>author.name</code></td><td><code>Amazon Redshift</code></td></tr><tr><td><code>author.query_id</code></td><td>Query ID of the UNLOAD command</td></tr></tbody></table>
+<p>→ Why manifests matter:</p>
+<ul>
+<li>COPY command (Project 22) can use this manifest to load data into ANOTHER Redshift cluster</li>
+<li>Automation scripts can verify all files were created successfully</li>
+<li>Audit trail — which files were produced by which UNLOAD</li>
+<li>The <code>record_count</code> in verbose manifest enables row count validation without reading files</li>
+</ul>
+<p><strong>Use case: Redshift Cluster A → UNLOAD → S3 → COPY with MANIFEST → Redshift Cluster B</strong><br>
+→ Data replication between Redshift clusters using S3 as intermediate storage<br>
+→ Manifest ensures exact same files are loaded that were unloaded</p>
+<hr>
+<h3>STEP 12 — VERIFY OUTPUT AND INTEGRATE DOWNSTREAM</h3>
+<hr>
+<p><strong>Verification Checklist:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th><th>Expected</th></tr></thead><tbody><tr><td>Files exist in S3?</td><td>S3 Console → navigate to target path</td><td>Files present with expected naming</td></tr><tr><td>File count correct?</td><td>Count files in S3 prefix</td><td>Matches slice count (PARALLEL ON) or 1 (PARALLEL OFF)</td></tr><tr><td>File format correct?</td><td>Check extensions</td><td><code>.csv</code>, <code>.csv.gz</code>, <code>.parquet</code> as configured</td></tr><tr><td>Total row count correct?</td><td>For CSV: count lines across all files; For Parquet: use manifest VERBOSE</td><td>Matches SELECT count</td></tr><tr><td>Sample data correct?</td><td>Download one file → inspect content</td><td>Data matches query results</td></tr><tr><td>Partition structure correct?</td><td>S3 path structure</td><td><code>key=value/</code> directories present</td></tr><tr><td>Compression working?</td><td>Compare file size vs expected uncompressed size</td><td>Significant size reduction</td></tr><tr><td>Encryption applied?</td><td>S3 Console → file properties → Server-side encryption</td><td>Shows SSE-S3 or SSE-KMS</td></tr><tr><td>Manifest generated?</td><td>Check for <code>manifest</code> file in target path</td><td>Present with correct file listing</td></tr></tbody></table>
+<hr>
+<p><strong>Downstream Integration for Each Use Case:</strong></p>
+<p><strong>Marketing CSV → External Platform:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UNLOAD (CSV, PARALLEL OFF)
+</span>  ↓
+Single file in S3: exports/marketing/segments/2025-01-15/000.csv.gz
+  ↓
+Generate S3 presigned URL (temporary access link)
+  ↓
+Share URL with advertising platform
+  ↓
+URL expires after configured duration (1 hour - 7 days)</code></pre></div>
+<p><strong>Finance Archive → Long-Term Storage:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UNLOAD (CSV, GZIP, SSE-KMS)
+</span>  ↓
+Files in S3: exports/finance/monthly-revenue/2025/01/000.csv.gz
+  ↓
+S3 Lifecycle Policy transitions to Glacier after 1 year (Project 12)
+  ↓
+Retained for 7 years → auto-deleted
+  ↓
+If audit required → restore from Glacier → decrypt with KMS</code></pre></div>
+<p><strong>Data Science → ML Training:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UNLOAD (Parquet, PARALLEL ON)
+</span>  ↓
+Files in S3: exports/datascience/customer-features/v3/*.parquet
+  ↓
+SageMaker training job reads Parquet files from S3 path
+  ↓
+Training completes → model artifacts stored in S3</code></pre></div>
+<p><strong>Curated Data Lake → Athena Access:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UNLOAD (Parquet, PARTITION BY year/month, PARALLEL ON)
+</span>  ↓
+Partitioned files in S3: curated/daily-revenue-summary/year=2025/month=01/*.parquet
+  ↓
+Glue Crawler (Project 17) crawls curated/ path
+  ↓
+Catalog table created: shopnow_curated_db.daily_revenue_summary
+  ↓
+Athena (Project 18) queries curated table with partition pruning
+  ↓
+Analysts who don't have Redshift access can query via Athena</code></pre></div>
+<p>→ This last pattern is extremely powerful:</p>
+<ul>
+<li>Complex computations happen in Redshift (optimized for joins/aggregations)</li>
+<li>Results are materialized to S3 in optimized format</li>
+<li>Broader team queries results via Athena (no Redshift license/access needed)</li>
+<li>Reduces Redshift cluster load (fewer concurrent queries)</li>
+</ul>
+<hr>
+<h3>STEP 13 — AUTOMATE UNLOAD OPERATIONS</h3>
+<p><strong>Option A: Redshift Scheduled Query</strong><br>
+→ Navigate to Redshift Query Editor V2 → Create Scheduled Query</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Query name</td><td><code>daily-curated-revenue-export</code></td></tr><tr><td>Schedule</td><td>Daily at 05:00 UTC (after COPY completes at 04:00)</td></tr><tr><td>SQL</td><td>UNLOAD command with dynamic date in S3 path</td></tr><tr><td>IAM Role</td><td>Redshift scheduler role</td></tr><tr><td>Notification</td><td>SNS topic on failure (Project 6)</td></tr></tbody></table>
+<p>→ Challenge: Dynamic dates in S3 paths require SQL date functions<br>
+→ Example path: <code>'s3://bucket/curated/daily-summary/' || TO_CHAR(CURRENT_DATE, 'YYYY/MM/DD') || '/'</code></p>
+<p><strong>Option B: EventBridge → Lambda → Redshift Data API</strong><br>
+→ EventBridge (Project 38) triggers Lambda (Project 26) which calls Redshift Data API<br>
+→ Lambda can construct dynamic S3 paths easily<br>
+→ Explored in detail in Project 34</p>
+<p><strong>Option C: Step Functions Orchestration (Project 32)</strong><br>
+→ Full pipeline: Glue ETL → COPY → UNLOAD → Crawler → SNS notification<br>
+→ Each step has error handling and retry logic<br>
+→ Explored in Project 32 and Project 49</p>
+<p><strong>Option D: Glue Workflow (Project 31)</strong><br>
+→ Not directly applicable — Glue Workflows orchestrate Glue jobs, not Redshift queries<br>
+→ But can trigger Lambda step which executes UNLOAD via Redshift Data API</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use UNLOAD for exporting large result sets — never manual copy-paste or row-by-row fetch<br>
+→ Always use PARQUET format for data lake integration — columnar, compressed, schema-embedded<br>
+→ Always use CSV format for external sharing with non-technical consumers<br>
+→ Always use PARTITION BY for data lake curated layer — enables Athena partition pruning<br>
+→ Always use MANIFEST VERBOSE for production exports — enables validation and auditability<br>
+→ Always use CLEANPATH (or manual delete) before overwriting — prevents stale file contamination<br>
+→ Always use ADDQUOTES and ESCAPE for CSV with text fields — prevents parsing errors<br>
+→ Always use date-based or version-based paths — enables historical comparison and rollback<br>
+→ Always encrypt sensitive exports with SSE-KMS — especially finance and PII data<br>
+→ Always verify row counts after UNLOAD — compare with source query count<br>
+→ Always set MAXFILESIZE to 128-256 MB for data lake exports — optimal for Athena<br>
+→ Always run Glue Crawler on UNLOAD output paths to register in catalog<br>
+→ Always align UNLOAD schedule AFTER COPY/ETL completes — ensure data is fresh</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use PARALLEL OFF for large exports (&gt; 5M rows) — leader node becomes bottleneck<br>
+→ Never forget ALLOWOVERWRITE or CLEANPATH — UNLOAD fails silently on existing paths<br>
+→ Never use UNLOAD without checking the output — verify file count, size, and content<br>
+→ Never export Parquet with GZIP parameter — Parquet has built-in Snappy; external compression not supported<br>
+→ Never export to a path that mixes files from different queries — downstream consumers read ALL files<br>
+→ Never skip MANIFEST for production exports — you lose auditability<br>
+→ Never use UNLOAD as a real-time data pipeline — it's batch-oriented; use Kinesis for streaming<br>
+→ Never give Redshift write access to raw/transformed S3 zones — UNLOAD should only write to exports/curated<br>
+→ Never hardcode dates in UNLOAD paths for scheduled queries — use date functions for dynamic paths<br>
+→ Never ignore file count in PARALLEL ON mode — too many tiny files degrades downstream performance<br>
+→ Never UNLOAD during peak query hours without resource management — UNLOAD consumes WLM queue slots</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE UNLOAD</h2>
+<table><thead><tr><th>Scenario</th><th>Use UNLOAD?</th><th>Why</th></tr></thead><tbody><tr><td>Export large query results to S3</td><td>✅ Yes</td><td>Purpose-built for parallel export</td></tr><tr><td>Feed curated data back to data lake</td><td>✅ Yes</td><td>PARTITION BY creates Athena-ready output</td></tr><tr><td>Create ML training datasets</td><td>✅ Yes</td><td>Parquet format optimal for SageMaker/Spark</td></tr><tr><td>Archive historical aggregations</td><td>✅ Yes</td><td>Long-term S3 storage cheaper than Redshift retention</td></tr><tr><td>Share results with external partners</td><td>✅ Yes</td><td>CSV format universally readable</td></tr><tr><td>Replicate data between Redshift clusters</td><td>✅ Yes</td><td>UNLOAD → S3 → COPY pattern with MANIFEST</td></tr><tr><td>Export &lt; 100 rows for quick inspection</td><td>❌ No</td><td>Just use Query Editor → download results</td></tr><tr><td>Real-time data streaming to S3</td><td>❌ No</td><td>Use Kinesis Firehose</td></tr><tr><td>Continuous replication to S3</td><td>❌ No</td><td>Use Redshift Streaming Ingestion or CDC</td></tr><tr><td>Export to a database (not S3)</td><td>❌ No</td><td>Use Glue ETL with JDBC (Project 43)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE UNLOAD</h2>
+<p>→ When you need real-time continuous export → Use Kinesis Firehose or change data capture<br>
+→ When target is another database (not S3) → Use Glue ETL JDBC connection (Project 43)<br>
+→ When result set is tiny (&lt; 100 rows) → Download from Query Editor directly<br>
+→ When you want to query S3 data from Redshift WITHOUT loading → Use Spectrum (Project 28) — that's read, not write<br>
+→ When you need to export to formats not supported (Avro, ORC) → UNLOAD supports CSV, Parquet, JSON only → use Glue to convert after UNLOAD</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → UNLOAD EXECUTION ENGINE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>UNLOAD command parsed by Leader Node
+</span>       ↓
+Leader compiles the SELECT query into a distributed execution plan
+  (same as any regular query — same optimizer, same plan)
+       ↓
+Compute nodes execute the query:
+  ├── Table scans with zone map filtering (SORTKEY benefit)
+  ├── Joins with co-located data (DISTKEY benefit)
+  ├── Aggregations distributed across nodes
+  └── Window functions computed in parallel
+       ↓
+Query results exist in memory on each compute node
+  (Each node holds a PORTION of the result set)
+       ↓
+FORMATTING PHASE:
+  ├── CSV: Convert each row to delimited text
+  │     ├── Apply DELIMITER
+  │     ├── Apply ADDQUOTES
+  │     ├── Apply ESCAPE
+  │     ├── Apply NULL AS
+  │     └── Apply HEADER (first file only)
+  │
+  ├── PARQUET: Convert columnar result into Parquet format
+  │     ├── Organize by column
+  │     ├── Apply Snappy compression per column chunk
+  │     ├── Compute column statistics (min/max/null_count)
+  │     └── Write file footer with schema
+  │
+  └── JSON: Convert each row to JSON object
+        ├── Key names from column names
+        └── One JSON object per line
+       ↓
+WRITING PHASE:
+  ├── PARALLEL ON:
+  │     ├── Each slice opens S3 connection
+  │     ├── Each slice writes its portion directly
+  │     ├── File names: {sequence}_{part}_{slice}.{format}
+  │     └── All slices write simultaneously
+  │
+  └── PARALLEL OFF:
+        ├── All compute nodes send results to Leader Node
+        ├── Leader aggregates all results
+        ├── Leader writes single file to S3
+        └── Bottleneck: Leader node network/memory
+       ↓
+PARTITION BY (if specified):
+  ├── Before writing, each node groups its rows by partition values
+  ├── Each unique partition value combination gets a separate S3 "directory"
+  ├── Files within each partition follow the same PARALLEL rules
+  └── Partition columns are REMOVED from the file content (exist only in path)
+       ↓
+MANIFEST (if specified):
+  ├── Leader collects all output file paths from all nodes
+  ├── Creates manifest JSON file
+  ├── If VERBOSE: includes file sizes and row counts
+  └── Writes manifest to S3 at target path + /manifest
+       ↓
+Leader confirms all S3 writes completed
+       ↓
+Transaction committed → UNLOAD returns row count</code></pre></div>
+<hr>
+<h3>2 → PARALLEL ON: DEEP DIVE INTO FILE DISTRIBUTION</h3>
+<p>→ With a 4-slice cluster and a query returning 10 million rows:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Slice 0 holds ~2.5M rows of query result
+</span>Slice 1 holds ~2.5M rows of query result
+Slice 2 holds ~2.5M rows of query result
+Slice 3 holds ~2.5M rows of query result
+
+MAXFILESIZE = 256 MB
+
+Slice 0: 2.5M rows = ~600 MB → splits into 3 files (200 MB each)
+  ├── 0000_part_00 (200 MB)
+  ├── 0001_part_00 (200 MB)
+  └── 0002_part_00 (200 MB)
+
+Slice 1: 2.5M rows = ~600 MB → splits into 3 files
+  ├── 0000_part_01 (200 MB)
+  ├── 0001_part_01 (200 MB)
+  └── 0002_part_01 (200 MB)
+
+Slice 2: 2.5M rows = ~600 MB → splits into 3 files
+  ...
+
+Slice 3: 2.5M rows = ~600 MB → splits into 3 files
+  ...
+
+Total: 12 files × ~200 MB = ~2.4 GB
+All 12 files written SIMULTANEOUSLY</code></pre></div>
+<p>→ File naming convention: <code>{sequence_within_slice}_part_{slice_number}</code><br>
+→ Sequence resets for each slice<br>
+→ This naming is NOT configurable — Redshift controls it</p>
+<hr>
+<h3>3 → PARALLEL OFF: WHY IT'S SLOWER</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>All 4 slices execute query in parallel
+</span>  ├── Slice 0: 2.5M rows ready
+  ├── Slice 1: 2.5M rows ready
+  ├── Slice 2: 2.5M rows ready
+  └── Slice 3: 2.5M rows ready
+       ↓
+All results sent to Leader Node over cluster interconnect
+  (10M rows × ~240 bytes/row = ~2.4 GB of data transfer)
+       ↓
+Leader Node receives all data
+  (Must fit in Leader's memory — can be a constraint for very large results)
+       ↓
+Leader writes single file to S3
+  (Single S3 PutObject or multipart upload)
+  (Upload speed: ~100 MB/s for single stream)
+       ↓
+2.4 GB / 100 MB/s = ~24 seconds for S3 write alone
+  Plus: data transfer from compute to leader: ~10 seconds
+  Plus: formatting overhead: ~5 seconds
+  Total: ~40 seconds
+       ↓
+Compare to PARALLEL ON:
+  2.4 GB / 4 parallel streams / 100 MB/s = ~6 seconds for S3 write
+  No leader bottleneck
+  Total: ~10 seconds</code></pre></div>
+<p>→ PARALLEL OFF is 3-4x slower for this example<br>
+→ For 100M+ rows → PARALLEL OFF may run out of Leader memory → job fails<br>
+→ Rule: Use PARALLEL OFF only for small exports (&lt; 5M rows) where single file convenience matters</p>
+<hr>
+<h3>4 → PARTITION BY: INTERNAL ROUTING</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Query result row: {order_date: '2025-01-15', region: 'US-West', revenue: 5000}
+</span>
+PARTITION BY (year, month):
+  ├── Extract year = 2025
+  ├── Extract month = 01
+  └── Target path: s3://bucket/prefix/year=2025/month=01/
+
+Slice 0 processes its 2.5M rows:
+  ├── Group by (year, month)
+  │     ├── (2024, 12): 500K rows → write to year=2024/month=12/0000_part_00
+  │     ├── (2025, 01): 2M rows → write to year=2025/month=01/0000_part_00
+  │     └── ... other months
+  └── Each partition group gets its own output file(s)
+
+Slice 1 does the same independently:
+  ├── (2024, 12): 480K rows → write to year=2024/month=12/0000_part_01
+  ├── (2025, 01): 2.02M rows → write to year=2025/month=01/0000_part_01
+  └── ...
+
+Result: Each partition directory has one file per slice
+  year=2025/month=01/
+    ├── 0000_part_00 (from slice 0)
+    ├── 0000_part_01 (from slice 1)
+    ├── 0000_part_02 (from slice 2)
+    └── 0000_part_03 (from slice 3)</code></pre></div>
+<p>→ Partition routing happens WITHIN each compute node — no data redistribution between nodes<br>
+→ This is why partitioned UNLOAD is nearly as fast as non-partitioned</p>
+<hr>
+<h3>5 → UNLOAD vs COPY: SYMMETRIC ARCHITECTURE</h3>
+<table><thead><tr><th>Aspect</th><th>COPY (Project 22)</th><th>UNLOAD (This Project)</th></tr></thead><tbody><tr><td>Direction</td><td>S3 → Redshift</td><td>Redshift → S3</td></tr><tr><td>Parallelism</td><td>Each slice reads from S3</td><td>Each slice writes to S3</td></tr><tr><td>Leader role</td><td>Plans file distribution</td><td>Plans query execution</td></tr><tr><td>Compute role</td><td>Read + parse + distribute + sort</td><td>Query + format + write</td></tr><tr><td>IAM permissions</td><td><code>s3:GetObject</code></td><td><code>s3:PutObject</code></td></tr><tr><td>Format support</td><td>CSV, JSON, Parquet, Avro, ORC</td><td>CSV, JSON, Parquet</td></tr><tr><td>Compression</td><td>Decompresses on read</td><td>Compresses on write</td></tr><tr><td>Partitioning</td><td>Reads from partitioned paths</td><td>Writes to partitioned paths</td></tr><tr><td>Manifest</td><td>Reads manifest to identify files</td><td>Generates manifest listing output files</td></tr><tr><td>Error handling</td><td><code>stl_load_errors</code></td><td>Query errors (standard SQL errors)</td></tr><tr><td>Performance key</td><td>File count = multiple of slices</td><td>PARALLEL ON + MAXFILESIZE</td></tr></tbody></table>
+<p>→ They are designed as complementary operations<br>
+→ UNLOAD output can be directly COPY-loaded into another Redshift cluster<br>
+→ UNLOAD with MANIFEST → COPY with MANIFEST → guaranteed same files</p>
+<hr>
+<h3>6 → WLM (WORKLOAD MANAGEMENT) IMPACT</h3>
+<p>→ UNLOAD runs as a regular query within Redshift's WLM system<br>
+→ It consumes a WLM queue slot (just like any SELECT query)</p>
+<p><strong>WLM queue behavior:</strong></p>
+<table><thead><tr><th>Scenario</th><th>Impact</th></tr></thead><tbody><tr><td>UNLOAD on small result set</td><td>Minimal — completes quickly, releases slot</td></tr><tr><td>UNLOAD on huge result set (1B rows)</td><td>Long-running — holds WLM slot for duration</td></tr><tr><td>Multiple UNLOADs simultaneously</td><td>Each takes a slot — may exhaust queue capacity</td></tr><tr><td>UNLOAD during peak query hours</td><td>Competes with analyst queries for slots</td></tr></tbody></table>
+<p>→ Best practice: Create a dedicated WLM queue for UNLOAD operations</p>
+<table><thead><tr><th>WLM Queue</th><th>Concurrency</th><th>Memory %</th><th>Purpose</th></tr></thead><tbody><tr><td>Default</td><td>5</td><td>60%</td><td>Analyst ad-hoc queries</td></tr><tr><td>ETL</td><td>2</td><td>30%</td><td>COPY and UNLOAD operations</td></tr><tr><td>Superuser</td><td>1</td><td>10%</td><td>Administrative tasks</td></tr></tbody></table>
+<p>→ Assign UNLOAD queries to the ETL queue via query group or user group<br>
+→ This prevents UNLOAD from stealing resources from analyst queries</p>
+<p>→ WLM configuration: Redshift Console → Cluster → Properties → Parameter Group → WLM Configuration<br>
+→ From Project 16 — parameter groups were introduced; WLM is the most important parameter group setting</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>UNLOAD fails with "Target path not empty"</td><td>Error before any export starts</td><td>Existing files at target path, ALLOWOVERWRITE/CLEANPATH not specified</td><td>Add ALLOWOVERWRITE or CLEANPATH or use unique paths</td></tr><tr><td>2</td><td>Stale files mixed with fresh export</td><td>Downstream queries return duplicate/inconsistent data</td><td>ALLOWOVERWRITE only overwrites matching filenames — leftover files from previous runs remain</td><td>Use CLEANPATH instead, or delete path before UNLOAD</td></tr><tr><td>3</td><td>PARALLEL OFF runs out of memory</td><td>Leader node OOM error</td><td>Result set too large for Leader node memory</td><td>Use PARALLEL ON for large results</td></tr><tr><td>4</td><td>CSV files have wrong column order</td><td>Downstream parser misinterprets data</td><td>CSV column order follows SELECT column order — SELECT order changed</td><td>Always use HEADER and explicit column list in SELECT</td></tr><tr><td>5</td><td>Parquet UNLOAD with GZIP parameter fails</td><td>Error: incompatible parameters</td><td>Parquet format has built-in Snappy — external compression not supported</td><td>Remove GZIP parameter when using FORMAT PARQUET</td></tr><tr><td>6</td><td>Partitioned output has <code>__HIVE_DEFAULT_PARTITION__</code></td><td>Athena can't filter these partitions properly</td><td>NULL values in partition columns</td><td>Filter out NULLs in the SELECT query before UNLOAD</td></tr><tr><td>7</td><td>Export takes hours for moderate data</td><td>Extremely slow UNLOAD</td><td>Complex query with inefficient plan (bad joins, missing sort keys)</td><td>Optimize the SELECT query first — UNLOAD speed depends on query speed</td></tr><tr><td>8</td><td>Files are unexpectedly large</td><td>Each file &gt; 1 GB despite MAXFILESIZE setting</td><td>MAXFILESIZE only applies with PARALLEL ON — ignored with PARALLEL OFF</td><td>Use PARALLEL ON to control file sizes</td></tr><tr><td>9</td><td>Access denied writing to S3</td><td>IAM permission error</td><td>Role missing <code>s3:PutObject</code> or wrong resource ARN</td><td>Add write permissions to the Redshift IAM Role</td></tr><tr><td>10</td><td>KMS encryption fails</td><td>KMS error during UNLOAD</td><td>Role missing <code>kms:GenerateDataKey</code> permission</td><td>Add KMS permissions to Redshift IAM Role</td></tr><tr><td>11</td><td>Manifest file missing</td><td>Expected manifest not in S3</td><td>Forgot MANIFEST parameter</td><td>Add MANIFEST or MANIFEST VERBOSE to UNLOAD command</td></tr><tr><td>12</td><td>Athena can't read UNLOAD Parquet files</td><td>Schema mismatch or unsupported types</td><td>Redshift SUPER type or complex types not supported by Athena</td><td>Cast complex types to simple types in the SELECT query</td></tr><tr><td>13</td><td>Cross-region UNLOAD is slow and costly</td><td>High latency, data transfer charges</td><td>Redshift and target S3 bucket in different regions</td><td>Keep in same region or use REGION parameter</td></tr><tr><td>14</td><td>UNLOAD blocks analyst queries</td><td>Analysts complain about slow dashboards during export</td><td>UNLOAD consuming WLM slots and cluster resources</td><td>Schedule UNLOAD during off-peak hours or use dedicated WLM queue</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Export Volume Scaling</strong></p>
+<table><thead><tr><th>Result Set Size</th><th>PARALLEL</th><th>Format</th><th>Estimated Duration</th><th>Output Size</th></tr></thead><tbody><tr><td>100K rows</td><td>OFF</td><td>CSV</td><td>5-10 seconds</td><td>~50 MB</td></tr><tr><td>1M rows</td><td>OFF</td><td>CSV GZIP</td><td>15-30 seconds</td><td>~100 MB</td></tr><tr><td>10M rows</td><td>ON</td><td>Parquet</td><td>30-60 seconds</td><td>~500 MB</td></tr><tr><td>100M rows</td><td>ON</td><td>Parquet</td><td>3-8 minutes</td><td>~5 GB</td></tr><tr><td>1B rows</td><td>ON</td><td>Parquet</td><td>15-45 minutes</td><td>~50 GB</td></tr><tr><td>10B rows</td><td>ON</td><td>Parquet</td><td>1-3 hours</td><td>~500 GB</td></tr></tbody></table>
+<p>→ UNLOAD scales with cluster size — more compute nodes = faster export<br>
+→ PARALLEL ON scales linearly with slice count</p>
+<p>→ <strong>Multi-Export Scheduling</strong></p>
+<table><thead><tr><th>Approach</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Sequential UNLOADs</td><td>Simple, no resource contention</td><td>Slow total time</td></tr><tr><td>Parallel UNLOADs (different tables)</td><td>Fast total time</td><td>Consumes multiple WLM slots</td></tr><tr><td>Single UNLOAD with complex query</td><td>One operation</td><td>Complex query may be slower than separate simpler ones</td></tr></tbody></table>
+<p>→ For ShopNow's 4 exports:</p>
+<ul>
+<li>Run marketing and finance exports sequentially (both small)</li>
+<li>Run data science export separately (large, resource-intensive)</li>
+<li>Run curated layer export separately (medium, daily)</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Component</th><th>Cost Impact</th></tr></thead><tbody><tr><td>Redshift cluster time</td><td>Already running — UNLOAD uses existing capacity</td></tr><tr><td>S3 PUT requests</td><td>$0.005 per 1,000 requests — negligible</td></tr><tr><td>S3 storage</td><td>Depends on retention — lifecycle policies manage cost</td></tr><tr><td>S3 data transfer (same region)</td><td>Free</td></tr><tr><td>S3 data transfer (cross-region)</td><td>$0.02/GB — avoid by keeping same region</td></tr><tr><td>KMS encryption calls</td><td>$0.03 per 10,000 requests — negligible</td></tr></tbody></table>
+<p>→ UNLOAD itself is essentially FREE — the dominant cost is the data stored in S3 afterward<br>
+→ Use S3 lifecycle policies (Project 12) to manage long-term storage costs</p>
+<p>→ <strong>Downstream Scaling</strong></p>
+<table><thead><tr><th>Downstream Consumer</th><th>Scales With</th></tr></thead><tbody><tr><td>Athena queries on UNLOAD output</td><td>File count, file size, partitioning</td></tr><tr><td>Glue Crawler on UNLOAD output</td><td>File count, partition count</td></tr><tr><td>SageMaker training on UNLOAD output</td><td>File count (parallel readers)</td></tr><tr><td>COPY into another Redshift</td><td>File count = multiple of target slices</td></tr></tbody></table>
+<p>→ Optimizing UNLOAD output (file size, partitioning, format) benefits ALL downstream consumers<br>
+→ MAXFILESIZE 128-256 MB is the universal sweet spot</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify UNLOAD correctness end-to-end:</strong></p>
+<table><thead><tr><th>Step</th><th>Verification</th><th>Method</th><th>Expected</th></tr></thead><tbody><tr><td>1</td><td>UNLOAD completed?</td><td>Check query result in Query Editor</td><td>Returns row count</td></tr><tr><td>2</td><td>Files in S3?</td><td>S3 Console → target path</td><td>Files present</td></tr><tr><td>3</td><td>File count correct?</td><td>Count files vs expected (PARALLEL ON: ≥ slice count)</td><td>Reasonable count</td></tr><tr><td>4</td><td>File sizes reasonable?</td><td>Check individual file sizes</td><td>~MAXFILESIZE or less</td></tr><tr><td>5</td><td>Total size reasonable?</td><td>Sum all file sizes</td><td>Parquet: ~10-30% of raw data; CSV: ~50-100%</td></tr><tr><td>6</td><td>Row count matches?</td><td>MANIFEST VERBOSE → sum record_counts</td><td>Matches UNLOAD return value</td></tr><tr><td>7</td><td>Schema correct?</td><td>Download one file → inspect</td><td>Columns match SELECT</td></tr><tr><td>8</td><td>Partition structure correct?</td><td>S3 path inspection</td><td><code>key=value/</code> directories</td></tr><tr><td>9</td><td>Compression working?</td><td>Compare compressed vs expected uncompressed</td><td>Significant reduction</td></tr><tr><td>10</td><td>Encryption applied?</td><td>S3 file properties → encryption</td><td>SSE-S3 or SSE-KMS</td></tr><tr><td>11</td><td>Downstream readable?</td><td>Query via Athena / Load via COPY</td><td>Data accessible</td></tr></tbody></table>
+<p>→ <strong>Monitoring and Alerting:</strong></p>
+<table><thead><tr><th>Alert Condition</th><th>How to Detect</th><th>Action</th></tr></thead><tbody><tr><td>UNLOAD failed</td><td>Query error in scheduled query log</td><td>SNS notification → investigate</td></tr><tr><td>UNLOAD produced 0 rows</td><td>MANIFEST shows 0 records</td><td>Data issue — check source query</td></tr><tr><td>UNLOAD took &gt; 2x normal time</td><td>Compare duration with historical baseline</td><td>Investigate — data growth? query plan change?</td></tr><tr><td>S3 output size anomaly</td><td>Compare with expected range</td><td>Data quality issue or schema change</td></tr><tr><td>DLQ alarm after UNLOAD (if triggering downstream processing)</td><td>CloudWatch alarm on downstream queue</td><td>Processing failure — check format compatibility</td></tr></tbody></table>
+<p>→ <strong>Complete Data Flow Visualization (Projects 1 → 22 → 23):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>RAW DATA                    TRANSFORMED DATA               WAREHOUSE                EXPORTED DATA
+</span>(Project 1)                 (Project 21)                   (Project 22)             (This Project)
+
+S3: raw/orders/*.csv  ───▶  S3: transformed/orders/*.parquet ───▶  Redshift: orders  ───▶  S3: curated/daily-summary/*.parquet
+                      Glue                                  COPY                      UNLOAD
+                      ETL                                                              │
+                                                                                       ▼
+                                                                                  Glue Crawler
+                                                                                  (Project 17)
+                                                                                       │
+                                                                                       ▼
+                                                                                  Athena Query
+                                                                                  (Project 18)
+                                                                                       │
+                                                                                       ▼
+                                                                               Analysts WITHOUT
+                                                                               Redshift access</code></pre></div>
+<p>→ This creates a FULL CIRCLE: S3 → Glue → S3 → Redshift → S3 → Glue → Athena<br>
+→ Each stage adds value: raw → clean → optimized → analyzed → curated → accessible</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ UNLOAD is the parallel export engine — the mirror image of COPY (Project 22)<br>
+→ Every compute node writes to S3 simultaneously → massive throughput for large exports<br>
+→ PARALLEL ON for data lake integration (multiple files, maximum speed)<br>
+→ PARALLEL OFF for external sharing (single file, convenience)<br>
+→ PARTITION BY transforms Redshift into a data lake WRITER — creates Athena-ready partitioned Parquet<br>
+→ MANIFEST VERBOSE provides auditability — file list, sizes, and row counts<br>
+→ Format choice depends on consumer: CSV for humans/external, Parquet for analytics/ML, JSON for APIs<br>
+→ CLEANPATH prevents stale data contamination — always use for recurring exports</p>
+<p>→ The data lake now has three zones fully populated:</p>
+<table><thead><tr><th>Zone</th><th>Source</th><th>Content</th><th>Consumer</th></tr></thead><tbody><tr><td>Raw</td><td>Direct upload / ingestion</td><td>CSV, JSON — untouched</td><td>Glue ETL (Project 21)</td></tr><tr><td>Transformed</td><td>Glue ETL output (Project 21)</td><td>Parquet, partitioned, clean</td><td>Redshift COPY (Project 22), Athena (Project 18)</td></tr><tr><td>Curated</td><td>Redshift UNLOAD (this project)</td><td>Parquet, partitioned, aggregated</td><td>Athena (Project 18), external consumers</td></tr></tbody></table>
+<p>→ This project connects to:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 22 (COPY)</td><td>Reverse operation — together they enable bidirectional S3 ↔ Redshift flow</td></tr><tr><td>Project 17 (Crawler)</td><td>Crawl UNLOAD output to register in Glue Catalog</td></tr><tr><td>Project 18 (Athena)</td><td>Query UNLOAD output without Redshift access</td></tr><tr><td>Project 28 (Spectrum)</td><td>Alternative to UNLOAD — query S3 FROM Redshift without loading/exporting</td></tr><tr><td>Project 34 (Lambda → Redshift)</td><td>Automate UNLOAD via Lambda + Redshift Data API</td></tr><tr><td>Project 43 (Redshift → MariaDB)</td><td>Different export target — database instead of S3</td></tr><tr><td>Project 49 (Complex Pipeline)</td><td>UNLOAD becomes one step in multi-service orchestration</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ We now have complete bidirectional data flow: S3 ↔ Redshift<br>
+→ But what about the OTHER direction — operational database to data lake?<br>
+→ ShopNow's MariaDB database (Project 9) holds live operational data:</p>
+<ul>
+<li>Customer registrations (updated in real-time)</li>
+<li>Order status changes (processing → shipped → delivered)</li>
+<li>Product inventory levels (decremented on each sale)</li>
+</ul>
+<p>→ This operational data is NOT in the data lake or the warehouse<br>
+→ The analytics team cannot access it without querying the production database directly<br>
+→ Direct analyst queries on production MariaDB cause performance degradation for the application<br>
+→ The solution: Extract data FROM MariaDB → Transform → Load INTO S3 (the data lake)</p>
+<p>→ <strong>This is exactly what Project 24 solves</strong><br>
+→ Project 24 introduces Glue ETL with JDBC connections — reading from MariaDB and writing to S3<br>
+→ You will learn how Glue connects to a database inside a VPC, reads tables via JDBC, transforms the data, and writes optimized Parquet to S3<br>
+→ This extends the Glue ETL pattern from Project 21 (S3 source) to database sources</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 24: "The Operational Database That Needed a Backup in S3 — MariaDB to S3 Export via Glue ETL"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-22.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 23/60</span></div><a class="nav-btn next" href="project-24.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

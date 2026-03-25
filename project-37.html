@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 37: THE CREDENTIALS HARDCODED IN CONFIG FILES — Secrets Manager for Data — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 37: THE CREDENTIALS HARDCODED IN CONFIG FILES — Secrets Manager for Database Credentials</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ The auditor David (from Project 36) has signed off on encryption at rest<br>
+→ But his final finding is equally alarming — credential management is non-existent</p>
+<p><strong>Finding 1 — Glue ETL Jobs (Project 24)</strong><br>
+→ The Glue JDBC connection to MariaDB stores the database password in the connection properties<br>
+→ Anyone with <code>glue:GetConnection</code> IAM permission can read the password in plain text<br>
+→ The password has not been changed in 14 months<br>
+→ Three former employees who set up the connection still know this password</p>
+<p><strong>Finding 2 — Athena Federated Query Connector (Project 35)</strong><br>
+→ The Lambda connector references a Secrets Manager secret (correctly set up in Project 35)<br>
+→ But the secret was created manually with a password that the developer chose<br>
+→ That same password is also written in a Confluence wiki page titled "Database Credentials"<br>
+→ No automatic rotation is configured<br>
+→ If the password is compromised — manual update required across multiple services</p>
+<p><strong>Finding 3 — EC2 Application (Project 14)</strong><br>
+→ The application running on EC2 connects to MariaDB using credentials stored in a <code>.env</code> file on the instance<br>
+→ The <code>.env</code> file contains:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DB_HOST=shopnow-mariadb-prod-encrypted.abc123.ap-south-1.rds.amazonaws.com
+</span>DB_PORT=3306
+DB_USER=app_user
+DB_PASSWORD[REDACTED:PASSWORD]3!SecurePass
+DB_NAME=shopnow_prod</code></pre></div>
+<p>→ Anyone who SSH into the instance (or gains shell access via exploit) reads credentials instantly<br>
+→ The AMI snapshot of this instance also contains these credentials<br>
+→ If the instance is compromised — attacker has direct database access</p>
+<p><strong>Finding 4 — Lambda Functions (Project 26, 34)</strong><br>
+→ Two Lambda functions that write to MariaDB store credentials as Lambda environment variables<br>
+→ Environment variables are visible in the Lambda console to anyone with <code>lambda:GetFunction</code> permission<br>
+→ Environment variables are included in deployment packages and version histories</p>
+<p><strong>Finding 5 — Shared Credentials Anti-Pattern</strong><br>
+→ All services use the SAME database username and password: <code>admin</code> / <code>ShopNow2023!SecurePass</code><br>
+→ If one credential is leaked — everything is compromised<br>
+→ No way to know WHICH service accessed the database — all connections look identical in MariaDB logs<br>
+→ Cannot revoke access for one service without breaking all others</p>
+<p><strong>The Auditor's Mandate:</strong></p>
+<blockquote>
+<p>"Centralize all credentials. Eliminate hardcoded secrets everywhere.<br>
+Implement automatic rotation. Use unique credentials per service.<br>
+Prove you can answer: WHO retrieved WHICH credential, WHEN."</p>
+</blockquote>
+<p>→ This requires AWS Secrets Manager as the centralized credential vault</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand why this is a SEPARATE problem from encryption (Project 36)</p>
+<p><strong>Encryption (Project 36) protects:</strong><br>
+→ Data AT REST on disk — S3 objects, RDS volumes, Redshift blocks<br>
+→ If someone steals a hard drive → data is unreadable<br>
+→ Encryption does NOT prevent authorized applications from reading data<br>
+→ If an application has valid credentials → encryption is transparent</p>
+<p><strong>Secrets Management (This project) protects:</strong><br>
+→ The CREDENTIALS that grant access to data<br>
+→ If someone steals credentials → they bypass encryption entirely (they authenticate as a valid user)<br>
+→ Secrets Manager ensures credentials are:</p>
+<ul>
+<li>Never stored in plain text anywhere</li>
+<li>Fetched dynamically at runtime</li>
+<li>Rotated automatically</li>
+<li>Audited for every access</li>
+<li>Independently revocable per consumer</li>
+</ul>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Understand Secrets Manager architecture</li>
+<li>Step 2 — Create dedicated MariaDB users per service</li>
+<li>Step 3 — Store each credential set as a separate secret</li>
+<li>Step 4 — Configure secret encryption with KMS (connecting to Project 36)</li>
+<li>Step 5 — Configure IAM policies for secret access</li>
+<li>Step 6 — Update Glue JDBC connection to use Secrets Manager</li>
+<li>Step 7 — Verify Athena connector secret configuration (from Project 35)</li>
+<li>Step 8 — Update EC2 application to fetch secrets dynamically</li>
+<li>Step 9 — Update Lambda functions to fetch secrets dynamically</li>
+<li>Step 10 — Configure automatic rotation</li>
+<li>Step 11 — Verify audit trail in CloudTrail</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND SECRETS MANAGER ARCHITECTURE</h3>
+<p><strong>What Secrets Manager actually stores:</strong><br>
+→ A "secret" is a JSON blob containing key-value pairs<br>
+→ For a database credential, the standard structure is:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>{
+</span>  "username": "app_user",
+  "password": "auto-generated-complex-password",
+  "engine": "mysql",
+  "host": "shopnow-mariadb-prod-encrypted.abc123.ap-south-1.rds.amazonaws.com",
+  "port": 3306,
+  "dbname": "shopnow_prod"
+}</code></pre></div>
+<p>→ This JSON is encrypted using a KMS key (from Project 36)<br>
+→ Stored in Secrets Manager's internal storage (not in S3, not in DynamoDB)<br>
+→ Each secret has:</p>
+<ul>
+<li>A name (path-like): <code>shopnow/prod/mariadb/app-user</code></li>
+<li>An ARN: <code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/app-user-AbCdEf</code></li>
+<li>Version stages: <code>AWSCURRENT</code> (active), <code>AWSPREVIOUS</code> (last rotation), <code>AWSPENDING</code> (during rotation)</li>
+<li>Metadata: Description, tags, rotation configuration, KMS key ID</li>
+</ul>
+<p><strong>How Secrets Manager differs from SSM Parameter Store (SecureString):</strong></p>
+<table><thead><tr><th>Feature</th><th>Secrets Manager</th><th>SSM Parameter Store (SecureString)</th></tr></thead><tbody><tr><td>Automatic rotation</td><td>✅ Built-in with Lambda</td><td>❌ Manual implementation required</td></tr><tr><td>RDS/MariaDB integration</td><td>✅ Native rotation templates</td><td>❌ No database integration</td></tr><tr><td>Cross-region replication</td><td>✅ Built-in replica secrets</td><td>❌ Not supported</td></tr><tr><td>Versioning with staging labels</td><td>✅ AWSCURRENT/AWSPREVIOUS/AWSPENDING</td><td>❌ Basic version history only</td></tr><tr><td>Cost</td><td>$0.40 per secret per month + $0.05 per 10,000 API calls</td><td>Free tier for Standard, $0.05 per Advanced parameter per month</td></tr><tr><td>Maximum secret size</td><td>64 KB</td><td>8 KB (Advanced: 8 KB)</td></tr><tr><td>Random password generation</td><td>✅ Built-in API</td><td>❌ Not available</td></tr></tbody></table>
+<p>→ For database credentials with rotation → Secrets Manager is the correct choice<br>
+→ For simple configuration values (non-sensitive) → SSM Parameter Store is cheaper</p>
+<hr>
+<h3>STEP 2 — CREATE DEDICATED MARIADB USERS PER SERVICE</h3>
+<p>→ Before creating secrets — fix the "shared credentials" anti-pattern<br>
+→ Currently ALL services use the <code>admin</code> account<br>
+→ This violates least privilege AND prevents per-service auditing</p>
+<p><strong>Create dedicated database users in MariaDB:</strong></p>
+<p>→ Connect to MariaDB (via EC2 bastion or MySQL client — Project 14 connectivity)</p>
+<p><strong>Users to create (conceptual — database-level configuration):</strong></p>
+<table><thead><tr><th>MariaDB Username</th><th>Purpose</th><th>Permissions Needed</th></tr></thead><tbody><tr><td><code>app_ec2_user</code></td><td>EC2 application — reads/writes orders, customers</td><td>SELECT, INSERT, UPDATE, DELETE on <code>shopnow_prod.*</code></td></tr><tr><td><code>glue_etl_user</code></td><td>Glue ETL jobs — reads all tables for extraction</td><td>SELECT on <code>shopnow_prod.*</code></td></tr><tr><td><code>athena_federated_user</code></td><td>Athena connector — reads for analytics</td><td>SELECT on <code>shopnow_prod.*</code></td></tr><tr><td><code>lambda_processor_user</code></td><td>Lambda functions — writes processed results</td><td>SELECT, INSERT, UPDATE on specific tables</td></tr><tr><td><code>rotation_admin_user</code></td><td>Secrets Manager rotation Lambda — manages passwords</td><td>SELECT, INSERT, UPDATE on <code>mysql.user</code>, CREATE USER, ALTER USER</td></tr></tbody></table>
+<p><strong>Why separate users?</strong><br>
+→ If EC2 credential is compromised → only EC2-level access is exposed, not Glue or Athena<br>
+→ MariaDB general log shows WHICH user connected → per-service audit trail<br>
+→ Can revoke one user without affecting others<br>
+→ Can apply different MariaDB permission levels per service (least privilege)</p>
+<hr>
+<h3>STEP 3 — STORE EACH CREDENTIAL AS A SEPARATE SECRET</h3>
+<p>→ Navigate to AWS Secrets Manager → "Store a new secret"</p>
+<hr>
+<p><strong>Secret 1 — EC2 Application Credentials</strong></p>
+<p><strong>Page 1 — Secret type:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Secret type</td><td>"Credentials for Amazon RDS database"</td></tr><tr><td>Username</td><td><code>app_ec2_user</code></td></tr><tr><td>Password</td><td>Click "Generate password" → Secrets Manager generates a cryptographically random password</td></tr><tr><td>Encryption key</td><td>Select <code>shopnow-rds-mariadb-key</code> (from Project 36)</td></tr><tr><td>Database</td><td>Select your RDS MariaDB instance from dropdown</td></tr></tbody></table>
+<p><strong>Understanding password generation:</strong><br>
+→ Secrets Manager can auto-generate passwords with configurable rules:</p>
+<table><thead><tr><th>Parameter</th><th>Default</th><th>Configurable</th></tr></thead><tbody><tr><td>Password length</td><td>32 characters</td><td>✅ 1-4096 characters</td></tr><tr><td>Include uppercase</td><td>✅ Yes</td><td>✅</td></tr><tr><td>Include lowercase</td><td>✅ Yes</td><td>✅</td></tr><tr><td>Include numbers</td><td>✅ Yes</td><td>✅</td></tr><tr><td>Include punctuation</td><td>✅ Yes</td><td>✅</td></tr><tr><td>Exclude characters</td><td>None</td><td>✅ Can exclude specific characters (e.g., <code>@</code>, <code>/</code>, <code>\</code> which cause issues in JDBC URLs)</td></tr></tbody></table>
+<p>→ IMPORTANT: Exclude characters that break JDBC connection strings<br>
+→ Characters to exclude: <code>@ / \ ' " ; : { } [ ]</code><br>
+→ These characters in passwords cause parsing failures in JDBC URLs, environment variables, and config files<br>
+→ Set "Exclude characters" to: <code>/@"'\;:{}[]</code></p>
+<p><strong>Page 2 — Secret name and description:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Secret name</td><td><code>shopnow/prod/mariadb/ec2-app</code></td></tr><tr><td>Description</td><td><code>Credentials for EC2 application connecting to production MariaDB</code></td></tr><tr><td>Tags — Key: <code>Service</code></td><td>Value: <code>EC2</code></td></tr><tr><td>Tags — Key: <code>Environment</code></td><td>Value: <code>Production</code></td></tr><tr><td>Tags — Key: <code>Database</code></td><td>Value: <code>MariaDB</code></td></tr><tr><td>Tags — Key: <code>ManagedBy</code></td><td>Value: <code>SecurityTeam</code></td></tr></tbody></table>
+<p><strong>Naming Convention Best Practice:</strong></p>
+<code>{company}/{environment}/{engine}/{consumer}</code>
+<table><thead><tr><th>Pattern</th><th>Example</th></tr></thead><tbody><tr><td><code>shopnow/prod/mariadb/ec2-app</code></td><td>EC2 application production credentials</td></tr><tr><td><code>shopnow/prod/mariadb/glue-etl</code></td><td>Glue ETL production credentials</td></tr><tr><td><code>shopnow/prod/mariadb/athena-connector</code></td><td>Athena federated connector credentials</td></tr><tr><td><code>shopnow/prod/mariadb/lambda-processor</code></td><td>Lambda function credentials</td></tr><tr><td><code>shopnow/staging/mariadb/ec2-app</code></td><td>EC2 application staging credentials</td></tr></tbody></table>
+<p>→ This hierarchical naming enables:</p>
+<ul>
+<li>IAM policies that grant access to <code>shopnow/prod/mariadb/*</code> (all prod MariaDB secrets)</li>
+<li>IAM policies that grant access to <code>shopnow/prod/mariadb/ec2-app</code> only (specific secret)</li>
+<li>Easy browsing and filtering in the console</li>
+<li>Clear organizational structure</li>
+</ul>
+<p><strong>Page 3 — Rotation configuration:</strong><br>
+→ Skip for now — we configure rotation in Step 10 after all secrets are created</p>
+<p><strong>Page 4 — Review and store:</strong><br>
+→ Click "Store" → Secret created<br>
+→ Note the ARN: <code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/ec2-app-AbCdEf</code><br>
+→ The 6-character random suffix (<code>-AbCdEf</code>) is auto-appended by Secrets Manager for uniqueness</p>
+<hr>
+<p><strong>Secret 2 — Glue ETL Credentials</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Secret type</td><td>Credentials for Amazon RDS database</td></tr><tr><td>Username</td><td><code>glue_etl_user</code></td></tr><tr><td>Password</td><td>Auto-generated (exclude JDBC-breaking characters)</td></tr><tr><td>Encryption key</td><td><code>shopnow-rds-mariadb-key</code></td></tr><tr><td>Secret name</td><td><code>shopnow/prod/mariadb/glue-etl</code></td></tr><tr><td>Tag — Service</td><td><code>Glue</code></td></tr></tbody></table>
+<hr>
+<p><strong>Secret 3 — Athena Federated Connector Credentials</strong></p>
+<p>→ This secret may already exist from Project 35<br>
+→ If it exists — UPDATE it with the new dedicated username</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Username</td><td><code>athena_federated_user</code> (was <code>admin</code> — now dedicated user)</td></tr><tr><td>Password</td><td>Auto-generated</td></tr><tr><td>Secret name</td><td><code>shopnow/prod/mariadb/athena-connector</code></td></tr><tr><td>Tag — Service</td><td><code>Athena</code></td></tr></tbody></table>
+<p>→ If updating an existing secret → Navigate to secret → "Retrieve secret value" → "Edit"<br>
+→ Change the username and password fields<br>
+→ ALSO update the MariaDB database to create this new user with appropriate permissions</p>
+<hr>
+<p><strong>Secret 4 — Lambda Processor Credentials</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Secret type</td><td>Credentials for Amazon RDS database</td></tr><tr><td>Username</td><td><code>lambda_processor_user</code></td></tr><tr><td>Password</td><td>Auto-generated</td></tr><tr><td>Encryption key</td><td><code>shopnow-rds-mariadb-key</code></td></tr><tr><td>Secret name</td><td><code>shopnow/prod/mariadb/lambda-processor</code></td></tr><tr><td>Tag — Service</td><td><code>Lambda</code></td></tr></tbody></table>
+<hr>
+<p><strong>Summary of Secrets Created:</strong></p>
+<table><thead><tr><th>Secret Name</th><th>Consumer</th><th>MariaDB User</th><th>KMS Key</th></tr></thead><tbody><tr><td><code>shopnow/prod/mariadb/ec2-app</code></td><td>EC2 Application</td><td><code>app_ec2_user</code></td><td><code>shopnow-rds-mariadb-key</code></td></tr><tr><td><code>shopnow/prod/mariadb/glue-etl</code></td><td>Glue ETL Jobs</td><td><code>glue_etl_user</code></td><td><code>shopnow-rds-mariadb-key</code></td></tr><tr><td><code>shopnow/prod/mariadb/athena-connector</code></td><td>Athena Federated Query</td><td><code>athena_federated_user</code></td><td><code>shopnow-rds-mariadb-key</code></td></tr><tr><td><code>shopnow/prod/mariadb/lambda-processor</code></td><td>Lambda Functions</td><td><code>lambda_processor_user</code></td><td><code>shopnow-rds-mariadb-key</code></td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — UNDERSTAND SECRET ENCRYPTION WITH KMS</h3>
+<p>→ Connecting to Project 36's KMS concepts:</p>
+<p><strong>How Secrets Manager uses KMS:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>You store a secret (JSON with credentials)
+</span>        ↓
+Secrets Manager calls KMS: GenerateDataKey(KeyId = shopnow-rds-mariadb-key)
+        ↓
+KMS returns:
+  1. Plaintext DEK
+  2. Encrypted DEK
+        ↓
+Secrets Manager encrypts the secret JSON using the plaintext DEK (AES-256-GCM)
+        ↓
+Secrets Manager stores:
+  - Encrypted secret value
+  - Encrypted DEK
+        ↓
+Plaintext DEK discarded from memory</code></pre></div>
+<p><strong>When a service retrieves the secret:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Service calls: GetSecretValue(SecretId = shopnow/prod/mariadb/ec2-app)
+</span>        ↓
+Secrets Manager retrieves encrypted secret + encrypted DEK
+        ↓
+Secrets Manager calls KMS: Decrypt(CiphertextBlob = encrypted DEK)
+        ↓
+KMS checks:
+  1. Caller has kms:Decrypt in key policy? (Project 36 key user check)
+  2. Caller has kms:Decrypt in IAM policy?
+  3. Key is enabled?
+        ↓
+KMS returns plaintext DEK
+        ↓
+Secrets Manager decrypts secret JSON using plaintext DEK
+        ↓
+Returns plain text secret to the caller
+        ↓
+CloudTrail logs BOTH:
+  - secretsmanager:GetSecretValue event
+  - kms:Decrypt event</code></pre></div>
+<p>→ This means: To retrieve a secret, the caller needs BOTH:</p>
+<ul>
+<li><code>secretsmanager:GetSecretValue</code> permission (IAM policy)</li>
+<li><code>kms:Decrypt</code> permission on the encryption key (IAM policy + Key policy)<br>
+→ This is TRIPLE-gated security:</li>
+</ul>
+<ol>
+<li>Secrets Manager resource policy (optional)</li>
+<li>IAM policy on the caller role</li>
+<li>KMS key policy on the encryption key</li>
+</ol>
+<hr>
+<h3>STEP 5 — CONFIGURE IAM POLICIES FOR SECRET ACCESS</h3>
+<p>→ Each consumer service needs IAM permissions to read ONLY its own secret</p>
+<p><strong>IAM Policy for EC2 Application Role (<code>EC2AppRole</code>):</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td><code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/ec2-app-*</code></td><td>Read the EC2 app secret</td></tr><tr><td><code>kms:Decrypt</code></td><td><code>arn:aws:kms:ap-south-1:123456789012:key/&lt;rds-key-id&gt;</code></td><td>Decrypt the secret (KMS envelope)</td></tr></tbody></table>
+<p>→ The <code>*</code> at the end of the secret ARN accounts for the random suffix Secrets Manager appends<br>
+→ This role CANNOT read <code>shopnow/prod/mariadb/glue-etl</code> — different ARN pattern</p>
+<p><strong>IAM Policy for Glue ETL Role (<code>GlueETLRole</code>):</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td><code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/glue-etl-*</code></td><td>Read the Glue secret</td></tr><tr><td><code>kms:Decrypt</code></td><td><code>arn:aws:kms:ap-south-1:123456789012:key/&lt;rds-key-id&gt;</code></td><td>Decrypt the secret</td></tr></tbody></table>
+<p><strong>IAM Policy for Athena Connector Lambda Role:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td><code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/athena-connector-*</code></td><td>Read the Athena connector secret</td></tr><tr><td><code>kms:Decrypt</code></td><td><code>arn:aws:kms:ap-south-1:123456789012:key/&lt;rds-key-id&gt;</code></td><td>Decrypt the secret</td></tr></tbody></table>
+<p><strong>IAM Policy for Lambda Processor Role:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td><code>arn:aws:secretsmanager:ap-south-1:123456789012:secret:shopnow/prod/mariadb/lambda-processor-*</code></td><td>Read the Lambda secret</td></tr><tr><td><code>kms:Decrypt</code></td><td><code>arn:aws:kms:ap-south-1:123456789012:key/&lt;rds-key-id&gt;</code></td><td>Decrypt the secret</td></tr></tbody></table>
+<p><strong>CRITICAL: Least Privilege Enforcement</strong></p>
+<table><thead><tr><th>Role</th><th>CAN Access</th><th>CANNOT Access</th></tr></thead><tbody><tr><td>EC2AppRole</td><td><code>ec2-app</code> secret only</td><td>glue-etl, athena-connector, lambda-processor</td></tr><tr><td>GlueETLRole</td><td><code>glue-etl</code> secret only</td><td>ec2-app, athena-connector, lambda-processor</td></tr><tr><td>Athena Connector Role</td><td><code>athena-connector</code> secret only</td><td>ec2-app, glue-etl, lambda-processor</td></tr><tr><td>Lambda Processor Role</td><td><code>lambda-processor</code> secret only</td><td>ec2-app, glue-etl, athena-connector</td></tr></tbody></table>
+<p>→ If EC2 instance is compromised → attacker gets EC2 credentials only<br>
+→ Cannot pivot to Glue or Lambda credentials<br>
+→ Blast radius is contained to one service</p>
+<hr>
+<h3>STEP 6 — CONFIGURE SECRETS MANAGER RESOURCE POLICY (Optional but Recommended)</h3>
+<p>→ Similar to S3 bucket policies and KMS key policies — Secrets Manager supports resource-based policies<br>
+→ Navigate to each secret → "Resource permissions" → Edit</p>
+<p><strong>Resource Policy for <code>shopnow/prod/mariadb/ec2-app</code>:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Purpose</th></tr></thead><tbody><tr><td>Allow EC2 Role</td><td>Allow</td><td><code>arn:aws:iam::123456789012:role/EC2AppRole</code></td><td><code>secretsmanager:GetSecretValue</code></td><td>Explicitly allow EC2 role</td></tr><tr><td>Deny All Others</td><td>Deny</td><td><code>*</code></td><td><code>secretsmanager:GetSecretValue</code></td><td>Deny everyone else (with condition excluding allowed roles and rotation Lambda)</td></tr></tbody></table>
+<p><strong>Why add a resource policy when IAM policy already restricts?</strong><br>
+→ Defense in depth — even if someone accidentally grants <code>secretsmanager:*</code> to a broad role<br>
+→ The resource policy on the secret STILL denies access unless the principal is explicitly listed<br>
+→ This is the same "belt AND suspenders" approach as KMS key policies (Project 36)</p>
+<hr>
+<h3>STEP 7 — UPDATE GLUE JDBC CONNECTION TO USE SECRETS MANAGER</h3>
+<p>→ Navigate to AWS Glue Console → "Connections" (under Data Catalog)<br>
+→ The existing connection from Project 24 has credentials embedded in connection properties</p>
+<p><strong>Current (Insecure) Glue Connection Configuration:</strong></p>
+<table><thead><tr><th>Property</th><th>Current Value</th></tr></thead><tbody><tr><td>Connection type</td><td>JDBC</td></tr><tr><td>JDBC URL</td><td><code>jdbc:mysql://shopnow-mariadb-prod-encrypted....:3306/shopnow_prod</code></td></tr><tr><td>Username</td><td><code>admin</code> (hardcoded)</td></tr><tr><td>Password</td><td><code>ShopNow2023!SecurePass</code> (hardcoded in plain text)</td></tr></tbody></table>
+<p><strong>Updated (Secure) Glue Connection Configuration:</strong></p>
+<p>→ AWS Glue natively supports Secrets Manager integration (introduced 2022+)<br>
+→ Edit the connection → Advanced properties</p>
+<table><thead><tr><th>Property</th><th>New Value</th></tr></thead><tbody><tr><td>Connection type</td><td>JDBC</td></tr><tr><td>JDBC URL</td><td><code>jdbc:mysql://shopnow-mariadb-prod-encrypted....:3306/shopnow_prod</code></td></tr><tr><td>Credential type</td><td>AWS Secrets Manager</td></tr><tr><td>Secret</td><td>Select <code>shopnow/prod/mariadb/glue-etl</code></td></tr></tbody></table>
+<p>→ Glue will fetch credentials from Secrets Manager at job runtime<br>
+→ No credentials stored in the connection properties<br>
+→ If the password rotates → Glue automatically gets the new password on next job run</p>
+<p><strong>Alternative for older Glue versions without native Secrets Manager integration:</strong><br>
+→ Glue Job can fetch the secret within the job script itself<br>
+→ The job script calls Secrets Manager API → retrieves credentials → uses them for JDBC connection<br>
+→ The GlueETLRole must have <code>secretsmanager:GetSecretValue</code> permission (configured in Step 5)</p>
+<hr>
+<h3>STEP 8 — VERIFY ATHENA CONNECTOR SECRET CONFIGURATION</h3>
+<p>→ The Athena MySQL connector (Project 35) already references a Secrets Manager secret<br>
+→ Verify the connection string uses the <code>${secret_name}</code> pattern:</p>
+<p><strong>Current Connection String (from Project 35):</strong></p>
+<code>mysql://jdbc:mysql://&lt;RDS_ENDPOINT&gt;:3306/&lt;DATABASE&gt;?${shopnow/prod/mariadb/athena-connector}</code>
+<p>→ If the secret name has changed → Update the Lambda environment variable <code>default</code> connection string<br>
+→ Navigate to Lambda → <code>shopnow-athena-mysql-connector</code> → Configuration → Environment variables<br>
+→ Update the connection string to reference the new secret name</p>
+<p>→ Also verify the Lambda execution role has:</p>
+<ul>
+<li><code>secretsmanager:GetSecretValue</code> on the athena-connector secret ARN (Step 5)</li>
+<li><code>kms:Decrypt</code> on the RDS KMS key (Step 5)</li>
+</ul>
+<p>→ Test by running a simple Athena federated query (Project 35 verification steps)</p>
+<hr>
+<h3>STEP 9 — UPDATE EC2 APPLICATION CONFIGURATION</h3>
+<p>→ The EC2 application currently reads from a <code>.env</code> file<br>
+→ The application must be reconfigured to fetch credentials from Secrets Manager at startup</p>
+<p><strong>Architecture Change:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE (Insecure):
+</span>EC2 App starts → reads .env file → gets credentials → connects to MariaDB
+
+AFTER (Secure):
+EC2 App starts → calls Secrets Manager API → gets credentials → connects to MariaDB</code></pre></div>
+<p><strong>EC2 Instance Configuration:</strong><br>
+→ The EC2 instance already has an IAM Role attached (Instance Profile — Project 11)<br>
+→ Add the Secrets Manager and KMS permissions to that role (Step 5)<br>
+→ The application code must be updated to call <code>GetSecretValue</code> API instead of reading <code>.env</code></p>
+<p><strong>Post-Migration Cleanup:</strong><br>
+→ DELETE the <code>.env</code> file from the EC2 instance<br>
+→ DELETE the <code>.env</code> file from any AMI snapshots<br>
+→ Verify the application starts successfully without the <code>.env</code> file<br>
+→ Verify the application connects to MariaDB using Secrets Manager credentials</p>
+<p><strong>Important — VPC Endpoint Consideration:</strong><br>
+→ If EC2 is in a private subnet (Project 5) → it needs to reach Secrets Manager API<br>
+→ Option A: NAT Gateway (already exists from Project 5)<br>
+→ Option B: VPC Interface Endpoint for Secrets Manager (from Project 27, 35 concepts)</p>
+<table><thead><tr><th>Endpoint</th><th>Type</th><th>Service Name</th></tr></thead><tbody><tr><td>Secrets Manager</td><td>Interface Endpoint</td><td><code>com.amazonaws.ap-south-1.secretsmanager</code></td></tr></tbody></table>
+<p>→ If this endpoint already exists from Project 35 setup → No action needed<br>
+→ If not → Create it following Project 27 patterns</p>
+<hr>
+<h3>STEP 10 — UPDATE LAMBDA FUNCTIONS</h3>
+<p>→ Lambda functions (Project 26, 34) currently use environment variables for credentials</p>
+<p><strong>Current (Insecure) Lambda Configuration:</strong></p>
+<table><thead><tr><th>Environment Variable</th><th>Value</th></tr></thead><tbody><tr><td><code>DB_HOST</code></td><td><code>shopnow-mariadb-prod-encrypted....rds.amazonaws.com</code></td></tr><tr><td><code>DB_USER</code></td><td><code>admin</code></td></tr><tr><td><code>DB_PASSWORD</code></td><td><code>ShopNow2023!SecurePass</code></td></tr></tbody></table>
+<p><strong>Updated (Secure) Lambda Configuration:</strong></p>
+<table><thead><tr><th>Environment Variable</th><th>Value</th></tr></thead><tbody><tr><td><code>SECRET_NAME</code></td><td><code>shopnow/prod/mariadb/lambda-processor</code></td></tr><tr><td><code>AWS_REGION</code></td><td><code>ap-south-1</code></td></tr></tbody></table>
+<p>→ The Lambda function code fetches the secret at runtime using the Secrets Manager SDK<br>
+→ Remove <code>DB_USER</code>, <code>DB_PASSWORD</code>, and <code>DB_HOST</code> environment variables entirely<br>
+→ The Lambda execution role already has the permissions from Step 5</p>
+<p><strong>Lambda VPC Consideration:</strong><br>
+→ If Lambda runs in VPC (Project 45 concept) → needs VPC Endpoint for Secrets Manager<br>
+→ Same endpoint as discussed in Steps 8 and 9<br>
+→ If Lambda runs outside VPC → it can reach Secrets Manager directly via internet</p>
+<p><strong>Caching Consideration:</strong><br>
+→ Each <code>GetSecretValue</code> call adds ~50-200ms latency<br>
+→ For Lambda functions invoked frequently → cache the secret in memory</p>
+<p><strong>Caching Strategy:</strong></p>
+<table><thead><tr><th>Approach</th><th>How It Works</th><th>Trade-off</th></tr></thead><tbody><tr><td>No caching</td><td>Every invocation calls Secrets Manager</td><td>Highest latency, highest API cost, always fresh</td></tr><tr><td>In-memory cache (Lambda execution context)</td><td>First invocation fetches, subsequent reuse cached value</td><td>Low latency after first call, but stale during rotation window</td></tr><tr><td>AWS Secrets Manager Caching Library</td><td>AWS-provided library with configurable TTL</td><td>Recommended — configurable staleness tolerance</td></tr></tbody></table>
+<p><strong>Recommended Cache TTL:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>Cache TTL</td><td>300 seconds (5 minutes)</td><td>Balance between freshness and performance</td></tr><tr><td>Max cache size</td><td>1000 secrets</td><td>More than enough for most Lambda functions</td></tr><tr><td>Exception retry delay</td><td>1 second</td><td>Retry quickly on transient errors</td></tr></tbody></table>
+<p>→ With 5-minute cache → During password rotation, there is a maximum 5-minute window where Lambda might use the old password<br>
+→ Secrets Manager rotation handles this gracefully (explained in Step 11)</p>
+<hr>
+<h3>STEP 11 — CONFIGURE AUTOMATIC ROTATION</h3>
+<p>→ This is the most powerful feature of Secrets Manager — and the auditor's primary requirement<br>
+→ Navigate to each secret → "Rotation configuration" → Edit rotation</p>
+<hr>
+<p><strong>Understanding How Rotation Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Day 0: Secret has passwor[REDACTED:PASSWORD]123" (AWSCURRENT)
+</span>        ↓
+Rotation triggered (automatic schedule or manual)
+        ↓
+Step 1 — createSecret:
+  Secrets Manager generates new password "NewPass456"
+  Stores it as version stage AWSPENDING
+  Old password "OldPass123" remains AWSCURRENT
+  Both passwords are valid in the secret store
+        ↓
+Step 2 — setSecret:
+  Rotation Lambda connects to MariaDB
+  Changes the database user's password TO "NewPass456"
+  Now MariaDB accepts "NewPass456"
+  MariaDB no longer accepts "OldPass123"
+        ↓
+Step 3 — testSecret:
+  Rotation Lambda tests connection to MariaDB
+  using the new password "NewPass456"
+  Verifies it works (SELECT 1)
+        ↓
+Step 4 — finishSecret:
+  Secrets Manager moves version labels:
+    "NewPass456" → AWSCURRENT
+    "OldPass123" → AWSPREVIOUS
+  Rotation complete</code></pre></div>
+<p>→ Applications fetching <code>AWSCURRENT</code> now get "NewPass456"<br>
+→ Applications with cached "OldPass123" will get authentication errors<br>
+→ Those applications retry → fetch fresh secret → get "NewPass456" → reconnect successfully<br>
+→ The cache TTL (Step 10) determines maximum disruption window</p>
+<hr>
+<p><strong>Rotation Configuration Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Automatic rotation</td><td>✅ Enable</td><td></td></tr><tr><td>Rotation schedule</td><td>Every 30 days</td><td>Compliance standard — configurable from 1 day to 365 days</td></tr><tr><td>Rotation window</td><td>3:00 AM - 5:00 AM UTC</td><td>Choose low-traffic window</td></tr><tr><td>Rotation function</td><td>"Create a new Lambda function" or "Use existing"</td><td></td></tr><tr><td>Rotation strategy</td><td>"Single user" or "Alternating users"</td><td>See explanation below</td></tr></tbody></table>
+<p><strong>Two Rotation Strategies:</strong></p>
+<p><strong>Strategy 1 — Single User Rotation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>One MariaDB user: glue_etl_user
+</span>        ↓
+Rotation changes THIS user's password
+        ↓
+Brief moment where old password is invalid, new password is active
+        ↓
+Risk: If application connects with old cached password 
+      during the exact moment of password change → connection fails
+        ↓
+Application retries → fetches new password → succeeds</code></pre></div>
+<table><thead><tr><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Simple — one user to manage</td><td>Brief disruption window during password change</td></tr><tr><td>Lower MariaDB user count</td><td>Applications with aggressive connection pooling may see errors</td></tr><tr><td>Sufficient for most use cases</td><td></td></tr></tbody></table>
+<p><strong>Strategy 2 — Alternating Users Rotation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Two MariaDB users: glue_etl_user and glue_etl_user_clone
+</span>        ↓
+Rotation 1: Changes glue_etl_user_clone's password, makes it AWSCURRENT
+Rotation 2: Changes glue_etl_user's password, makes it AWSCURRENT
+Rotation 3: Changes glue_etl_user_clone's password, makes it AWSCURRENT
+... alternates forever
+        ↓
+The user NOT being rotated still has a valid password
+        ↓
+Zero disruption — old password remains valid until next rotation cycle</code></pre></div>
+<table><thead><tr><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Zero disruption during rotation</td><td>Requires TWO MariaDB users per service</td></tr><tr><td>Old password valid until next rotation</td><td>More complex setup</td></tr><tr><td>Recommended for production workloads</td><td>Doubles MariaDB user management</td></tr></tbody></table>
+<p>→ For ShopNow production → Use Alternating Users strategy<br>
+→ For dev/test → Single User is sufficient</p>
+<hr>
+<p><strong>Rotation Lambda Function:</strong></p>
+<p>→ When you enable rotation, Secrets Manager deploys a Lambda function automatically<br>
+→ This Lambda function:</p>
+<ul>
+<li>Runs in your VPC (same subnets as RDS)</li>
+<li>Has security group allowing outbound to MariaDB on port 3306</li>
+<li>Has permissions to call Secrets Manager and KMS</li>
+<li>Contains the 4-step rotation logic (createSecret, setSecret, testSecret, finishSecret)</li>
+</ul>
+<p><strong>Rotation Lambda Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Lambda function name</td><td><code>SecretsManager-shopnow-prod-mariadb-rotation</code></td><td>Auto-generated or custom</td></tr><tr><td>VPC</td><td>Same VPC as RDS</td><td>Must reach MariaDB</td></tr><tr><td>Subnets</td><td>Same private subnets as RDS</td><td>Network path to database</td></tr><tr><td>Security Group</td><td>New SG: <code>sg-secrets-rotation-lambda</code></td><td>Outbound 3306 to RDS SG</td></tr><tr><td>Runtime</td><td>Python 3.9+</td><td>AWS-provided rotation template</td></tr><tr><td>Timeout</td><td>300 seconds</td><td>Sufficient for rotation steps</td></tr><tr><td>Memory</td><td>128 MB</td><td>Rotation is lightweight</td></tr></tbody></table>
+<p><strong>Security Group for Rotation Lambda:</strong></p>
+<p><strong>Outbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Destination</th><th>Reason</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-rds-mariadb</code></td><td>Change password in MariaDB</td></tr><tr><td>HTTPS</td><td>443</td><td>Secrets Manager VPC Endpoint SG</td><td>Call Secrets Manager API</td></tr><tr><td>HTTPS</td><td>443</td><td>S3 prefix list (for VPC endpoint)</td><td>Lambda runtime dependencies</td></tr></tbody></table>
+<p><strong>Update RDS Security Group — Add Inbound:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Reason</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-secrets-rotation-lambda</code></td><td>Allow rotation Lambda to connect</td></tr></tbody></table>
+<p>→ This follows the same security group cross-referencing pattern from Projects 14, 24, 35</p>
+<p><strong>Rotation Lambda IAM Role Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>secretsmanager:GetSecretValue</code></td><td>All secrets this Lambda rotates</td><td>Read current and pending versions</td></tr><tr><td><code>secretsmanager:DescribeSecret</code></td><td>All secrets this Lambda rotates</td><td>Check rotation status</td></tr><tr><td><code>secretsmanager:PutSecretValue</code></td><td>All secrets this Lambda rotates</td><td>Write new password</td></tr><tr><td><code>secretsmanager:UpdateSecretVersionStage</code></td><td>All secrets this Lambda rotates</td><td>Move AWSCURRENT/AWSPENDING labels</td></tr><tr><td><code>secretsmanager:GetRandomPassword</code></td><td><code>*</code></td><td>Generate new random password</td></tr><tr><td><code>kms:Decrypt</code></td><td>RDS KMS key ARN</td><td>Decrypt existing secret</td></tr><tr><td><code>kms:GenerateDataKey</code></td><td>RDS KMS key ARN</td><td>Encrypt new secret version</td></tr><tr><td><code>ec2:CreateNetworkInterface</code></td><td><code>*</code></td><td>VPC Lambda ENI</td></tr><tr><td><code>ec2:DescribeNetworkInterfaces</code></td><td><code>*</code></td><td>VPC Lambda networking</td></tr><tr><td><code>ec2:DeleteNetworkInterface</code></td><td><code>*</code></td><td>VPC Lambda cleanup</td></tr><tr><td><code>logs:CreateLogGroup</code></td><td>Lambda log group</td><td>CloudWatch logging</td></tr><tr><td><code>logs:CreateLogStream</code></td><td>Lambda log group</td><td>CloudWatch logging</td></tr><tr><td><code>logs:PutLogEvents</code></td><td>Lambda log group</td><td>CloudWatch logging</td></tr></tbody></table>
+<p><strong>For Alternating Users Strategy — Additional Requirement:</strong><br>
+→ The rotation Lambda needs a "superuser" secret that has permission to change OTHER users' passwords<br>
+→ This is the <code>rotation_admin_user</code> created in Step 2<br>
+→ Store this admin credential as a SEPARATE secret: <code>shopnow/prod/mariadb/rotation-admin</code><br>
+→ Configure the rotation function to use this admin secret for making password changes<br>
+→ This admin secret itself should be rotated using Single User strategy (it rotates itself)</p>
+<hr>
+<p><strong>Configure Rotation for Each Secret:</strong></p>
+<table><thead><tr><th>Secret</th><th>Strategy</th><th>Rotation Interval</th><th>Rotation Lambda</th><th>Admin Secret (for Alternating)</th></tr></thead><tbody><tr><td><code>shopnow/prod/mariadb/ec2-app</code></td><td>Alternating Users</td><td>30 days</td><td><code>SecretsManager-rotation-lambda</code></td><td><code>shopnow/prod/mariadb/rotation-admin</code></td></tr><tr><td><code>shopnow/prod/mariadb/glue-etl</code></td><td>Alternating Users</td><td>30 days</td><td>Same Lambda</td><td>Same admin secret</td></tr><tr><td><code>shopnow/prod/mariadb/athena-connector</code></td><td>Alternating Users</td><td>30 days</td><td>Same Lambda</td><td>Same admin secret</td></tr><tr><td><code>shopnow/prod/mariadb/lambda-processor</code></td><td>Alternating Users</td><td>30 days</td><td>Same Lambda</td><td>Same admin secret</td></tr><tr><td><code>shopnow/prod/mariadb/rotation-admin</code></td><td>Single User</td><td>90 days</td><td>Separate Lambda</td><td>N/A (rotates itself)</td></tr></tbody></table>
+<hr>
+<h3>STEP 12 — VERIFY AUDIT TRAIL IN CLOUDTRAIL</h3>
+<p>→ Navigate to CloudTrail → Event history</p>
+<p><strong>Secrets Manager Events to Monitor:</strong></p>
+<table><thead><tr><th>Event Name</th><th>What It Means</th><th>Who Should See It</th></tr></thead><tbody><tr><td><code>GetSecretValue</code></td><td>Someone retrieved a secret</td><td>Expected from application roles during normal operation</td></tr><tr><td><code>CreateSecret</code></td><td>New secret was created</td><td>Security team during initial setup</td></tr><tr><td><code>PutSecretValue</code></td><td>Secret value was updated</td><td>Rotation Lambda during rotation</td></tr><tr><td><code>UpdateSecretVersionStage</code></td><td>Version labels moved</td><td>Rotation Lambda during rotation</td></tr><tr><td><code>RotationStarted</code></td><td>Rotation process began</td><td>Automated per schedule</td></tr><tr><td><code>RotationSucceeded</code></td><td>Rotation completed successfully</td><td>Expected every 30 days</td></tr><tr><td><code>RotationFailed</code></td><td>Rotation failed</td><td>⚠️ ALERT — investigate immediately</td></tr><tr><td><code>DeleteSecret</code></td><td>Secret scheduled for deletion</td><td>Security team only — verify intentional</td></tr><tr><td><code>GetRandomPassword</code></td><td>Random password generated</td><td>Rotation Lambda during rotation</td></tr><tr><td><code>DescribeSecret</code></td><td>Secret metadata queried</td><td>Normal operational activity</td></tr></tbody></table>
+<p><strong>Setting Up Alerts for Suspicious Activity:</strong><br>
+→ Using CloudWatch (Project 8) + EventBridge (Project 38) concepts:</p>
+<table><thead><tr><th>Alert Condition</th><th>What It Indicates</th><th>Action</th></tr></thead><tbody><tr><td><code>GetSecretValue</code> from unexpected IAM role</td><td>Unauthorized credential access attempt</td><td>Investigate immediately</td></tr><tr><td><code>RotationFailed</code> event</td><td>Password rotation failed — old password still active</td><td>Fix rotation Lambda, manual rotation</td></tr><tr><td><code>GetSecretValue</code> from unexpected IP/region</td><td>Potential credential theft</td><td>Disable secret, rotate immediately</td></tr><tr><td><code>DeleteSecret</code> event</td><td>Secret deletion — intentional or malicious?</td><td>Verify with security team</td></tr><tr><td>Spike in <code>GetSecretValue</code> calls</td><td>Potential automated credential scraping</td><td>Rate limit, investigate source</td></tr></tbody></table>
+<hr>
+<h3>STEP 13 — SECRET VERSIONING DEEP DIVE</h3>
+<p>→ Every secret has version stages that control which value is "active"</p>
+<p><strong>Version Stage Lifecycle:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Initial Secret Creation:
+</span>  Version 1 → AWSCURRENT (this is what GetSecretValue returns by default)
+
+After First Rotation:
+  Version 1 → AWSPREVIOUS
+  Version 2 → AWSCURRENT
+
+After Second Rotation:
+  Version 2 → AWSPREVIOUS
+  Version 3 → AWSCURRENT
+  Version 1 → (no stage — still exists but not labeled)
+
+During Rotation (brief window):
+  Version 2 → AWSCURRENT (old password — still works in DB)
+  Version 3 → AWSPENDING (new password — being set in DB)</code></pre></div>
+<p><strong>How Applications Should Handle Versions:</strong></p>
+<table><thead><tr><th>Scenario</th><th>What to Do</th></tr></thead><tbody><tr><td>Normal operation</td><td>Fetch default (AWSCURRENT) — always returns latest valid credential</td></tr><tr><td>Connection fails after rotation</td><td>Catch authentication error → fetch fresh secret (invalidate cache) → retry</td></tr><tr><td>Need to rollback rotation</td><td>Manually set AWSCURRENT back to previous version</td></tr><tr><td>Testing new credential before cutover</td><td>Fetch AWSPENDING version explicitly</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use separate database users per service — never share credentials<br>
+→ Always use hierarchical secret naming: <code>{company}/{env}/{engine}/{consumer}</code><br>
+→ Always exclude JDBC-breaking characters from auto-generated passwords<br>
+→ Always encrypt secrets with Customer Managed KMS keys (Project 36)<br>
+→ Always configure automatic rotation with Alternating Users strategy for production<br>
+→ Always set cache TTL to balance freshness vs performance (5 minutes recommended)<br>
+→ Always configure resource policies on secrets as defense-in-depth<br>
+→ Always set up CloudTrail monitoring for Secrets Manager events<br>
+→ Always alert on <code>RotationFailed</code> events — they mean passwords are NOT being changed<br>
+→ Always test rotation manually before enabling automatic schedule<br>
+→ Always verify rotation Lambda has VPC access to RDS and Secrets Manager<br>
+→ Always delete <code>.env</code> files, config files, and environment variables after migration to Secrets Manager</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never store database passwords in Lambda environment variables — visible in console and API<br>
+→ Never store credentials in <code>.env</code> files on EC2 instances — survives in AMI snapshots<br>
+→ Never store credentials in Glue connection properties without Secrets Manager integration<br>
+→ Never share one database user across multiple services — prevents audit and blast radius containment<br>
+→ Never use the <code>admin</code>/root database user for application access — use least-privilege dedicated users<br>
+→ Never skip password character exclusion — JDBC URL parsing breaks on <code>@</code>, <code>/</code>, <code>\</code> characters<br>
+→ Never set rotation interval longer than 90 days for production — compliance frameworks require shorter<br>
+→ Never forget to update RDS security group for rotation Lambda access — rotation fails silently<br>
+→ Never delete a secret without verifying no services depend on it — check CloudTrail for recent <code>GetSecretValue</code><br>
+→ Never hardcode secret ARNs — use secret names (Secrets Manager resolves names to ARNs)<br>
+→ Never grant <code>secretsmanager:*</code> to application roles — only grant <code>GetSecretValue</code><br>
+→ Never store non-credential configuration in Secrets Manager — use SSM Parameter Store (cheaper)</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Credential Type</th><th>Store In</th><th>Why</th></tr></thead><tbody><tr><td>Database username/password</td><td>Secrets Manager</td><td>Native rotation, RDS integration</td></tr><tr><td>API keys for third-party services</td><td>Secrets Manager</td><td>Rotation support, encryption, audit</td></tr><tr><td>OAuth tokens/refresh tokens</td><td>Secrets Manager</td><td>Automatic rotation via custom Lambda</td></tr><tr><td>SSH private keys</td><td>Secrets Manager</td><td>Secure storage, access control</td></tr><tr><td>Application configuration (non-sensitive)</td><td>SSM Parameter Store (String)</td><td>Free, simple key-value</td></tr><tr><td>Application configuration (sensitive)</td><td>SSM Parameter Store (SecureString)</td><td>KMS encrypted, cheaper than Secrets Manager</td></tr><tr><td>Encryption keys</td><td>KMS (Project 36)</td><td>Purpose-built for key management</td></tr><tr><td>Temporary credentials for cross-account access</td><td>STS AssumeRole (Project 40)</td><td>Dynamic, time-limited, no storage needed</td></tr></tbody></table>
+<table><thead><tr><th>Rotation Strategy</th><th>When to Use</th></tr></thead><tbody><tr><td>Single User</td><td>Dev/test environments, non-critical services, simple setup</td></tr><tr><td>Alternating Users</td><td>Production workloads, zero-disruption requirement, compliance mandates</td></tr><tr><td>Custom Lambda rotation</td><td>Non-RDS databases, third-party API keys, custom credential formats</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Secrets Manager for storing large configuration files — use S3 with SSE-KMS<br>
+→ Do NOT use Secrets Manager for feature flags — use AWS AppConfig or SSM Parameter Store<br>
+→ Do NOT use Secrets Manager for temporary credentials — use STS (Project 40)<br>
+→ Do NOT use Secrets Manager for encryption keys — use KMS (Project 36)<br>
+→ Do NOT use Secrets Manager if cost is primary concern and rotation is not needed — use SSM SecureString ($0 vs $0.40/month)<br>
+→ Do NOT use Secrets Manager for public/non-sensitive values — use SSM Parameter Store Standard (free)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — SECRET STORAGE ARCHITECTURE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────┐
+</span>│           Secrets Manager Service             │
+│                                               │
+│  ┌─────────────────────────────────────────┐  │
+│  │ Secret: shopnow/prod/mariadb/ec2-app    │  │
+│  │                                         │  │
+│  │ Version AWSCURRENT:                     │  │
+│  │   Encrypted Blob = AES-256-GCM(         │  │
+│  │     plaintext JSON,                     │  │
+│  │     DEK                                 │  │
+│  │   )                                     │  │
+│  │   Encrypted DEK = KMS_Encrypt(          │  │
+│  │     DEK,                                │  │
+│  │     shopnow-rds-mariadb-key             │  │
+│  │   )                                     │  │
+│  │                                         │  │
+│  │ Version AWSPREVIOUS:                    │  │
+│  │   (previous rotation's encrypted blob)  │  │
+│  └─────────────────────────────────────────┘  │
+│                                               │
+│  Secrets Manager NEVER stores plaintext       │
+│  Plaintext only exists in memory during       │
+│  GetSecretValue API response                  │
+└──────────────────────────────────────────────┘</code></pre></div>
+<p>→ Secrets Manager's internal storage is NOT S3 or DynamoDB<br>
+→ It is a purpose-built, encrypted, replicated store within the Secrets Manager service<br>
+→ The storage itself is encrypted, PLUS your secret is encrypted with YOUR KMS key<br>
+→ This is defense-in-depth: Even if Secrets Manager's internal storage were compromised, data is encrypted with your key</p>
+<hr>
+<h3>MECHANIC 2 — GetSecretValue API FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Application calls GetSecretValue(SecretId = "shopnow/prod/mariadb/ec2-app")
+</span>        ↓
+Secrets Manager checks:
+  1. Resource policy on the secret → Allow or Deny?
+  2. IAM policy on the caller → secretsmanager:GetSecretValue allowed?
+  3. Any SCP restrictions? (Project 54 preview)
+        ↓
+If authorized:
+  Secrets Manager retrieves encrypted blob + encrypted DEK
+        ↓
+  Secrets Manager calls KMS Decrypt internally:
+    - Uses the caller's identity for KMS authorization check
+    - KMS checks key policy + IAM policy for kms:Decrypt
+        ↓
+  If KMS authorizes:
+    KMS returns plaintext DEK
+    Secrets Manager decrypts the secret blob
+    Returns plaintext JSON to caller
+        ↓
+  CloudTrail records:
+    Event 1: secretsmanager:GetSecretValue (who, when, which secret)
+    Event 2: kms:Decrypt (who, when, which key)</code></pre></div>
+<p><strong>CRITICAL DETAIL: KMS Authorization Uses Caller Identity</strong><br>
+→ When Secrets Manager calls KMS Decrypt → KMS sees the ORIGINAL caller (e.g., EC2AppRole)<br>
+→ NOT the Secrets Manager service identity<br>
+→ This means: Even if Secrets Manager tries to decrypt, it checks YOUR role's KMS permissions<br>
+→ If your role does not have <code>kms:Decrypt</code> on the key → Secrets Manager cannot decrypt → GetSecretValue fails<br>
+→ This is why BOTH <code>secretsmanager:GetSecretValue</code> AND <code>kms:Decrypt</code> are required</p>
+<hr>
+<h3>MECHANIC 3 — ROTATION LAMBDA INTERNAL FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Rotation Triggered (schedule or manual)
+</span>        │
+        ├── Step 1: createSecret
+        │   └── Lambda calls GetRandomPassword → generates "NewPass456"
+        │   └── Lambda calls PutSecretValue(AWSPENDING) → stores new password in secret
+        │   └── At this point: AWSCURRENT = "OldPass123", AWSPENDING = "NewPass456"
+        │   └── MariaDB still only accepts "OldPass123"
+        │
+        ├── Step 2: setSecret
+        │   └── Lambda connects to MariaDB using admin credentials
+        │   └── Lambda executes ALTER USER to change password to "NewPass456"
+        │   └── At this point: MariaDB accepts "NewPass456"
+        │   └── MariaDB may still accept "OldPass123" briefly (connection caching)
+        │
+        ├── Step 3: testSecret
+        │   └── Lambda fetches AWSPENDING version from Secrets Manager
+        │   └── Lambda connects to MariaDB using "NewPass456"
+        │   └── Lambda runs test query (SELECT 1 or similar)
+        │   └── If test fails → rotation aborted → AWSCURRENT stays as "OldPass123"
+        │
+        └── Step 4: finishSecret
+            └── Lambda calls UpdateSecretVersionStage:
+                  Move AWSCURRENT label to new version ("NewPass456")
+                  Move AWSPREVIOUS label to old version ("OldPass123")
+            └── At this point: GetSecretValue returns "NewPass456" by default
+            └── Rotation complete → CloudTrail logs RotationSucceeded</code></pre></div>
+<p><strong>What if rotation fails at Step 2 or 3?</strong><br>
+→ AWSCURRENT still points to "OldPass123"<br>
+→ Applications continue working with old password<br>
+→ CloudTrail logs <code>RotationFailed</code> event<br>
+→ Secret remains in "rotation in progress" state<br>
+→ Fix the issue → retry rotation manually or wait for next scheduled attempt</p>
+<hr>
+<h3>MECHANIC 4 — ALTERNATING USERS INTERNAL FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Secret stores TWO usernames: glue_etl_user and glue_etl_user_clone
+</span>        │
+Rotation 1:
+        ├── Currently active: glue_etl_user (AWSCURRENT)
+        ├── createSecret → generate new password for glue_etl_user_clone
+        ├── setSecret → change glue_etl_user_clone's password in MariaDB
+        ├── testSecret → verify glue_etl_user_clone can connect
+        ├── finishSecret → AWSCURRENT now returns glue_etl_user_clone credentials
+        │
+Rotation 2:
+        ├── Currently active: glue_etl_user_clone (AWSCURRENT)
+        ├── createSecret → generate new password for glue_etl_user
+        ├── setSecret → change glue_etl_user's password in MariaDB
+        ├── testSecret → verify glue_etl_user can connect
+        ├── finishSecret → AWSCURRENT now returns glue_etl_user credentials
+        │
+... alternates forever</code></pre></div>
+<p>→ The KEY ADVANTAGE: During rotation, the currently active user's password is NOT being changed<br>
+→ Applications using the current user experience ZERO disruption<br>
+→ Only the inactive user's password is changed<br>
+→ After rotation completes → applications fetch the newly activated user on next secret retrieval</p>
+<hr>
+<h3>MECHANIC 5 — SECRET REPLICATION (Preview for Multi-Region — Project 55)</h3>
+<p>→ Secrets Manager supports cross-region secret replication<br>
+→ Navigate to secret → "Replicate secret" → Select destination regions</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Source region</td><td><code>ap-south-1</code> (Mumbai)</td></tr><tr><td>Replica region(s)</td><td><code>us-east-1</code> (Virginia) — for DR</td></tr><tr><td>Replica KMS key</td><td>Must be a KMS key in the destination region</td></tr></tbody></table>
+<p>→ Replicated secrets are read-only in the replica region<br>
+→ Changes to the source (including rotation) automatically propagate to replicas<br>
+→ Applications in the DR region can read the replicated secret<br>
+→ Useful for cross-region failover scenarios (Project 55)</p>
+<hr>
+<h3>MECHANIC 6 — COST MODEL</h3>
+<table><thead><tr><th>Component</th><th>Cost</th><th>Notes</th></tr></thead><tbody><tr><td>Secret storage</td><td>$0.40 per secret per month</td><td>Regardless of how many versions</td></tr><tr><td>API calls</td><td>$0.05 per 10,000 calls</td><td>GetSecretValue, PutSecretValue, etc.</td></tr><tr><td>Rotation Lambda</td><td>Lambda pricing (minimal)</td><td>Runs once per rotation interval, ~5 seconds</td></tr><tr><td>KMS calls (for encryption/decryption)</td><td>$0.03 per 10,000 calls</td><td>Each GetSecretValue triggers a KMS Decrypt</td></tr><tr><td>Replica secrets</td><td>$0.40 per replica per month</td><td>Per region replicated to</td></tr></tbody></table>
+<p><strong>ShopNow Cost Estimate:</strong></p>
+<table><thead><tr><th>Item</th><th>Calculation</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>5 secrets</td><td>5 × $0.40</td><td>$2.00</td></tr><tr><td>~100 GetSecretValue calls/day</td><td>3,000/month × $0.05/10,000</td><td>$0.015</td></tr><tr><td>KMS calls</td><td>Same as above</td><td>$0.009</td></tr><tr><td>Rotation Lambda</td><td>~5 invocations/month × negligible</td><td>~$0.00</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~$2.03/month</strong></td></tr></tbody></table>
+<p>→ Secrets Manager is extremely cost-effective for the security it provides<br>
+→ Compare to: a data breach costing $4.45 million average (IBM 2023 report)</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Rotation Lambda cannot reach MariaDB</td><td><code>RotationFailed</code> in CloudTrail</td><td>Lambda not in same VPC, or SG missing outbound 3306 to RDS SG</td><td>Deploy Lambda in VPC with correct SG cross-reference</td></tr><tr><td>2</td><td>Rotation Lambda cannot reach Secrets Manager</td><td>Lambda timeout during rotation</td><td>No VPC Endpoint for Secrets Manager and no NAT Gateway</td><td>Create Interface Endpoint for <code>secretsmanager</code></td></tr><tr><td>3</td><td>Application gets <code>AccessDeniedException</code> on GetSecretValue</td><td>Cannot fetch credentials</td><td>Missing <code>secretsmanager:GetSecretValue</code> in IAM policy OR resource policy denies</td><td>Add permission to IAM policy + check resource policy</td></tr><tr><td>4</td><td>Application gets <code>AccessDeniedException</code> on KMS</td><td>Secret exists but cannot decrypt</td><td>Missing <code>kms:Decrypt</code> on the KMS key in IAM policy OR key policy</td><td>Add KMS permission (Project 36 dual-gate model)</td></tr><tr><td>5</td><td>Password contains <code>@</code> character — JDBC URL breaks</td><td>Database connection fails with parsing error</td><td>Auto-generated password includes special characters</td><td>Exclude problematic characters in password generation settings</td></tr><tr><td>6</td><td>Rotation succeeds but application uses cached old password</td><td>Intermittent connection failures after rotation</td><td>Application caches credential longer than rotation window</td><td>Implement retry logic: on auth failure → invalidate cache → refetch secret → retry</td></tr><tr><td>7</td><td>Deleted secret that was still in use</td><td>Application cannot start — no credentials</td><td>Secret deletion not coordinated with consumers</td><td>Check CloudTrail for recent GetSecretValue before deleting. Secrets Manager has 7-30 day recovery window</td></tr><tr><td>8</td><td>Single User rotation causes brief connection drops</td><td>Application logs show authentication errors during rotation window</td><td>Single User strategy changes password of active user</td><td>Switch to Alternating Users strategy for production</td></tr><tr><td>9</td><td>Rotation admin secret expired or locked</td><td>All rotations fail — no secrets can be rotated</td><td>rotation-admin password changed externally or account locked in MariaDB</td><td>Manually reset rotation-admin password in both MariaDB and Secrets Manager</td></tr><tr><td>10</td><td>Too many concurrent GetSecretValue calls</td><td><code>ThrottlingException</code></td><td>Lambda with high concurrency + no caching → thousands of API calls/second</td><td>Implement caching library with 5-minute TTL</td></tr><tr><td>11</td><td>Secret name contains invalid characters</td><td><code>ValidationException</code> on CreateSecret</td><td>Names only allow alphanumeric, <code>/</code>, <code>_</code>, <code>+</code>, <code>.</code>, <code>@</code>, <code>-</code></td><td>Use naming convention: <code>company/env/engine/consumer</code></td></tr><tr><td>12</td><td>Cross-account secret access fails</td><td><code>AccessDeniedException</code> from different account</td><td>Resource policy does not include external account principal</td><td>Add cross-account principal to resource policy (Project 39 concepts)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Secret Count Scaling</strong></p>
+<ul>
+<li>Default: 500,000 secrets per region per account</li>
+<li>Practically unlimited for most organizations</li>
+<li>Naming convention becomes critical at scale — use hierarchical paths</li>
+<li>Use tags for filtering and cost allocation</li>
+</ul>
+<p>→ <strong>API Request Scaling</strong></p>
+<ul>
+<li>Default: 10,000 GetSecretValue requests per second per account per region</li>
+<li>With caching → actual API calls are a fraction of application requests</li>
+<li>Example: 1,000 Lambda concurrent executions with 5-minute cache → ~3-4 API calls/second average</li>
+<li>Without caching → 1,000 Lambda invocations/second → 1,000 API calls/second → within limits but wasteful</li>
+</ul>
+<p>→ <strong>Rotation Scaling</strong></p>
+<ul>
+<li>Each secret has its own rotation schedule</li>
+<li>Multiple secrets can share one rotation Lambda function</li>
+<li>Rotation Lambda invoked once per rotation per secret</li>
+<li>100 secrets rotating every 30 days → ~3 rotation Lambda invocations per day → negligible</li>
+</ul>
+<p>→ <strong>Multi-Region Scaling</strong></p>
+<ul>
+<li>Each secret can be replicated to multiple regions</li>
+<li>Replication is asynchronous — eventual consistency (typically seconds)</li>
+<li>Applications in each region read from local replica → low latency</li>
+<li>Rotation in source region propagates to replicas automatically</li>
+</ul>
+<p>→ <strong>Multi-Account Scaling (Preview for Projects 39-40)</strong></p>
+<ul>
+<li>Secrets CAN be shared cross-account via resource policy</li>
+<li>Or each account stores its own secrets (preferred for isolation)</li>
+<li>Central security account manages rotation configuration</li>
+<li>Application accounts only have <code>GetSecretValue</code> permission</li>
+</ul>
+<p>→ <strong>Connection Pool Scaling with Alternating Users</strong></p>
+<ul>
+<li>After rotation → applications gradually migrate connections to new user</li>
+<li>Connection pools may hold connections with OLD user → these remain valid until next rotation</li>
+<li>No pool draining required — connections gracefully transition</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the setup is working:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>How</th><th>Expected Result</th></tr></thead><tbody><tr><td>Secret exists and contains correct structure</td><td>Secrets Manager → Select secret → "Retrieve secret value"</td><td>JSON with username, password, host, port, dbname</td></tr><tr><td>Secret is encrypted with correct KMS key</td><td>Secret details → "Encryption key"</td><td>Shows <code>shopnow-rds-mariadb-key</code> alias/ARN</td></tr><tr><td>Application can fetch the secret</td><td>Application logs / test invocation</td><td>Successful credential retrieval, database connection</td></tr><tr><td>Rotation is configured</td><td>Secret details → "Rotation configuration"</td><td>Shows enabled, schedule, Lambda function</td></tr><tr><td>Rotation works</td><td>Click "Rotate secret immediately" (manual trigger)</td><td>Secret value changes, applications continue working</td></tr><tr><td>CloudTrail shows access</td><td>CloudTrail → Filter <code>secretsmanager.amazonaws.com</code></td><td><code>GetSecretValue</code> events with caller identity</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing health:</strong></p>
+<table><thead><tr><th>Metric / Event</th><th>Where</th><th>Alert Threshold</th></tr></thead><tbody><tr><td><code>RotationFailed</code> event</td><td>CloudTrail / EventBridge</td><td>Any occurrence → CRITICAL alert</td></tr><tr><td><code>RotationSucceeded</code> event</td><td>CloudTrail / EventBridge</td><td>Should occur per schedule (every 30 days)</td></tr><tr><td>GetSecretValue error rate</td><td>CloudTrail analysis</td><td>Any <code>AccessDeniedException</code> from expected roles</td></tr><tr><td>Secret last rotated date</td><td>Secrets Manager console → "Last rotated"</td><td>Should be within rotation interval</td></tr><tr><td>Rotation Lambda errors</td><td>CloudWatch → Lambda metrics</td><td>Any invocation errors</td></tr><tr><td>KMS Decrypt failures related to secret access</td><td>CloudTrail → KMS events</td><td>Any unexpected failures</td></tr></tbody></table>
+<p>→ <strong>How to present to the auditor:</strong></p>
+<table><thead><tr><th>Auditor Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"Where are credentials stored?"</td><td>Show Secrets Manager console — all credentials centralized</td></tr><tr><td>"Are credentials encrypted?"</td><td>Show KMS key association on each secret</td></tr><tr><td>"Are credentials rotated?"</td><td>Show rotation configuration — 30-day schedule, last rotated date</td></tr><tr><td>"Can you prove who accessed which credential?"</td><td>Show CloudTrail → filter by <code>GetSecretValue</code> → shows IAM role, timestamp, secret ARN</td></tr><tr><td>"Are credentials shared across services?"</td><td>Show separate secrets per service with unique MariaDB usernames</td></tr><tr><td>"Can you revoke one service's access without affecting others?"</td><td>Demonstrate: Remove IAM permission from one role → that service fails → others continue</td></tr><tr><td>"What happens if a credential is compromised?"</td><td>Demonstrate: Manual rotation → immediate password change → old password invalid → applications auto-recover</td></tr><tr><td>"Are hardcoded credentials eliminated?"</td><td>Show: No <code>.env</code> files, no Lambda env vars with passwords, no Glue connection embedded credentials</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Secrets Manager is the centralized credential vault — NEVER store credentials in config files, environment variables, or connection properties<br>
+→ Each service should have its OWN database user and its OWN secret — blast radius containment<br>
+→ Automatic rotation with Alternating Users strategy provides zero-disruption credential cycling<br>
+→ Secret access requires TRIPLE authorization: Secrets Manager resource policy + IAM policy + KMS key policy<br>
+→ Every <code>GetSecretValue</code> call is logged in CloudTrail — complete audit trail of who accessed what<br>
+→ Secrets are encrypted using YOUR KMS keys (Project 36) — you control the encryption independently<br>
+→ Rotation Lambda must be in the same VPC as RDS with proper security group cross-referencing (Projects 14, 24, 35 pattern)<br>
+→ Caching is essential for high-frequency consumers — 5-minute TTL balances freshness and performance<br>
+→ Applications MUST implement retry-on-auth-failure logic to handle the rotation transition window</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 36 created the KMS key that encrypts these secrets<br>
+→ Project 35 already configured Athena connector with Secrets Manager — now formalized and secured<br>
+→ Project 24 Glue JDBC connection — now migrated to Secrets Manager<br>
+→ Project 14 EC2-to-RDS connectivity — credentials now fetched dynamically<br>
+→ Project 9 RDS MariaDB — now has dedicated users per service instead of shared admin<br>
+→ Project 5 VPC and Project 27 VPC Endpoints — enable private access to Secrets Manager API</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 38 (next) introduces EventBridge for smart event routing<br>
+→ EventBridge can trigger workflows when Secrets Manager events occur (e.g., <code>RotationFailed</code> → trigger incident response)<br>
+→ Project 48 Redshift Federated Query to MariaDB will use Secrets Manager for the external schema configuration — same patterns as this project but with Redshift's <code>CREATE EXTERNAL SCHEMA</code> syntax referencing a secret ARN<br>
+→ Project 57 will combine Secrets Manager + KMS + CloudTrail + Config Rules into a comprehensive security architecture</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The auditor David is now satisfied<br>
+→ Encryption is in place (Project 36), credentials are managed (this project)<br>
+→ But the operations team raises a new concern:</p>
+<blockquote>
+<p>"We have 15 different scheduled tasks across our infrastructure:</p>
+<ul>
+<li>A Glue ETL job that runs daily at 2 AM</li>
+<li>An S3 upload notification that triggers Lambda</li>
+<li>A CloudWatch alarm that sends SNS alerts</li>
+<li>A Secrets Manager rotation that runs monthly</li>
+</ul>
+<p>But there's NO central place to see all these events.<br>
+When the S3 upload happens, we want to trigger DIFFERENT actions based on the file prefix.<br>
+When rotation fails, we want to trigger an incident response workflow.<br>
+When the Glue job completes, we want to notify the data team AND trigger the next pipeline step.</p>
+<p>We need SMART event routing — not just simple triggers."</p>
+</blockquote>
+<p>→ The current approach uses scattered S3 Event Notifications (Project 15), CloudWatch Alarms (Project 8), and direct Lambda triggers (Project 26)<br>
+→ There is no central event bus, no content-based routing, no event replay capability</p>
+<p>→ <strong>This is the exact problem Project 38 solves</strong><br>
+→ Project 38 introduces Amazon EventBridge — the central event bus for rule-based service integration<br>
+→ EventBridge replaces and extends the scattered notification patterns with unified, filterable, replayable event routing</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 38: "The System That Needed Smart Event Routing — EventBridge Rule-Based Service Integration"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-36.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 37/60</span></div><a class="nav-btn next" href="project-38.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 55: THE PLATFORM THAT COULDN'T AFFORD REGIONAL FAILURE — Cross-Region DR — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 55: THE PLATFORM THAT COULDN'T AFFORD REGIONAL FAILURE — Cross-Region DR for MariaDB + S3 + Redshift</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ PayScale's entire data platform runs in ap-south-1 (Mumbai)<br>
+→ On March 15, 2025 at 2:47 PM IST — AWS ap-south-1 experiences a major service event<br>
+→ Multiple Availability Zones are affected simultaneously (rare but documented — happened to us-east-1 in 2017, ap-northeast-1 in 2019)</p>
+<p><strong>The Cascade of Failures:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>2:47 PM — EC2 instances in ap-south-1a become unreachable
+</span>2:48 PM — RDS MariaDB Multi-AZ failover SUCCEEDS to ap-south-1b ✅
+2:52 PM — ap-south-1b also experiences degradation
+2:53 PM — RDS MariaDB in ap-south-1b becomes read-only (storage subsystem degraded)
+2:55 PM — S3 in ap-south-1 returns intermittent 503 errors
+2:58 PM — Redshift cluster in ap-south-1 becomes unreachable
+3:00 PM — Kinesis Data Stream stops accepting PutRecords
+3:05 PM — ALL PayScale services in ap-south-1 are DOWN</code></pre></div>
+<p><strong>Business Impact During the Outage:</strong></p>
+<table><thead><tr><th>System</th><th>Status</th><th>Business Impact</th><th>Revenue Loss</th></tr></thead><tbody><tr><td>Payment Processing (MariaDB)</td><td>❌ DOWN</td><td>No transactions can be processed</td><td>$500,000/hour</td></tr><tr><td>Fraud Detection (Streaming)</td><td>❌ DOWN</td><td>No real-time fraud scoring</td><td>$50,000/hour (undetected fraud)</td></tr><tr><td>Data Lake (S3 + Athena)</td><td>❌ DOWN</td><td>No analytics, no dashboards</td><td>Operational blindness</td></tr><tr><td>Data Warehouse (Redshift)</td><td>❌ DOWN</td><td>No reporting, no BI</td><td>Decision-making blocked</td></tr><tr><td>Notifications (SNS)</td><td>❌ DOWN</td><td>Cannot alert teams or customers</td><td>Customer trust erosion</td></tr></tbody></table>
+<p><strong>Total Impact: $550,000/hour + reputational damage</strong></p>
+<p><strong>The Aftermath:</strong></p>
+<p>→ ap-south-1 recovered after 6 hours (8:47 PM)<br>
+→ Total business impact: $3.3 million + regulatory investigation + customer churn<br>
+→ The Board demands: "This can NEVER happen again"</p>
+<p><strong>The Board's Requirements:</strong></p>
+<table><thead><tr><th>Requirement</th><th>Target</th><th>Current State</th></tr></thead><tbody><tr><td>Recovery Time Objective (RTO)</td><td>&lt; 4 hours</td><td>No DR plan — recovery depends on AWS regional recovery</td></tr><tr><td>Recovery Point Objective (RPO)</td><td>&lt; 1 hour</td><td>No cross-region replication — data loss = time since last backup</td></tr><tr><td>DR Region</td><td>ap-southeast-1 (Singapore)</td><td>No resources in any other region</td></tr><tr><td>DR Testing</td><td>Quarterly</td><td>Never tested</td></tr><tr><td>Automatic Failover</td><td>For critical path (payments)</td><td>Manual intervention required for everything</td></tr><tr><td>Data Consistency</td><td>All systems consistent after failover</td><td>No consistency guarantee</td></tr></tbody></table>
+<p><strong>Understanding RTO and RPO:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    DISASTER OCCURS
+</span>                         │
+    ◄────── RPO ────────►│◄──────── RTO ────────►
+                         │
+    Last data            │                    Systems
+    safely               │                    recovered
+    replicated           │                    and running
+                         │
+    RPO = How much       │    RTO = How long
+    DATA you can         │    until systems
+    afford to LOSE       │    are RUNNING again</code></pre></div>
+<table><thead><tr><th>RPO Target</th><th>Meaning</th><th>Technical Implication</th></tr></thead><tbody><tr><td>RPO = 0</td><td>Zero data loss</td><td>Synchronous replication (expensive, latency impact)</td></tr><tr><td>RPO &lt; 1 hour</td><td>Lose up to 1 hour of data</td><td>Asynchronous replication with &lt; 1 hour lag</td></tr><tr><td>RPO &lt; 24 hours</td><td>Lose up to 1 day of data</td><td>Daily backups/snapshots</td></tr></tbody></table>
+<table><thead><tr><th>RTO Target</th><th>Meaning</th><th>Technical Implication</th></tr></thead><tbody><tr><td>RTO = 0</td><td>Instant failover</td><td>Active-Active architecture (most expensive)</td></tr><tr><td>RTO &lt; 1 hour</td><td>Quick failover</td><td>Warm Standby (pre-provisioned resources)</td></tr><tr><td>RTO &lt; 4 hours</td><td>Moderate recovery</td><td>Pilot Light (minimal resources + scale-up on failover)</td></tr><tr><td>RTO &lt; 24 hours</td><td>Slow recovery</td><td>Backup &amp; Restore (cheapest, slowest)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the four DR strategy tiers</p>
+<table><thead><tr><th>Strategy</th><th>RTO</th><th>RPO</th><th>Cost</th><th>How It Works</th></tr></thead><tbody><tr><td><strong>Backup &amp; Restore</strong></td><td>24+ hours</td><td>24 hours</td><td>$ (lowest)</td><td>Backups in DR region → Restore from backup during disaster</td></tr><tr><td><strong>Pilot Light</strong></td><td>1-4 hours</td><td>Minutes-1 hour</td><td>$$</td><td>Minimal core infrastructure running in DR → Scale up during disaster</td></tr><tr><td><strong>Warm Standby</strong></td><td>Minutes-1 hour</td><td>Seconds-minutes</td><td>$$$</td><td>Scaled-down copy running in DR → Scale up during disaster</td></tr><tr><td><strong>Active-Active</strong></td><td>~0 (instant)</td><td>~0 (zero loss)</td><td>$$$$ (highest)</td><td>Full duplicate running in DR → Traffic splits between regions</td></tr></tbody></table>
+<p><strong>PayScale's Requirements Mapping:</strong></p>
+<table><thead><tr><th>Requirement</th><th>Best Strategy Match</th></tr></thead><tbody><tr><td>RTO &lt; 4 hours</td><td>Pilot Light or Warm Standby</td></tr><tr><td>RPO &lt; 1 hour</td><td>Pilot Light (with continuous replication)</td></tr><tr><td>Cost-conscious (not unlimited budget)</td><td>Pilot Light (cheapest option meeting requirements)</td></tr></tbody></table>
+<p>→ PayScale chooses <strong>Pilot Light</strong> strategy<br>
+→ Minimal infrastructure always running in DR region<br>
+→ Data continuously replicated to DR region<br>
+→ On disaster declaration → Scale up DR resources → Switch traffic</p>
+<p><strong>What "Pilot Light" Means for Each Service:</strong></p>
+<table><thead><tr><th>Service</th><th>Primary (ap-south-1)</th><th>DR (ap-southeast-1)</th><th>Pilot Light State</th></tr></thead><tbody><tr><td>MariaDB (RDS)</td><td>Full production instance</td><td>Cross-Region Read Replica</td><td>Running (minimal cost — reads only)</td></tr><tr><td>S3 Data Lake</td><td>All buckets with data</td><td>Cross-Region Replication targets</td><td>Data replicated continuously</td></tr><tr><td>Redshift</td><td>Serverless workgroup + namespace</td><td>Cross-Region snapshots</td><td>Snapshots only (no running compute)</td></tr><tr><td>Kinesis</td><td>Active stream</td><td>No stream (recreate on failover)</td><td>Nothing running</td></tr><tr><td>Lambda</td><td>Active functions</td><td>Functions deployed but not invoked</td><td>Deployed (no cost when idle)</td></tr><tr><td>VPC + Networking</td><td>Full VPC + TGW</td><td>VPC + basic networking</td><td>Pre-configured (minimal cost)</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Set up DR region VPC and networking</li>
+<li>Step 2 — Configure MariaDB Cross-Region Read Replica</li>
+<li>Step 3 — Configure S3 Cross-Region Replication</li>
+<li>Step 4 — Configure Redshift Cross-Region Snapshots</li>
+<li>Step 5 — Configure Route 53 DNS Failover</li>
+<li>Step 6 — Design the failover runbook</li>
+<li>Step 7 — Design the failback procedure</li>
+<li>Step 8 — Configure DR monitoring and alerting</li>
+<li>Step 9 — Design DR testing procedures</li>
+<li>Step 10 — Calculate DR costs</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — SET UP DR REGION VPC AND NETWORKING</h3>
+<p><strong>DR Region: ap-southeast-1 (Singapore)</strong></p>
+<p><strong>Why Singapore?</strong><br>
+→ Closest AWS region to Mumbai (lowest latency for replication)<br>
+→ ~60ms latency between Mumbai and Singapore<br>
+→ Different geographic fault domain (different country, different seismic zone)<br>
+→ Data residency: Singapore is acceptable for PayScale's compliance requirements<br>
+→ Full service availability (all needed services available)</p>
+<p><strong>VPC Configuration in DR Region (Account B — Risk/Fraud):</strong></p>
+<table><thead><tr><th>Setting</th><th>Primary (ap-south-1)</th><th>DR (ap-southeast-1)</th><th>Notes</th></tr></thead><tbody><tr><td>VPC CIDR</td><td>10.1.0.0/16</td><td>10.101.0.0/16</td><td>Different CIDR — no overlap (required for TGW peering)</td></tr><tr><td>Public subnet 1a</td><td>10.1.0.0/24</td><td>10.101.0.0/24</td><td>NAT Gateway location</td></tr><tr><td>Public subnet 1b</td><td>10.1.1.0/24</td><td>10.101.1.0/24</td><td>NAT Gateway HA</td></tr><tr><td>Private subnet 1a</td><td>10.1.2.0/24</td><td>10.101.2.0/24</td><td>Application servers</td></tr><tr><td>Private subnet 1b</td><td>10.1.3.0/24</td><td>10.101.3.0/24</td><td>Application servers</td></tr><tr><td>DB subnet 1a</td><td>10.1.4.0/24</td><td>10.101.4.0/24</td><td>RDS instances</td></tr><tr><td>DB subnet 1b</td><td>10.1.5.0/24</td><td>10.101.5.0/24</td><td>RDS instances</td></tr><tr><td>TGW subnet 1a</td><td>10.1.100.0/28</td><td>10.101.100.0/28</td><td>Transit Gateway (if cross-region)</td></tr><tr><td>TGW subnet 1b</td><td>10.1.100.16/28</td><td>10.101.100.16/28</td><td>Transit Gateway</td></tr></tbody></table>
+<p><strong>CIDR Planning Rationale:</strong><br>
+→ Primary region uses 10.X.0.0/16 (from Project 5, 50)<br>
+→ DR region uses 10.10X.0.0/16 (X = account number in primary)<br>
+→ This ensures NO overlap between primary and DR CIDRs<br>
+→ Non-overlapping CIDRs are required for cross-region TGW peering or VPN</p>
+<p><strong>Pilot Light Networking (Minimal — Pre-configured but not fully active):</strong></p>
+<table><thead><tr><th>Component</th><th>Primary (ap-south-1)</th><th>DR (ap-southeast-1) — Pilot Light</th></tr></thead><tbody><tr><td>Internet Gateway</td><td>✅ Active</td><td>✅ Created (attached to VPC)</td></tr><tr><td>NAT Gateway</td><td>✅ Active (2 — one per AZ)</td><td>❌ NOT created (create during failover — saves $64/month)</td></tr><tr><td>VPC Endpoints (S3)</td><td>✅ Active</td><td>✅ Created (no hourly cost for Gateway endpoints)</td></tr><tr><td>Security Groups</td><td>✅ Configured</td><td>✅ Pre-configured (identical rules)</td></tr><tr><td>Route Tables</td><td>✅ Configured</td><td>✅ Pre-configured (routes ready — NAT route added during failover)</td></tr><tr><td>Transit Gateway</td><td>✅ Active (from Project 50)</td><td>❌ NOT created (create during failover if cross-region TGW needed)</td></tr></tbody></table>
+<p><strong>Why NOT create NAT Gateway in advance?</strong><br>
+→ NAT Gateway costs $0.045/hour = $32/month per NAT<br>
+→ 2 NATs in DR region = $64/month doing NOTHING during normal operations<br>
+→ NAT Gateway creation takes ~2 minutes — acceptable within 4-hour RTO<br>
+→ Trade-off: Save $64/month vs add 2 minutes to failover time</p>
+<p><strong>Pre-failover Checklist for DR VPC:</strong><br>
+→ VPC created ✅<br>
+→ Subnets created ✅<br>
+→ IGW attached ✅<br>
+→ Route tables configured (except NAT route) ✅<br>
+→ Security groups pre-configured ✅<br>
+→ VPC Endpoints for S3 created ✅<br>
+→ RDS subnet group created ✅<br>
+→ Everything is READY — just needs NAT Gateway and workload activation</p>
+<hr>
+<h3>STEP 2 — CONFIGURE MARIADB CROSS-REGION READ REPLICA</h3>
+<p><strong>This is the MOST CRITICAL DR component — MariaDB handles payment processing</strong></p>
+<p><strong>From Project 29:</strong> Read Replicas use asynchronous replication<br>
+→ Same-region Read Replicas have millisecond replication lag<br>
+→ Cross-Region Read Replicas have higher lag (seconds to minutes) due to network distance</p>
+<p><strong>Create Cross-Region Read Replica:</strong></p>
+<p>→ Navigate to RDS Console (ap-south-1) → Select MariaDB instance → Actions → Create read replica</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Destination region</td><td>ap-southeast-1 (Singapore)</td><td>DR region</td></tr><tr><td>DB instance identifier</td><td><code>payscale-mariadb-dr-replica</code></td><td>Descriptive DR naming</td></tr><tr><td>DB instance class</td><td>db.t3.medium</td><td>Smaller than primary — minimal cost during pilot light</td></tr><tr><td>Multi-AZ deployment</td><td>❌ No (for pilot light)</td><td>Save cost — enable during failover if needed</td></tr><tr><td>Storage type</td><td>gp3</td><td>Matches primary</td></tr><tr><td>Storage encrypted</td><td>✅ Yes</td><td>Must be encrypted (SCP from Project 54 enforces this)</td></tr><tr><td>KMS key</td><td>Customer managed key in ap-southeast-1</td><td>Different region = different KMS key</td></tr><tr><td>VPC</td><td>DR VPC in ap-southeast-1</td><td>The VPC created in Step 1</td></tr><tr><td>DB subnet group</td><td>DR subnet group (db subnets in ap-southeast-1)</td><td>Pre-created in Step 1</td></tr><tr><td>Publicly accessible</td><td>❌ No</td><td>Private access only</td></tr><tr><td>Monitoring</td><td>Enhanced Monitoring: ✅ Enabled</td><td>Track replication lag</td></tr></tbody></table>
+<p><strong>Cross-Region KMS Encryption:</strong></p>
+<p>→ The primary MariaDB is encrypted with a KMS key in ap-south-1<br>
+→ Cross-region replica CANNOT use the same KMS key (KMS keys are regional)<br>
+→ You must specify a KMS key in ap-southeast-1 for the replica<br>
+→ RDS handles the re-encryption transparently during replication</p>
+<table><thead><tr><th>Primary (ap-south-1)</th><th>DR Replica (ap-southeast-1)</th></tr></thead><tbody><tr><td>KMS Key: <code>arn:aws:kms:ap-south-1:222222222222:key/primary-key-id</code></td><td>KMS Key: <code>arn:aws:kms:ap-southeast-1:222222222222:key/dr-key-id</code></td></tr></tbody></table>
+<p>→ Create the DR KMS key in ap-southeast-1 BEFORE creating the read replica</p>
+<p><strong>Replication Lag Monitoring:</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Normal Value</th><th>Alert Threshold</th><th>Meaning</th></tr></thead><tbody><tr><td>ReplicaLag</td><td>CloudWatch RDS (ap-southeast-1)</td><td>&lt; 5 seconds</td><td>&gt; 60 seconds</td><td>DR replica is falling behind primary</td></tr><tr><td>ReplicaLag</td><td>CloudWatch RDS (ap-southeast-1)</td><td>&lt; 5 seconds</td><td>&gt; 300 seconds (5 min)</td><td>Critical — RPO at risk</td></tr><tr><td>ReplicaLag</td><td>CloudWatch RDS (ap-southeast-1)</td><td>&lt; 5 seconds</td><td>&gt; 3600 seconds (1 hour)</td><td>RPO VIOLATED — investigate immediately</td></tr></tbody></table>
+<p><strong>What Replication Lag Means for RPO:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Replication Lag = 30 seconds
+</span>    → If disaster happens NOW → DR replica is 30 seconds behind
+    → After promotion → You lose the last 30 seconds of transactions
+    → RPO achieved: 30 seconds ✅ (within 1-hour target)
+
+Replication Lag = 45 minutes
+    → If disaster happens NOW → DR replica is 45 minutes behind
+    → After promotion → You lose the last 45 minutes of transactions
+    → RPO achieved: 45 minutes ✅ (within 1-hour target — but cutting it close)
+
+Replication Lag = 2 hours
+    → If disaster happens NOW → DR replica is 2 hours behind
+    → After promotion → You lose the last 2 hours of transactions
+    → RPO VIOLATED ❌ — investigate and fix replication lag</code></pre></div>
+<p><strong>Factors Affecting Cross-Region Replication Lag:</strong></p>
+<table><thead><tr><th>Factor</th><th>Impact</th><th>Mitigation</th></tr></thead><tbody><tr><td>Network latency (Mumbai → Singapore)</td><td>~60ms per transaction</td><td>Unavoidable — inherent to cross-region</td></tr><tr><td>Write volume on primary</td><td>High writes = more data to replicate</td><td>Scale replica instance class if lag grows</td></tr><tr><td>Replica instance class too small</td><td>Cannot process replication stream fast enough</td><td>Use same or larger instance class as primary</td></tr><tr><td>Long-running transactions on primary</td><td>Large transactions take time to replicate</td><td>Optimize long-running queries</td></tr><tr><td>Network bandwidth between regions</td><td>AWS backbone — generally not a bottleneck</td><td>Monitor NetworkTransmitThroughput</td></tr></tbody></table>
+<p><strong>Pilot Light Cost for MariaDB DR:</strong></p>
+<table><thead><tr><th>Component</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>db.t3.medium in ap-southeast-1</td><td>~$50/month</td></tr><tr><td>gp3 storage (100 GB)</td><td>~$8/month</td></tr><tr><td>Cross-region data transfer (replication)</td><td>~$10/month (based on write volume)</td></tr><tr><td><strong>Total</strong></td><td><strong>~$68/month</strong></td></tr></tbody></table>
+<p>→ $68/month insurance against $3.3 million disaster impact = exceptional ROI</p>
+<hr>
+<h3>STEP 3 — CONFIGURE S3 CROSS-REGION REPLICATION</h3>
+<p><strong>From Project 30:</strong> S3 CRR replicates objects automatically to a destination bucket in another region</p>
+<p><strong>Replication Configuration for Each Data Lake Bucket:</strong></p>
+<table><thead><tr><th>Source Bucket (ap-south-1)</th><th>Destination Bucket (ap-southeast-1)</th><th>Replication Scope</th></tr></thead><tbody><tr><td><code>payscale-datalake-landing</code></td><td><code>payscale-datalake-landing-dr</code></td><td>All objects</td></tr><tr><td><code>payscale-datalake-raw</code></td><td><code>payscale-datalake-raw-dr</code></td><td>All objects</td></tr><tr><td><code>payscale-datalake-curated</code></td><td><code>payscale-datalake-curated-dr</code></td><td>All objects</td></tr><tr><td><code>payscale-datalake-refined</code></td><td><code>payscale-datalake-refined-dr</code></td><td>All objects</td></tr></tbody></table>
+<p><strong>Create Destination Buckets (ap-southeast-1):</strong></p>
+<p>→ Navigate to S3 Console → Create bucket (select ap-southeast-1 region)</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Bucket name</td><td><code>payscale-datalake-raw-dr</code></td><td>DR naming convention</td></tr><tr><td>Region</td><td>ap-southeast-1</td><td>DR region</td></tr><tr><td>Versioning</td><td>✅ Enabled</td><td>REQUIRED for CRR (from Project 30)</td></tr><tr><td>Encryption</td><td>SSE-KMS (with DR region KMS key)</td><td>Matches primary encryption</td></tr><tr><td>Block Public Access</td><td>✅ All blocked</td><td>Security baseline</td></tr></tbody></table>
+<p>→ Repeat for all 4 zone buckets</p>
+<p><strong>Configure Replication Rules (on Source Buckets):</strong></p>
+<p>→ Navigate to S3 Console → Source bucket → Management → Replication rules → Create rule</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Rule name</td><td><code>crr-raw-to-dr</code></td><td>Descriptive</td></tr><tr><td>Status</td><td>Enabled</td><td>Active replication</td></tr><tr><td>Source bucket</td><td><code>payscale-datalake-raw</code> (ap-south-1)</td><td>Primary bucket</td></tr><tr><td>Apply to</td><td>Entire bucket (all objects)</td><td>Replicate everything</td></tr><tr><td>Destination</td><td><code>payscale-datalake-raw-dr</code> (ap-southeast-1)</td><td>DR bucket</td></tr><tr><td>IAM role</td><td><code>S3ReplicationRole</code></td><td>Role with replication permissions</td></tr><tr><td>Encryption</td><td>Replicate objects encrypted with KMS</td><td>Handle KMS-encrypted objects</td></tr><tr><td>Destination KMS key</td><td>DR region KMS key ARN</td><td>Re-encrypt in DR region</td></tr><tr><td>Replication Time Control (RTC)</td><td>✅ Enabled</td><td>Guarantees 99.99% of objects replicated within 15 minutes</td></tr><tr><td>Replication metrics</td><td>✅ Enabled</td><td>Monitor replication lag and pending objects</td></tr><tr><td>Delete marker replication</td><td>✅ Enabled</td><td>Replicate deletions too</td></tr></tbody></table>
+<p><strong>S3 Replication IAM Role:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:GetReplicationConfiguration</code></td><td>Source bucket ARN</td><td>Read replication config</td></tr><tr><td><code>s3:ListBucket</code></td><td>Source bucket ARN</td><td>List source objects</td></tr><tr><td><code>s3:GetObjectVersionForReplication</code></td><td>Source bucket ARN/*</td><td>Read source objects</td></tr><tr><td><code>s3:ReplicateObject</code></td><td>Destination bucket ARN/*</td><td>Write to destination</td></tr><tr><td><code>s3:ReplicateDelete</code></td><td>Destination bucket ARN/*</td><td>Replicate deletions</td></tr><tr><td><code>kms:Decrypt</code></td><td>Source KMS key ARN</td><td>Decrypt source objects</td></tr><tr><td><code>kms:Encrypt</code></td><td>Destination KMS key ARN</td><td>Encrypt destination objects</td></tr></tbody></table>
+<p><strong>Trust Policy:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity</td><td><code>s3.amazonaws.com</code></td></tr></tbody></table>
+<p><strong>Replication Time Control (RTC) — Critical for RPO:</strong></p>
+<table><thead><tr><th>Without RTC</th><th>With RTC</th></tr></thead><tbody><tr><td>Best-effort replication — usually seconds/minutes</td><td>SLA: 99.99% of objects replicated within 15 minutes</td></tr><tr><td>No SLA guarantee</td><td>AWS provides credits if SLA violated</td></tr><tr><td>Free</td><td>$0.015 per GB replicated</td></tr><tr><td>Acceptable for non-critical data</td><td>Required for RPO &lt; 1 hour</td></tr></tbody></table>
+<p>→ PayScale enables RTC for all data lake buckets — $0.015/GB is negligible vs RPO guarantee</p>
+<p><strong>Replication Monitoring:</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Alert Threshold</th><th>Meaning</th></tr></thead><tbody><tr><td>ReplicationLatency</td><td>S3 Replication Metrics</td><td>&gt; 900 seconds (15 min)</td><td>Objects taking too long to replicate</td></tr><tr><td>OperationsPendingReplication</td><td>S3 Replication Metrics</td><td>&gt; 10,000 objects</td><td>Large backlog of unreplicated objects</td></tr><tr><td>BytesPendingReplication</td><td>S3 Replication Metrics</td><td>&gt; 1 GB</td><td>Significant data pending replication</td></tr><tr><td>OperationsFailedReplication</td><td>S3 Replication Metrics</td><td>&gt; 0</td><td>Replication failures — investigate</td></tr></tbody></table>
+<p><strong>Existing Objects Replication:</strong></p>
+<p>→ CRR only replicates NEW objects created after the rule is enabled<br>
+→ Existing objects are NOT automatically replicated<br>
+→ To replicate existing objects → Use S3 Batch Replication</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Job type</td><td>S3 Batch Replication</td></tr><tr><td>Source</td><td><code>payscale-datalake-raw</code> (all existing objects)</td></tr><tr><td>Destination</td><td><code>payscale-datalake-raw-dr</code></td></tr><tr><td>Status</td><td>Run once → Replicates all existing objects</td></tr></tbody></table>
+<p>→ Run Batch Replication for all 4 zone buckets<br>
+→ After completion → CRR handles all new objects automatically</p>
+<p><strong>Pilot Light Cost for S3 DR:</strong></p>
+<table><thead><tr><th>Component</th><th>Calculation</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>S3 Storage (DR copies)</td><td>~1 TB × $0.023/GB</td><td>$23.55</td></tr><tr><td>CRR Data Transfer</td><td>~100 GB new data/month × $0.02/GB</td><td>$2.00</td></tr><tr><td>RTC Fee</td><td>~100 GB × $0.015/GB</td><td>$1.50</td></tr><tr><td><strong>Total</strong></td><td></td><td><strong>~$27/month</strong></td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — CONFIGURE REDSHIFT CROSS-REGION SNAPSHOTS</h3>
+<p><strong>Redshift Serverless (from Project 53) Snapshot Configuration:</strong></p>
+<p>→ Navigate to Redshift Console → Serverless → Namespace → <code>payscale-dw-namespace</code><br>
+→ Recovery settings</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Cross-Region snapshot</td><td>✅ Enabled</td><td>Copy snapshots to DR region</td></tr><tr><td>Destination region</td><td>ap-southeast-1</td><td>DR region</td></tr><tr><td>Snapshot retention (DR region)</td><td>7 days</td><td>Keep 7 days of snapshots in DR</td></tr><tr><td>KMS key (DR region)</td><td>Customer managed key in ap-southeast-1</td><td>Re-encrypt snapshots in DR region</td></tr><tr><td>Snapshot frequency</td><td>Every 8 hours</td><td>3 snapshots per day — RPO = 8 hours for Redshift</td></tr></tbody></table>
+<p><strong>Redshift RPO Analysis:</strong></p>
+<table><thead><tr><th>Snapshot Frequency</th><th>RPO</th><th>Monthly Cost (snapshot storage)</th></tr></thead><tbody><tr><td>Every 24 hours</td><td>24 hours</td><td>Low (~$5)</td></tr><tr><td>Every 8 hours</td><td>8 hours</td><td>Medium (~$15)</td></tr><tr><td>Every 1 hour</td><td>1 hour</td><td>Higher (~$50)</td></tr><tr><td>Continuous (CDC via DMS)</td><td>Minutes</td><td>Highest (DMS instance cost)</td></tr></tbody></table>
+<p>→ PayScale chooses <strong>every 8 hours</strong> for Redshift<br>
+→ Why not 1 hour? Redshift contains ANALYTICAL data — not transactional<br>
+→ The source data exists in MariaDB (RPO &lt; 1 hour) and S3 (RPO &lt; 15 minutes)<br>
+→ After failover → Redshift can be rebuilt from MariaDB + S3 if the 8-hour snapshot is too stale<br>
+→ This is a cost optimization — Redshift is DERIVED data, not source-of-truth</p>
+<p><strong>Failover Procedure for Redshift:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Restore from Cross-Region Snapshot (Fast)
+</span>    → Restore snapshot in ap-southeast-1
+    → Create new Serverless namespace + workgroup
+    → RTO: 15-30 minutes (snapshot restore)
+    → RPO: Up to 8 hours (last snapshot time)
+
+Option B: Rebuild from S3 Data Lake (More Current)
+    → Create new Serverless namespace + workgroup in ap-southeast-1
+    → COPY data from DR S3 buckets (payscale-datalake-curated-dr)
+    → RTO: 1-2 hours (depending on data volume)
+    → RPO: &lt; 15 minutes (S3 CRR lag)
+
+Recommended: Option A first (fast), then refresh from S3 for latest data</code></pre></div>
+<hr>
+<h3>STEP 5 — CONFIGURE ROUTE 53 DNS FAILOVER</h3>
+<p><strong>Purpose:</strong> Automatically route traffic from primary to DR when primary is unhealthy</p>
+<p><strong>Current DNS Setup:</strong></p>
+<code>api.payscale.com → ALB in ap-south-1 → EC2 instances → MariaDB (ap-south-1)</code>
+<p><strong>DR DNS Setup:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>api.payscale.com → Route 53 Failover Routing
+</span>    |
+    ├── PRIMARY: ALB in ap-south-1 (Health Check: HEALTHY → route here)
+    |
+    └── SECONDARY: ALB in ap-southeast-1 (Health Check: Route here if PRIMARY unhealthy)</code></pre></div>
+<p><strong>Step 5a — Create Health Check:</strong></p>
+<p>→ Navigate to Route 53 Console → Health checks → Create health check</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Name</td><td><code>primary-api-health</code></td><td>Identifies primary region health</td></tr><tr><td>What to monitor</td><td>Endpoint</td><td>Monitor the primary ALB</td></tr><tr><td>Protocol</td><td>HTTPS</td><td>Match application protocol</td></tr><tr><td>IP address or domain</td><td>Primary ALB DNS name</td><td>The load balancer to monitor</td></tr><tr><td>Port</td><td>443</td><td>HTTPS port</td></tr><tr><td>Path</td><td><code>/health</code></td><td>Application health endpoint</td></tr><tr><td>Request interval</td><td>10 seconds (Fast)</td><td>Quick detection of failures</td></tr><tr><td>Failure threshold</td><td>3</td><td>Mark unhealthy after 3 consecutive failures (30 seconds)</td></tr><tr><td>Regions</td><td>Select 3+ Route 53 health check regions</td><td>Multiple vantage points prevent false positives</td></tr><tr><td>Invert health check</td><td>❌ No</td><td>Normal behavior</td></tr><tr><td>CloudWatch alarm</td><td>✅ Enable</td><td>Alert when health check fails</td></tr></tbody></table>
+<p><strong>Step 5b — Create Failover DNS Records:</strong></p>
+<p>→ Navigate to Route 53 Console → Hosted zones → payscale.com → Create record</p>
+<p><strong>Primary Record:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Record name</td><td><code>api.payscale.com</code></td><td>Application endpoint</td></tr><tr><td>Record type</td><td>A (Alias)</td><td>Points to ALB</td></tr><tr><td>Routing policy</td><td>Failover</td><td>Enable primary/secondary failover</td></tr><tr><td>Failover record type</td><td>Primary</td><td>This is the primary record</td></tr><tr><td>Value</td><td>ALB DNS in ap-south-1</td><td>Primary region ALB</td></tr><tr><td>Health check</td><td><code>primary-api-health</code></td><td>Associate with health check</td></tr><tr><td>Record ID</td><td><code>primary-ap-south-1</code></td><td>Unique identifier</td></tr><tr><td>TTL</td><td>60 seconds</td><td>Low TTL for fast DNS propagation during failover</td></tr></tbody></table>
+<p><strong>Secondary Record:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>Record name</td><td><code>api.payscale.com</code></td><td>Same domain name</td></tr><tr><td>Record type</td><td>A (Alias)</td><td>Points to ALB</td></tr><tr><td>Routing policy</td><td>Failover</td><td>Enable primary/secondary failover</td></tr><tr><td>Failover record type</td><td>Secondary</td><td>This is the DR record</td></tr><tr><td>Value</td><td>ALB DNS in ap-southeast-1</td><td>DR region ALB</td></tr><tr><td>Health check</td><td>None (or separate DR health check)</td><td>Secondary doesn't need health check</td></tr><tr><td>Record ID</td><td><code>secondary-ap-southeast-1</code></td><td>Unique identifier</td></tr></tbody></table>
+<p><strong>How DNS Failover Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>NORMAL OPERATION:
+</span>    Client → DNS query for api.payscale.com
+    Route 53 → Health check on primary: HEALTHY ✅
+    Route 53 → Returns: ALB-ap-south-1 IP address
+    Client → Connects to ap-south-1
+
+DURING DISASTER:
+    Client → DNS query for api.payscale.com
+    Route 53 → Health check on primary: UNHEALTHY ❌ (3 consecutive failures)
+    Route 53 → Returns: ALB-ap-southeast-1 IP address
+    Client → Connects to ap-southeast-1 (DR region)
+
+AFTER RECOVERY:
+    Client → DNS query for api.payscale.com
+    Route 53 → Health check on primary: HEALTHY ✅ (recovered)
+    Route 53 → Returns: ALB-ap-south-1 IP address (back to primary)
+    Client → Connects to ap-south-1 (primary restored)</code></pre></div>
+<p><strong>DNS TTL and Propagation:</strong></p>
+<table><thead><tr><th>TTL</th><th>Propagation Time</th><th>Impact</th></tr></thead><tbody><tr><td>300 seconds (5 min)</td><td>Up to 5 minutes for clients to see new IP</td><td>5 minutes of potential downtime during failover</td></tr><tr><td>60 seconds (1 min)</td><td>Up to 1 minute for clients to see new IP</td><td>1 minute of potential downtime</td></tr><tr><td>10 seconds</td><td>Nearly instant propagation</td><td>Minimal downtime — but higher DNS query costs</td></tr></tbody></table>
+<p>→ PayScale sets TTL to 60 seconds — acceptable trade-off<br>
+→ Some clients may cache DNS longer than TTL — this is client behavior, not controllable</p>
+<p><strong>Important — DNS Failover is AUTOMATIC for Route 53 but DR resources must be READY:</strong><br>
+→ Route 53 automatically switches DNS when health check fails<br>
+→ BUT the DR ALB, EC2 instances, and promoted MariaDB must be running<br>
+→ For Pilot Light → Some resources need to be started/scaled during failover<br>
+→ This is why we need a failover RUNBOOK (Step 6)</p>
+<hr>
+<h3>STEP 6 — DESIGN THE FAILOVER RUNBOOK</h3>
+<p><strong>The Failover Runbook — Step-by-Step Procedure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TRIGGER: Primary region health check fails for &gt; 5 minutes
+</span>    OR: AWS Service Health Dashboard reports regional event
+    OR: Manual declaration by Platform Team Lead</code></pre></div>
+<p><strong>Phase 1: ASSESS (0-15 minutes)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>1.1</td><td>Confirm regional outage (not just application issue)</td><td>On-Call Engineer</td><td>5 min</td></tr><tr><td>1.2</td><td>Check AWS Service Health Dashboard</td><td>On-Call Engineer</td><td>2 min</td></tr><tr><td>1.3</td><td>Verify DR replica lag (MariaDB ReplicaLag metric)</td><td>DBA</td><td>2 min</td></tr><tr><td>1.4</td><td>Verify S3 replication status (pending objects)</td><td>Data Engineer</td><td>2 min</td></tr><tr><td>1.5</td><td>Decision: Declare disaster and initiate failover</td><td>Platform Team Lead</td><td>5 min</td></tr></tbody></table>
+<p><strong>Phase 2: NETWORK ACTIVATION (15-30 minutes)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>2.1</td><td>Create NAT Gateways in DR VPC (ap-southeast-1)</td><td>Network Engineer</td><td>5 min</td></tr><tr><td>2.2</td><td>Update route tables with NAT Gateway routes</td><td>Network Engineer</td><td>5 min</td></tr><tr><td>2.3</td><td>Verify VPC Endpoint connectivity (S3)</td><td>Network Engineer</td><td>2 min</td></tr><tr><td>2.4</td><td>Verify security groups are correct</td><td>Network Engineer</td><td>3 min</td></tr></tbody></table>
+<p><strong>Phase 3: DATABASE FAILOVER (30-60 minutes)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>3.1</td><td>Check MariaDB replica lag one final time</td><td>DBA</td><td>2 min</td></tr><tr><td>3.2</td><td><strong>PROMOTE</strong> Cross-Region Read Replica to standalone</td><td>DBA</td><td>10-15 min</td></tr><tr><td>3.3</td><td>Verify promoted instance is read-write</td><td>DBA</td><td>5 min</td></tr><tr><td>3.4</td><td>Update application connection strings to DR endpoint</td><td>DevOps</td><td>5 min</td></tr><tr><td>3.5</td><td>Run data integrity check on promoted instance</td><td>DBA</td><td>10 min</td></tr></tbody></table>
+<p><strong>MariaDB Promotion Details:</strong></p>
+<p>→ Navigate to RDS Console (ap-southeast-1) → Select read replica → Actions → Promote</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Instance to promote</td><td><code>payscale-mariadb-dr-replica</code></td></tr><tr><td>Backup retention</td><td>7 days (enable backups on promoted instance)</td></tr><tr><td>Multi-AZ</td><td>✅ Enable (for HA in DR region)</td></tr></tbody></table>
+<p><strong>CRITICAL: Promotion is IRREVERSIBLE</strong><br>
+→ Once promoted → The replica becomes an independent standalone instance<br>
+→ It is NO LONGER replicating from the primary<br>
+→ To re-establish replication → Must create a NEW replica (during failback)</p>
+<p><strong>Phase 4: DATA LAKE ACTIVATION (30-45 minutes — parallel with Phase 3)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>4.1</td><td>Verify DR S3 buckets have latest data</td><td>Data Engineer</td><td>5 min</td></tr><tr><td>4.2</td><td>Update Glue Catalog in DR region (recreate crawlers/tables)</td><td>Data Engineer</td><td>15 min</td></tr><tr><td>4.3</td><td>Configure Athena workgroup in DR region</td><td>Data Engineer</td><td>5 min</td></tr><tr><td>4.4</td><td>Verify Athena can query DR S3 buckets</td><td>Data Engineer</td><td>5 min</td></tr><tr><td>4.5</td><td>Update Lake Formation permissions in DR region</td><td>Data Engineer</td><td>10 min</td></tr></tbody></table>
+<p><strong>Phase 5: WAREHOUSE ACTIVATION (45-90 minutes — parallel with Phase 3-4)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>5.1</td><td>Restore Redshift from latest cross-region snapshot</td><td>Data Engineer</td><td>15-30 min</td></tr><tr><td>5.2</td><td>Create Serverless workgroup in DR region</td><td>Data Engineer</td><td>5 min</td></tr><tr><td>5.3</td><td>Verify Redshift data integrity</td><td>Data Engineer</td><td>10 min</td></tr><tr><td>5.4</td><td>Refresh latest data from DR S3 buckets via COPY</td><td>Data Engineer</td><td>15-30 min</td></tr><tr><td>5.5</td><td>Recreate Spectrum external schemas pointing to DR Glue Catalog</td><td>Data Engineer</td><td>5 min</td></tr><tr><td>5.6</td><td>Recreate Federated Query schema pointing to promoted MariaDB</td><td>Data Engineer</td><td>5 min</td></tr></tbody></table>
+<p><strong>Phase 6: APPLICATION ACTIVATION (60-120 minutes)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>6.1</td><td>Launch EC2 instances from AMIs in DR region</td><td>DevOps</td><td>10 min</td></tr><tr><td>6.2</td><td>Configure application to use promoted MariaDB endpoint</td><td>DevOps</td><td>5 min</td></tr><tr><td>6.3</td><td>Start application services</td><td>DevOps</td><td>5 min</td></tr><tr><td>6.4</td><td>Register instances with DR ALB</td><td>DevOps</td><td>5 min</td></tr><tr><td>6.5</td><td>Verify ALB health checks pass</td><td>DevOps</td><td>5 min</td></tr><tr><td>6.6</td><td>Route 53 health check detects DR ALB as healthy → DNS failover completes</td><td>Automatic</td><td>1-2 min</td></tr></tbody></table>
+<p><strong>Phase 7: STREAMING ACTIVATION (90-150 minutes — if needed)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>7.1</td><td>Create Kinesis Data Stream in DR region</td><td>Data Engineer</td><td>5 min</td></tr><tr><td>7.2</td><td>Create Firehose delivery stream pointing to DR S3 buckets</td><td>Data Engineer</td><td>10 min</td></tr><tr><td>7.3</td><td>Update application to produce to DR Kinesis stream</td><td>DevOps</td><td>5 min</td></tr><tr><td>7.4</td><td>Deploy Lambda fraud alerting function in DR region</td><td>DevOps</td><td>5 min</td></tr><tr><td>7.5</td><td>Verify streaming pipeline end-to-end</td><td>Data Engineer</td><td>10 min</td></tr></tbody></table>
+<p><strong>Phase 8: VALIDATION (150-180 minutes)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Who</th><th>Duration</th></tr></thead><tbody><tr><td>8.1</td><td>Run end-to-end transaction test</td><td>QA</td><td>15 min</td></tr><tr><td>8.2</td><td>Verify fraud detection pipeline</td><td>Fraud Team</td><td>10 min</td></tr><tr><td>8.3</td><td>Verify Athena queries on DR data lake</td><td>Analysts</td><td>5 min</td></tr><tr><td>8.4</td><td>Verify Redshift dashboards</td><td>BI Team</td><td>5 min</td></tr><tr><td>8.5</td><td>Send "DR ACTIVE" notification to all teams</td><td>Platform Lead</td><td>5 min</td></tr></tbody></table>
+<p><strong>Total Failover Timeline:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>T+0:     Disaster detected
+</span>T+15:    Decision to failover
+T+30:    Network ready
+T+60:    MariaDB promoted + Data Lake accessible
+T+90:    Redshift restored
+T+120:   Application serving traffic
+T+150:   Streaming pipeline active
+T+180:   Full validation complete
+
+TOTAL RTO: ~3 hours ✅ (within 4-hour target)</code></pre></div>
+<hr>
+<h3>STEP 7 — DESIGN THE FAILBACK PROCEDURE</h3>
+<p><strong>Failback = Returning to primary region after it recovers</strong></p>
+<p><strong>Failback is MORE COMPLEX than failover because:</strong><br>
+→ During failover → DR region accumulated NEW data<br>
+→ This new data must be synchronized BACK to the primary region<br>
+→ The primary region's old data may be stale or inconsistent</p>
+<p><strong>Failback Steps:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Phase 1: PRIMARY REGION RECOVERY VERIFICATION
+</span>    → Verify ap-south-1 is fully recovered
+    → Verify all services are operational
+    → Run health checks for 24 hours minimum
+
+Phase 2: DATA SYNCHRONIZATION (DR → Primary)
+    |
+    ├── MariaDB:
+    │   → Create new Cross-Region Read Replica from DR instance → Primary region
+    │   → Wait for replica to catch up (replication lag → 0)
+    │   → This may take hours depending on data volume
+    │
+    ├── S3:
+    │   → Enable CRR from DR buckets → Primary buckets
+    │   → Run Batch Replication for objects created during failover
+    │   → Verify all objects replicated
+    │
+    └── Redshift:
+        → Take snapshot in DR → Copy to primary
+        → OR rebuild from primary S3 buckets after S3 sync
+
+Phase 3: TRAFFIC CUTOVER
+    → Promote primary region MariaDB replica to standalone
+    → Update Route 53 to point back to primary
+    → Verify primary is serving traffic correctly
+    → Monitor for 24 hours
+
+Phase 4: DR RE-ESTABLISHMENT
+    → Create new Cross-Region Read Replica (primary → DR)
+    → Re-enable S3 CRR (primary → DR)
+    → Re-enable Redshift cross-region snapshots
+    → Verify DR is synchronized
+    → Ready for next disaster</code></pre></div>
+<p><strong>Failback Timeline: 24-48 hours (not urgent — DR is already serving traffic)</strong></p>
+<hr>
+<h3>STEP 8 — CONFIGURE DR MONITORING AND ALERTING</h3>
+<p><strong>DR Health Dashboard:</strong></p>
+<table><thead><tr><th>Metric</th><th>Source</th><th>Normal</th><th>Warning</th><th>Critical</th></tr></thead><tbody><tr><td>MariaDB Replication Lag</td><td>CloudWatch RDS (DR)</td><td>&lt; 5 seconds</td><td>&gt; 60 seconds</td><td>&gt; 3600 seconds</td></tr><tr><td>S3 Replication Pending Ops</td><td>S3 Metrics</td><td>&lt; 100</td><td>&gt; 1,000</td><td>&gt; 10,000</td></tr><tr><td>S3 Replication Pending Bytes</td><td>S3 Metrics</td><td>&lt; 100 MB</td><td>&gt; 1 GB</td><td>&gt; 10 GB</td></tr><tr><td>S3 Replication Latency</td><td>S3 Metrics</td><td>&lt; 300 seconds</td><td>&gt; 600 seconds</td><td>&gt; 900 seconds</td></tr><tr><td>Redshift Last Snapshot Age</td><td>Custom Metric</td><td>&lt; 8 hours</td><td>&gt; 10 hours</td><td>&gt; 16 hours</td></tr><tr><td>Route 53 Health Check</td><td>Route 53</td><td>HEALTHY</td><td>—</td><td>UNHEALTHY</td></tr><tr><td>DR VPC Status</td><td>Custom Check</td><td>Pre-configured</td><td>—</td><td>Configuration drift detected</td></tr></tbody></table>
+<p><strong>SNS Alerts for DR:</strong></p>
+<table><thead><tr><th>Alert</th><th>Condition</th><th>Recipients</th><th>Priority</th></tr></thead><tbody><tr><td>MariaDB Replication Lag Critical</td><td>ReplicaLag &gt; 3600s</td><td>DBA + Platform Lead</td><td>P1 — Immediate</td></tr><tr><td>S3 Replication Failure</td><td>OperationsFailedReplication &gt; 0</td><td>Data Engineer</td><td>P2 — Urgent</td></tr><tr><td>Redshift Snapshot Missed</td><td>No snapshot in &gt; 16 hours</td><td>Data Engineer</td><td>P2 — Urgent</td></tr><tr><td>Route 53 Primary Unhealthy</td><td>Health check fails 3x</td><td>Platform Team (ALL)</td><td>P1 — DISASTER ALERT</td></tr><tr><td>DR VPC Configuration Drift</td><td>Security groups or routes changed</td><td>Network Engineer</td><td>P3 — Warning</td></tr></tbody></table>
+<hr>
+<h3>STEP 9 — DESIGN DR TESTING PROCEDURES</h3>
+<p><strong>DR Testing is NON-NEGOTIABLE — an untested DR plan is not a plan</strong></p>
+<p><strong>Testing Frequency:</strong></p>
+<table><thead><tr><th>Test Type</th><th>Frequency</th><th>Duration</th><th>Impact on Production</th></tr></thead><tbody><tr><td>Tabletop exercise</td><td>Monthly</td><td>2 hours</td><td>Zero — discussion only</td></tr><tr><td>Component test</td><td>Monthly</td><td>4 hours</td><td>Zero — test individual DR components</td></tr><tr><td>Partial failover</td><td>Quarterly</td><td>8 hours</td><td>Minimal — test read-only traffic to DR</td></tr><tr><td>Full failover</td><td>Semi-annually</td><td>24 hours</td><td>Moderate — actual traffic switch to DR</td></tr></tbody></table>
+<p><strong>Tabletop Exercise (Monthly):</strong><br>
+→ Walk through the failover runbook verbally<br>
+→ Each team member confirms they know their role<br>
+→ Identify gaps in documentation<br>
+→ Update runbook with improvements</p>
+<p><strong>Component Test (Monthly — Rotating):</strong></p>
+<table><thead><tr><th>Month</th><th>Component Tested</th><th>Test Procedure</th></tr></thead><tbody><tr><td>January</td><td>MariaDB Replica</td><td>Verify replica lag &lt; 5s, test manual promotion in isolated environment</td></tr><tr><td>February</td><td>S3 CRR</td><td>Upload test file to primary → Verify appears in DR within 15 minutes</td></tr><tr><td>March</td><td>Redshift Snapshot</td><td>Restore latest cross-region snapshot → Verify data integrity</td></tr><tr><td>April</td><td>Route 53 Failover</td><td>Temporarily fail health check → Verify DNS switches to DR</td></tr><tr><td>May</td><td>Network (VPC/NAT)</td><td>Create NAT Gateway in DR → Verify routing works → Delete NAT</td></tr><tr><td>June</td><td>Full Application Stack</td><td>Launch EC2 from AMI in DR → Connect to DR database → Test API</td></tr></tbody></table>
+<p><strong>Full Failover Test (Semi-Annual):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PRE-TEST:
+</span>    → Notify all teams: "DR test on Saturday 6 AM - 6 PM"
+    → Notify customers: "Planned maintenance window"
+    → Prepare rollback plan
+
+TEST EXECUTION:
+    → Follow complete failover runbook (Step 6)
+    → Route actual traffic to DR region
+    → Run for 4-8 hours on DR infrastructure
+    → Collect performance metrics
+
+VALIDATION:
+    → Compare DR performance to primary baseline
+    → Verify all services functional
+    → Verify data integrity
+    → Document issues found
+
+FAILBACK:
+    → Follow failback procedure (Step 7)
+    → Return traffic to primary
+    → Verify primary is serving correctly
+
+POST-TEST:
+    → Retrospective meeting
+    → Update runbook with lessons learned
+    → Fix any issues discovered
+    → Report to Board on DR readiness</code></pre></div>
+<hr>
+<h3>STEP 10 — CALCULATE COMPLETE DR COSTS</h3>
+<p><strong>Monthly Pilot Light Costs:</strong></p>
+<table><thead><tr><th>Component</th><th>Configuration</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>MariaDB Cross-Region Replica</td><td>db.t3.medium in ap-southeast-1</td><td>$50</td></tr><tr><td>MariaDB Storage (DR)</td><td>100 GB gp3</td><td>$8</td></tr><tr><td>MariaDB Data Transfer (replication)</td><td>~50 GB/month</td><td>$5</td></tr><tr><td>S3 Storage (DR copies)</td><td>~1 TB across all zones</td><td>$24</td></tr><tr><td>S3 CRR Data Transfer</td><td>~100 GB new data/month</td><td>$2</td></tr><tr><td>S3 RTC Fee</td><td>~100 GB/month</td><td>$1.50</td></tr><tr><td>Redshift Cross-Region Snapshots</td><td>~640 GB × 3 snapshots/day × 7 days retention</td><td>$15</td></tr><tr><td>Route 53 Health Check</td><td>1 health check</td><td>$0.75</td></tr><tr><td>Route 53 Failover Records</td><td>2 records</td><td>Negligible</td></tr><tr><td>DR VPC (pre-configured)</td><td>VPC + Subnets + IGW + Endpoints</td><td>$0 (no hourly charges for these)</td></tr><tr><td>CloudWatch Alarms (DR metrics)</td><td>~10 alarms</td><td>$1</td></tr><tr><td>KMS Key (DR region)</td><td>1 customer managed key</td><td>$1</td></tr><tr><td><strong>TOTAL PILOT LIGHT</strong></td><td></td><td><strong>~$108/month</strong></td></tr></tbody></table>
+<p><strong>Additional Costs DURING Failover (only when disaster is active):</strong></p>
+<table><thead><tr><th>Component</th><th>Configuration</th><th>Hourly Cost</th></tr></thead><tbody><tr><td>NAT Gateways (2)</td><td>Created during failover</td><td>$0.09/hour</td></tr><tr><td>EC2 Instances (application)</td><td>Launched during failover</td><td>Varies (same as primary)</td></tr><tr><td>Redshift Serverless</td><td>Created during failover</td><td>$0.36 × RPUs/hour</td></tr><tr><td>Kinesis Stream (DR)</td><td>Created during failover</td><td>On-demand pricing</td></tr><tr><td>Firehose (DR)</td><td>Created during failover</td><td>$0.029/GB</td></tr></tbody></table>
+<p><strong>Cost Comparison:</strong></p>
+<table><thead><tr><th>Strategy</th><th>Monthly Steady-State Cost</th><th>Business Protection</th></tr></thead><tbody><tr><td>No DR (current)</td><td>$0</td><td>$0 — but $3.3M risk per incident</td></tr><tr><td>Pilot Light (proposed)</td><td>$108/month</td><td>Full protection — RTO &lt; 4h, RPO &lt; 1h</td></tr><tr><td>Warm Standby</td><td>~$800/month</td><td>Better protection — RTO &lt; 1h</td></tr><tr><td>Active-Active</td><td>~$3,000/month</td><td>Best protection — RTO ~0</td></tr></tbody></table>
+<p><strong>ROI Calculation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Annual DR Cost: $108 × 12 = $1,296
+</span>Expected Disaster Frequency: 1 regional outage every 3 years (historical average)
+Expected Loss Without DR: $3,300,000 per incident
+Annual Expected Loss: $3,300,000 / 3 = $1,100,000
+
+Annual DR Investment: $1,296
+Annual Risk Reduction: $1,100,000
+ROI: $1,100,000 / $1,296 = 848:1</code></pre></div>
+<p>→ $1,296/year to protect against $1.1M/year expected loss = extraordinary ROI</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always choose a DR region in a different geographic fault domain from primary<br>
+→ Always maintain Cross-Region Read Replica for critical databases — it's the fastest failover path<br>
+→ Always enable S3 Cross-Region Replication with Replication Time Control for RPO guarantees<br>
+→ Always configure cross-region Redshift snapshots — even if RPO for analytics is less strict<br>
+→ Always set low DNS TTL (60 seconds) on Route 53 failover records — enables fast DNS propagation<br>
+→ Always create and maintain a detailed failover runbook with specific steps, owners, and durations<br>
+→ Always pre-configure DR VPC, subnets, security groups, and VPC endpoints — eliminate setup time during crisis<br>
+→ Always monitor replication lag for MariaDB and S3 continuously — lag = RPO risk<br>
+→ Always test DR at least quarterly — untested DR plans fail when needed most<br>
+→ Always replicate existing S3 objects via Batch Replication — CRR only handles new objects<br>
+→ Always use different KMS keys per region — KMS keys are regional<br>
+→ Always document the failback procedure — getting back to primary is harder than failing over<br>
+→ Always keep DR costs visible in budget reporting — prevents cost-cutting that removes DR protection<br>
+→ Always notify teams and customers before planned DR tests</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never assume Multi-AZ within a region is sufficient DR — regional outages affect all AZs<br>
+→ Never skip DR testing — the first time you test DR should NOT be during an actual disaster<br>
+→ Never promote a read replica without checking replication lag first — high lag = significant data loss<br>
+→ Never forget that MariaDB promotion is IRREVERSIBLE — plan the failback path before promoting<br>
+→ Never use the same KMS key across regions — KMS keys are regional resources<br>
+→ Never set Route 53 TTL to 3600 seconds (1 hour) — failover DNS propagation will take an hour<br>
+→ Never assume S3 CRR replicates existing objects — it only replicates NEW objects after rule creation<br>
+→ Never run DR infrastructure at full production scale during pilot light — waste of money<br>
+→ Never skip the failback plan — you'll be stuck in DR region indefinitely<br>
+→ Never rely solely on automated DNS failover — verify DR resources are actually ready before traffic switches<br>
+→ Never ignore replication lag alerts — growing lag means RPO is at risk<br>
+→ Never test DR only once — systems change, and DR configuration must be validated regularly<br>
+→ Never assume DR will work because it worked last time — infrastructure drift happens</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → CROSS-REGION READ REPLICA REPLICATION MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Primary MariaDB (ap-south-1)
+</span>    |
+    | Transaction: INSERT INTO transactions VALUES (...)
+    |
+    ↓
+Binary Log (binlog) written on primary
+    |
+    ↓
+Binlog shipped over AWS backbone network
+    (ap-south-1 → ap-southeast-1, ~60ms latency)
+    |
+    ↓
+DR Read Replica (ap-southeast-1) receives binlog
+    |
+    ↓
+Relay Log written on replica
+    |
+    ↓
+SQL Thread applies relay log to replica database
+    |
+    ↓
+Replica is now consistent with primary (minus replication lag)</code></pre></div>
+<p><strong>Key Differences from Same-Region Replica:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Same-Region Replica</th><th>Cross-Region Replica</th></tr></thead><tbody><tr><td>Network path</td><td>Within region (&lt; 1ms)</td><td>Cross-region backbone (~60ms)</td></tr><tr><td>Typical replication lag</td><td>&lt; 1 second</td><td>1-30 seconds</td></tr><tr><td>Data transfer cost</td><td>Free (same region)</td><td>$0.02/GB (cross-region)</td></tr><tr><td>KMS encryption</td><td>Same key</td><td>Different key (re-encrypted)</td></tr><tr><td>Promotion time</td><td>~1-2 minutes</td><td>~5-15 minutes</td></tr></tbody></table>
+<p><strong>During Promotion:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE PROMOTION:
+</span>    DR Replica: Read-Only, replicating from primary
+    
+PROMOTION INITIATED:
+    Step 1: Replica stops replication (breaks link to primary)
+    Step 2: Replica applies remaining relay log entries
+    Step 3: Replica becomes standalone Read-Write instance
+    Step 4: Replica gets new endpoint DNS name
+    Step 5: Backup is enabled on the new standalone instance
+    
+    Duration: 5-15 minutes
+    
+AFTER PROMOTION:
+    DR Instance: Read-Write, INDEPENDENT (no longer connected to primary)
+    Primary: Still running (if region recovered) but no longer replicated to DR</code></pre></div>
+<hr>
+<h3>2 → S3 CROSS-REGION REPLICATION MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Object uploaded to source bucket (ap-south-1):
+</span>    PutObject: s3://payscale-datalake-raw/domain=fraud/entity=transactions/year=2025/month=01/day=15/part-001.parquet
+    |
+    ↓
+S3 Replication Service detects new object
+    (monitors source bucket for new/modified objects)
+    |
+    ↓
+Replication Service reads object from source
+    |
+    ↓
+If KMS encrypted:
+    → Decrypt with source KMS key
+    → Re-encrypt with destination KMS key
+    |
+    ↓
+Object transmitted over AWS backbone
+    (ap-south-1 → ap-southeast-1)
+    |
+    ↓
+Object written to destination bucket (ap-southeast-1):
+    PutObject: s3://payscale-datalake-raw-dr/domain=fraud/entity=transactions/year=2025/month=01/day=15/part-001.parquet
+    |
+    ↓
+With RTC enabled:
+    → AWS guarantees 99.99% of objects replicated within 15 minutes
+    → Replication metrics updated (latency, pending operations)</code></pre></div>
+<p><strong>Replication Guarantees:</strong></p>
+<table><thead><tr><th>Feature</th><th>Without RTC</th><th>With RTC</th></tr></thead><tbody><tr><td>Replication SLA</td><td>Best-effort</td><td>99.99% within 15 minutes</td></tr><tr><td>Monitoring</td><td>Basic (pending operations count)</td><td>Detailed (latency, bytes, operations)</td></tr><tr><td>SLA credits</td><td>None</td><td>Yes — credits if SLA violated</td></tr><tr><td>Cost</td><td>Free (only data transfer)</td><td>$0.015/GB additional</td></tr></tbody></table>
+<hr>
+<h3>3 → ROUTE 53 FAILOVER MECHANICS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>NORMAL STATE:
+</span>    Route 53 Health Checkers (in 3+ regions worldwide)
+        → Every 10 seconds: HTTPS GET to primary ALB /health endpoint
+        → Response 200 OK → PRIMARY HEALTHY ✅
+        → DNS resolution: api.payscale.com → PRIMARY ALB IP
+
+FAILURE DETECTED:
+    T+0s:   Health checker #1 (us-east-1) gets timeout → Mark as failed
+    T+10s:  Health checker #2 (eu-west-1) gets timeout → Mark as failed
+    T+20s:  Health checker #3 (ap-northeast-1) gets timeout → Mark as failed
+    
+    3 consecutive failures from multiple regions → PRIMARY UNHEALTHY ❌
+    
+    T+20s:  Route 53 updates DNS:
+            api.payscale.com → SECONDARY ALB IP (DR region)
+    
+    T+20s to T+80s: DNS propagation
+            Clients with cached DNS → Still go to primary (for up to TTL=60s)
+            New DNS lookups → Get DR region IP
+    
+    T+80s:  Most clients now reaching DR region</code></pre></div>
+<p><strong>Health Check Considerations:</strong></p>
+<table><thead><tr><th>Configuration</th><th>Impact</th></tr></thead><tbody><tr><td>Request interval: 10s (fast)</td><td>Faster detection but higher cost ($1/month vs $0.50 for 30s)</td></tr><tr><td>Failure threshold: 3</td><td>3 × 10s = 30 seconds to detect failure</td></tr><tr><td>Multiple regions: 3+</td><td>Prevents false positive from single region network issue</td></tr><tr><td>String matching (optional)</td><td>Check response body for specific string — catches application errors not just network failures</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>DR replica lag ignored for months</td><td>During failover — 4 hours of data lost (RPO violated)</td><td>Replication lag grew unnoticed</td><td>Monitor ReplicaLag with CloudWatch alarm</td></tr><tr><td>2</td><td>S3 CRR not configured for existing objects</td><td>DR buckets empty for historical data — only recent data present</td><td>CRR only replicates new objects</td><td>Run S3 Batch Replication for existing objects</td></tr><tr><td>3</td><td>DR KMS key not created</td><td>Cross-region replica creation fails</td><td>KMS keys are regional — cannot use primary region key</td><td>Create KMS key in DR region first</td></tr><tr><td>4</td><td>Route 53 TTL too high (3600s)</td><td>DNS failover takes 1 hour — clients still reaching dead primary</td><td>Cached DNS records with high TTL</td><td>Set TTL to 60 seconds on failover records</td></tr><tr><td>5</td><td>DR VPC security groups outdated</td><td>Application connects to DR but cannot reach database</td><td>Primary SG rules updated but DR not synchronized</td><td>Automate SG synchronization or use Infrastructure as Code</td></tr><tr><td>6</td><td>Promoted replica without checking lag</td><td>Promoted with 3-hour lag — lost 3 hours of transactions</td><td>Didn't verify ReplicaLag before promotion</td><td>Always check ReplicaLag metric before promotion decision</td></tr><tr><td>7</td><td>No failback plan</td><td>Stuck in DR region for weeks — higher latency for India users</td><td>Never planned the return to primary</td><td>Document failback procedure before first failover</td></tr><tr><td>8</td><td>DR test never performed</td><td>Failover runbook has errors — discovered during actual disaster</td><td>No regular testing</td><td>Test quarterly minimum — tabletop monthly</td></tr><tr><td>9</td><td>AMIs not replicated to DR region</td><td>Cannot launch EC2 instances in DR — no AMIs available</td><td>Forgot to copy AMIs cross-region</td><td>Automate AMI replication to DR region</td></tr><tr><td>10</td><td>Glue Catalog not recreated in DR</td><td>Athena cannot query DR S3 buckets — no table definitions</td><td>Glue Catalog is regional — not automatically replicated</td><td>Pre-create Glue resources in DR OR automate creation during failover</td></tr><tr><td>11</td><td>NAT Gateway creation fails during failover</td><td>Elastic IP limit reached in DR region</td><td>No Elastic IPs allocated in DR region</td><td>Pre-allocate Elastic IPs in DR region</td></tr><tr><td>12</td><td>Application connection strings hardcoded to primary</td><td>Application cannot connect to promoted DR database</td><td>Connection strings point to ap-south-1 endpoint</td><td>Use Route 53 private hosted zone or parameter store for connection strings</td></tr><tr><td>13</td><td>Cross-region snapshot expired</td><td>No recent Redshift snapshot available in DR</td><td>Retention period too short (1 day) + snapshot missed</td><td>Set retention to 7+ days, monitor snapshot creation</td></tr><tr><td>14</td><td>DR resources deleted to save costs</td><td>No DR infrastructure when disaster occurs</td><td>Cost-cutting removed DR replicas/replication</td><td>Protect DR resources with SCPs (from Project 54) — prevent deletion</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scalability</strong></p>
+<table><thead><tr><th>Data Volume</th><th>MariaDB Replication</th><th>S3 CRR</th><th>Redshift Snapshots</th><th>Monthly DR Cost</th></tr></thead><tbody><tr><td>100 GB</td><td>Minimal lag</td><td>&lt; 1 hour replication</td><td>Small snapshots</td><td>~$50</td></tr><tr><td>1 TB</td><td>Low lag (&lt; 30s)</td><td>~15 min with RTC</td><td>Medium snapshots</td><td>~$108</td></tr><tr><td>10 TB</td><td>Moderate lag (monitor closely)</td><td>~15 min with RTC</td><td>Large snapshots (1-2 hours to restore)</td><td>~$500</td></tr><tr><td>100 TB</td><td>High lag risk — consider DMS for CDC</td><td>~15 min with RTC</td><td>Very large snapshots (4-8 hours to restore)</td><td>~$3,000</td></tr></tbody></table>
+<p>→ <strong>Multi-Account DR Scalability</strong></p>
+<ul>
+<li>Each account that needs DR → Replicate its resources independently</li>
+<li>Organizations (from Project 54) ensures DR accounts have same governance</li>
+<li>Account vending (from Project 54) can auto-provision DR infrastructure for new accounts</li>
+</ul>
+<p>→ <strong>Multi-Region Scalability</strong></p>
+<table><thead><tr><th>Scenario</th><th>Architecture</th></tr></thead><tbody><tr><td>Single primary + Single DR</td><td>ap-south-1 → ap-southeast-1 (PayScale's current)</td></tr><tr><td>Single primary + Multiple DR</td><td>ap-south-1 → ap-southeast-1 + us-west-2 (for global presence)</td></tr><tr><td>Active-Active (two primaries)</td><td>ap-south-1 ↔ ap-southeast-1 (complex — requires conflict resolution)</td></tr><tr><td>Global (3+ regions)</td><td>Regional primary with cross-region replication ring</td></tr></tbody></table>
+<p>→ PayScale's Pilot Light is designed for single DR — scalable to Warm Standby or Active-Active if requirements change</p>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify DR is ready at any moment:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th><th>Frequency</th></tr></thead><tbody><tr><td>MariaDB replica running</td><td>RDS Console (DR region)</td><td>Status: Available, Role: Replica</td><td>Continuous (CloudWatch)</td></tr><tr><td>MariaDB replica lag</td><td>CloudWatch → ReplicaLag</td><td>&lt; 60 seconds</td><td>Continuous (alarm)</td></tr><tr><td>S3 replication active</td><td>S3 Console → Replication metrics</td><td>Pending operations &lt; 100</td><td>Continuous (alarm)</td></tr><tr><td>S3 replication latency</td><td>S3 Console → Replication metrics</td><td>&lt; 900 seconds</td><td>Continuous (alarm)</td></tr><tr><td>Redshift snapshot current</td><td>Redshift Console (DR region) → Snapshots</td><td>Latest snapshot &lt; 8 hours old</td><td>Every 8 hours (alarm)</td></tr><tr><td>Route 53 health check active</td><td>Route 53 Console → Health checks</td><td>Status: Healthy</td><td>Continuous</td></tr><tr><td>DR VPC configured</td><td>VPC Console (DR region)</td><td>All subnets, SGs, endpoints present</td><td>Weekly manual check</td></tr><tr><td>DR KMS key active</td><td>KMS Console (DR region)</td><td>Key status: Enabled</td><td>Monthly check</td></tr><tr><td>Failover runbook current</td><td>Internal wiki/documentation</td><td>Last reviewed &lt; 30 days ago</td><td>Monthly review</td></tr><tr><td>Last DR test</td><td>Test records</td><td>&lt; 90 days ago</td><td>Quarterly test</td></tr></tbody></table>
+<p>→ <strong>DR Readiness Score (Custom Dashboard):</strong></p>
+<table><thead><tr><th>Component</th><th>Weight</th><th>Status</th><th>Score</th></tr></thead><tbody><tr><td>MariaDB Replica Lag &lt; 60s</td><td>25%</td><td>✅ Green (5s lag)</td><td>25/25</td></tr><tr><td>S3 Replication Pending &lt; 100 ops</td><td>20%</td><td>✅ Green (12 ops)</td><td>20/20</td></tr><tr><td>Redshift Snapshot &lt; 8 hours</td><td>15%</td><td>✅ Green (3 hours ago)</td><td>15/15</td></tr><tr><td>Route 53 Health Check Active</td><td>15%</td><td>✅ Green (healthy)</td><td>15/15</td></tr><tr><td>DR VPC Configured</td><td>10%</td><td>✅ Green (no drift)</td><td>10/10</td></tr><tr><td>Last DR Test &lt; 90 days</td><td>10%</td><td>⚠️ Yellow (75 days ago)</td><td>7/10</td></tr><tr><td>Runbook Updated &lt; 30 days</td><td>5%</td><td>✅ Green (15 days ago)</td><td>5/5</td></tr><tr><td><strong>TOTAL DR READINESS</strong></td><td><strong>100%</strong></td><td></td><td><strong>97/100</strong></td></tr></tbody></table>
+<p>→ Report this score to the Board quarterly<br>
+→ Any score &lt; 80% → Escalate to Platform Team Lead<br>
+→ Any score &lt; 60% → Escalate to CTO</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Disaster Recovery is INSURANCE — the cost of NOT having it ($3.3M per incident) far exceeds the cost of having it ($108/month)<br>
+→ Pilot Light is the optimal strategy for PayScale — minimal steady-state cost with &lt; 4 hour RTO and &lt; 1 hour RPO<br>
+→ Three data replication mechanisms work in parallel:</p>
+<ul>
+<li>MariaDB Cross-Region Read Replica (continuous, seconds lag)</li>
+<li>S3 Cross-Region Replication with RTC (continuous, &lt; 15 minute guarantee)</li>
+<li>Redshift Cross-Region Snapshots (periodic, 8-hour intervals)<br>
+→ Route 53 DNS failover provides automatic traffic switching when primary health check fails<br>
+→ A detailed failover RUNBOOK with specific steps, owners, and durations is as important as the technical infrastructure<br>
+→ MariaDB replica promotion is IRREVERSIBLE — always check replication lag before promoting<br>
+→ DR testing is NON-NEGOTIABLE — monthly tabletop, quarterly component tests, semi-annual full failover<br>
+→ Failback (returning to primary) is harder than failover — plan and document it in advance<br>
+→ DR infrastructure must be protected from cost-cutting with SCPs (from Project 54)<br>
+→ Monitoring replication lag continuously is the MOST IMPORTANT DR operational task</li>
+</ul>
+<p>→ <strong>Connection to previous projects:</strong></p>
+<ul>
+<li>RDS MariaDB Multi-AZ (Project 29) — Multi-AZ protects against AZ failure; Cross-Region DR protects against regional failure</li>
+<li>S3 Cross-Region Replication (Project 30) — CRR is the foundation for data lake DR</li>
+<li>Redshift Serverless (Project 53) — Snapshot-based DR for the warehouse</li>
+<li>Kinesis streaming (Project 52) — Must be recreated in DR during failover</li>
+<li>VPC networking (Project 5) — DR VPC must be pre-configured</li>
+<li>KMS encryption (Project 36) — Different KMS keys per region</li>
+<li>Organizations and SCPs (Project 54) — Governance ensures DR accounts have same security baseline</li>
+<li>Route 53 — DNS failover is the traffic switching mechanism</li>
+</ul>
+<p>→ <strong>Connection to next projects:</strong></p>
+<ul>
+<li>Cost optimization (Project 56) will analyze DR costs alongside primary costs for total cost management</li>
+<li>Zero-trust security (Project 57) will ensure DR infrastructure has the same security posture as primary</li>
+<li>Data Mesh (Project 60) will require DR considerations for each domain's data products</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ PayScale now has comprehensive disaster recovery — $108/month protecting against $3.3M risk<br>
+→ But the CFO's quarterly review reveals a DIFFERENT kind of problem:<br>
+→ "Our total AWS spend has grown from $5,000/month to $18,000/month in 12 months"<br>
+→ "I see charges for services I don't recognize"<br>
+→ "Some S3 buckets have 3 TB of data that nobody has accessed in 6 months"<br>
+→ "The Redshift provisioned cluster we just replaced is STILL running — someone forgot to delete it"<br>
+→ "We're paying for 14 NAT Gateways when Transit Gateway centralized egress reduced it to 2 — but 12 old ones are still running"<br>
+→ "Our Reserved Instance coverage is 0% — we're paying full on-demand pricing for everything"<br>
+→ "The dev team launched 15 EC2 instances 3 months ago for a test — they're still running"</p>
+<p><strong>The Cost Breakdown (Current — Unoptimized):</strong></p>
+<table><thead><tr><th>Category</th><th>Monthly Cost</th><th>Waste Estimate</th></tr></thead><tbody><tr><td>EC2 instances</td><td>$4,200</td><td>~$1,500 (idle/forgotten instances)</td></tr><tr><td>RDS instances</td><td>$2,800</td><td>~$400 (oversized dev instances)</td></tr><tr><td>S3 storage</td><td>$2,100</td><td>~$800 (no lifecycle policies on older buckets)</td></tr><tr><td>Redshift (old provisioned + new Serverless)</td><td>$1,880</td><td>~$730 (old cluster not deleted)</td></tr><tr><td>NAT Gateways</td><td>$896</td><td>~$384 (12 orphaned NATs after TGW centralization)</td></tr><tr><td>Data Transfer</td><td>$1,500</td><td>~$300 (S3 traffic through NAT instead of VPC Endpoints)</td></tr><tr><td>Glue ETL</td><td>$1,200</td><td>~$200 (oversized DPU allocation)</td></tr><tr><td>Other services</td><td>$3,420</td><td>~$500 (various unused resources)</td></tr><tr><td><strong>Total</strong></td><td><strong>$18,000</strong></td><td><strong>~$4,814 waste (27%)</strong></td></tr></tbody></table>
+<p>→ $4,814/month × 12 = <strong>$57,768/year wasted</strong></p>
+<p>→ The CFO demands: "Cut AWS costs by 40% without impacting performance"<br>
+→ The Platform Team says: "We don't even know where all the waste is"</p>
+<p>→ <strong>This is the exact problem Project 56 solves</strong><br>
+→ Project 56: "The CFO Who Demanded 40% Cost Reduction — S3 Intelligent Tiering + Redshift RA3 + Reserved Capacity"<br>
+→ It introduces a systematic cost optimization framework:</p>
+<ul>
+<li>S3 Intelligent Tiering and Storage Lens for storage optimization (from Project 12)</li>
+<li>Redshift RA3 vs DC2 vs Serverless comparison (from Project 53)</li>
+<li>Reserved Instances and Savings Plans for committed workloads</li>
+<li>Cost Explorer and Trusted Advisor for waste identification</li>
+<li>Right-sizing recommendations for EC2 and RDS</li>
+<li>Orphaned resource detection and cleanup<br>
+→ The goal: Reduce $18,000/month to $10,800/month (40% reduction) while maintaining or improving performance</li>
+</ul>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 56: "The CFO Who Demanded 40% Cost Reduction — S3 Intelligent Tiering + Redshift RA3 + Reserved Capacity"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-54.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 5 &bull; 55/60</span></div><a class="nav-btn next" href="project-56.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

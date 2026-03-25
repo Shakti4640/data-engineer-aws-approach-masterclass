@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 33: THE APPLICATION THAT CRASHED EVERY BLACK FRIDAY — EC2 Auto Scaling w — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 33: THE APPLICATION THAT CRASHED EVERY BLACK FRIDAY — EC2 Auto Scaling with CloudWatch Triggers</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's data pipeline (Project 32) runs flawlessly every morning<br>
+→ Enriched data flows into Redshift → dashboards are accurate → CEO is happy</p>
+<p>→ But the CUSTOMER-FACING side has a catastrophic problem:</p>
+<p><strong>The Architecture Today:</strong><br>
+→ One EC2 instance (from Project 3) runs the ShopNow web application<br>
+→ It sits in a public subnet (from Project 5) behind an Elastic IP<br>
+→ It connects to RDS MariaDB (from Project 14) in a private subnet<br>
+→ Security Groups (from Project 4) allow HTTP/HTTPS traffic from the internet</p>
+<p><strong>What happened on Black Friday 2024:</strong></p>
+<p>→ Normal daily traffic: ~500 concurrent users<br>
+→ Black Friday 8 AM: Marketing sends email blast → 1,500 users hit the site<br>
+→ Black Friday 10 AM: Social media campaign goes viral → 5,000 concurrent users<br>
+→ Black Friday 11 AM: Flash sale announcement → 12,000 concurrent users</p>
+<p><strong>Timeline of disaster:</strong></p>
+<table><thead><tr><th>Time</th><th>Concurrent Users</th><th>CPU Utilization</th><th>What Happened</th></tr></thead><tbody><tr><td>8:00 AM</td><td>500</td><td>25%</td><td>Normal operations</td></tr><tr><td>8:30 AM</td><td>1,500</td><td>55%</td><td>Pages loading slowly (3 seconds)</td></tr><tr><td>9:15 AM</td><td>3,000</td><td>78%</td><td>Pages loading very slowly (8 seconds)</td></tr><tr><td>10:00 AM</td><td>5,000</td><td>92%</td><td>Timeouts begin — some users see 504 errors</td></tr><tr><td>10:30 AM</td><td>8,000</td><td>99%</td><td>Application becomes unresponsive</td></tr><tr><td>10:45 AM</td><td>12,000</td><td>100%</td><td>EC2 instance effectively frozen — all requests timeout</td></tr><tr><td>11:00 AM</td><td>12,000</td><td>100%</td><td>Instance fails health check — application completely DOWN</td></tr><tr><td>11:15 AM</td><td>—</td><td>—</td><td>Engineer manually launches 2nd EC2 — takes 20 minutes to configure</td></tr><tr><td>11:45 AM</td><td>—</td><td>—</td><td>2nd instance up but no load balancer — traffic still hits crashed instance</td></tr><tr><td>12:30 PM</td><td>—</td><td>—</td><td>Engineer restarts original instance + manually configures load balancing</td></tr><tr><td>1:00 PM</td><td>—</td><td>—</td><td>Site partially restored — 3 hours of downtime</td></tr></tbody></table>
+<p><strong>Business Impact:</strong><br>
+→ 3 hours of downtime during peak shopping<br>
+→ $200,000 in lost revenue<br>
+→ 4,000 customers abandoned carts permanently<br>
+→ Social media backlash — "#ShopNowDown" trending<br>
+→ Customer trust damaged</p>
+<p><strong>Post-Mortem Findings:</strong></p>
+<table><thead><tr><th>Finding</th><th>Root Cause</th></tr></thead><tbody><tr><td>Single point of failure</td><td>One EC2 instance — no redundancy</td></tr><tr><td>No automatic scaling</td><td>No mechanism to add instances when load increases</td></tr><tr><td>No load distribution</td><td>No load balancer to spread traffic across multiple instances</td></tr><tr><td>No health monitoring</td><td>CloudWatch alarm existed (Project 8) but only sent email — no automated response</td></tr><tr><td>Manual recovery</td><td>Engineer had to manually launch, configure, and route traffic — 2+ hours</td></tr><tr><td>No pre-warming</td><td>Could not anticipate and pre-scale before known events</td></tr></tbody></table>
+<p>→ The CTO mandates: "Build infrastructure that automatically scales from 2 to 20 instances based on demand, distributes traffic, replaces unhealthy instances, and does all of this WITHOUT human intervention"</p>
+<p>→ This requires THREE interconnected AWS services:</p>
+<ol>
+<li><strong>Launch Template</strong> — defines WHAT to launch (instance blueprint)</li>
+<li><strong>Application Load Balancer (ALB)</strong> — distributes traffic across instances</li>
+<li><strong>Auto Scaling Group (ASG)</strong> — decides WHEN and HOW MANY instances to run</li>
+</ol>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the conceptual architecture:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>                    INTERNET
+</span>                       │
+                       ▼
+              [Application Load Balancer]
+                    /    |    \
+                   ▼     ▼     ▼
+              [EC2-1] [EC2-2] [EC2-3]     ← Auto Scaling Group
+                   \     |     /           manages these instances
+                    ▼    ▼    ▼
+              [RDS MariaDB - Private Subnet]</code></pre></div>
+<p>→ The mental model — three layers working together:</p>
+<table><thead><tr><th>Layer</th><th>Component</th><th>Responsibility</th></tr></thead><tbody><tr><td>Traffic Distribution</td><td>Application Load Balancer</td><td>Receives ALL incoming requests → distributes evenly across healthy instances</td></tr><tr><td>Compute Fleet</td><td>Auto Scaling Group</td><td>Maintains desired number of instances → scales out/in based on metrics</td></tr><tr><td>Instance Blueprint</td><td>Launch Template</td><td>Defines the exact configuration for every new instance launched</td></tr></tbody></table>
+<p>→ The flow of events during a traffic spike:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Traffic increases
+</span>       │
+       ▼
+CloudWatch detects CPU &gt; 70% across instances
+       │
+       ▼
+CloudWatch Alarm triggers Auto Scaling Policy
+       │
+       ▼
+ASG launches new instances using Launch Template
+       │
+       ▼
+New instances register with ALB Target Group
+       │
+       ▼
+ALB starts routing traffic to new instances
+       │
+       ▼
+CPU drops below threshold → system stabilizes
+       │
+       ▼
+(Later) Traffic decreases → CPU drops below 30%
+       │
+       ▼
+Scale-in policy terminates excess instances
+       │
+       ▼
+Cost returns to baseline</code></pre></div>
+<p>→ The approach — build bottom-up:</p>
+<ul>
+<li>Step 1 — Create Launch Template (instance blueprint)</li>
+<li>Step 2 — Create Application Load Balancer + Target Group</li>
+<li>Step 3 — Create Auto Scaling Group linking Template + ALB</li>
+<li>Step 4 — Configure Scaling Policies with CloudWatch integration</li>
+<li>Step 5 — Configure Health Checks</li>
+<li>Step 6 — Test and validate</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>PREREQUISITE VERIFICATION</h3>
+<p>→ From previous projects, these must already exist:</p>
+<table><thead><tr><th>Component</th><th>Created In</th><th>Status</th></tr></thead><tbody><tr><td>VPC with public + private subnets across 2 AZs</td><td>Project 5</td><td><code>vpc-shopnow</code> with <code>public-subnet-1a</code>, <code>public-subnet-1b</code>, <code>private-subnet-1a</code>, <code>private-subnet-1b</code></td></tr><tr><td>Internet Gateway attached to VPC</td><td>Project 5</td><td>Attached and route table configured</td></tr><tr><td>Security Group for web traffic</td><td>Project 4</td><td>Allows HTTP (80), HTTPS (443) inbound</td></tr><tr><td>Security Group for RDS</td><td>Project 4</td><td>Allows 3306 from web SG</td></tr><tr><td>RDS MariaDB in private subnet</td><td>Project 9, 14</td><td>Running and accessible from web tier</td></tr><tr><td>IAM Role for EC2</td><td>Project 11</td><td>Instance profile with S3 read access</td></tr><tr><td>CloudWatch basic monitoring understanding</td><td>Project 8</td><td>Alarm creation knowledge</td></tr></tbody></table>
+<hr>
+<h3>STEP 1 — CREATE A LAUNCH TEMPLATE</h3>
+<p>→ Navigate to EC2 Console → Launch Templates → Create Launch Template</p>
+<p><strong>Why Launch Template instead of Launch Configuration?</strong></p>
+<table><thead><tr><th>Feature</th><th>Launch Configuration (Legacy)</th><th>Launch Template (Current)</th></tr></thead><tbody><tr><td>Versioning</td><td>❌ No — must create new one for any change</td><td>✅ Yes — create new versions, keep old ones</td></tr><tr><td>Multiple instance types</td><td>❌ Single type only</td><td>✅ Can specify multiple types for flexibility</td></tr><tr><td>Spot + On-Demand mix</td><td>❌ Not supported</td><td>✅ Supported</td></tr><tr><td>T2/T3 Unlimited</td><td>❌ Not configurable</td><td>✅ Configurable</td></tr><tr><td>Reusable outside ASG</td><td>❌ Only for ASG</td><td>✅ Can launch standalone instances too</td></tr><tr><td>AWS Recommendation</td><td>Deprecated — do not use for new setups</td><td>✅ Recommended for all new configurations</td></tr></tbody></table>
+<p>→ Always use Launch Template — Launch Configuration is legacy</p>
+<hr>
+<p><strong>Setting: Launch Template Name</strong><br>
+→ <code>shopnow-web-app-template</code></p>
+<p><strong>Setting: Template Version Description</strong><br>
+→ <code>v1 - Initial web application configuration</code></p>
+<p><strong>Setting: AMI (Amazon Machine Image)</strong><br>
+→ This defines the operating system and pre-installed software</p>
+<table><thead><tr><th>Option</th><th>Description</th><th>Recommendation</th></tr></thead><tbody><tr><td>Amazon Linux 2023</td><td>Latest Amazon-maintained Linux</td><td>✅ Best for general workloads</td></tr><tr><td>Custom AMI</td><td>Your pre-built image with app already installed</td><td>✅ Best for production — faster launch</td></tr><tr><td>Ubuntu</td><td>Community Ubuntu images</td><td>Good alternative</td></tr><tr><td>Windows</td><td>Windows Server images</td><td>Only if app requires Windows</td></tr></tbody></table>
+<p>→ For ShopNow → Use CUSTOM AMI<br>
+→ Why? When ASG launches a new instance, it needs the application READY immediately<br>
+→ If using base AMI → instance launches → must install app → configure → start service → 10+ minutes before serving traffic<br>
+→ With custom AMI → instance launches → app is already installed → starts serving in 2-3 minutes</p>
+<p><strong>How to create a Custom AMI:</strong><br>
+→ Take your existing working EC2 instance (from Project 3)<br>
+→ EC2 Console → Select instance → Actions → Image and templates → Create image<br>
+→ Image name: <code>shopnow-web-app-ami-v1</code><br>
+→ This creates an AMI with your OS + application + all configurations baked in<br>
+→ Use this AMI ID in the Launch Template</p>
+<p><strong>Setting: Instance Type</strong><br>
+→ Primary: <code>t3.medium</code> (2 vCPU, 4 GB RAM)</p>
+<p>→ Understanding instance type selection for Auto Scaling:</p>
+<table><thead><tr><th>Factor</th><th>Consideration</th></tr></thead><tbody><tr><td>Application memory needs</td><td>ShopNow web app needs ~2 GB → 4 GB instance gives headroom</td></tr><tr><td>CPU pattern</td><td>Web apps are bursty → T3 burstable instances are cost-effective</td></tr><tr><td>Consistent high CPU</td><td>If CPU is always &gt;80% → use M-series (compute optimized)</td></tr><tr><td>Cost</td><td>T3.medium: ~$0.0416/hr On-Demand in us-east-1</td></tr></tbody></table>
+<p><strong>Setting: Key Pair</strong><br>
+→ Select existing key pair (from Project 3)<br>
+→ All instances launched by ASG will use this key pair for SSH access</p>
+<p><strong>Setting: Network Settings</strong></p>
+<p>→ DO NOT specify subnet here — the ASG controls which subnets instances launch into<br>
+→ DO specify Security Groups:</p>
+<table><thead><tr><th>Security Group</th><th>Purpose</th></tr></thead><tbody><tr><td><code>sg-shopnow-web</code></td><td>Allows HTTP/HTTPS from ALB security group (NOT from 0.0.0.0/0 — explained in ALB section)</td></tr><tr><td><code>sg-shopnow-internal</code></td><td>Allows outbound to RDS MariaDB on port 3306</td></tr></tbody></table>
+<p>→ IMPORTANT SECURITY CHANGE from Project 4:<br>
+→ Previously — the web SG allowed HTTP from <code>0.0.0.0/0</code> (anywhere on internet)<br>
+→ Now — the web SG should allow HTTP ONLY from the ALB's security group<br>
+→ Traffic flow: Internet → ALB → EC2 instances<br>
+→ EC2 instances should NOT be directly accessible from the internet<br>
+→ This is a fundamental security improvement when introducing a load balancer</p>
+<p><strong>Updated Security Group Rules:</strong></p>
+<table><thead><tr><th>SG Name</th><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td><code>sg-shopnow-alb</code></td><td>Inbound</td><td>TCP</td><td>80</td><td>0.0.0.0/0</td><td>Internet to ALB</td></tr><tr><td><code>sg-shopnow-alb</code></td><td>Inbound</td><td>TCP</td><td>443</td><td>0.0.0.0/0</td><td>Internet to ALB (HTTPS)</td></tr><tr><td><code>sg-shopnow-web</code></td><td>Inbound</td><td>TCP</td><td>80</td><td><code>sg-shopnow-alb</code></td><td>ALB to EC2 instances</td></tr><tr><td><code>sg-shopnow-web</code></td><td>Outbound</td><td>TCP</td><td>3306</td><td><code>sg-shopnow-rds</code></td><td>EC2 to RDS MariaDB</td></tr><tr><td><code>sg-shopnow-web</code></td><td>Outbound</td><td>TCP</td><td>443</td><td>0.0.0.0/0</td><td>EC2 to internet (for updates, S3 access)</td></tr></tbody></table>
+<p>→ Notice: <code>sg-shopnow-web</code> inbound references <code>sg-shopnow-alb</code> — not an IP range<br>
+→ This means ONLY traffic coming through the ALB is accepted<br>
+→ Even if someone discovers the EC2 instance's IP → direct access is BLOCKED</p>
+<p><strong>Setting: Storage</strong><br>
+→ Root volume: 20 GB, gp3 (General Purpose SSD)<br>
+→ gp3 vs gp2:</p>
+<table><thead><tr><th>Feature</th><th>gp2</th><th>gp3</th></tr></thead><tbody><tr><td>Baseline IOPS</td><td>3 IOPS/GB (scales with size)</td><td>3,000 IOPS (fixed baseline)</td></tr><tr><td>Throughput</td><td>128 MB/s</td><td>125 MB/s (configurable up to 1,000)</td></tr><tr><td>Cost</td><td>$0.10/GB/month</td><td>$0.08/GB/month</td></tr><tr><td>Recommendation</td><td>Legacy</td><td>✅ Use gp3 for all new volumes</td></tr></tbody></table>
+<p><strong>Setting: IAM Instance Profile</strong><br>
+→ Select: <code>EC2-ShopNow-Role</code> (from Project 11)<br>
+→ This gives all launched instances the same IAM permissions (S3 access, CloudWatch agent, etc.)</p>
+<p><strong>Setting: User Data (Advanced Details)</strong><br>
+→ User Data is a script that runs when the instance FIRST boots<br>
+→ Use this for final configuration that can't be baked into AMI</p>
+<p>→ Example User Data purpose for ShopNow:</p>
+<table><thead><tr><th>Task</th><th>Why in User Data vs AMI</th></tr></thead><tbody><tr><td>Start the application service</td><td>Service should start on boot — User Data ensures it</td></tr><tr><td>Pull latest configuration from S3</td><td>Configuration changes without rebuilding AMI</td></tr><tr><td>Register with monitoring</td><td>CloudWatch agent start command</td></tr><tr><td>Set hostname dynamically</td><td>Each instance gets unique hostname</td></tr></tbody></table>
+<p>→ User Data runs as root on first boot only (unless configured otherwise)<br>
+→ Maximum size: 16 KB (base64 encoded)</p>
+<p><strong>Setting: Monitoring</strong><br>
+→ Detailed monitoring: ENABLED<br>
+→ Default CloudWatch: Metrics every 5 minutes<br>
+→ Detailed monitoring: Metrics every 1 minute<br>
+→ For Auto Scaling — 1-minute granularity is CRITICAL<br>
+→ If metrics are 5-minute delayed → scaling decisions are 5 minutes late → during a spike, 5 minutes = thousands of failed requests</p>
+<p>→ Cost: $3.50/instance/month for detailed monitoring — worth it for production</p>
+<p><strong>Setting: Metadata Options</strong><br>
+→ IMDSv2: Required<br>
+→ This forces all instance metadata requests to use the secure token-based method<br>
+→ Prevents SSRF attacks that could steal IAM credentials from metadata service<br>
+→ Security best practice — always require IMDSv2</p>
+<p><strong>Setting: Credit Specification (for T-series instances)</strong><br>
+→ Standard: Instance earns and spends CPU credits — throttled when credits depleted<br>
+→ Unlimited: Instance can burst beyond credit balance — charged per vCPU-hour for surplus</p>
+<p>→ For Auto Scaling web tier → Standard<br>
+→ Why? If an instance is consistently above baseline → you should scale OUT (add instances), not burst UP<br>
+→ Unlimited masks the need to scale → you pay burst charges instead of scaling correctly</p>
+<p>→ Click "Create Launch Template"</p>
+<hr>
+<h3>STEP 2 — CREATE AN APPLICATION LOAD BALANCER</h3>
+<p>→ Navigate to EC2 Console → Load Balancers → Create Load Balancer</p>
+<p><strong>Understanding Load Balancer Types:</strong></p>
+<table><thead><tr><th>Type</th><th>Layer</th><th>Protocol</th><th>Use Case</th></tr></thead><tbody><tr><td>Application Load Balancer (ALB)</td><td>Layer 7 (HTTP/HTTPS)</td><td>HTTP, HTTPS, WebSocket</td><td>Web applications, API routing, path-based routing</td></tr><tr><td>Network Load Balancer (NLB)</td><td>Layer 4 (TCP/UDP)</td><td>TCP, UDP, TLS</td><td>Ultra-low latency, millions of connections, non-HTTP</td></tr><tr><td>Gateway Load Balancer (GWLB)</td><td>Layer 3 (IP)</td><td>IP</td><td>Third-party virtual appliances (firewalls, IDS)</td></tr><tr><td>Classic Load Balancer (CLB)</td><td>Layer 4/7</td><td>HTTP, TCP</td><td>❌ Legacy — do not use for new deployments</td></tr></tbody></table>
+<p>→ ShopNow serves HTTP web pages → ALB is the correct choice<br>
+→ Select "Application Load Balancer"</p>
+<hr>
+<p><strong>Setting: Load Balancer Name</strong><br>
+→ <code>shopnow-web-alb</code></p>
+<p><strong>Setting: Scheme</strong></p>
+<table><thead><tr><th>Option</th><th>Description</th><th>Use Case</th></tr></thead><tbody><tr><td>Internet-facing</td><td>ALB has public IP — accessible from internet</td><td>✅ Customer-facing web applications</td></tr><tr><td>Internal</td><td>ALB has private IP — only accessible within VPC</td><td>Internal microservice communication</td></tr></tbody></table>
+<p>→ ShopNow: Internet-facing</p>
+<p><strong>Setting: IP Address Type</strong></p>
+<table><thead><tr><th>Option</th><th>Description</th></tr></thead><tbody><tr><td>IPv4</td><td>Standard IPv4 only</td></tr><tr><td>Dualstack</td><td>IPv4 + IPv6</td></tr></tbody></table>
+<p>→ ShopNow: IPv4 (unless you need IPv6 support)</p>
+<p><strong>Setting: VPC</strong><br>
+→ Select: <code>vpc-shopnow</code> (from Project 5)</p>
+<p><strong>Setting: Availability Zone Mappings</strong><br>
+→ Select at LEAST 2 AZs — ALB requires minimum 2</p>
+<table><thead><tr><th>AZ</th><th>Subnet</th><th>Why This Subnet</th></tr></thead><tbody><tr><td>ap-south-1a</td><td><code>public-subnet-1a</code></td><td>ALB needs public subnet (internet-facing)</td></tr><tr><td>ap-south-1b</td><td><code>public-subnet-1b</code></td><td>Second AZ for high availability</td></tr></tbody></table>
+<p>→ CRITICAL: ALB must be in PUBLIC subnets (with Internet Gateway route)<br>
+→ EC2 instances can be in PUBLIC or PRIVATE subnets — ALB routes to them via private IP<br>
+→ Best practice: ALB in public subnet → EC2 in private subnet<br>
+→ ShopNow currently has EC2 in public subnet → this works but private is more secure</p>
+<p><strong>Setting: Security Group</strong><br>
+→ Select: <code>sg-shopnow-alb</code> (created in Step 1's security group section)<br>
+→ Allows inbound HTTP (80) and HTTPS (443) from 0.0.0.0/0</p>
+<hr>
+<h3>STEP 3 — CREATE A TARGET GROUP</h3>
+<p>→ During ALB creation → "Listeners and routing" section → Create Target Group</p>
+<p><strong>What is a Target Group?</strong><br>
+→ A Target Group is a collection of targets (EC2 instances) that the ALB routes traffic to<br>
+→ The ALB doesn't know about individual instances — it knows about Target Groups<br>
+→ The ASG automatically registers/deregisters instances with the Target Group</p>
+<p><strong>Setting: Target Type</strong></p>
+<table><thead><tr><th>Type</th><th>Description</th><th>Use Case</th></tr></thead><tbody><tr><td>Instances</td><td>Routes to EC2 instances by instance ID</td><td>✅ Standard for ASG</td></tr><tr><td>IP addresses</td><td>Routes to specific IPs (can be outside VPC)</td><td>Cross-VPC, on-premises targets</td></tr><tr><td>Lambda</td><td>Routes to Lambda function</td><td>Serverless web apps</td></tr><tr><td>Application Load Balancer</td><td>Routes to another ALB</td><td>Multi-ALB architectures</td></tr></tbody></table>
+<p>→ ShopNow: Instances</p>
+<p><strong>Setting: Target Group Name</strong><br>
+→ <code>shopnow-web-tg</code></p>
+<p><strong>Setting: Protocol / Port</strong><br>
+→ HTTP / 80<br>
+→ This is the protocol and port the ALB uses to communicate with EC2 instances<br>
+→ Even if ALB receives HTTPS (443) from the internet, it can forward as HTTP (80) to instances<br>
+→ This is called "SSL Termination at the ALB" — ALB handles encryption/decryption</p>
+<p><strong>Setting: VPC</strong><br>
+→ <code>vpc-shopnow</code></p>
+<p><strong>Setting: Protocol Version</strong><br>
+→ HTTP1 (default — sufficient for most web apps)<br>
+→ HTTP2: Use for gRPC or high-performance APIs<br>
+→ gRPC: Use for gRPC-specific routing</p>
+<p><strong>Setting: Health Checks — CRITICAL CONFIGURATION</strong></p>
+<p>→ The ALB continuously checks if each instance is healthy<br>
+→ Unhealthy instances stop receiving traffic<br>
+→ The ASG replaces instances that fail health checks</p>
+<table><thead><tr><th>Health Check Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>Protocol</td><td>HTTP</td><td>Check via HTTP request</td></tr><tr><td>Path</td><td><code>/health</code></td><td>Dedicated health endpoint — NOT <code>/</code> (homepage is too heavy)</td></tr><tr><td>Port</td><td>Traffic port (80)</td><td>Same port as application</td></tr><tr><td>Healthy threshold</td><td>3</td><td>Instance must pass 3 consecutive checks to be marked healthy</td></tr><tr><td>Unhealthy threshold</td><td>2</td><td>Instance fails after 2 consecutive failed checks</td></tr><tr><td>Timeout</td><td>5 seconds</td><td>If no response within 5s → check fails</td></tr><tr><td>Interval</td><td>30 seconds</td><td>Check every 30 seconds</td></tr><tr><td>Success codes</td><td>200</td><td>HTTP 200 = healthy</td></tr></tbody></table>
+<p><strong>Why <code>/health</code> endpoint instead of <code>/</code>?</strong></p>
+<table><thead><tr><th>Endpoint</th><th>Response Size</th><th>Database Query</th><th>Latency</th><th>Risk</th></tr></thead><tbody><tr><td><code>/</code> (homepage)</td><td>500 KB HTML + images</td><td>Yes — product listings</td><td>500ms–2s</td><td>Heavy — wastes resources, slow response may false-positive unhealthy</td></tr><tr><td><code>/health</code></td><td>10 bytes <code>{"status":"ok"}</code></td><td>No (or lightweight DB ping)</td><td>5ms</td><td>✅ Lightweight — accurate health signal</td></tr></tbody></table>
+<p>→ The <code>/health</code> endpoint should verify:</p>
+<ul>
+<li>Application process is running</li>
+<li>Application can respond to HTTP requests</li>
+<li>Optionally: Database connection is alive (lightweight ping)</li>
+<li>Should NOT: Run complex queries, render full pages, call external APIs</li>
+</ul>
+<p><strong>Setting: Advanced Health Check Settings</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Deregistration delay</td><td>300 seconds</td><td>When instance is removed from TG, ALB waits 300s for in-flight requests to complete before stopping traffic</td></tr><tr><td>Slow start duration</td><td>60 seconds</td><td>Newly registered instance receives gradually increasing traffic for 60s instead of full load immediately</td></tr><tr><td>Stickiness</td><td>Disabled (for now)</td><td>Each request can go to any instance — stateless architecture</td></tr></tbody></table>
+<p><strong>Understanding Stickiness:</strong></p>
+<table><thead><tr><th>Stickiness</th><th>Behavior</th><th>When to Use</th></tr></thead><tbody><tr><td>Disabled</td><td>Each request routes to any healthy instance</td><td>✅ Stateless apps (sessions in database/Redis)</td></tr><tr><td>Enabled (duration-based)</td><td>Same client routes to same instance for configured duration</td><td>Legacy apps with server-side sessions</td></tr><tr><td>Enabled (app-based)</td><td>Application controls which cookie determines stickiness</td><td>Custom session management</td></tr></tbody></table>
+<p>→ ShopNow should be STATELESS — sessions stored in RDS or ElastiCache<br>
+→ Stickiness disabled → true horizontal scaling</p>
+<p>→ DO NOT register any instances manually — the ASG will do this automatically</p>
+<hr>
+<h3>STEP 4 — CONFIGURE ALB LISTENER</h3>
+<p>→ Back in ALB creation → Listeners section</p>
+<p><strong>Listener 1: HTTP (Port 80)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>HTTP</td></tr><tr><td>Port</td><td>80</td></tr><tr><td>Default Action</td><td>Forward to Target Group: <code>shopnow-web-tg</code></td></tr></tbody></table>
+<p>→ For production — add HTTPS listener:</p>
+<p><strong>Listener 2: HTTPS (Port 443) — Production Requirement</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Protocol</td><td>HTTPS</td></tr><tr><td>Port</td><td>443</td></tr><tr><td>Default Action</td><td>Forward to Target Group: <code>shopnow-web-tg</code></td></tr><tr><td>SSL Certificate</td><td>Select from ACM (AWS Certificate Manager)</td></tr><tr><td>SSL Policy</td><td><code>ELBSecurityPolicy-TLS13-1-2-2021-06</code> (latest TLS 1.3)</td></tr></tbody></table>
+<p>→ Then modify HTTP listener to REDIRECT to HTTPS:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>HTTP (80) Default Action</td><td>Redirect to HTTPS (443), Status code 301</td></tr></tbody></table>
+<p>→ This forces all traffic to use encryption<br>
+→ Certificate provisioning via ACM is free for ALB-attached certificates</p>
+<p>→ Click "Create Load Balancer"</p>
+<p>→ ALB takes 2-5 minutes to provision<br>
+→ Once active → note the ALB DNS name: <code>shopnow-web-alb-1234567890.ap-south-1.elb.amazonaws.com</code><br>
+→ This DNS name is what customers will access (typically behind a CNAME in Route 53)</p>
+<hr>
+<h3>STEP 5 — CREATE THE AUTO SCALING GROUP</h3>
+<p>→ Navigate to EC2 Console → Auto Scaling Groups → Create Auto Scaling Group</p>
+<p><strong>Setting: Auto Scaling Group Name</strong><br>
+→ <code>shopnow-web-asg</code></p>
+<p><strong>Setting: Launch Template</strong><br>
+→ Select: <code>shopnow-web-app-template</code><br>
+→ Version: Latest (always use latest version — so template updates automatically apply)</p>
+<hr>
+<p><strong>Setting: Instance Type Requirements (Mixed Instances Policy)</strong><br>
+→ This is where you can specify MULTIPLE instance types for flexibility</p>
+<table><thead><tr><th>Priority</th><th>Instance Type</th><th>vCPU</th><th>Memory</th><th>Why</th></tr></thead><tbody><tr><td>1</td><td>t3.medium</td><td>2</td><td>4 GB</td><td>Primary — cost-effective burstable</td></tr><tr><td>2</td><td>t3a.medium</td><td>2</td><td>4 GB</td><td>AMD variant — 10% cheaper</td></tr><tr><td>3</td><td>m5.large</td><td>2</td><td>8 GB</td><td>Fallback if t3 capacity unavailable</td></tr></tbody></table>
+<p>→ Why multiple types?<br>
+→ During large scaling events, a single instance type might have insufficient capacity in the AZ<br>
+→ With multiple types → ASG tries next type if preferred is unavailable<br>
+→ This is called "Instance Type Diversification" — critical for reliability</p>
+<p><strong>Setting: Instance Purchase Options</strong></p>
+<table><thead><tr><th>Option</th><th>Description</th><th>Use Case</th></tr></thead><tbody><tr><td>On-Demand only</td><td>Full price, guaranteed capacity</td><td>✅ Production baseline</td></tr><tr><td>Spot only</td><td>Up to 90% discount, can be interrupted</td><td>Batch processing, fault-tolerant workloads</td></tr><tr><td>Mixed (On-Demand + Spot)</td><td>Base capacity On-Demand, burst capacity Spot</td><td>✅ Cost-optimized production</td></tr></tbody></table>
+<p>→ For ShopNow production web tier:</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr></thead><tbody><tr><td>On-Demand base capacity</td><td>2</td><td>Minimum 2 instances always On-Demand (guaranteed)</td></tr><tr><td>On-Demand percentage above base</td><td>50%</td><td>Half of scaling capacity is On-Demand</td></tr><tr><td>Spot allocation strategy</td><td>Capacity-optimized</td><td>Choose Spot pools with most available capacity (least interruption)</td></tr></tbody></table>
+<p>→ This means: First 2 instances = On-Demand (always running)<br>
+→ Scaling beyond 2: Half On-Demand, half Spot<br>
+→ If Spot instances are interrupted → On-Demand replacements launch automatically</p>
+<hr>
+<p><strong>Setting: Network — VPC and Subnets</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td><code>vpc-shopnow</code></td></tr><tr><td>Subnets</td><td><code>public-subnet-1a</code>, <code>public-subnet-1b</code></td></tr></tbody></table>
+<p>→ ASG launches instances ACROSS these subnets (and therefore across AZs)<br>
+→ If AZ-a has 3 instances and AZ-b has 2 → next instance launches in AZ-b (AZ rebalancing)<br>
+→ This ensures high availability — if one AZ goes down, instances in other AZ keep serving</p>
+<hr>
+<p><strong>Setting: Load Balancing</strong><br>
+→ Attach to an existing load balancer<br>
+→ Select Target Group: <code>shopnow-web-tg</code><br>
+→ This is the LINK between ASG and ALB<br>
+→ When ASG launches a new instance → automatically registers it with the Target Group<br>
+→ When ASG terminates an instance → automatically deregisters it from the Target Group<br>
+→ No manual intervention needed</p>
+<hr>
+<p><strong>Setting: Health Checks</strong></p>
+<table><thead><tr><th>Health Check Type</th><th>Source</th><th>What It Checks</th></tr></thead><tbody><tr><td>EC2 Health Check</td><td>EC2 service</td><td>Is the instance running? (system status + instance status)</td></tr><tr><td>ELB Health Check</td><td>ALB Target Group</td><td>Is the application responding on <code>/health</code>?</td></tr></tbody></table>
+<p>→ Enable BOTH:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>EC2 health check</td><td>✅ Enabled (always on)</td></tr><tr><td>ELB health check</td><td>✅ Enabled</td></tr><tr><td>Health check grace period</td><td>300 seconds</td></tr></tbody></table>
+<p><strong>Understanding Health Check Grace Period:</strong></p>
+<p>→ When a new instance launches:</p>
+<ol>
+<li>EC2 instance starts (30-60 seconds)</li>
+<li>Operating system boots (30-60 seconds)</li>
+<li>Application starts (30-120 seconds)</li>
+<li>Application becomes ready to serve traffic</li>
+</ol>
+<p>→ Total: 2-4 minutes before the instance can pass health checks<br>
+→ If grace period is too short (e.g., 60 seconds) → ASG checks health before app is ready → marks as unhealthy → TERMINATES the instance → launches another → same thing → infinite loop</p>
+<p>→ Grace period = 300 seconds → ASG waits 5 minutes before starting health checks on new instances<br>
+→ This gives the application time to fully start</p>
+<p>→ Set this based on your application's actual startup time + buffer<br>
+→ If your custom AMI boots and serves in 2 minutes → grace period = 180 seconds (3 minutes)</p>
+<hr>
+<p><strong>Setting: Group Size</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Desired capacity</td><td>2</td><td>ASG launches 2 instances immediately</td></tr><tr><td>Minimum capacity</td><td>2</td><td>ASG never goes below 2 instances (even during scale-in)</td></tr><tr><td>Maximum capacity</td><td>20</td><td>ASG never exceeds 20 instances (cost safety net)</td></tr></tbody></table>
+<p>→ These three numbers define the boundaries of scaling:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MIN ◄──────────── DESIRED ──────────────► MAX
+</span> 2                    2                     20
+ │                    │                      │
+ └─ Floor (never      └─ Current target     └─ Ceiling (never
+    go below this)       (ASG maintains        go above this)
+                         this count)</code></pre></div>
+<p>→ Desired starts at 2 → scaling policies dynamically adjust Desired between Min and Max<br>
+→ Scale-out: Desired increases → ASG launches instances<br>
+→ Scale-in: Desired decreases → ASG terminates instances<br>
+→ Desired never goes below Min or above Max</p>
+<hr>
+<h3>STEP 6 — CONFIGURE SCALING POLICIES</h3>
+<p>→ This is where CloudWatch integration happens (connecting to Project 8)</p>
+<p><strong>Understanding Scaling Policy Types:</strong></p>
+<table><thead><tr><th>Policy Type</th><th>How It Works</th><th>Complexity</th><th>Recommendation</th></tr></thead><tbody><tr><td>Target Tracking</td><td>"Keep CPU at 60%" — ASG automatically figures out how many instances needed</td><td>Simple</td><td>✅ Start here — handles 80% of use cases</td></tr><tr><td>Step Scaling</td><td>"If CPU &gt; 70%, add 2 instances; if CPU &gt; 90%, add 5 instances" — discrete steps</td><td>Medium</td><td>When you need different responses at different thresholds</td></tr><tr><td>Simple Scaling</td><td>"If alarm fires, add 1 instance" — waits for cooldown before next action</td><td>Simple but limited</td><td>❌ Legacy — use Target Tracking or Step instead</td></tr><tr><td>Scheduled Scaling</td><td>"At 8 AM, set Desired to 10; at 10 PM, set Desired to 2" — time-based</td><td>Simple</td><td>✅ For predictable patterns (Black Friday pre-scaling)</td></tr><tr><td>Predictive Scaling</td><td>ML-based — analyzes historical patterns and pre-scales</td><td>Advanced</td><td>✅ For recurring traffic patterns</td></tr></tbody></table>
+<hr>
+<p><strong>POLICY 1 — Target Tracking (Primary — Reactive Scaling)</strong></p>
+<p>→ In ASG configuration → Scaling Policies → Add Policy</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-cpu-target-tracking</code></td></tr><tr><td>Policy Type</td><td>Target Tracking Scaling</td></tr><tr><td>Metric Type</td><td>Average CPU Utilization</td></tr><tr><td>Target Value</td><td>60</td></tr><tr><td>Instance warmup</td><td>300 seconds</td></tr></tbody></table>
+<p><strong>What this does internally:</strong></p>
+<p>→ ASG continuously monitors average CPU across ALL instances in the group<br>
+→ If average CPU &gt; 60% → ASG calculates how many instances needed to bring CPU back to 60%<br>
+→ Example: 2 instances at 80% CPU → ASG determines 3 instances would bring average to ~53% → launches 1<br>
+→ If average CPU &lt; 60% → ASG calculates if instances can be removed while staying at/below 60%<br>
+→ Example: 4 instances at 30% CPU → ASG determines 2 instances would be at ~60% → terminates 2</p>
+<p><strong>Understanding Instance Warmup:</strong></p>
+<p>→ When a new instance launches → it takes time to reach normal load<br>
+→ During warmup period → the new instance's metrics are NOT included in the average calculation<br>
+→ Without warmup: New instance has 0% CPU → drags average down → ASG thinks load decreased → terminates another instance → load spikes again → oscillation<br>
+→ With warmup (300s): New instance ignored for 5 minutes → average calculated from existing instances only → stable scaling</p>
+<p><strong>Choosing the Target Value:</strong></p>
+<table><thead><tr><th>Target CPU</th><th>Behavior</th><th>Trade-off</th></tr></thead><tbody><tr><td>40%</td><td>Scales out aggressively — more instances running</td><td>Higher cost, very responsive</td></tr><tr><td>60%</td><td>✅ Balanced — good headroom for spikes</td><td>Recommended for most web apps</td></tr><tr><td>80%</td><td>Scales out conservatively — fewer instances</td><td>Lower cost, less headroom for sudden spikes</td></tr></tbody></table>
+<p>→ 60% chosen because: Web apps have bursty traffic → need headroom between average and 100%<br>
+→ If target is 80% and a sudden spike hits → instances go to 100% before new ones launch → user impact</p>
+<hr>
+<p><strong>POLICY 2 — Step Scaling (Secondary — Aggressive Response to Critical Load)</strong></p>
+<p>→ Target Tracking handles gradual increases<br>
+→ Step Scaling adds EMERGENCY response for sudden spikes</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-cpu-emergency-step</code></td></tr><tr><td>Policy Type</td><td>Step Scaling</td></tr><tr><td>CloudWatch Alarm</td><td>Create new alarm (see below)</td></tr></tbody></table>
+<p><strong>Create CloudWatch Alarm for Step Scaling:</strong></p>
+<p>→ Navigate to CloudWatch Console → Alarms → Create Alarm (pattern from Project 8)</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Namespace</td><td>AWS/EC2</td></tr><tr><td>Metric Name</td><td>CPUUtilization</td></tr><tr><td>Statistic</td><td>Average</td></tr><tr><td>Period</td><td>60 seconds (requires detailed monitoring from Step 1)</td></tr><tr><td>Dimension</td><td>AutoScalingGroupName = <code>shopnow-web-asg</code></td></tr><tr><td>Condition</td><td>Greater than 85%</td></tr><tr><td>Datapoints to alarm</td><td>2 out of 3 (2 consecutive high readings in 3 periods)</td></tr><tr><td>Alarm Action</td><td>Auto Scaling Policy (linked to step scaling)</td></tr></tbody></table>
+<p><strong>Step Scaling Adjustments:</strong></p>
+<table><thead><tr><th>Lower Bound</th><th>Upper Bound</th><th>Adjustment</th><th>Meaning</th></tr></thead><tbody><tr><td>85%</td><td>95%</td><td>+3 instances</td><td>Significant load — add 3</td></tr><tr><td>95%</td><td>— (infinity)</td><td>+5 instances</td><td>Critical load — add 5 immediately</td></tr></tbody></table>
+<p>→ This ensures:</p>
+<ul>
+<li>Normal fluctuations (CPU 40-85%): Handled by Target Tracking smoothly</li>
+<li>Sudden spike to 90%: Step Scaling adds 3 instances immediately (faster than Target Tracking)</li>
+<li>Extreme spike to 98%: Step Scaling adds 5 instances — emergency response</li>
+</ul>
+<p><strong>Scale-In Step Policy (Optional):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-cpu-scalein-step</code></td></tr><tr><td>Alarm Condition</td><td>CPU &lt; 30% for 10 minutes</td></tr><tr><td>Adjustment</td><td>-1 instance</td></tr></tbody></table>
+<p>→ Scale-in is CONSERVATIVE — remove 1 at a time<br>
+→ Scale-out is AGGRESSIVE — add multiple at once<br>
+→ This asymmetry is intentional:</p>
+<ul>
+<li>Scaling out too slowly = users impacted</li>
+<li>Scaling in too aggressively = premature removal → might need to scale out again immediately</li>
+</ul>
+<hr>
+<p><strong>POLICY 3 — Scheduled Scaling (Predictive — For Known Events)</strong></p>
+<p>→ ShopNow KNOWS Black Friday is coming → pre-scale BEFORE traffic arrives</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-black-friday-prescale</code></td></tr><tr><td>Recurrence</td><td>One-time: 2025-11-28 06:00 UTC</td></tr><tr><td>Desired</td><td>15</td></tr><tr><td>Min</td><td>10</td></tr><tr><td>Max</td><td>20</td></tr></tbody></table>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-black-friday-scaledown</code></td></tr><tr><td>Recurrence</td><td>One-time: 2025-11-29 06:00 UTC</td></tr><tr><td>Desired</td><td>2</td></tr><tr><td>Min</td><td>2</td></tr><tr><td>Max</td><td>20</td></tr></tbody></table>
+<p>→ At 6 AM on Black Friday → ASG immediately launches 13 additional instances (from 2 to 15)<br>
+→ Instances are WARM and READY before 8 AM traffic surge<br>
+→ At 6 AM next day → ASG scales back to normal</p>
+<p><strong>Recurring Scheduled Actions (for daily patterns):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-business-hours-scale</code></td><td></td></tr><tr><td>Recurrence</td><td><code>0 8 * * MON-FRI</code></td><td>Every weekday at 8 AM</td></tr><tr><td>Desired</td><td>4</td><td>Double capacity for business hours</td></tr><tr><td>Min</td><td>4</td><td></td></tr></tbody></table>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-night-scale</code></td><td></td></tr><tr><td>Recurrence</td><td><code>0 22 * * MON-FRI</code></td><td>Every weekday at 10 PM</td></tr><tr><td>Desired</td><td>2</td><td>Reduce to baseline</td></tr><tr><td>Min</td><td>2</td><td></td></tr></tbody></table>
+<hr>
+<p><strong>POLICY 4 — Predictive Scaling (ML-Based)</strong></p>
+<p>→ AWS analyzes 14 days of historical CloudWatch metrics<br>
+→ Predicts future traffic patterns using ML models<br>
+→ Pre-scales BEFORE predicted spikes</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Policy Name</td><td><code>shopnow-predictive-scaling</code></td></tr><tr><td>Metric</td><td>CPU Utilization</td></tr><tr><td>Target Value</td><td>60%</td></tr><tr><td>Scheduling Mode</td><td>Forecast and Scale (proactive)</td></tr><tr><td>Forecast Lookback</td><td>14 days</td></tr><tr><td>Pre-launch time</td><td>5 minutes (instances launch 5 min before predicted spike)</td></tr></tbody></table>
+<p>→ Works best when traffic has REPEATABLE patterns (daily/weekly cycles)<br>
+→ Does NOT help with unpredictable spikes (viral social media) — that's what Target Tracking handles</p>
+<hr>
+<h3>STEP 7 — CONFIGURE SCALING COOLDOWNS AND PROTECTIONS</h3>
+<p><strong>Cooldown Settings:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Default cooldown</td><td>300 seconds</td><td>After a scaling activity → wait 5 minutes before another</td></tr><tr><td>Scale-in protection</td><td>Disabled for now</td><td>When enabled → specific instances cannot be terminated during scale-in</td></tr><tr><td>Warm pool</td><td>See below</td><td>Pre-initialized instances ready to launch faster</td></tr></tbody></table>
+<p><strong>Understanding Cooldown:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Alarm fires → Scale-out: +2 instances → COOLDOWN STARTS (300s)
+</span>                                              │
+During cooldown → No additional scaling       │
+                  activities occur             │
+                                              │
+Cooldown ends → Evaluate metrics again ◄──────┘</code></pre></div>
+<p>→ Without cooldown: Alarm fires → add 2 → metrics still high (new instances warming up) → alarm fires again → add 2 more → overscaling<br>
+→ With cooldown: Alarm fires → add 2 → wait 5 minutes → new instances absorb load → metrics normalize → no further action needed</p>
+<p>→ Target Tracking policies manage their own cooldown internally → you don't set cooldown for them<br>
+→ Step Scaling policies USE the ASG's default cooldown</p>
+<hr>
+<p><strong>Warm Pool Configuration (Optional — Advanced):</strong></p>
+<p>→ A warm pool keeps pre-initialized instances in a STOPPED or RUNNING state<br>
+→ When scale-out happens → ASG pulls from warm pool instead of launching fresh</p>
+<table><thead><tr><th>Warm Pool State</th><th>Instance Status</th><th>Boot Time on Scale-Out</th><th>Cost</th></tr></thead><tbody><tr><td>Stopped</td><td>Initialized but halted</td><td>~30 seconds (just start)</td><td>EBS storage cost only</td></tr><tr><td>Running</td><td>Fully running, not serving</td><td>~5 seconds (just register with ALB)</td><td>Full instance cost</td></tr><tr><td>Hibernated</td><td>RAM state saved to disk</td><td>~10 seconds (resume from RAM)</td><td>EBS storage cost</td></tr></tbody></table>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Warm pool size</td><td>Max prepared capacity: 5</td></tr><tr><td>Pool state</td><td>Stopped</td></tr><tr><td>Reuse policy</td><td>Return to warm pool on scale-in (don't terminate)</td></tr></tbody></table>
+<p>→ Without warm pool: Scale-out takes 3-5 minutes (launch + boot + app start)<br>
+→ With warm pool (stopped): Scale-out takes 30-60 seconds<br>
+→ Significant improvement for time-sensitive scaling</p>
+<hr>
+<h3>STEP 8 — CONFIGURE INSTANCE TERMINATION POLICY</h3>
+<p>→ When scaling in → which instance should ASG terminate?</p>
+<p><strong>Available Termination Policies:</strong></p>
+<table><thead><tr><th>Policy</th><th>Behavior</th><th>Use Case</th></tr></thead><tbody><tr><td>Default</td><td>AZ balance → oldest launch config → closest to billing hour</td><td>✅ Good for most cases</td></tr><tr><td>OldestInstance</td><td>Terminate the oldest instance first</td><td>Rolling updates — refresh fleet</td></tr><tr><td>NewestInstance</td><td>Terminate the newest instance first</td><td>Preserve long-running instances</td></tr><tr><td>OldestLaunchConfiguration</td><td>Terminate instances with oldest Launch Template version</td><td>✅ Ensures fleet uses latest template</td></tr><tr><td>ClosestToNextInstanceHour</td><td>Terminate instance closest to completing billing hour</td><td>Cost optimization (legacy — per-second billing now)</td></tr><tr><td>AllocationStrategy</td><td>Terminate based on On-Demand/Spot allocation</td><td>Mixed fleet optimization</td></tr></tbody></table>
+<p>→ ShopNow configuration:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Termination Policy</td><td><code>OldestLaunchConfiguration</code>, then <code>Default</code></td></tr></tbody></table>
+<p>→ This ensures: When scaling in → instances using OLD template versions are terminated first → fleet naturally migrates to latest template version</p>
+<hr>
+<h3>STEP 9 — CONFIGURE INSTANCE REFRESH (Rolling Updates)</h3>
+<p>→ When you update the Launch Template (new AMI, new configuration):<br>
+→ Existing instances are still running the OLD version<br>
+→ Instance Refresh replaces them gradually</p>
+<p><strong>Setting: Instance Refresh Configuration</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>Minimum healthy percentage</td><td>90%</td><td>At least 90% of instances must be healthy during refresh</td></tr><tr><td>Instance warmup</td><td>300 seconds</td><td>Wait 5 minutes after launching new instance before replacing next</td></tr><tr><td>Checkpoint percentage</td><td>20%</td><td>After replacing 20% → pause and wait for manual confirmation (optional)</td></tr><tr><td>Skip matching</td><td>Enabled</td><td>Don't replace instances already running latest template version</td></tr></tbody></table>
+<p>→ Example with 10 instances:</p>
+<ol>
+<li>Launch 1 new instance with latest template</li>
+<li>Wait for it to pass health checks (300s)</li>
+<li>Terminate 1 old instance</li>
+<li>Repeat until all 10 replaced</li>
+<li>At 20% (2 replaced) → checkpoint → verify everything works → continue</li>
+</ol>
+<p>→ This achieves ZERO-DOWNTIME deployment</p>
+<hr>
+<h3>STEP 10 — CONFIGURE NOTIFICATIONS</h3>
+<p>→ ASG can send notifications for lifecycle events</p>
+<p>→ Navigate to ASG → Notifications tab → Add notification</p>
+<table><thead><tr><th>Event</th><th>SNS Topic</th><th>Purpose</th></tr></thead><tbody><tr><td>Launch</td><td><code>shopnow-asg-notifications</code></td><td>Know when new instances are added</td></tr><tr><td>Terminate</td><td><code>shopnow-asg-notifications</code></td><td>Know when instances are removed</td></tr><tr><td>Fail to launch</td><td><code>shopnow-pipeline-failure</code> (from Project 32)</td><td>CRITICAL — investigate immediately</td></tr><tr><td>Fail to terminate</td><td><code>shopnow-pipeline-failure</code></td><td>Investigate — stuck instances cost money</td></tr></tbody></table>
+<p>→ Create SNS Topic <code>shopnow-asg-notifications</code> with engineering team subscribed<br>
+→ This provides visibility into every scaling action</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use Launch Template (never Launch Configuration)<br>
+→ Always use custom AMI with application pre-installed for faster scaling response<br>
+→ Always deploy across minimum 2 Availability Zones<br>
+→ Always set Minimum capacity ≥ 2 for production (single instance = single point of failure)<br>
+→ Always enable detailed monitoring (1-minute metrics) for responsive scaling<br>
+→ Always set health check grace period longer than application startup time<br>
+→ Always enable BOTH EC2 and ELB health checks<br>
+→ Always create a dedicated <code>/health</code> endpoint — lightweight, no database-heavy queries<br>
+→ Always set Maximum capacity as a COST SAFETY NET — prevents runaway scaling<br>
+→ Always use Target Tracking as primary policy — simplest and most effective<br>
+→ Always add Scheduled Scaling for known events (sales, campaigns, launches)<br>
+→ Always configure scale-in to be CONSERVATIVE (remove slowly) and scale-out to be AGGRESSIVE (add fast)<br>
+→ Always restrict EC2 Security Group to accept traffic ONLY from ALB Security Group<br>
+→ Always use instance warmup to prevent oscillation<br>
+→ Always set up ASG notifications for launch failures</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never set Minimum to 1 in production — one instance = one AZ = one failure away from downtime<br>
+→ Never set health check grace period too short — causes termination loop (launch → fail check → terminate → launch)<br>
+→ Never use only Simple Scaling — it's the least responsive policy type<br>
+→ Never set Target Tracking target too high (&gt;80%) — no headroom for sudden spikes<br>
+→ Never forget to update the AMI in Launch Template when deploying new application versions<br>
+→ Never allow EC2 instances to be directly accessible from internet when behind ALB<br>
+→ Never enable stickiness unless your application truly requires it — breaks even load distribution<br>
+→ Never set Maximum too low — during a genuine traffic spike, hitting the ceiling means dropped requests<br>
+→ Never set Maximum too high without cost alerts — a bug in your app could trigger infinite scaling<br>
+→ Never mix Launch Template and manual instance registration in the same Target Group<br>
+→ Never skip the warm pool evaluation for latency-sensitive applications<br>
+→ Never ignore Spot Instance interruption handling if using mixed fleet<br>
+→ Never deploy a new AMI to ALL instances simultaneously — use Instance Refresh with checkpoints</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE AUTO SCALING</h2>
+<table><thead><tr><th>Scenario</th><th>Use Auto Scaling?</th></tr></thead><tbody><tr><td>Web application with variable traffic</td><td>✅ Yes — primary use case</td></tr><tr><td>Predictable daily traffic patterns (high day, low night)</td><td>✅ Yes — Scheduled + Target Tracking</td></tr><tr><td>Unpredictable traffic spikes (viral content, flash sales)</td><td>✅ Yes — Target Tracking + Step Scaling</td></tr><tr><td>Batch processing with variable job volume</td><td>✅ Yes — scale workers based on queue depth (SQS metric)</td></tr><tr><td>Known future events (Black Friday, product launch)</td><td>✅ Yes — Scheduled Scaling to pre-warm</td></tr><tr><td>Single-instance development/test environment</td><td>❌ No — unnecessary complexity</td></tr><tr><td>Database servers (RDS, Redshift)</td><td>❌ No — use managed scaling (RDS Read Replicas, Redshift resize)</td></tr><tr><td>Serverless architecture (Lambda, Fargate)</td><td>❌ No — scaling is built into the service</td></tr><tr><td>Constant, unchanging workload</td><td>⚠️ Maybe — ASG still provides health check replacement even without scaling</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE AUTO SCALING</h2>
+<p>→ When your application is NOT horizontally scalable</p>
+<ul>
+<li>If your app can't run on multiple instances (singleton processes, file locks) → fix the app first</li>
+<li>Auto Scaling adds instances — if the app can't share load → more instances don't help</li>
+</ul>
+<p>→ When you're running a managed service (RDS, Redshift, ElastiCache)</p>
+<ul>
+<li>These have their own scaling mechanisms</li>
+<li>Don't put managed services behind ASG</li>
+</ul>
+<p>→ When your application has extremely long startup time (&gt;15 minutes)</p>
+<ul>
+<li>By the time new instances are ready, the spike may have passed</li>
+<li>Use warm pools or consider container-based deployment (ECS/EKS)</li>
+</ul>
+<p>→ When cost is more important than availability</p>
+<ul>
+<li>Dev/test environments → single instance is fine</li>
+<li>ASG with Min=2 doubles your baseline cost</li>
+</ul>
+<p>→ When your workload is purely serverless</p>
+<ul>
+<li>Lambda auto-scales per request</li>
+<li>Fargate auto-scales per task</li>
+<li>No need for EC2 Auto Scaling</li>
+</ul>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — ASG CONTROL LOOP</h3>
+<p>→ The ASG runs a continuous control loop:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EVERY 10-60 SECONDS:
+</span>    │
+    ├─ Check: Is current running count == Desired?
+    │   ├─ Running &lt; Desired → LAUNCH instances (scale out)
+    │   ├─ Running &gt; Desired → TERMINATE instances (scale in)
+    │   └─ Running == Desired → No action
+    │
+    ├─ Check: Are all instances healthy?
+    │   ├─ Unhealthy instance found → TERMINATE it → Desired stays same → replacement launches
+    │   └─ All healthy → No action
+    │
+    ├─ Check: Are instances balanced across AZs?
+    │   ├─ Imbalanced → Launch in under-represented AZ, terminate in over-represented AZ
+    │   └─ Balanced → No action
+    │
+    └─ Check: Any scaling policies triggered?
+        ├─ Scale-out policy → Increase Desired → triggers launch in next loop iteration
+        ├─ Scale-in policy → Decrease Desired → triggers termination in next loop iteration
+        └─ No policy triggered → No action</code></pre></div>
+<p>→ This loop is the HEART of Auto Scaling — it's always running, always evaluating<br>
+→ The Desired count is the SINGLE number that controls everything<br>
+→ Scaling policies MODIFY Desired → the control loop ACTS on it</p>
+<hr>
+<h3>MECHANIC 2 — ALB REQUEST ROUTING</h3>
+<p>→ When a request arrives at the ALB:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Client Request → DNS → ALB Endpoint
+</span>    │
+    ▼
+ALB receives request on Listener (port 80/443)
+    │
+    ▼
+Listener evaluates Rules (in priority order):
+    │
+    ├─ Rule 1: If path = /api/* → Forward to API Target Group
+    ├─ Rule 2: If path = /static/* → Forward to Static Target Group
+    └─ Default Rule: Forward to shopnow-web-tg
+    │
+    ▼
+Target Group selects a healthy target using ROUTING ALGORITHM:
+    │
+    ├─ Round Robin (default): Distribute requests evenly across all healthy targets
+    └─ Least Outstanding Requests: Send to target with fewest in-flight requests
+    │
+    ▼
+ALB forwards request to selected EC2 instance
+    │
+    ▼
+EC2 instance processes request → returns response → ALB forwards to client</code></pre></div>
+<p><strong>Understanding Routing Algorithms:</strong></p>
+<table><thead><tr><th>Algorithm</th><th>Behavior</th><th>Best For</th></tr></thead><tbody><tr><td>Round Robin</td><td>Alternates between targets sequentially</td><td>Uniform request processing time</td></tr><tr><td>Least Outstanding Requests</td><td>Routes to target with fewest active connections</td><td>✅ Variable request processing time (recommended)</td></tr></tbody></table>
+<p>→ ShopNow: Use Least Outstanding Requests<br>
+→ Some pages (product detail) take 100ms, others (checkout) take 2 seconds<br>
+→ Round Robin would overload instances processing slow requests</p>
+<hr>
+<h3>MECHANIC 3 — HEALTH CHECK LIFECYCLE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>New instance launched by ASG
+</span>    │
+    ▼
+Instance enters "Pending" state
+    │
+    ▼
+EC2 starts → OS boots → Application starts
+    │
+    ▼
+Health check grace period countdown (300 seconds)
+    │  (NO health checks during this period)
+    ▼
+Grace period ends → Health checks begin
+    │
+    ├─ ALB sends GET /health every 30 seconds
+    │   ├─ Response 200 within 5s → Healthy count +1
+    │   └─ No response / non-200 → Unhealthy count +1
+    │
+    ├─ Healthy threshold reached (3 consecutive) → Instance marked HEALTHY
+    │   └─ ALB starts routing traffic to this instance
+    │
+    └─ Unhealthy threshold reached (2 consecutive) → Instance marked UNHEALTHY
+        └─ ALB stops routing traffic → ASG terminates instance → launches replacement</code></pre></div>
+<p><strong>Two-Layer Health Checks:</strong></p>
+<table><thead><tr><th>Layer</th><th>Check</th><th>Catches</th></tr></thead><tbody><tr><td>EC2 Health Check</td><td>Is the VM running? System status OK?</td><td>Hardware failure, kernel panic, network unreachable</td></tr><tr><td>ELB Health Check</td><td>Does the application respond on /health?</td><td>Application crash, memory exhaustion, deadlock, dependency failure</td></tr></tbody></table>
+<p>→ EC2 check passes but ELB check fails = Application is broken but OS is fine<br>
+→ Without ELB health check → ASG thinks instance is healthy → keeps routing traffic → users see errors<br>
+→ With ELB health check → ASG detects application failure → replaces instance automatically</p>
+<hr>
+<h3>MECHANIC 4 — TARGET TRACKING INTERNAL ALGORITHM</h3>
+<p>→ Target Tracking uses a proportional scaling algorithm:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Target: 60% CPU
+</span>Current instances: 4
+Current average CPU: 80%
+
+Required instances = Current instances × (Current metric / Target metric)
+Required instances = 4 × (80 / 60)
+Required instances = 5.33
+Required instances = 6 (rounded UP for scale-out)
+
+Action: Increase Desired from 4 to 6 → launch 2 instances</code></pre></div>
+<p><strong>Scale-in calculation:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Current instances: 6
+</span>Current average CPU: 35%
+
+Required instances = 6 × (35 / 60)
+Required instances = 3.5
+Required instances = 4 (rounded UP for scale-in — conservative)
+
+Action: Decrease Desired from 6 to 4 → terminate 2 instances</code></pre></div>
+<p>→ Notice: Scale-out rounds UP → aggressive<br>
+→ Scale-in also rounds UP → conservative (keeps more instances than minimum needed)<br>
+→ This asymmetry is by design — AWS prioritizes availability over cost savings</p>
+<p><strong>Target Tracking also creates TWO CloudWatch Alarms automatically:</strong></p>
+<table><thead><tr><th>Alarm</th><th>Threshold</th><th>Action</th></tr></thead><tbody><tr><td><code>TargetTracking-shopnow-web-asg-AlarmHigh</code></td><td>CPU &gt; 60% for 3 minutes</td><td>Scale out</td></tr><tr><td><code>TargetTracking-shopnow-web-asg-AlarmLow</code></td><td>CPU &lt; 42% for 15 minutes</td><td>Scale in</td></tr></tbody></table>
+<p>→ The LOW alarm threshold is NOT 60% — it's intentionally lower (~70% of target)<br>
+→ And it requires 15 minutes (not 3) before triggering<br>
+→ This prevents oscillation: scale out at 60%, scale in only when well below 60% for extended period</p>
+<hr>
+<h3>MECHANIC 5 — INSTANCE LAUNCH SEQUENCE</h3>
+<p>→ When ASG decides to launch a new instance:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ASG selects target AZ (least instances or rebalancing)
+</span>2. ASG reads Launch Template (latest version)
+3. ASG calls EC2 RunInstances API with template parameters
+4. EC2 allocates resources in selected AZ
+5. EC2 creates ENI (network interface) in specified subnet
+6. EC2 attaches Security Groups
+7. EC2 attaches IAM Instance Profile
+8. EC2 creates EBS volumes
+9. EC2 starts the instance
+10. User Data script executes (if configured)
+11. Instance enters "Pending" state in ASG
+12. ASG registers instance with Target Group
+13. Health check grace period begins
+14. Grace period ends → health checks begin
+15. Health checks pass → instance marked InService
+16. ALB starts routing traffic to instance</code></pre></div>
+<p>→ Total time: 2-5 minutes (without warm pool)<br>
+→ With warm pool (stopped): Steps 1-10 already done → starts at step 11 → 30-60 seconds</p>
+<hr>
+<h3>MECHANIC 6 — AZ REBALANCING</h3>
+<p>→ ASG automatically distributes instances evenly across AZs</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Desired: 4 instances
+</span>AZs: ap-south-1a, ap-south-1b
+
+Balanced state:
+    AZ-1a: [Instance-1] [Instance-2]
+    AZ-1b: [Instance-3] [Instance-4]
+
+If Instance-2 fails:
+    AZ-1a: [Instance-1] ← only 1
+    AZ-1b: [Instance-3] [Instance-4] ← has 2
+
+ASG detects imbalance → launches new instance in AZ-1a:
+    AZ-1a: [Instance-1] [Instance-5] ← rebalanced
+    AZ-1b: [Instance-3] [Instance-4]</code></pre></div>
+<p>→ During rebalancing → ASG may temporarily EXCEED Desired capacity<br>
+→ It launches first (in under-represented AZ) → then terminates (in over-represented AZ)<br>
+→ This ensures availability is maintained during rebalancing</p>
+<p>→ If an entire AZ goes down:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Before AZ failure:
+</span>    AZ-1a: [Instance-1] [Instance-2]
+    AZ-1b: [Instance-3] [Instance-4]
+
+AZ-1a goes down:
+    AZ-1a: ❌ ❌
+    AZ-1b: [Instance-3] [Instance-4]
+
+ASG detects: Running (2) &lt; Desired (4)
+ASG launches 2 new instances in AZ-1b:
+    AZ-1a: ❌ (unavailable)
+    AZ-1b: [Instance-3] [Instance-4] [Instance-5] [Instance-6]</code></pre></div>
+<p>→ Service continues with all 4 instances in the surviving AZ<br>
+→ When AZ-1a recovers → ASG gradually rebalances back</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Health check grace period too short</td><td>New instances terminated before app starts → infinite launch-terminate loop</td><td>Set grace period = app startup time + 60 second buffer</td></tr><tr><td>2</td><td>No ELB health check enabled</td><td>ASG doesn't detect application crashes — only OS-level failures</td><td>Always enable ELB health checks in addition to EC2</td></tr><tr><td>3</td><td>Application stores session state locally</td><td>When request goes to different instance → user logged out → cart empty</td><td>Use external session store (ElastiCache/RDS) — stateless instances</td></tr><tr><td>4</td><td>AMI not updated with latest app version</td><td>New instances launched by ASG run OLD version → inconsistent behavior</td><td>Update AMI in Launch Template before scaling events → use Instance Refresh</td></tr><tr><td>5</td><td>Security Group allows direct internet access to EC2</td><td>Bypasses ALB → uneven load → security risk</td><td>EC2 SG inbound: only from ALB SG</td></tr><tr><td>6</td><td>Max capacity too low</td><td>During genuine spike → ASG hits ceiling → can't add more → users impacted</td><td>Set Max with headroom → monitor with CloudWatch Alarm when approaching Max</td></tr><tr><td>7</td><td>Max capacity too high with no cost alarm</td><td>Bug causes infinite scaling → 100 instances → massive bill</td><td>Set AWS Budget alarm + CloudWatch alarm on ASG GroupDesiredCapacity</td></tr><tr><td>8</td><td>Forgot to create ALB in multiple AZs</td><td>ALB has reduced availability → single AZ failure affects all traffic</td><td>Always select minimum 2 AZ subnets for ALB</td></tr><tr><td>9</td><td>Scaling policy oscillation</td><td>Instances added → CPU drops → instances removed → CPU rises → repeat</td><td>Use Target Tracking (handles this automatically) + appropriate warmup/cooldown</td></tr><tr><td>10</td><td>Spot Instances terminated during peak</td><td>Spot capacity reclaimed by AWS → instances lost during high traffic</td><td>Set On-Demand base capacity ≥ minimum needed for acceptable service</td></tr><tr><td>11</td><td>User Data script fails silently</td><td>Instance launches but application doesn't start → fails health check → terminated</td><td>Log User Data output to CloudWatch → test User Data on standalone instance first</td></tr><tr><td>12</td><td>Deregistration delay too short</td><td>ALB stops sending traffic before in-flight requests complete → 502 errors for users</td><td>Set deregistration delay ≥ longest expected request duration</td></tr><tr><td>13</td><td>Using only scheduled scaling for unpredictable traffic</td><td>Schedule says scale up at 8 AM but viral tweet hits at 3 AM → no instances ready</td><td>Always combine scheduled with reactive (Target Tracking)</td></tr><tr><td>14</td><td>Not testing the full scaling cycle</td><td>Scaling out works but scaling in has unexpected behavior (persistent connections, graceful shutdown)</td><td>Test both scale-out AND scale-in in staging</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Instance Count Scaling</strong></p>
+<ul>
+<li>ASG supports up to 500 instances per group (soft limit — can request increase)</li>
+<li>For larger fleets → multiple ASGs behind same ALB Target Group</li>
+<li>OR use ECS/EKS for container-based scaling (thousands of containers)</li>
+</ul>
+<p>→ <strong>ALB Scaling</strong></p>
+<ul>
+<li>ALB scales AUTOMATICALLY based on traffic — no configuration needed</li>
+<li>For sudden massive spikes (millions of requests/second) → ALB may take 1-5 minutes to scale</li>
+<li>For known events → "pre-warm" the ALB by contacting AWS Support with expected traffic pattern</li>
+<li>OR gradually ramp up traffic before the event</li>
+</ul>
+<p>→ <strong>AZ Scaling</strong></p>
+<ul>
+<li>More AZs = better availability but potentially higher cross-AZ data transfer costs</li>
+<li>2 AZs: Good for most applications</li>
+<li>3 AZs: Better availability, recommended for critical production</li>
+<li>All AZs in region: Maximum availability, higher complexity</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Instances</th><th>Type</th><th>Monthly Cost (t3.medium, ap-south-1)</th></tr></thead><tbody><tr><td>2 (minimum)</td><td>On-Demand</td><td>~$60</td></tr><tr><td>5 (average day)</td><td>Mixed (3 OD + 2 Spot)</td><td>~$110</td></tr><tr><td>15 (Black Friday)</td><td>Mixed (8 OD + 7 Spot)</td><td>~$290 (for that day)</td></tr><tr><td>20 (maximum)</td><td>Mixed</td><td>~$400 (for that day)</td></tr></tbody></table>
+<p>→ Auto Scaling SAVES money compared to provisioning for peak 24/7<br>
+→ Without ASG: 20 instances running 24/7 = ~$4,800/month<br>
+→ With ASG: Average 5 instances with peaks = ~$1,500/month (70% savings)</p>
+<p>→ <strong>Metric Scaling</strong></p>
+<ul>
+<li>Don't limit to CPU — you can scale on ANY CloudWatch metric:</li>
+</ul>
+<table><thead><tr><th>Metric</th><th>When to Use</th></tr></thead><tbody><tr><td>CPU Utilization</td><td>General-purpose — most common</td></tr><tr><td>Network In/Out</td><td>Network-bound applications</td></tr><tr><td>Request Count Per Target (ALB metric)</td><td>✅ Best for web apps — directly measures load per instance</td></tr><tr><td>SQS Queue Depth</td><td>Worker instances processing messages (ties to Project 7)</td></tr><tr><td>Custom Metric (via CloudWatch)</td><td>Application-specific: active sessions, response time, error rate</td></tr></tbody></table>
+<p>→ Advanced: Scale on <code>RequestCountPerTarget</code> instead of CPU<br>
+→ "Keep 500 requests per instance" → more direct measure of web load than CPU</p>
+<p>→ <strong>Regional Scaling</strong></p>
+<ul>
+<li>ASG is regional (works across AZs within one region)</li>
+<li>For multi-region scaling → use Route 53 health checks + separate ASGs per region (Project 55 DR patterns)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the setup is correctly configured:</strong></p>
+<table><thead><tr><th>Check</th><th>Where to Look</th><th>Expected</th></tr></thead><tbody><tr><td>Launch Template exists with correct AMI</td><td>EC2 → Launch Templates</td><td>Latest version with custom AMI</td></tr><tr><td>ALB is active and has DNS name</td><td>EC2 → Load Balancers → State</td><td>Active</td></tr><tr><td>Target Group has registered targets</td><td>EC2 → Target Groups → Targets tab</td><td>2 instances showing "healthy"</td></tr><tr><td>ASG shows correct desired/min/max</td><td>EC2 → Auto Scaling Groups → Details</td><td>2/2/20</td></tr><tr><td>Instances are in multiple AZs</td><td>ASG → Instance management tab</td><td>Instances spread across 2+ AZs</td></tr><tr><td>Scaling policies are active</td><td>ASG → Automatic scaling tab</td><td>Target Tracking policy enabled</td></tr><tr><td>CloudWatch Alarms exist</td><td>CloudWatch → Alarms</td><td>TargetTracking alarms in OK state</td></tr><tr><td>Health checks passing</td><td>Target Group → Targets → Health status</td><td>All targets: healthy</td></tr></tbody></table>
+<p>→ <strong>How to validate scaling works:</strong></p>
+<table><thead><tr><th>Test</th><th>Method</th><th>Expected Result</th></tr></thead><tbody><tr><td>Scale-out test</td><td>Generate load → watch CPU rise above 60%</td><td>ASG launches additional instances within 3-5 minutes</td></tr><tr><td>Scale-in test</td><td>Remove load → watch CPU drop below 40%</td><td>ASG terminates excess instances within 15-20 minutes</td></tr><tr><td>Health check test</td><td>Stop application on one instance</td><td>ALB marks unhealthy → ASG terminates → replacement launches</td></tr><tr><td>AZ failure test</td><td>Terminate all instances in one AZ</td><td>ASG launches replacements in surviving AZ</td></tr><tr><td>ALB routing test</td><td>Hit ALB DNS repeatedly</td><td>Responses come from different instances (check hostname in response)</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing operations:</strong></p>
+<table><thead><tr><th>Dashboard Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>Instance count</td><td><code>GroupDesiredCapacity</code>, <code>GroupInServiceInstances</code></td><td>See current fleet size</td></tr><tr><td>CPU across fleet</td><td>Average <code>CPUUtilization</code> by ASG dimension</td><td>See if scaling is keeping up</td></tr><tr><td>Request count</td><td>ALB <code>RequestCount</code></td><td>Traffic volume</td></tr><tr><td>Target response time</td><td>ALB <code>TargetResponseTime</code></td><td>User experience indicator</td></tr><tr><td>Healthy host count</td><td>TG <code>HealthyHostCount</code></td><td>How many instances are serving</td></tr><tr><td>5xx errors</td><td>ALB <code>HTTPCode_Target_5XX_Count</code></td><td>Application errors</td></tr><tr><td>Scaling activities</td><td>ASG Activity History</td><td>See every scale-out/in event</td></tr></tbody></table>
+<p>→ <strong>How to debug scaling issues:</strong></p>
+<table><thead><tr><th>Symptom</th><th>Debug Steps</th></tr></thead><tbody><tr><td>ASG won't scale out</td><td>Check scaling policy → Check CloudWatch Alarm state → Verify Max not reached → Check Launch Template for errors → Check service quotas (vCPU limits)</td></tr><tr><td>New instances keep getting terminated</td><td>Check health check grace period → Check User Data script → Check application startup logs → Verify AMI has working application</td></tr><tr><td>ALB returns 502 errors</td><td>Check Target Group health → Check Security Group rules → Check application logs → Verify application is listening on correct port</td></tr><tr><td>Uneven traffic distribution</td><td>Check stickiness settings → Verify all instances are healthy → Check routing algorithm (switch to Least Outstanding Requests) → Verify instances have similar capacity</td></tr><tr><td>Scaling too slow for spikes</td><td>Reduce CloudWatch alarm evaluation period → Add Step Scaling for emergency thresholds → Enable Predictive Scaling → Consider warm pool</td></tr><tr><td>Scaling oscillation (up-down-up-down)</td><td>Increase cooldown period → Increase instance warmup → Check if Target Tracking target is too close to natural CPU baseline → Verify detailed monitoring is enabled</td></tr><tr><td>Instances launching in wrong AZ</td><td>Check subnet configuration in ASG → Verify subnets are in correct AZs → Check AZ capacity availability</td></tr><tr><td>Scale-in removing too many instances too fast</td><td>Verify scale-in policy is conservative → Add scale-in protection to critical instances → Increase scale-in cooldown → Check termination policy</td></tr><tr><td>Spot instances being interrupted frequently</td><td>Switch to Capacity Optimized allocation strategy → Diversify instance types (more fallback types) → Increase On-Demand base capacity</td></tr><tr><td>Launch failures</td><td>Check ASG Activity History for error messages → Verify AMI exists and is not deregistered → Check IAM permissions → Check VPC subnet has available IP addresses → Check EC2 service quota for instance type</td></tr><tr><td>ALB DNS not resolving</td><td>Verify ALB is in ACTIVE state → Check that ALB has at least 2 AZ subnets → Verify Internet Gateway is attached to VPC → Check Route Table has 0.0.0.0/0 → IGW route</td></tr><tr><td>Health checks pass but application not working correctly</td><td>Health endpoint <code>/health</code> is too simple → Add dependency checks (DB ping, cache ping) → But keep it lightweight</td></tr><tr><td>Cost unexpectedly high</td><td>Check if scale-in is working → Verify Max capacity isn't being hit constantly → Check if terminated instances are being replaced unnecessarily → Review warm pool costs</td></tr></tbody></table>
+<p>→ <strong>ASG Activity History — The Ultimate Scaling Debug Tool:</strong></p>
+<p>→ Navigate to ASG → Activity tab</p>
+<table><thead><tr><th>Column</th><th>Information</th></tr></thead><tbody><tr><td>Activity ID</td><td>Unique identifier for the scaling event</td></tr><tr><td>Description</td><td>What happened: "Launching a new EC2 instance: i-0abc123" or "Terminating EC2 instance: i-0def456"</td></tr><tr><td>Cause</td><td>WHY it happened: "At 2025-01-15T10:30:00Z a monitor alarm TargetTracking-shopnow-web-asg-AlarmHigh was in state ALARM"</td></tr><tr><td>Status</td><td>Successful / Failed / Cancelled</td></tr><tr><td>Start Time</td><td>When the action began</td></tr><tr><td>End Time</td><td>When the action completed</td></tr></tbody></table>
+<p>→ The "Cause" field is the MOST important — it tells you exactly which alarm or policy triggered the scaling action<br>
+→ For failed launches — the "Status Message" contains the specific error (e.g., "Insufficient capacity for instance type t3.medium in AZ ap-south-1a")</p>
+<p>→ <strong>Combining Monitoring Across Projects:</strong></p>
+<table><thead><tr><th>Monitoring Layer</th><th>Tool</th><th>Configured In</th></tr></thead><tbody><tr><td>Instance-level CPU/Memory</td><td>CloudWatch Metrics + Agent</td><td>Project 8, 19</td></tr><tr><td>Application health</td><td>ALB Health Checks</td><td>This Project (33)</td></tr><tr><td>Scaling events</td><td>ASG Activity History + Notifications</td><td>This Project (33)</td></tr><tr><td>Application logs</td><td>CloudWatch Logs</td><td>Project 19</td></tr><tr><td>Pipeline status</td><td>Step Functions execution history</td><td>Project 32</td></tr><tr><td>Alerting</td><td>SNS notifications</td><td>Project 6, 8</td></tr><tr><td>Event-driven routing</td><td>EventBridge rules</td><td>Project 38</td></tr></tbody></table>
+<p>→ In production — create a unified CloudWatch Dashboard combining:</p>
+<ul>
+<li>ALB request count + response time</li>
+<li>ASG instance count + scaling activities</li>
+<li>EC2 CPU/Memory across fleet</li>
+<li>RDS connections + CPU (from Project 9)</li>
+<li>Application error rates from CloudWatch Logs</li>
+</ul>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Auto Scaling is NOT just about adding instances — it's a THREE-COMPONENT system:</p>
+<ol>
+<li><strong>Launch Template</strong> — the WHAT (instance blueprint with AMI, type, security, IAM)</li>
+<li><strong>Application Load Balancer</strong> — the HOW (traffic distribution + health detection)</li>
+<li><strong>Auto Scaling Group</strong> — the WHEN and HOW MANY (scaling policies + fleet management)</li>
+</ol>
+<p>→ All three must work together — removing any one breaks the system:</p>
+<ul>
+<li>Without Launch Template → ASG doesn't know what to launch</li>
+<li>Without ALB → traffic can't reach new instances → scaling is useless</li>
+<li>Without ASG → no automatic scaling → back to manual intervention</li>
+</ul>
+<p>→ The FOUR scaling policy types serve different purposes:</p>
+<ul>
+<li><strong>Target Tracking</strong> → "Keep metric at X" → handles 80% of scenarios → START HERE</li>
+<li><strong>Step Scaling</strong> → "At different thresholds, respond differently" → emergency response</li>
+<li><strong>Scheduled Scaling</strong> → "At known times, pre-scale" → predictable events</li>
+<li><strong>Predictive Scaling</strong> → "Learn from history, pre-scale automatically" → repeating patterns</li>
+</ul>
+<p>→ The GOLDEN RULE of scaling:</p>
+<ul>
+<li><strong>Scale OUT aggressively</strong> (add many instances quickly)</li>
+<li><strong>Scale IN conservatively</strong> (remove few instances slowly)</li>
+<li>Users feel scale-out delays (errors, timeouts)</li>
+<li>Users don't feel unnecessary extra instances (just costs you money)</li>
+<li>It's always better to over-provision briefly than under-provision during a spike</li>
+</ul>
+<p>→ Health checks are the AUTOMATIC HEALING mechanism:</p>
+<ul>
+<li>EC2 health check → detects infrastructure failure</li>
+<li>ELB health check → detects application failure</li>
+<li>BOTH enabled → comprehensive detection → automatic replacement</li>
+</ul>
+<p>→ Security fundamentally changes when introducing ALB:</p>
+<ul>
+<li>Internet → ALB (public) → EC2 (private from internet)</li>
+<li>EC2 Security Group: Accept traffic ONLY from ALB Security Group</li>
+<li>This is a significant improvement over Project 4's direct internet-to-EC2 model</li>
+</ul>
+<p>→ <strong>Connection to Previous Projects:</strong></p>
+<ul>
+<li>Project 3 → Single EC2 instance was the starting point — now replaced by managed fleet</li>
+<li>Project 4 → Security Groups evolve — EC2 SG now references ALB SG instead of 0.0.0.0/0</li>
+<li>Project 5 → VPC subnets used for ALB (public) and potentially EC2 (public or private)</li>
+<li>Project 8 → CloudWatch Alarms now TRIGGER scaling actions, not just send emails</li>
+<li>Project 11 → IAM Instance Profile applied via Launch Template to all instances</li>
+<li>Project 6 → SNS notifications for scaling events</li>
+</ul>
+<p>→ <strong>What this project fundamentally changes:</strong></p>
+<ul>
+<li>Before: One server → it dies → site dies → manual recovery in hours</li>
+<li>After: Fleet of servers → one dies → automatically replaced in minutes → users never notice</li>
+<li>Before: Traffic spike → server overwhelmed → site crashes</li>
+<li>After: Traffic spike → CloudWatch detects → ASG adds instances → ALB distributes → site stays fast</li>
+<li>Before: Black Friday requires manual preparation → human error → disaster</li>
+<li>After: Scheduled + predictive scaling → infrastructure ready BEFORE traffic arrives</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow's web tier is now auto-scaling and resilient<br>
+→ The data pipeline (Project 32) loads enriched data into Redshift every morning<br>
+→ But there's a GAP between these two systems:</p>
+<p>→ Every day, new product data files land in S3 from external vendors<br>
+→ These files need to be loaded into Redshift for the analytics team<br>
+→ Currently — the Step Functions pipeline (Project 32) handles the Glue-based ETL<br>
+→ But the FINAL step — loading into Redshift — is triggered inside Step Functions with a hardcoded schedule</p>
+<p>→ The business wants something MORE event-driven:</p>
+<ul>
+<li>Vendor uploads a file to S3 at unpredictable times (could be 2 AM, could be 3 PM)</li>
+<li>As SOON as the file lands → trigger a Lambda function</li>
+<li>Lambda validates the file format</li>
+<li>Lambda triggers Redshift COPY via Data API</li>
+<li>Lambda sends SNS notification on success/failure</li>
+<li>No human intervention — fully automated, event-driven</li>
+</ul>
+<p>→ This requires combining:</p>
+<ul>
+<li>S3 Event Notifications (Project 15 pattern)</li>
+<li>Lambda with VPC access to Redshift (new pattern)</li>
+<li>Redshift Data API (Project 22 pattern extended)</li>
+<li>EventBridge for scheduling (Project 38 pattern)</li>
+</ul>
+<p>→ <strong>Project 34 introduces the S3 → Lambda → Redshift Automated Pipeline — event-driven data loading without orchestrators</strong></p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 34: "The Daily Data Feed That Needed Warehouse Ingestion — S3 → Lambda → Redshift Automated Pipeline"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-32.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 33/60</span></div><a class="nav-btn next" href="project-34.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

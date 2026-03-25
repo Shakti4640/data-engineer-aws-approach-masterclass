@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 43: THE WAREHOUSE DATA THAT NEEDED TO FLOW BACK TO OPERATIONS — Redshift — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 43: THE WAREHOUSE DATA THAT NEEDED TO FLOW BACK TO OPERATIONS — Redshift to MariaDB Data Sync via Glue</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's data architecture has matured significantly:</p>
+<ul>
+<li>Raw data flows INTO the data lake (S3) via Glue ETL (Project 21)</li>
+<li>Operational data flows FROM MariaDB TO S3 via Glue JDBC (Project 24)</li>
+<li>S3 data is loaded INTO Redshift via COPY (Project 22)</li>
+<li>Redshift performs complex aggregations, ML scoring, and business metrics computation</li>
+<li>Cross-account access to the data lake is governed via Lake Formation (Project 42)</li>
+</ul>
+<p>→ But ALL data flows are ONE-DIRECTIONAL: Operational → Analytical</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT FLOW (One-Way):
+</span>MariaDB (Operational) → Glue ETL → S3 (Data Lake) → Redshift (Warehouse)
+                                                          │
+                                                          ▼
+                                                    Analytics/BI
+                                                    
+MISSING FLOW (Reverse):
+Redshift (Warehouse) → ??? → MariaDB (Operational)</code></pre></div>
+<p><strong>The Business Need:</strong></p>
+<p>→ Redshift computes several high-value derived datasets that the operational application NEEDS:</p>
+<table><thead><tr><th>Redshift Dataset</th><th>What It Contains</th><th>Who Needs It</th><th>Why</th></tr></thead><tbody><tr><td><code>customer_lifetime_value</code></td><td>CLV score per customer (ML-computed)</td><td>MariaDB → Web Application</td><td>Display personalized offers based on CLV tier</td></tr><tr><td><code>product_recommendations</code></td><td>Recommended products per customer</td><td>MariaDB → Web Application</td><td>Show "Recommended for You" section</td></tr><tr><td><code>inventory_forecast</code></td><td>Predicted inventory needs per product per week</td><td>MariaDB → Inventory Management System</td><td>Auto-generate purchase orders</td></tr><tr><td><code>sales_daily_summary</code></td><td>Daily sales aggregation by region/category</td><td>MariaDB → Operations Dashboard</td><td>Real-time operations dashboard</td></tr><tr><td><code>fraud_risk_scores</code></td><td>Fraud probability per transaction</td><td>MariaDB → Payment Processing System</td><td>Flag high-risk transactions</td></tr></tbody></table>
+<p><strong>Current Workaround (Broken):</strong></p>
+<p>→ A data analyst manually runs Redshift UNLOAD (Project 23) to export CSV files to S3<br>
+→ Another analyst downloads the CSV from S3<br>
+→ The DBA manually imports the CSV into MariaDB using a MySQL client<br>
+→ This process happens once a week (should be daily)<br>
+→ It takes 4 hours of manual work each time<br>
+→ Data is always 1-7 days stale in MariaDB<br>
+→ The web application shows week-old recommendations — customers see irrelevant products<br>
+→ The fraud detection system uses week-old scores — new fraud patterns are missed for days</p>
+<p><strong>Specific Technical Challenges:</strong></p>
+<p><strong>Challenge 1 — Schema Mismatch:</strong><br>
+→ Redshift uses different data types than MariaDB</p>
+<table><thead><tr><th>Data Element</th><th>Redshift Type</th><th>MariaDB Type</th><th>Issue</th></tr></thead><tbody><tr><td>Customer ID</td><td><code>BIGINT</code></td><td><code>INT UNSIGNED</code></td><td>Potential overflow</td></tr><tr><td>CLV Score</td><td><code>DECIMAL(18,6)</code></td><td><code>DECIMAL(10,2)</code></td><td>Precision loss</td></tr><tr><td>Recommendation List</td><td><code>VARCHAR(65535)</code> (Redshift SUPER or JSON)</td><td><code>TEXT</code> or <code>JSON</code></td><td>Format conversion needed</td></tr><tr><td>Timestamp</td><td><code>TIMESTAMP WITHOUT TIME ZONE</code></td><td><code>DATETIME</code></td><td>Timezone handling</td></tr><tr><td>Boolean flags</td><td><code>BOOLEAN</code></td><td><code>TINYINT(1)</code></td><td>Type mapping</td></tr></tbody></table>
+<p><strong>Challenge 2 — Incremental vs Full Load:</strong><br>
+→ <code>customer_lifetime_value</code> has 5 million rows — full reload takes 45 minutes<br>
+→ Only ~50,000 rows change daily<br>
+→ Need incremental sync — only push changed rows<br>
+→ But Redshift doesn't have native change data capture</p>
+<p><strong>Challenge 3 — Concurrency:</strong><br>
+→ MariaDB serves live web traffic — 500 requests/second<br>
+→ Bulk writing 50,000 rows while the application reads from the same tables<br>
+→ Risk of lock contention, slow queries, and application timeouts</p>
+<p><strong>Challenge 4 — Failure Recovery:</strong><br>
+→ If the sync fails halfway through — MariaDB has partial data<br>
+→ Some customers have new recommendations, others have old ones<br>
+→ Need atomic updates — either ALL rows are updated or NONE</p>
+<p><strong>The Data Engineering Lead asks:</strong></p>
+<blockquote>
+<p>"I need an automated daily pipeline that:<br>
+Reads computed datasets from Redshift,<br>
+Transforms data types for MariaDB compatibility,<br>
+Writes to MariaDB incrementally (only changed rows),<br>
+Does this without disrupting live application traffic,<br>
+Recovers cleanly from failures,<br>
+And runs automatically every night."</p>
+</blockquote>
+<p>→ This requires a Glue ETL job that reads from Redshift (as source) and writes to MariaDB (as sink)<br>
+→ The REVERSE of Project 24 (which read from MariaDB and wrote to S3)</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the architectural pattern being implemented</p>
+<p><strong>This is "Reverse ETL":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Traditional ETL:     Operational DB → Transform → Data Warehouse
+</span>Reverse ETL:         Data Warehouse → Transform → Operational DB</code></pre></div>
+<p>→ Reverse ETL is increasingly common as warehouses become compute engines (ML scoring, aggregations)<br>
+→ The warehouse computes insights → those insights must flow back to operational systems</p>
+<p><strong>Why Glue for Reverse ETL (not direct Redshift → MariaDB):</strong></p>
+<table><thead><tr><th>Approach</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Redshift UNLOAD → S3 → Lambda → MariaDB</td><td>Uses existing patterns (Project 23, 34)</td><td>Complex orchestration, no built-in type mapping</td></tr><tr><td>Redshift Federated Query write-back</td><td>Direct SQL (Project 48 preview)</td><td>Read-only — federated query cannot WRITE to external sources</td></tr><tr><td>DMS (Database Migration Service)</td><td>Built for replication</td><td>Designed for migration, not selective aggregation sync</td></tr><tr><td><strong>Glue ETL Job (This project)</strong></td><td><strong>Built-in JDBC connectors for both Redshift and MariaDB, type mapping, bookmarking, scheduling</strong></td><td><strong>Requires VPC networking for both connections</strong></td></tr></tbody></table>
+<p>→ Glue is the best fit because:</p>
+<ul>
+<li>It has native JDBC connectors for BOTH Redshift and MariaDB</li>
+<li>It supports DynamicFrame transformations for type conversion</li>
+<li>It supports job bookmarking for incremental processing (Project 46 preview)</li>
+<li>It integrates with Glue Workflow for orchestration (Project 31)</li>
+<li>It runs within VPC for private connectivity to both databases</li>
+</ul>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Create Glue JDBC Connection to Redshift (source)</li>
+<li>Step 2 — Verify existing Glue JDBC Connection to MariaDB (sink — from Project 24)</li>
+<li>Step 3 — Configure VPC networking for dual-database connectivity</li>
+<li>Step 4 — Create the Glue ETL Job for Redshift → MariaDB</li>
+<li>Step 5 — Handle schema/type mapping between Redshift and MariaDB</li>
+<li>Step 6 — Implement incremental sync strategy</li>
+<li>Step 7 — Implement safe write strategy for live MariaDB</li>
+<li>Step 8 — Configure job scheduling and orchestration</li>
+<li>Step 9 — Configure monitoring and alerting</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — CREATE GLUE JDBC CONNECTION TO REDSHIFT</h3>
+<p>→ Navigate to AWS Glue → "Connections" → "Create connection"</p>
+<p><strong>Understanding Glue Connections to Redshift:</strong></p>
+<p>→ Glue can connect to Redshift via TWO methods:</p>
+<table><thead><tr><th>Method</th><th>Connection Type</th><th>When to Use</th></tr></thead><tbody><tr><td>JDBC Connection</td><td>Generic JDBC with Redshift JDBC driver</td><td>Works for all Redshift cluster types, full SQL control</td></tr><tr><td>Native Redshift Connection</td><td>Glue's built-in Redshift connector</td><td>Optimized for Redshift, uses temporary S3 staging</td></tr></tbody></table>
+<p>→ For this project → Use the Native Redshift Connection (more efficient for large datasets)</p>
+<p><strong>Native Redshift Connection Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Connection name</td><td><code>shopnow-redshift-source-connection</code></td><td>Descriptive name</td></tr><tr><td>Connection type</td><td>Amazon Redshift</td><td>Native connector</td></tr><tr><td>Redshift cluster</td><td><code>shopnow-warehouse-cluster</code> (from Project 16)</td><td>Select from dropdown</td></tr><tr><td>Database name</td><td><code>shopnow_analytics</code></td><td>The Redshift database containing computed tables</td></tr><tr><td>Username/Password</td><td>Use Secrets Manager: <code>shopnow/prod/redshift/glue-reader</code></td><td>From Project 37 patterns</td></tr><tr><td>VPC</td><td><code>vpc-shopnow-main</code> (from Project 5)</td><td>Same VPC as Redshift</td></tr><tr><td>Subnet</td><td>Private subnet where Redshift resides</td><td>Must be in same AZ as Redshift</td></tr><tr><td>Security group</td><td><code>sg-glue-redshift-connector</code> (new — configured below)</td><td>Controls network access</td></tr></tbody></table>
+<p><strong>Why Native Redshift Connection is Better than JDBC:</strong></p>
+<table><thead><tr><th>Feature</th><th>JDBC Connection</th><th>Native Redshift Connection</th></tr></thead><tbody><tr><td>Data transfer mechanism</td><td>Row-by-row over JDBC</td><td>Bulk UNLOAD to S3 → Glue reads from S3</td></tr><tr><td>Performance for large datasets</td><td>Slow (millions of rows over JDBC = hours)</td><td>Fast (UNLOAD is parallel, S3 read is parallel)</td></tr><tr><td>Temporary S3 staging</td><td>Not used</td><td>Required — Glue uses S3 as intermediary</td></tr><tr><td>Memory efficiency</td><td>Loads into Glue worker memory</td><td>Streams from S3 — more memory efficient</td></tr></tbody></table>
+<p><strong>Temporary S3 Staging for Native Redshift Connection:</strong></p>
+<p>→ The native connector works like this:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Job starts
+</span>    │
+    ├── Glue tells Redshift: "UNLOAD this query to S3 temporary location"
+    │     Redshift executes UNLOAD → writes Parquet/CSV to s3://staging-bucket/temp/
+    │
+    ├── Glue reads the UNLOADED files from S3
+    │     Much faster than row-by-row JDBC
+    │
+    ├── Glue processes/transforms the data
+    │
+    └── Glue writes to MariaDB via JDBC
+        (MariaDB doesn't have a bulk-load equivalent — JDBC is the only option)</code></pre></div>
+<p><strong>Configure Temporary S3 Bucket for Staging:</strong></p>
+<p>→ S3 → Create bucket: <code>shopnow-glue-redshift-staging</code></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Region</td><td>Same as Redshift cluster</td></tr><tr><td>Encryption</td><td>SSE-KMS → <code>shopnow-s3-datalake-key</code> (Project 36)</td></tr><tr><td>Block Public Access</td><td>All ON</td></tr><tr><td>Lifecycle Rule</td><td>Expire objects after 1 day (staging data is temporary)</td></tr></tbody></table>
+<p><strong>IAM Permissions for Redshift to UNLOAD to Staging Bucket:</strong></p>
+<p>→ The Redshift cluster's IAM role (from Project 22) needs:</p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging/*</code></td><td>Write UNLOAD output</td></tr><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging/*</code></td><td>Read (for verification)</td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging</code></td><td>List staging files</td></tr><tr><td><code>s3:DeleteObject</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging/*</code></td><td>Clean up after Glue reads</td></tr><tr><td><code>kms:GenerateDataKey</code></td><td>KMS key ARN</td><td>Encrypt staging files</td></tr><tr><td><code>kms:Decrypt</code></td><td>KMS key ARN</td><td>Read encrypted staging files</td></tr></tbody></table>
+<p><strong>Glue Job IAM Role Permissions for Staging Bucket:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging/*</code></td><td>Read UNLOADED data</td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging</code></td><td>List staging files</td></tr><tr><td><code>s3:DeleteObject</code></td><td><code>arn:aws:s3:::shopnow-glue-redshift-staging/*</code></td><td>Clean up staging data</td></tr><tr><td><code>kms:Decrypt</code></td><td>KMS key ARN</td><td>Decrypt staging files</td></tr></tbody></table>
+<hr>
+<p><strong>Create Secrets Manager Secret for Redshift (if not already exists):</strong></p>
+<p>→ Following Project 37 patterns:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Secret name</td><td><code>shopnow/prod/redshift/glue-reader</code></td></tr><tr><td>Username</td><td><code>glue_reader_user</code> (dedicated Redshift user with SELECT-only permissions)</td></tr><tr><td>Password</td><td>Auto-generated</td></tr><tr><td>Engine</td><td><code>redshift</code></td></tr><tr><td>Host</td><td>Redshift cluster endpoint</td></tr><tr><td>Port</td><td><code>5439</code></td></tr><tr><td>Database</td><td><code>shopnow_analytics</code></td></tr><tr><td>KMS key</td><td><code>shopnow-redshift-warehouse-key</code> (Project 36)</td></tr></tbody></table>
+<p><strong>Redshift User Permissions:</strong><br>
+→ The <code>glue_reader_user</code> should have:</p>
+<ul>
+<li><code>SELECT</code> on the specific schemas/tables being synced</li>
+<li>NO <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> — read-only from Redshift</li>
+<li><code>USAGE</code> on the schema</li>
+</ul>
+<hr>
+<h3>STEP 2 — VERIFY EXISTING GLUE JDBC CONNECTION TO MARIADB</h3>
+<p>→ The MariaDB connection was created in Project 24<br>
+→ Verify it's configured with Secrets Manager (updated in Project 37)</p>
+<p><strong>Connection Verification:</strong></p>
+<table><thead><tr><th>Setting</th><th>Expected Value</th><th>Reference</th></tr></thead><tbody><tr><td>Connection name</td><td><code>shopnow-mariadb-connection</code></td><td>Project 24</td></tr><tr><td>Connection type</td><td>JDBC</td><td></td></tr><tr><td>JDBC URL</td><td><code>jdbc:mysql://shopnow-mariadb-prod-encrypted...:3306/shopnow_prod</code></td><td>Project 9, 36 (encrypted endpoint)</td></tr><tr><td>Credential type</td><td>AWS Secrets Manager</td><td>Project 37</td></tr><tr><td>Secret</td><td><code>shopnow/prod/mariadb/glue-etl</code></td><td>Project 37</td></tr><tr><td>VPC</td><td>Same VPC as Redshift</td><td>Project 5</td></tr><tr><td>Subnet</td><td>Private subnet where MariaDB resides</td><td></td></tr><tr><td>Security group</td><td><code>sg-glue-mariadb-connector</code></td><td>Project 24</td></tr></tbody></table>
+<p><strong>MariaDB User Permissions for Glue WRITE Operations:</strong></p>
+<p>→ In Project 24, the <code>glue_etl_user</code> had SELECT-only permissions (reading FROM MariaDB)<br>
+→ For THIS project → the user needs WRITE permissions too</p>
+<p><strong>Update MariaDB User Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Tables</th><th>Purpose</th></tr></thead><tbody><tr><td><code>SELECT</code></td><td><code>customer_lifetime_value</code>, <code>product_recommendations</code>, <code>inventory_forecast</code>, <code>sales_daily_summary</code>, <code>fraud_risk_scores</code></td><td>Read existing data for comparison</td></tr><tr><td><code>INSERT</code></td><td>Same tables</td><td>Insert new rows</td></tr><tr><td><code>UPDATE</code></td><td>Same tables</td><td>Update existing rows</td></tr><tr><td><code>DELETE</code></td><td>Same tables + staging tables</td><td>Delete old data / clean staging</td></tr><tr><td><code>CREATE TABLE</code></td><td><code>shopnow_prod</code> schema</td><td>Create staging tables if needed</td></tr><tr><td><code>DROP TABLE</code></td><td>Staging tables only</td><td>Clean up staging tables</td></tr><tr><td><code>CREATE TEMPORARY TABLES</code></td><td><code>shopnow_prod</code> schema</td><td>Temporary tables for atomic swaps</td></tr></tbody></table>
+<p><strong>IMPORTANT: Least Privilege Consideration:</strong><br>
+→ Project 37 established SEPARATE database users per service<br>
+→ Consider creating a NEW dedicated user for the reverse ETL:</p>
+<table><thead><tr><th>Secret Name</th><th>MariaDB User</th><th>Permissions</th></tr></thead><tbody><tr><td><code>shopnow/prod/mariadb/glue-etl</code></td><td><code>glue_etl_user</code></td><td>SELECT only (existing — for MariaDB → S3 ETL)</td></tr><tr><td><code>shopnow/prod/mariadb/glue-reverse-etl</code></td><td><code>glue_reverse_etl_user</code></td><td>SELECT, INSERT, UPDATE, DELETE on sync tables</td></tr></tbody></table>
+<p>→ This way, the forward ETL job cannot accidentally write to MariaDB<br>
+→ And the reverse ETL job has explicit write permissions only on specific tables</p>
+<hr>
+<h3>STEP 3 — CONFIGURE VPC NETWORKING FOR DUAL-DATABASE CONNECTIVITY</h3>
+<p>→ The Glue job must reach BOTH Redshift AND MariaDB within the same job execution<br>
+→ Both databases are in the same VPC (Project 5) but may be in different subnets</p>
+<p><strong>Network Topology:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VPC: vpc-shopnow-main (10.0.0.0/16)
+</span>    │
+    ├── Private Subnet A (10.0.1.0/24) — AZ: ap-south-1a
+    │     ├── Redshift Cluster (primary node)
+    │     └── RDS MariaDB (primary)
+    │
+    ├── Private Subnet B (10.0.2.0/24) — AZ: ap-south-1b
+    │     ├── Redshift Cluster (compute nodes)
+    │     └── RDS MariaDB (standby — Multi-AZ from Project 29)
+    │
+    └── Private Subnet C (10.0.3.0/24) — AZ: ap-south-1a
+          └── Glue ENIs (Elastic Network Interfaces)</code></pre></div>
+<p><strong>Glue Job VPC Configuration:</strong></p>
+<p>→ When a Glue job uses JDBC connections → Glue creates ENIs (Elastic Network Interfaces) in the specified VPC/subnet<br>
+→ The Glue job runs within the VPC — can reach private resources</p>
+<p><strong>Security Group Configuration:</strong></p>
+<p><strong>Security Group: <code>sg-glue-reverse-etl</code> (for the Glue job ENIs)</strong></p>
+<p><strong>Inbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Reason</th></tr></thead><tbody><tr><td>All TCP</td><td>All</td><td>Self (<code>sg-glue-reverse-etl</code>)</td><td>Glue workers communicate with each other</td></tr></tbody></table>
+<p><strong>Outbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Destination</th><th>Reason</th></tr></thead><tbody><tr><td>PostgreSQL</td><td>5439</td><td><code>sg-redshift-cluster</code></td><td>Connect to Redshift</td></tr><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-rds-mariadb</code></td><td>Connect to MariaDB</td></tr><tr><td>HTTPS</td><td>443</td><td>S3 VPC Endpoint prefix list</td><td>Access staging bucket + Glue service</td></tr><tr><td>HTTPS</td><td>443</td><td>Secrets Manager VPC Endpoint SG</td><td>Fetch credentials</td></tr><tr><td>HTTPS</td><td>443</td><td>KMS VPC Endpoint SG (if exists)</td><td>Decrypt secrets and staging data</td></tr></tbody></table>
+<p><strong>Update Redshift Security Group (<code>sg-redshift-cluster</code>):</strong></p>
+<p><strong>Add Inbound Rule:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Reason</th></tr></thead><tbody><tr><td>PostgreSQL</td><td>5439</td><td><code>sg-glue-reverse-etl</code></td><td>Allow Glue reverse ETL to read from Redshift</td></tr></tbody></table>
+<p><strong>Update MariaDB Security Group (<code>sg-rds-mariadb</code>):</strong></p>
+<p><strong>Add Inbound Rule:</strong></p>
+<table><thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Reason</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>3306</td><td><code>sg-glue-reverse-etl</code></td><td>Allow Glue reverse ETL to write to MariaDB</td></tr></tbody></table>
+<p>→ This follows the same security group cross-referencing pattern from Projects 14, 24, 35</p>
+<p><strong>VPC Endpoint Requirements:</strong></p>
+<p>→ Glue running inside VPC needs to reach AWS services (S3, Secrets Manager, KMS, Glue service)<br>
+→ VPC Endpoints required (from Project 27, verified in Projects 35, 37):</p>
+<table><thead><tr><th>Endpoint</th><th>Type</th><th>Already Exists?</th></tr></thead><tbody><tr><td>S3</td><td>Gateway Endpoint</td><td>✅ Yes (Project 27)</td></tr><tr><td>Secrets Manager</td><td>Interface Endpoint</td><td>✅ Yes (Project 35, 37)</td></tr><tr><td>Glue</td><td>Interface Endpoint</td><td>⚠️ May need to create</td></tr><tr><td>KMS</td><td>Interface Endpoint</td><td>⚠️ May need to create</td></tr></tbody></table>
+<p><strong>Create Glue VPC Endpoint (if not exists):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Service name</td><td><code>com.amazonaws.ap-south-1.glue</code></td></tr><tr><td>VPC</td><td><code>vpc-shopnow-main</code></td></tr><tr><td>Subnets</td><td>Private subnets A and B</td></tr><tr><td>Security group</td><td>Allow HTTPS (443) from <code>sg-glue-reverse-etl</code></td></tr><tr><td>Private DNS</td><td>✅ Enable</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — CREATE THE GLUE ETL JOB</h3>
+<p>→ Navigate to AWS Glue → "ETL jobs" → "Create job"</p>
+<p><strong>Job Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Job name</td><td><code>shopnow-reverse-etl-redshift-to-mariadb</code></td><td>Descriptive name</td></tr><tr><td>IAM role</td><td><code>GlueReverseETLRole</code></td><td>Dedicated role with appropriate permissions</td></tr><tr><td>Type</td><td>Spark</td><td>Spark engine for distributed processing</td></tr><tr><td>Glue version</td><td>Glue 4.0</td><td>Latest version with best performance</td></tr><tr><td>Language</td><td>Python 3</td><td>Script language</td></tr><tr><td>Worker type</td><td>G.1X</td><td>Standard worker — sufficient for this workload</td></tr><tr><td>Number of workers</td><td>5</td><td>Start with 5 — adjust based on data volume</td></tr><tr><td>Job timeout</td><td>120 minutes</td><td>Prevent runaway jobs</td></tr><tr><td>Max retries</td><td>1</td><td>Retry once on failure</td></tr><tr><td>Job bookmark</td><td>Enable</td><td>For incremental processing (Step 6)</td></tr><tr><td>Connections</td><td><code>shopnow-redshift-source-connection</code>, <code>shopnow-mariadb-connection</code></td><td>Both database connections</td></tr><tr><td>Temporary path</td><td><code>s3://shopnow-glue-redshift-staging/temp/</code></td><td>For Redshift UNLOAD staging</td></tr><tr><td>Script path</td><td><code>s3://shopnow-glue-scripts/reverse-etl/redshift-to-mariadb.py</code></td><td>Job script location</td></tr></tbody></table>
+<p><strong>IAM Role: <code>GlueReverseETLRole</code> Permissions:</strong></p>
+<table><thead><tr><th>Permission</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td><code>glue:*</code></td><td>Job and connection ARNs</td><td>Glue service operations</td></tr><tr><td><code>s3:GetObject</code>, <code>s3:PutObject</code>, <code>s3:DeleteObject</code></td><td>Staging bucket ARN</td><td>Redshift UNLOAD staging</td></tr><tr><td><code>s3:GetObject</code></td><td>Script bucket ARN</td><td>Read job script</td></tr><tr><td><code>s3:PutObject</code></td><td>Logs bucket ARN</td><td>Write job logs</td></tr><tr><td><code>secretsmanager:GetSecretValue</code></td><td>Redshift secret ARN + MariaDB secret ARN</td><td>Fetch database credentials</td></tr><tr><td><code>kms:Decrypt</code>, <code>kms:GenerateDataKey</code></td><td>S3 KMS key + Redshift KMS key + RDS KMS key</td><td>Encrypt/decrypt data</td></tr><tr><td><code>ec2:CreateNetworkInterface</code></td><td><code>*</code></td><td>VPC ENI creation</td></tr><tr><td><code>ec2:DescribeNetworkInterfaces</code></td><td><code>*</code></td><td>VPC networking</td></tr><tr><td><code>ec2:DeleteNetworkInterface</code></td><td><code>*</code></td><td>VPC cleanup</td></tr><tr><td><code>redshift:GetClusterCredentials</code></td><td>Cluster ARN (if using IAM auth)</td><td>Temporary Redshift credentials</td></tr><tr><td><code>logs:*</code></td><td>Log group ARN</td><td>CloudWatch logging</td></tr><tr><td><code>cloudwatch:PutMetricData</code></td><td><code>*</code></td><td>Custom metrics</td></tr></tbody></table>
+<hr>
+<h3>STEP 5 — HANDLE SCHEMA AND TYPE MAPPING</h3>
+<p>→ This is where Glue's DynamicFrame transformation capabilities are essential</p>
+<p><strong>Type Mapping Table (Redshift → MariaDB):</strong></p>
+<table><thead><tr><th>Source Column</th><th>Redshift Type</th><th>Target MariaDB Type</th><th>Transformation Needed</th></tr></thead><tbody><tr><td><code>customer_id</code></td><td><code>BIGINT</code></td><td><code>BIGINT</code> (change from INT UNSIGNED)</td><td>MariaDB table ALTER to BIGINT</td></tr><tr><td><code>clv_score</code></td><td><code>DECIMAL(18,6)</code></td><td><code>DECIMAL(18,6)</code> (increase from 10,2)</td><td>MariaDB table ALTER precision</td></tr><tr><td><code>clv_tier</code></td><td><code>VARCHAR(20)</code></td><td><code>VARCHAR(20)</code></td><td>None — direct mapping</td></tr><tr><td><code>recommendations_json</code></td><td><code>SUPER</code> or <code>VARCHAR(65535)</code></td><td><code>JSON</code> or <code>LONGTEXT</code></td><td>Cast to string if SUPER type</td></tr><tr><td><code>forecast_date</code></td><td><code>DATE</code></td><td><code>DATE</code></td><td>None — direct mapping</td></tr><tr><td><code>forecast_quantity</code></td><td><code>INTEGER</code></td><td><code>INT</code></td><td>None — direct mapping</td></tr><tr><td><code>fraud_score</code></td><td><code>FLOAT8</code> (DOUBLE)</td><td><code>DOUBLE</code></td><td>None — direct mapping</td></tr><tr><td><code>is_flagged</code></td><td><code>BOOLEAN</code></td><td><code>TINYINT(1)</code></td><td>Boolean → 0/1 conversion</td></tr><tr><td><code>computed_at</code></td><td><code>TIMESTAMP</code></td><td><code>DATETIME</code></td><td>Timezone handling — Redshift stores UTC</td></tr><tr><td><code>etl_batch_id</code></td><td><code>VARCHAR(50)</code></td><td><code>VARCHAR(50)</code></td><td>None — added by Glue for tracking</td></tr><tr><td><code>etl_loaded_at</code></td><td>(added by Glue)</td><td><code>DATETIME</code></td><td>Glue adds current timestamp</td></tr></tbody></table>
+<p><strong>Glue Job Transformation Logic (Conceptual — Configuration perspective):</strong></p>
+<p>→ The Glue job script performs these transformations:</p>
+<table><thead><tr><th>Transformation Step</th><th>Input</th><th>Output</th><th>Purpose</th></tr></thead><tbody><tr><td>Read from Redshift</td><td>Redshift table via native connector</td><td>DynamicFrame with Redshift types</td><td>Extract</td></tr><tr><td>Cast BOOLEAN to INT</td><td><code>is_flagged: BOOLEAN</code></td><td><code>is_flagged: INT (0 or 1)</code></td><td>MariaDB compatibility</td></tr><tr><td>Cast SUPER to STRING</td><td><code>recommendations_json: SUPER</code></td><td><code>recommendations_json: STRING</code></td><td>MariaDB JSON column compatibility</td></tr><tr><td>Round DECIMAL precision</td><td><code>clv_score: DECIMAL(18,6)</code></td><td><code>clv_score: DECIMAL(18,6)</code></td><td>Preserve precision</td></tr><tr><td>Add ETL metadata columns</td><td>N/A</td><td><code>etl_batch_id</code>, <code>etl_loaded_at</code></td><td>Traceability</td></tr><tr><td>Handle NULL values</td><td>Various NULL values</td><td>Default values or NULL</td><td>Prevent MariaDB NOT NULL constraint violations</td></tr><tr><td>Write to MariaDB</td><td>Transformed DynamicFrame</td><td>MariaDB table via JDBC</td><td>Load</td></tr></tbody></table>
+<p><strong>Glue Job Parameters (Configured in job settings, not code):</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>--source_database</code></td><td><code>shopnow_analytics</code></td><td>Redshift database</td></tr><tr><td><code>--source_table</code></td><td><code>customer_lifetime_value</code></td><td>Redshift table to read</td></tr><tr><td><code>--target_database</code></td><td><code>shopnow_prod</code></td><td>MariaDB database</td></tr><tr><td><code>--target_table</code></td><td><code>customer_lifetime_value</code></td><td>MariaDB table to write</td></tr><tr><td><code>--staging_bucket</code></td><td><code>s3://shopnow-glue-redshift-staging/</code></td><td>Temporary staging</td></tr><tr><td><code>--redshift_connection</code></td><td><code>shopnow-redshift-source-connection</code></td><td>Redshift connection name</td></tr><tr><td><code>--mariadb_connection</code></td><td><code>shopnow-mariadb-connection</code></td><td>MariaDB connection name</td></tr><tr><td><code>--write_mode</code></td><td><code>upsert</code></td><td>Insert or update (explained in Step 7)</td></tr><tr><td><code>--batch_id</code></td><td>Auto-generated (YYYYMMDD-HHMMSS)</td><td>ETL run identifier</td></tr></tbody></table>
+<hr>
+<h3>STEP 6 — IMPLEMENT INCREMENTAL SYNC STRATEGY</h3>
+<p>→ This addresses Challenge 2 — avoiding full table reload every day</p>
+<p><strong>Three Incremental Strategies:</strong></p>
+<table><thead><tr><th>Strategy</th><th>How It Works</th><th>When to Use</th><th>Complexity</th></tr></thead><tbody><tr><td>Full Replace</td><td>Drop + Recreate target table every run</td><td>Small tables (&lt; 100K rows)</td><td>Simplest</td></tr><tr><td>Timestamp-Based Incremental</td><td>Read only rows WHERE <code>computed_at &gt; last_run_timestamp</code></td><td>Tables with reliable timestamp column</td><td>Medium</td></tr><tr><td>Glue Job Bookmark</td><td>Glue tracks what was read last time — only reads new data</td><td>S3 sources (limited JDBC support)</td><td>Medium</td></tr></tbody></table>
+<p><strong>For ShopNow's Tables:</strong></p>
+<table><thead><tr><th>Table</th><th>Row Count</th><th>Daily Change Volume</th><th>Strategy</th></tr></thead><tbody><tr><td><code>customer_lifetime_value</code></td><td>5 million</td><td>~50,000 changed</td><td>Timestamp-Based Incremental</td></tr><tr><td><code>product_recommendations</code></td><td>5 million</td><td>~200,000 changed</td><td>Timestamp-Based Incremental</td></tr><tr><td><code>inventory_forecast</code></td><td>50,000</td><td>Full recompute daily</td><td>Full Replace</td></tr><tr><td><code>sales_daily_summary</code></td><td>365 rows (one per day)</td><td>1 new row + updates to last 7</td><td>Full Replace</td></tr><tr><td><code>fraud_risk_scores</code></td><td>1 million</td><td>~100,000 new + updates</td><td>Timestamp-Based Incremental</td></tr></tbody></table>
+<hr>
+<p><strong>Timestamp-Based Incremental Implementation:</strong></p>
+<p><strong>Prerequisites:</strong><br>
+→ Redshift tables must have a <code>computed_at</code> TIMESTAMP column<br>
+→ This column is set when Redshift computes/updates the row<br>
+→ Glue reads only rows WHERE <code>computed_at &gt; last_successful_sync_timestamp</code></p>
+<p><strong>Tracking Last Sync Timestamp:</strong></p>
+<p>→ Store the last successful sync timestamp in SSM Parameter Store:</p>
+<table><thead><tr><th>Parameter Name</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td><code>/shopnow/reverse-etl/customer_lifetime_value/last_sync</code></td><td><code>2025-01-15T02:00:00Z</code></td><td>Last successful sync timestamp</td></tr><tr><td><code>/shopnow/reverse-etl/product_recommendations/last_sync</code></td><td><code>2025-01-15T02:00:00Z</code></td><td>Last successful sync timestamp</td></tr><tr><td><code>/shopnow/reverse-etl/fraud_risk_scores/last_sync</code></td><td><code>2025-01-15T02:00:00Z</code></td><td>Last successful sync timestamp</td></tr></tbody></table>
+<p><strong>Why SSM Parameter Store instead of Secrets Manager?</strong><br>
+→ This is NOT a credential — it's a configuration value<br>
+→ SSM Parameter Store is free for standard parameters<br>
+→ Secrets Manager costs $0.40/month per secret — unnecessary for timestamps<br>
+→ Same pattern discussed in Project 37's "When to use what" section</p>
+<p><strong>Incremental Read Flow:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Job starts
+</span>    │
+    ├── Read last_sync timestamp from SSM Parameter Store
+    │     Value: 2025-01-14T02:00:00Z (yesterday's sync)
+    │
+    ├── Construct Redshift query:
+    │     SELECT * FROM customer_lifetime_value
+    │     WHERE computed_at &gt; '2025-01-14T02:00:00Z'
+    │
+    ├── Redshift UNLOAD filtered data to S3 staging
+    │     Only 50,000 changed rows (not 5 million)
+    │
+    ├── Glue reads staged data → transforms → writes to MariaDB
+    │
+    ├── If SUCCESS:
+    │     Update SSM Parameter: last_sync = 2025-01-15T02:00:00Z
+    │
+    └── If FAILURE:
+          Do NOT update SSM Parameter
+          Next run will re-read from same timestamp (idempotent retry)</code></pre></div>
+<p><strong>Why Update Timestamp ONLY on Success:</strong><br>
+→ If the job fails after reading but before writing → next run re-reads the same data<br>
+→ This ensures no data is lost between runs<br>
+→ The write to MariaDB must be IDEMPOTENT — writing the same row twice should produce the same result<br>
+→ This is achieved through UPSERT (Step 7)</p>
+<hr>
+<p><strong>Full Replace Implementation:</strong></p>
+<p>→ For small tables like <code>inventory_forecast</code> and <code>sales_daily_summary</code>:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Job starts
+</span>    │
+    ├── Read ALL data from Redshift table
+    │     SELECT * FROM inventory_forecast
+    │
+    ├── Transform data
+    │
+    ├── Write to MariaDB STAGING table:
+    │     inventory_forecast_staging (temporary copy)
+    │
+    ├── Atomic table swap in MariaDB:
+    │     RENAME TABLE inventory_forecast TO inventory_forecast_old,
+    │                  inventory_forecast_staging TO inventory_forecast
+    │
+    ├── Drop old table:
+    │     DROP TABLE inventory_forecast_old
+    │
+    └── Application never sees partial data — atomic swap</code></pre></div>
+<p>→ The RENAME TABLE operation in MariaDB is ATOMIC — takes milliseconds<br>
+→ Application reads from <code>inventory_forecast</code> throughout the process<br>
+→ At the moment of rename → application instantly sees new data<br>
+→ No lock contention, no partial reads</p>
+<hr>
+<h3>STEP 7 — IMPLEMENT SAFE WRITE STRATEGY FOR LIVE MARIADB</h3>
+<p>→ This addresses Challenge 3 (concurrency) and Challenge 4 (failure recovery)</p>
+<p><strong>Three Write Strategies:</strong></p>
+<table><thead><tr><th>Strategy</th><th>How It Works</th><th>Impact on Live Traffic</th><th>Failure Recovery</th></tr></thead><tbody><tr><td>Direct INSERT/UPDATE</td><td>Write directly to production table</td><td>HIGH — lock contention</td><td>Partial data on failure</td></tr><tr><td>Staging Table + Swap</td><td>Write to staging → atomic rename</td><td>ZERO — no locks on production</td><td>Clean — staging dropped on failure</td></tr><tr><td>Batch UPSERT with Small Batches</td><td>UPSERT in small batches (1000 rows)</td><td>LOW — brief micro-locks</td><td>Resume from last batch on failure</td></tr></tbody></table>
+<p><strong>For ShopNow — Recommended Strategy Per Table:</strong></p>
+<table><thead><tr><th>Table</th><th>Strategy</th><th>Why</th></tr></thead><tbody><tr><td><code>customer_lifetime_value</code></td><td>Batch UPSERT (1000 rows/batch)</td><td>50K rows — too many for single transaction, too few for staging swap overhead</td></tr><tr><td><code>product_recommendations</code></td><td>Batch UPSERT (1000 rows/batch)</td><td>200K rows — same reasoning</td></tr><tr><td><code>inventory_forecast</code></td><td>Staging Table + Swap</td><td>Small table, full replace, needs atomic consistency</td></tr><tr><td><code>sales_daily_summary</code></td><td>Staging Table + Swap</td><td>Small table, full replace</td></tr><tr><td><code>fraud_risk_scores</code></td><td>Batch UPSERT (1000 rows/batch)</td><td>100K rows — time-sensitive, needs incremental</td></tr></tbody></table>
+<hr>
+<p><strong>Batch UPSERT Configuration:</strong></p>
+<p>→ Glue writes to MariaDB using JDBC with UPSERT semantics</p>
+<p><strong>UPSERT in MariaDB/MySQL:</strong></p>
+<p>→ MariaDB supports <code>INSERT ... ON DUPLICATE KEY UPDATE</code><br>
+→ This means:</p>
+<ul>
+<li>If the row's PRIMARY KEY doesn't exist → INSERT new row</li>
+<li>If the row's PRIMARY KEY already exists → UPDATE the existing row</li>
+</ul>
+<p><strong>Glue JDBC Write Configuration for UPSERT:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Connection</td><td><code>shopnow-mariadb-connection</code></td><td>MariaDB JDBC connection</td></tr><tr><td>Database</td><td><code>shopnow_prod</code></td><td>Target database</td></tr><tr><td>Table</td><td><code>customer_lifetime_value</code></td><td>Target table</td></tr><tr><td>Write mode</td><td>Append (with custom pre/post actions)</td><td>Glue default write modes</td></tr><tr><td>Batch size</td><td>1000</td><td>Rows per JDBC batch</td></tr><tr><td>Custom SQL for UPSERT</td><td>Pre-action creates temp table, post-action merges</td><td>Handles upsert logic</td></tr></tbody></table>
+<p><strong>Understanding Glue JDBC Write Modes:</strong></p>
+<table><thead><tr><th>Mode</th><th>Glue Setting</th><th>What It Does</th><th>MariaDB Effect</th></tr></thead><tbody><tr><td>Append</td><td><code>mode = "append"</code></td><td>INSERT only — fails on duplicate key</td><td>Errors if row exists</td></tr><tr><td>Overwrite</td><td><code>mode = "overwrite"</code></td><td>DROP TABLE + CREATE TABLE + INSERT</td><td>Destroys existing data</td></tr><tr><td>Custom</td><td>Pre/Post actions</td><td>Execute custom SQL before/after data write</td><td>Full control</td></tr></tbody></table>
+<p>→ Neither <code>append</code> nor <code>overwrite</code> supports UPSERT natively<br>
+→ The solution: Use the STAGING TABLE pattern even for incremental writes</p>
+<p><strong>Incremental UPSERT via Staging Table Pattern:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Glue creates staging table in MariaDB
+</span>        CREATE TABLE customer_lifetime_value_staging LIKE customer_lifetime_value
+
+Step 2: Glue writes incremental data (50K rows) to staging table
+        INSERT INTO customer_lifetime_value_staging VALUES (...)
+        (Glue's standard append mode — no conflicts because staging is empty)
+
+Step 3: Glue executes MERGE from staging to production
+        INSERT INTO customer_lifetime_value 
+        SELECT * FROM customer_lifetime_value_staging
+        ON DUPLICATE KEY UPDATE
+          clv_score = VALUES(clv_score),
+          clv_tier = VALUES(clv_tier),
+          computed_at = VALUES(computed_at),
+          etl_batch_id = VALUES(etl_batch_id),
+          etl_loaded_at = VALUES(etl_loaded_at)
+
+Step 4: Drop staging table
+        DROP TABLE customer_lifetime_value_staging
+
+Step 5: Update SSM Parameter with new sync timestamp</code></pre></div>
+<p><strong>Configuring Pre/Post Actions in Glue:</strong></p>
+<p>→ In the Glue job configuration → Advanced properties → JDBC target settings:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Pre-action SQL</td><td><code>CREATE TABLE IF NOT EXISTS {table}_staging LIKE {table}; TRUNCATE TABLE {table}_staging;</code></td></tr><tr><td>Post-action SQL</td><td><code>INSERT INTO {table} SELECT * FROM {table}_staging ON DUPLICATE KEY UPDATE ...; DROP TABLE {table}_staging;</code></td></tr></tbody></table>
+<p>→ These SQL statements execute BEFORE and AFTER the Glue data write<br>
+→ Glue writes to the staging table → post-action merges staging into production</p>
+<hr>
+<h3>STEP 8 — CONFIGURE JOB SCHEDULING AND ORCHESTRATION</h3>
+<p>→ Multiple tables need to be synced → orchestrate them as a workflow</p>
+<p><strong>Option A — Glue Workflow (from Project 31):</strong></p>
+<p>→ Navigate to Glue → "Workflows" → "Create workflow"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Workflow name</td><td><code>shopnow-reverse-etl-workflow</code></td></tr><tr><td>Description</td><td><code>Daily Redshift to MariaDB reverse ETL pipeline</code></td></tr></tbody></table>
+<p><strong>Workflow Structure:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Trigger: Schedule (Daily 4:00 AM IST = cron(30 22 * * ? *) UTC)
+</span>    │
+    ├── Job 1: reverse-etl-customer-lifetime-value (incremental)
+    ├── Job 2: reverse-etl-product-recommendations (incremental)
+    ├── Job 3: reverse-etl-fraud-risk-scores (incremental)
+    │   (Jobs 1-3 run IN PARALLEL — independent tables)
+    │
+    ├── Conditional Trigger: ALL of Jobs 1-3 SUCCEEDED
+    │       │
+    │       ├── Job 4: reverse-etl-inventory-forecast (full replace)
+    │       └── Job 5: reverse-etl-sales-daily-summary (full replace)
+    │           (Jobs 4-5 run IN PARALLEL)
+    │
+    └── Conditional Trigger: ALL of Jobs 4-5 SUCCEEDED
+            │
+            └── SNS Notification: "Reverse ETL pipeline completed successfully"</code></pre></div>
+<p><strong>Why this execution order?</strong><br>
+→ Jobs 1-3 are the largest and most time-consuming → start first in parallel<br>
+→ Jobs 4-5 are small full-replace tables → depend on Jobs 1-3 completing (ensures Redshift is not overloaded)<br>
+→ SNS notification at end → data team knows fresh data is in MariaDB</p>
+<p><strong>Workflow Trigger Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trigger name</td><td><code>daily-4am-trigger</code></td></tr><tr><td>Trigger type</td><td>Schedule</td></tr><tr><td>Schedule</td><td><code>cron(30 22 * * ? *)</code> (4:00 AM IST)</td></tr><tr><td>Start on creation</td><td>✅ Yes</td></tr></tbody></table>
+<p><strong>Why 4:00 AM IST?</strong><br>
+→ Redshift aggregation jobs run at 2:00 AM IST (configured in Project 38 EventBridge schedule)<br>
+→ Redshift jobs take ~1.5 hours to complete<br>
+→ By 4:00 AM → Redshift has fresh computed data → reverse ETL reads the latest aggregations<br>
+→ By 5:30 AM → MariaDB has fresh data → when business users arrive at 9 AM, dashboards show yesterday's data</p>
+<hr>
+<p><strong>Option B — EventBridge + Step Functions (from Projects 38, 32):</strong></p>
+<p>→ More powerful orchestration with conditional logic and error handling</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>EventBridge Rule</td><td>Schedule: <code>cron(30 22 * * ? *)</code></td></tr><tr><td>Target</td><td>Step Functions state machine: <code>shopnow-reverse-etl-orchestrator</code></td></tr></tbody></table>
+<p><strong>Step Functions State Machine:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Start
+</span>  │
+  ├── Parallel State: "Incremental Tables"
+  │     ├── Task: Start Glue Job (customer_lifetime_value)
+  │     ├── Task: Start Glue Job (product_recommendations)
+  │     └── Task: Start Glue Job (fraud_risk_scores)
+  │     (Wait for ALL to complete)
+  │
+  ├── Choice State: "Check Results"
+  │     ├── If ALL SUCCEEDED → Continue to Full Replace
+  │     └── If ANY FAILED → Go to Error Handler
+  │
+  ├── Parallel State: "Full Replace Tables"
+  │     ├── Task: Start Glue Job (inventory_forecast)
+  │     └── Task: Start Glue Job (sales_daily_summary)
+  │
+  ├── Task: "Send Success Notification"
+  │     SNS Publish → shopnow-data-team-notifications
+  │
+  └── Error Handler (Catch):
+        ├── Task: "Send Failure Alert"
+        │     SNS Publish → shopnow-devops-pagerduty
+        └── Task: "Log Failure Details"
+              CloudWatch Logs → /shopnow/reverse-etl/failures</code></pre></div>
+<p>→ Step Functions provides:</p>
+<ul>
+<li>Visual execution history</li>
+<li>Automatic retry with configurable backoff</li>
+<li>Catch/error handling per step</li>
+<li>Conditional branching based on job results</li>
+<li>Execution audit trail</li>
+</ul>
+<p>→ For ShopNow → Use Option B (EventBridge + Step Functions) for maximum control and visibility</p>
+<hr>
+<h3>STEP 9 — CONFIGURE MONITORING AND ALERTING</h3>
+<p><strong>Glue Job Metrics to Monitor:</strong></p>
+<table><thead><tr><th>Metric</th><th>Where</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>Job run status</td><td>Glue Console → Job runs</td><td>Any FAILED status</td></tr><tr><td>Job run duration</td><td>Glue Console → Job runs → Duration</td><td>&gt; 90 minutes (approaching 120-min timeout)</td></tr><tr><td>Rows read from Redshift</td><td>Job logs / custom metric</td><td>Sudden drop to 0 (no data to sync)</td></tr><tr><td>Rows written to MariaDB</td><td>Job logs / custom metric</td><td>Mismatch with rows read (data loss)</td></tr><tr><td>DPU hours consumed</td><td>Glue Console → Job metrics</td><td>Cost monitoring</td></tr><tr><td>JDBC connection errors</td><td>CloudWatch Logs → Glue job log group</td><td>Any connection timeout or auth failure</td></tr></tbody></table>
+<p><strong>EventBridge Rules for Glue Job Monitoring (from Project 38):</strong></p>
+<table><thead><tr><th>Rule</th><th>Event Pattern</th><th>Target</th></tr></thead><tbody><tr><td><code>reverse-etl-job-failure</code></td><td><code>source: aws.glue</code>, <code>detail.state: FAILED</code>, <code>detail.jobName: shopnow-reverse-etl-*</code></td><td>SNS → DevOps pager</td></tr><tr><td><code>reverse-etl-job-timeout</code></td><td><code>source: aws.glue</code>, <code>detail.state: TIMEOUT</code></td><td>SNS → DevOps pager</td></tr><tr><td><code>reverse-etl-job-success</code></td><td><code>source: aws.glue</code>, <code>detail.state: SUCCEEDED</code></td><td>CloudWatch Logs (audit)</td></tr></tbody></table>
+<p><strong>MariaDB Health During Sync:</strong></p>
+<table><thead><tr><th>Metric</th><th>Where</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>CPU Utilization</td><td>CloudWatch → RDS metrics</td><td>&gt; 80% during sync window</td></tr><tr><td>Database Connections</td><td>CloudWatch → RDS metrics</td><td>&gt; 80% of max_connections</td></tr><tr><td>Write IOPS</td><td>CloudWatch → RDS metrics</td><td>Sustained spike during sync</td></tr><tr><td>Replication Lag (Read Replica)</td><td>CloudWatch → RDS metrics</td><td>&gt; 10 seconds during sync</td></tr><tr><td>Slow Query Log</td><td>MariaDB slow query log</td><td>Any queries &gt; 5 seconds during sync</td></tr></tbody></table>
+<p><strong>Redshift Health During Sync:</strong></p>
+<table><thead><tr><th>Metric</th><th>Where</th><th>Alert Threshold</th></tr></thead><tbody><tr><td>CPU Utilization</td><td>CloudWatch → Redshift metrics</td><td>&gt; 80% during UNLOAD</td></tr><tr><td>Query Duration</td><td>Redshift Console → Query monitoring</td><td>UNLOAD query &gt; 30 minutes</td></tr><tr><td>Disk Space Used</td><td>CloudWatch → Redshift metrics</td><td>&gt; 80% (UNLOAD creates temporary files)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use the native Redshift connector (not generic JDBC) for reading large datasets — uses S3 staging for parallel reads<br>
+→ Always create a dedicated MariaDB user for reverse ETL with explicit WRITE permissions — separate from read-only ETL user<br>
+→ Always use staging table + atomic swap pattern for full-replace tables — prevents partial reads by applications<br>
+→ Always use UPSERT via staging table for incremental tables — handles both new and updated rows cleanly<br>
+→ Always track sync timestamps in SSM Parameter Store — update ONLY on successful completion<br>
+→ Always add <code>etl_batch_id</code> and <code>etl_loaded_at</code> metadata columns — enables troubleshooting and data lineage<br>
+→ Always configure lifecycle rules on the S3 staging bucket — prevent storage cost accumulation<br>
+→ Always schedule reverse ETL AFTER warehouse computation completes — ensure fresh data<br>
+→ Always use Step Functions for orchestration — provides visual execution history and error handling<br>
+→ Always monitor both source (Redshift) and target (MariaDB) health during sync — prevent resource exhaustion<br>
+→ Always use batch sizes of 1000 rows for MariaDB JDBC writes — balances throughput and lock contention<br>
+→ Always test type mappings with sample data before running full pipeline — catch precision/overflow issues early</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never write directly to production MariaDB tables in large batches — causes lock contention with live traffic<br>
+→ Never use Glue's <code>overwrite</code> mode on production tables — it drops and recreates the table (causes downtime)<br>
+→ Never update SSM sync timestamp before confirming successful MariaDB write — causes data loss on retry<br>
+→ Never skip the staging table pattern for tables serving live traffic — partial writes corrupt application data<br>
+→ Never use generic JDBC for reading large Redshift tables — row-by-row JDBC is 10-100x slower than native connector<br>
+→ Never share the same MariaDB user between forward ETL (read) and reverse ETL (write) — violates least privilege<br>
+→ Never schedule reverse ETL during peak application traffic hours — competes for MariaDB resources<br>
+→ Never skip security group updates for the new Glue job — connectivity failures are the #1 cause of job failures<br>
+→ Never ignore type mismatches between Redshift and MariaDB — silent truncation or precision loss corrupts data<br>
+→ Never run full-replace on large tables (&gt; 100K rows) — use incremental sync instead<br>
+→ Never forget to clean up staging tables on job failure — orphaned staging tables accumulate</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Approach</th><th>Why</th></tr></thead><tbody><tr><td>Sync &lt; 100K rows, full recompute</td><td>Full Replace via staging + swap</td><td>Simple, atomic, clean</td></tr><tr><td>Sync &gt; 100K rows, daily changes &lt; 10%</td><td>Timestamp-based incremental with UPSERT</td><td>Efficient — only processes changes</td></tr><tr><td>Real-time sync requirement (&lt; 5 min lag)</td><td>NOT Glue — use DMS CDC (Project 58 preview)</td><td>Glue is batch, not real-time</td></tr><tr><td>One-time migration</td><td>DMS Full Load (Project 58)</td><td>Purpose-built for migration</td></tr><tr><td>Complex transformation between warehouse and operational DB</td><td>Glue ETL (this project)</td><td>Full transformation capability</td></tr><tr><td>Simple column subset copy</td><td>Redshift UNLOAD → S3 → Lambda → MariaDB</td><td>Lighter weight if no transformation needed</td></tr><tr><td>Bi-directional sync</td><td>Glue forward (Project 24) + Glue reverse (this project)</td><td>Separate jobs, separate schedules, separate users</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use Glue reverse ETL for real-time requirements — minimum batch latency is minutes<br>
+→ Do NOT use Glue for simple file copies — S3 replication or Lambda is lighter weight<br>
+→ Do NOT use Glue when Redshift federated query (Project 48) can serve the use case — avoids data duplication<br>
+→ Do NOT use Glue for streaming data — use Kinesis (Project 52) or DMS CDC (Project 58)<br>
+→ Do NOT use Glue when the target is another analytical store — use Redshift data sharing or S3 instead<br>
+→ Do NOT use Glue reverse ETL as a replacement for proper application caching — if the application needs sub-second responses, use ElastiCache</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — GLUE NATIVE REDSHIFT CONNECTOR FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Job starts with Redshift source configuration
+</span>        │
+        ▼
+Glue generates a Redshift UNLOAD command:
+  UNLOAD ('SELECT * FROM customer_lifetime_value WHERE computed_at &gt; :last_sync')
+  TO 's3://shopnow-glue-redshift-staging/temp/{job_run_id}/'
+  IAM_ROLE 'arn:aws:iam::111111111111:role/RedshiftS3AccessRole'
+  FORMAT PARQUET
+  PARALLEL ON
+  ALLOWOVERWRITE
+        │
+        ▼
+Redshift executes UNLOAD:
+  - Distributes the query across compute nodes
+  - Each compute node writes its portion to S3 in parallel
+  - Creates multiple Parquet files (one per slice per node)
+  - Files: part-00000.parquet, part-00001.parquet, ...
+        │
+        ▼
+Glue reads the Parquet files from S3:
+  - Spark workers read files in parallel
+  - Each worker processes a subset of files
+  - Data loaded into Spark DynamicFrames
+        │
+        ▼
+Glue performs transformations:
+  - Type casting (BOOLEAN → INT, SUPER → STRING)
+  - Add metadata columns (etl_batch_id, etl_loaded_at)
+  - Handle NULLs and defaults
+        │
+        ▼
+Glue writes to MariaDB via JDBC:
+  - Each Spark partition writes independently
+  - JDBC batch size: 1000 rows per batch
+  - Connection pool: ~5 concurrent JDBC connections
+  - Writes to staging table
+        │
+        ▼
+Glue executes post-action SQL:
+  - MERGE staging into production (UPSERT)
+  - DROP staging table
+        │
+        ▼
+Glue cleans up S3 staging files:
+  - DELETE s3://staging-bucket/temp/{job_run_id}/
+        │
+        ▼
+Job completes → Update SSM sync timestamp</code></pre></div>
+<hr>
+<h3>MECHANIC 2 — JDBC WRITE PERFORMANCE INTERNALS</h3>
+<p><strong>How Glue Writes to MariaDB via JDBC:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Glue Spark Job has N partitions of data
+</span>    │
+    ├── Partition 1 (Worker 1):
+    │     Opens JDBC connection to MariaDB
+    │     Begins batch:
+    │       INSERT INTO staging VALUES (row1), (row2), ..., (row1000)  ← 1 batch = 1000 rows
+    │       INSERT INTO staging VALUES (row1001), ..., (row2000)
+    │       ... continues until partition exhausted
+    │     Closes connection
+    │
+    ├── Partition 2 (Worker 2):
+    │     Opens JDBC connection to MariaDB (SEPARATE connection)
+    │     Same batch INSERT pattern
+    │
+    ... (N partitions = N concurrent JDBC connections)
+    │
+    └── All partitions complete → post-action SQL executes</code></pre></div>
+<p><strong>Performance Tuning Levers:</strong></p>
+<table><thead><tr><th>Setting</th><th>Impact</th><th>Recommendation</th></tr></thead><tbody><tr><td>Batch size</td><td>Larger batches = fewer round trips = faster</td><td>1000-5000 rows per batch</td></tr><tr><td>Number of partitions</td><td>More partitions = more parallel connections</td><td>5-10 for MariaDB (too many = connection exhaustion)</td></tr><tr><td>MariaDB <code>max_connections</code></td><td>Limits concurrent JDBC connections</td><td>Ensure headroom: app connections + Glue connections &lt; max</td></tr><tr><td>MariaDB <code>innodb_buffer_pool_size</code></td><td>Larger = better write performance</td><td>Ensure sufficient for batch inserts</td></tr><tr><td>Network latency (Glue → MariaDB)</td><td>Lower = faster per-batch round trip</td><td>Same AZ deployment recommended</td></tr></tbody></table>
+<p><strong>Connection Pooling Consideration:</strong></p>
+<p>→ Each Spark partition opens its OWN JDBC connection<br>
+→ 10 partitions = 10 concurrent connections to MariaDB<br>
+→ If MariaDB <code>max_connections = 150</code> and application uses 100 → only 50 available for Glue<br>
+→ Set Glue partitions to &lt; 50 to avoid connection exhaustion<br>
+→ Monitor RDS <code>DatabaseConnections</code> metric during sync</p>
+<hr>
+<h3>MECHANIC 3 — ATOMIC TABLE SWAP INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Before swap:
+</span>  MariaDB tables:
+    inventory_forecast (PRODUCTION — application reads from this)
+    inventory_forecast_staging (NEW DATA — Glue just finished writing)
+
+RENAME TABLE command:
+  RENAME TABLE inventory_forecast TO inventory_forecast_old,
+               inventory_forecast_staging TO inventory_forecast;
+
+What happens internally:
+  1. MariaDB acquires metadata lock on both tables
+  2. Metadata lock duration: microseconds (only changes table name pointers)
+  3. No data is moved — only the name-to-file mapping changes
+  4. Application queries that were mid-flight:
+     - Queries that started BEFORE rename → complete on old data (still valid)
+     - Queries that start AFTER rename → read new data
+  5. NO query fails — zero downtime
+
+After swap:
+  MariaDB tables:
+    inventory_forecast (was staging — NOW PRODUCTION with new data)
+    inventory_forecast_old (was production — NOW OLD, ready for deletion)</code></pre></div>
+<p>→ The RENAME TABLE operation is the SAFEST way to replace data in a live table<br>
+→ It's atomic at the metadata level — no data copying occurs<br>
+→ Application sees either ALL old data or ALL new data — never partial</p>
+<hr>
+<h3>MECHANIC 4 — COST MODEL</h3>
+<table><thead><tr><th>Component</th><th>Cost</th><th>Notes</th></tr></thead><tbody><tr><td>Glue job DPU hours</td><td>$0.44 per DPU-hour</td><td>5 workers × G.1X (4 DPU) × 0.5 hours = 10 DPU-hours = $4.40 per run</td></tr><tr><td>S3 staging storage</td><td>Minimal (lifecycle deletes after 1 day)</td><td>~$0.01 per run</td></tr><tr><td>S3 staging requests</td><td>Per 1,000 requests</td><td>~$0.01 per run</td></tr><tr><td>Redshift UNLOAD compute</td><td>Included in Redshift pricing</td><td>No additional charge</td></tr><tr><td>MariaDB JDBC writes</td><td>Included in RDS pricing</td><td>CPU/IO consumption on RDS instance</td></tr><tr><td>SSM Parameter Store</td><td>Free (Standard parameters)</td><td>No charge</td></tr><tr><td>Secrets Manager</td><td>$0.40/month per secret</td><td>Already exists from Project 37</td></tr><tr><td>Step Functions</td><td>$0.025 per 1,000 state transitions</td><td>~$0.001 per run</td></tr><tr><td>EventBridge schedule</td><td>Free</td><td>Schedule invocations are free</td></tr></tbody></table>
+<p><strong>Daily Cost: ~$4.42 per run × 1 run/day = ~$133/month</strong></p>
+<p>→ Main cost driver: Glue DPU hours<br>
+→ Optimization: Reduce workers if data volume is small, increase if job takes too long</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>Glue cannot connect to Redshift</td><td>Job fails immediately with connection timeout</td><td>Security group missing inbound 5439 from Glue SG</td><td>Add SG rule: Redshift SG allows 5439 from Glue SG</td></tr><tr><td>2</td><td>Glue cannot connect to MariaDB</td><td>Job fails with MySQL connection error</td><td>Security group missing inbound 3306 from Glue SG</td><td>Add SG rule: MariaDB SG allows 3306 from Glue SG</td></tr><tr><td>3</td><td>Redshift UNLOAD fails with S3 access denied</td><td>Job fails during Redshift read phase</td><td>Redshift IAM role missing S3 permissions on staging bucket</td><td>Add S3 PutObject to Redshift role for staging bucket</td></tr><tr><td>4</td><td>Type mismatch — DECIMAL truncation</td><td>CLV scores lose precision (3.141592 → 3.14)</td><td>MariaDB column DECIMAL(10,2) vs Redshift DECIMAL(18,6)</td><td>ALTER MariaDB column to DECIMAL(18,6)</td></tr><tr><td>5</td><td>MariaDB connection exhaustion</td><td>Application timeouts during ETL sync</td><td>Glue partitions + application connections &gt; max_connections</td><td>Reduce Glue partitions OR increase max_connections OR schedule during low traffic</td></tr><tr><td>6</td><td>Staging table not cleaned up after failure</td><td>Orphaned staging tables accumulate</td><td>Job failed after creating staging but before dropping it</td><td>Add cleanup logic in job error handler OR scheduled cleanup Lambda</td></tr><tr><td>7</td><td>SSM timestamp updated before write completes</td><td>Data loss — next run skips unwritten rows</td><td>Sync timestamp updated prematurely</td><td>Update timestamp ONLY after confirmed MariaDB write success</td></tr><tr><td>8</td><td>Full replace on large table causes downtime</td><td>Application sees empty table during reload</td><td>Used DROP + CREATE instead of staging + swap</td><td>Always use RENAME TABLE atomic swap for full replace</td></tr><tr><td>9</td><td>Duplicate rows in MariaDB</td><td>Same customer appears twice</td><td>Primary key not defined on MariaDB target table</td><td>Ensure PRIMARY KEY exists — required for UPSERT (ON DUPLICATE KEY UPDATE)</td></tr><tr><td>10</td><td>Glue job timeout at 120 minutes</td><td>Large dataset exceeds job timeout</td><td>Too much data or too few workers</td><td>Increase timeout, add workers, optimize Redshift query, reduce data volume</td></tr><tr><td>11</td><td>Redshift query queue blocked</td><td>UNLOAD query waits in WLM queue</td><td>Redshift WLM queue full with other queries</td><td>Schedule reverse ETL during low-query period OR create dedicated WLM queue</td></tr><tr><td>12</td><td>S3 staging files not cleaned up</td><td>Storage costs grow</td><td>Job succeeded but cleanup step failed</td><td>Add lifecycle rule on staging bucket (1-day expiration) as safety net</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scaling</strong></p>
+<ul>
+<li>&lt; 100K rows → Single Glue job, G.1X workers, 2-3 workers</li>
+<li>100K - 1M rows → 5 workers, batch UPSERT</li>
+<li>1M - 10M rows → 10 workers, consider partitioning by customer segment</li>
+<li>
+<blockquote>
+<p>10M rows → Consider DMS CDC (Project 58) for continuous replication instead of batch</p>
+</blockquote>
+</li>
+</ul>
+<p>→ <strong>Table Count Scaling</strong></p>
+<ul>
+<li>5 tables → Single workflow with parallel jobs (current design)</li>
+<li>10-20 tables → Multiple workflows grouped by priority/dependency</li>
+<li>50+ tables → Parameterized generic job with table-specific configurations in DynamoDB or SSM</li>
+<li>Avoid creating 50 separate Glue jobs — use one parameterized job with different arguments</li>
+</ul>
+<p>→ <strong>Frequency Scaling</strong></p>
+<ul>
+<li>Daily sync → Standard Glue job (this project)</li>
+<li>Hourly sync → Reduce data volume per run (narrower timestamp window), watch MariaDB load</li>
+<li>Near-real-time (&lt; 5 min) → NOT Glue — switch to DMS CDC (Project 58) or Kinesis (Project 52)</li>
+</ul>
+<p>→ <strong>MariaDB Write Scaling</strong></p>
+<ul>
+<li>Single RDS instance → Max ~5,000 writes/second sustained</li>
+<li>With Glue batch UPSERT → ~50K rows in 30 seconds (well within limits)</li>
+<li>If write volume exceeds capacity → Use RDS Proxy for connection pooling</li>
+<li>If MariaDB becomes bottleneck → Consider Aurora MySQL for higher write throughput</li>
+</ul>
+<p>→ <strong>Cost Scaling</strong></p>
+<ul>
+<li>Costs scale linearly with DPU-hours</li>
+<li>Double the data → approximately double the DPU-hours</li>
+<li>Optimize: Use Auto Scaling workers (Glue 4.0 feature) — start with minimum, scale up as needed</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify the reverse ETL pipeline:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>Where</th><th>Expected Result</th></tr></thead><tbody><tr><td>Glue connections test</td><td>Glue → Connections → Test each connection</td><td>"Successfully connected" for both Redshift and MariaDB</td></tr><tr><td>Security groups allow traffic</td><td>VPC → Security Groups → verify rules</td><td>Redshift SG and MariaDB SG allow inbound from Glue SG</td></tr><tr><td>VPC endpoints exist</td><td>VPC → Endpoints</td><td>S3, Secrets Manager, Glue, KMS endpoints present</td></tr><tr><td>Staging bucket exists with lifecycle</td><td>S3 → shopnow-glue-redshift-staging</td><td>Bucket exists, 1-day expiration rule active</td></tr><tr><td>Secrets exist</td><td>Secrets Manager</td><td>Redshift and MariaDB secrets present and valid</td></tr><tr><td>SSM parameters initialized</td><td>SSM Parameter Store</td><td><code>/shopnow/reverse-etl/*/last_sync</code> parameters exist</td></tr><tr><td>Glue job runs successfully</td><td>Glue → Job runs</td><td>Status: SUCCEEDED</td></tr><tr><td>Data appears in MariaDB</td><td>MariaDB query → SELECT COUNT(*) FROM target table</td><td>Row count matches expected</td></tr><tr><td>Metadata columns populated</td><td>MariaDB query → SELECT etl_batch_id, etl_loaded_at LIMIT 5</td><td>Batch ID and timestamp present</td></tr><tr><td>Staging tables cleaned up</td><td>MariaDB → SHOW TABLES LIKE '%staging%'</td><td>No orphaned staging tables</td></tr><tr><td>SSM timestamp updated</td><td>SSM Parameter Store → check value</td><td>Updated to latest sync time</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing pipeline health:</strong></p>
+<table><thead><tr><th>Signal</th><th>Where</th><th>Alert</th></tr></thead><tbody><tr><td>Job succeeded/failed</td><td>EventBridge → Glue Job State Change</td><td>SNS on failure (Project 38 pattern)</td></tr><tr><td>Job duration trend</td><td>CloudWatch → Glue job duration metric</td><td>Alert if duration increases &gt; 50% over baseline</td></tr><tr><td>Row count trend</td><td>Custom CloudWatch metric (published by job)</td><td>Alert if row count drops to 0 or spikes unexpectedly</td></tr><tr><td>MariaDB CPU during sync</td><td>CloudWatch → RDS metrics</td><td>Alert if &gt; 80% during sync window</td></tr><tr><td>MariaDB replication lag</td><td>CloudWatch → RDS Read Replica lag</td><td>Alert if &gt; 30 seconds during sync</td></tr><tr><td>Staging bucket size</td><td>S3 metrics</td><td>Alert if &gt; 10 GB (lifecycle not working)</td></tr><tr><td>SSM parameter staleness</td><td>Custom check → compare parameter timestamp to current date</td><td>Alert if &gt; 48 hours old (sync hasn't run)</td></tr></tbody></table>
+<p>→ <strong>How to present to stakeholders:</strong></p>
+<table><thead><tr><th>Stakeholder Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"How fresh is the data in MariaDB?"</td><td>SSM Parameter → last_sync timestamp shows latest sync time</td></tr><tr><td>"How long does the sync take?"</td><td>Glue job run history → typical duration ~30 minutes</td></tr><tr><td>"What happens if the sync fails?"</td><td>Step Functions execution history → shows retry, error handler, SNS alert</td></tr><tr><td>"Does the sync affect application performance?"</td><td>RDS metrics during sync window → CPU/connections within normal range</td></tr><tr><td>"How much does this cost?"</td><td>Cost breakdown → ~$133/month for daily sync</td></tr><tr><td>"Can we sync more frequently?"</td><td>Yes — adjust schedule from daily to hourly (with caveats on MariaDB load)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Reverse ETL (Warehouse → Operational DB) is the natural complement to forward ETL (Operational DB → Warehouse) — data must flow BOTH directions<br>
+→ Glue's native Redshift connector uses S3 staging for parallel bulk reads — 10-100x faster than row-by-row JDBC<br>
+→ Writing to a live operational database requires CAREFUL strategies — staging tables + atomic swap for full replace, batch UPSERT for incremental<br>
+→ The RENAME TABLE operation in MariaDB provides ZERO-DOWNTIME table replacement — applications never see partial data<br>
+→ Timestamp-based incremental sync processes only changed rows — essential for large tables (millions of rows)<br>
+→ Sync timestamps must be updated ONLY on success — premature update causes data loss on retry<br>
+→ Separate MariaDB users for forward ETL (read-only) and reverse ETL (read-write) enforces least privilege (Project 37 principle)<br>
+→ VPC networking requires security group rules for BOTH databases from the Glue ENI security group<br>
+→ Step Functions orchestration provides visual execution history, parallel job execution, and error handling<br>
+→ The staging S3 bucket needs lifecycle rules — Redshift UNLOAD creates temporary files that must be cleaned</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 9 created the RDS MariaDB instance — now receiving data FROM Redshift<br>
+→ Project 16 created the Redshift cluster — now serving as data SOURCE for reverse ETL<br>
+→ Project 22 established Redshift COPY from S3 — reverse direction now implemented<br>
+→ Project 23 established Redshift UNLOAD to S3 — Glue's native connector uses this internally<br>
+→ Project 24 established Glue JDBC to MariaDB (read direction) — now extended to write direction<br>
+→ Project 31 established Glue Workflows — used for job orchestration<br>
+→ Project 36 established KMS encryption — staging bucket and both databases encrypted<br>
+→ Project 37 established Secrets Manager — credentials for both databases fetched securely<br>
+→ Project 38 established EventBridge — triggers the pipeline and monitors job state changes</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 44 (next) will implement multi-account VPC Peering — enabling network connectivity between accounts that could support cross-account Glue jobs<br>
+→ Project 46 will deep-dive into Glue Job Bookmarks for incremental ETL — extending the timestamp-based incremental pattern from this project with Glue's native bookmark mechanism for S3 and JDBC sources<br>
+→ Project 48 will introduce Redshift Federated Query to MariaDB — the READ direction (Redshift querying live MariaDB) which complements this project's WRITE direction (Redshift data flowing to MariaDB)<br>
+→ Project 49 will build the complex multi-service pipeline (S3 → EventBridge → Step Functions → Glue → Redshift → SNS) — the Step Functions orchestration pattern from this project's Step 8 becomes a building block for that end-to-end pipeline<br>
+→ Project 58 will introduce DMS for continuous replication — when this project's batch approach is insufficient and near-real-time sync is needed, DMS CDC provides the alternative</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The reverse ETL pipeline is operational<br>
+→ Redshift aggregated data flows nightly to MariaDB for operational use<br>
+→ The web application shows fresh recommendations and CLV scores<br>
+→ Fraud detection uses current risk scores</p>
+<p>→ But the networking team raises a critical architecture concern:</p>
+<blockquote>
+<p>"Our Glue reverse ETL job connects to both Redshift and MariaDB within the SAME VPC in the SAME account.<br>
+But we have a new requirement:</p>
+<p>The US team (Account [REDACTED:BANK_ACCOUNT_NUMBER]3<code>) has their OWN MariaDB instance in their OWN VPC. They want to run Glue ETL jobs that read from HQ's Redshift (Account [REDACTED:BANK_ACCOUNT_NUMBER]1</code>)<br>
+and write to their local MariaDB (Account <code>333333333333</code>).</p>
+<p>The problem: HQ's VPC and US's VPC are in DIFFERENT accounts and DIFFERENT regions.<br>
+Glue in US account cannot reach HQ's Redshift because there is NO network path between the VPCs.</p>
+<p>Cross-account IAM roles (Project 40) handle IDENTITY and AUTHORIZATION.<br>
+Cross-account bucket policies (Project 39) handle S3 DATA access.<br>
+Cross-account Lake Formation (Project 42) handles CATALOG access.<br>
+Cross-account SNS/SQS (Project 41) handles MESSAGING.</p>
+<p>But NONE of these solve the NETWORK connectivity problem.<br>
+A Glue job in US's VPC simply CANNOT open a TCP connection to HQ's Redshift on port 5439.<br>
+The packets have nowhere to go — the VPCs are isolated network islands."</p>
+</blockquote>
+<p>→ Until now — all networking has been WITHIN a single VPC (Project 5)<br>
+→ VPC Endpoints (Project 27) connected VPC resources to AWS SERVICES — not to OTHER VPCs<br>
+→ Security groups (Project 4) controlled traffic WITHIN a VPC — not BETWEEN VPCs</p>
+<p>→ The fundamental missing piece is VPC-to-VPC network connectivity ACROSS accounts</p>
+<p>→ <strong>This is the exact problem Project 44 solves</strong><br>
+→ Project 44 introduces Multi-Account VPC Peering — creating a direct network path between two VPCs in different accounts<br>
+→ Once VPCs are peered, resources in one VPC can communicate with resources in the other VPC using private IP addresses<br>
+→ This enables cross-account Glue jobs, cross-account database connections, cross-account Lambda-to-RDS connectivity, and any other TCP/IP-based service communication<br>
+→ VPC Peering complements the IAM-level trust (Projects 39-40), the messaging-level trust (Project 41), and the catalog-level trust (Project 42) with NETWORK-level trust</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 44: "The Microservices Across Accounts That Needed to Communicate — Multi-Account VPC Peering"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-42.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 43/60</span></div><a class="nav-btn next" href="project-44.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

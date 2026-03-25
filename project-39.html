@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 39: THE SUBSIDIARY THAT NEEDED ACCESS TO HQ'S DATA — Inter-Account S3 Ac — AWS Masterclass</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<style>/* ===== GLOBAL RESET & BASE ===== */
+*, *::before, *::after { box-sizing: border-box; }
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    padding: 30px 40px;
+    background: linear-gradient(135deg, #faf8f4, #f0ece4, #e8e4dc);
+    background-attachment: fixed;
+    max-width: 1800px;
+    margin: 0 auto;
+    color: #3a3a3a;
+    line-height: 1.75;
+    min-height: 100vh;
+}
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: #ece8e0;
+}
+::-webkit-scrollbar-thumb {
+    background: #008ECC;
+    border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #006fa3;
+}
+
+/* ===== HEADINGS ===== */
+h1 {
+    color: #007ab8;
+    font-size: 2.2em;
+    font-weight: 800;
+    letter-spacing: 1px;
+    border-bottom: 4px solid #008ECC;
+    padding-bottom: 15px;
+    margin-bottom: 30px;
+    text-transform: uppercase;
+    line-height: 1.3;
+}
+
+h2 {
+    color: #b8600b;
+    font-size: 1.7em;
+    font-weight: 700;
+    margin-top: 50px;
+    margin-bottom: 20px;
+    padding: 14px 20px;
+    background: linear-gradient(90deg, rgba(184,96,11,0.1), rgba(184,96,11,0.02));
+    border-left: 5px solid #b8600b;
+    border-radius: 0 8px 8px 0;
+    line-height: 1.4;
+}
+
+h3 {
+    color: #7b2d8e;
+    font-size: 1.4em;
+    font-weight: 700;
+    margin-top: 40px;
+    margin-bottom: 16px;
+    padding: 10px 16px;
+    background: linear-gradient(90deg, rgba(123,45,142,0.08), transparent);
+    border-left: 4px solid #7b2d8e;
+    border-radius: 0 6px 6px 0;
+    line-height: 1.4;
+}
+
+h4 {
+    color: #2a5aa7;
+    font-size: 1.15em;
+    font-weight: 600;
+    margin-top: 25px;
+    margin-bottom: 10px;
+}
+
+/* ===== PARAGRAPHS ===== */
+p {
+    color: #3a3a3a;
+    line-height: 1.8;
+    margin: 12px 0;
+}
+
+strong, b {
+    color: #1a1a1a;
+    font-weight: 700;
+}
+
+a {
+    color: #008ECC;
+    text-decoration: underline dotted;
+    transition: color 0.2s;
+}
+a:hover {
+    color: #006fa3;
+    text-decoration: solid underline;
+}
+
+/* ===== HORIZONTAL RULES ===== */
+hr {
+    border: none;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,142,204,0.35), transparent);
+    margin: 30px 0;
+}
+
+hr + hr {
+    height: 2px;
+    margin-top: -26px;
+    background: linear-gradient(90deg, transparent, #b8600b, transparent);
+}
+
+/* ===== LISTS ===== */
+ul {
+    list-style: none;
+    padding-left: 8px;
+    margin: 10px 0;
+}
+ul > li {
+    padding-left: 24px;
+    margin: 6px 0;
+    color: #3a3a3a;
+    position: relative;
+    line-height: 1.75;
+}
+ul > li::before {
+    content: "▸";
+    color: #008ECC;
+    position: absolute;
+    left: 4px;
+    font-weight: 700;
+}
+
+ul ul {
+    padding-left: 20px;
+}
+ul ul > li::before {
+    color: #7b2d8e;
+}
+
+ol {
+    padding-left: 28px;
+    margin: 10px 0;
+}
+ol > li {
+    padding-left: 8px;
+    margin: 6px 0;
+    color: #3a3a3a;
+    line-height: 1.75;
+}
+ol > li::marker {
+    color: #b8600b;
+    font-weight: 700;
+}
+
+/* ===== TABLES ===== */
+.table-wrapper {
+    overflow: hidden;
+    border-radius: 10px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92em;
+    margin: 0;
+}
+
+thead th {
+    background: linear-gradient(135deg, #007ab8, #008ECC);
+    color: #ffffff;
+    font-weight: 700;
+    padding: 14px 16px;
+    text-align: left;
+    text-transform: uppercase;
+    font-size: 0.85em;
+    letter-spacing: 0.5px;
+    border-bottom: 3px solid #006fa3;
+    line-height: 1.5;
+}
+
+tbody tr:nth-child(even) {
+    background: rgba(0,142,204,0.04);
+}
+tbody tr:nth-child(odd) {
+    background: #ffffff;
+}
+tbody tr {
+    transition: background 0.2s;
+}
+tbody tr:hover {
+    background: rgba(0,142,204,0.09);
+}
+
+td {
+    padding: 12px 16px;
+    color: #3a3a3a;
+    border-bottom: 1px solid rgba(0,0,0,0.07);
+    line-height: 1.5;
+}
+td:first-child {
+    color: #007ab8;
+    font-weight: 600;
+}
+
+/* ===== CODE BLOCKS ===== */
+pre {
+    background: #fdfcfa !important;
+    border: 1px solid rgba(0,142,204,0.2) !important;
+    border-left: 4px solid #008ECC !important;
+    border-radius: 10px !important;
+    padding: 20px 24px !important;
+    overflow-x: auto;
+    margin: 20px 0 !important;
+    box-shadow: inset 0 1px 4px rgba(0,0,0,0.04);
+}
+
+pre code {
+    color: #2d2d2d !important;
+    font-family: 'Consolas', 'Courier New', 'Fira Code', monospace !important;
+    font-size: 0.88em !important;
+    line-height: 1.6 !important;
+    white-space: pre-wrap !important;
+    word-break: break-all !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+}
+
+code {
+    background: rgba(0,142,204,0.08);
+    color: #007ab8;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: 'Consolas', monospace;
+    font-size: 0.9em;
+    border: 1px solid rgba(0,142,204,0.15);
+}
+
+pre code span {
+    color: #2d2d2d !important;
+}
+
+/* ===== BLOCKQUOTES ===== */
+blockquote {
+    background: linear-gradient(135deg, rgba(184,96,11,0.06), rgba(0,142,204,0.04));
+    border-left: 5px solid #b8600b;
+    border-radius: 0 12px 12px 0;
+    padding: 20px 24px;
+    margin: 25px 0;
+    font-style: italic;
+    color: #2a2a2a;
+    font-size: 1.05em;
+    line-height: 1.8;
+}
+
+blockquote p {
+    color: #2a2a2a;
+}
+
+/* ===== SECTION CARDS ===== */
+.section-problem {
+    background: rgba(198, 40, 40, 0.05);
+    border: 1px solid rgba(198, 40, 40, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-approach {
+    background: rgba(184, 96, 11, 0.05);
+    border: 1px solid rgba(184, 96, 11, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-solve {
+    background: rgba(0, 142, 204, 0.04);
+    border: 1px solid rgba(0, 142, 204, 0.18);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-should-do {
+    background: rgba(46, 125, 50, 0.05);
+    border: 1px solid rgba(46, 125, 50, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-should-not {
+    background: rgba(198, 40, 40, 0.05);
+    border: 1px solid rgba(198, 40, 40, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-when-use {
+    background: rgba(0, 142, 204, 0.05);
+    border: 1px solid rgba(0, 142, 204, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-when-not {
+    background: rgba(184, 96, 11, 0.05);
+    border: 1px solid rgba(184, 96, 11, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-mechanics {
+    background: rgba(123, 45, 142, 0.04);
+    border: 1px solid rgba(123, 45, 142, 0.18);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-pitfalls {
+    background: rgba(191, 54, 12, 0.05);
+    border: 1px solid rgba(191, 54, 12, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-scalability {
+    background: rgba(0, 142, 204, 0.05);
+    border: 1px solid rgba(0, 142, 204, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-interpretability {
+    background: rgba(42, 90, 167, 0.05);
+    border: 1px solid rgba(42, 90, 167, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-takeaway {
+    background: linear-gradient(135deg, rgba(0,142,204,0.06), rgba(184,96,11,0.05));
+    border: 2px solid rgba(0,142,204,0.35);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-complete {
+    background: linear-gradient(135deg, rgba(184,96,11,0.07), rgba(123,45,142,0.05));
+    border: 2px solid #b8600b;
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+.section-bridge {
+    background: rgba(46, 125, 50, 0.04);
+    border: 1px solid rgba(46, 125, 50, 0.2);
+    border-radius: 12px;
+    padding: 25px 30px;
+    margin: 20px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+
+/* ===== CHAT MESSAGE WRAPPER (INDEX DIV BORDER) ===== */
+.chat-message {
+    background: #ffffff;
+    padding: 35px 40px;
+    margin: 20px 0;
+    border-radius: 14px;
+    border: 2px solid rgba(0,142,204,0.25);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.06), 0 1px 4px rgba(0,0,0,0.04);
+}
+
+.info, .stat, .stats {
+    display: none;
+}
+
+.relative {
+    position: relative;
+}
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 768px) {
+    body {
+        padding: 15px;
+    }
+    h1 {
+        font-size: 1.5em;
+    }
+    h2 {
+        font-size: 1.3em;
+        padding: 10px 14px;
+    }
+    h3 {
+        font-size: 1.15em;
+        padding: 8px 12px;
+    }
+    .chat-message {
+        padding: 20px 18px;
+    }
+    .table-wrapper {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    table {
+        display: table;
+        min-width: 600px;
+    }
+    pre {
+        font-size: 0.8em !important;
+        padding: 14px 16px !important;
+    }
+    .section-problem, .section-approach, .section-solve,
+    .section-should-do, .section-should-not, .section-when-use,
+    .section-when-not, .section-mechanics, .section-pitfalls,
+    .section-scalability, .section-interpretability, .section-takeaway,
+    .section-complete, .section-bridge {
+        padding: 15px 18px;
+    }
+}
+body { padding: 0; }
+.page-wrapper { max-width: 1800px; margin: 0 auto; padding: 32px 50px 140px 40px; }
+#progress-rail { position:fixed; top:0; right:0; width:6px; height:100vh; background:rgba(0,142,204,0.12); z-index:999; }
+#progress-fill { width:100%; height:0%; background:linear-gradient(180deg,#008ECC,#b8600b,#7b2d8e); transition:height .15s; }
+#progress-pct { position:fixed; top:50%; right:12px; transform:translateY(-50%); font-size:11px; font-weight:800; color:#006fa3; background:#fff; border:1px solid rgba(0,142,204,0.3); border-radius:20px; padding:4px 7px; writing-mode:vertical-rl; z-index:1000; }
+.bottom-nav { position:fixed; bottom:0; left:0; right:0; background:rgba(255,255,255,0.97); border-top:2px solid rgba(0,142,204,0.25); padding:12px 40px; display:flex; align-items:center; justify-content:space-between; gap:12px; z-index:998; backdrop-filter:blur(10px); box-shadow:0 -4px 20px rgba(0,0,0,0.08); }
+.nav-btn { display:inline-flex; align-items:center; gap:8px; padding:10px 22px; border-radius:30px; font-size:.88em; font-weight:700; text-decoration:none; cursor:pointer; transition:all .2s; border:2px solid transparent; white-space:nowrap; }
+.nav-btn.prev { background:#fff; border-color:rgba(0,142,204,0.3); color:#007ab8; }
+.nav-btn.prev:hover { background:rgba(0,142,204,0.08); border-color:#008ECC; transform:translateX(-2px); }
+.nav-btn.home { background:#fff; border-color:rgba(184,96,11,0.3); color:#b8600b; }
+.nav-btn.home:hover { background:rgba(184,96,11,0.06); border-color:#b8600b; }
+.nav-btn.next { background:linear-gradient(135deg,#007ab8,#008ECC); color:#fff; border-color:#007ab8; }
+.nav-btn.next:hover { background:linear-gradient(135deg,#006fa3,#007ab8); transform:translateX(2px); box-shadow:0 4px 15px rgba(0,142,204,0.35); }
+.nav-btn.disabled { opacity:.35; pointer-events:none; }
+.nav-center { display:flex; align-items:center; gap:10px; }
+.nav-progress-text { font-size:.8em; color:#888; font-weight:600; letter-spacing:.5px; }
+@media(max-width:768px){.page-wrapper{padding:15px 15px 140px;} .bottom-nav{padding:10px 15px;flex-wrap:wrap;} .nav-btn{padding:8px 14px;font-size:.82em;} #progress-pct{display:none;}}
+</style>
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 39: THE SUBSIDIARY THAT NEEDED ACCESS TO HQ'S DATA — Inter-Account S3 Access via Bucket Policy &amp; IAM Role</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow has expanded internationally<br>
+→ A subsidiary company "ShopNow Europe" was established with its OWN AWS account<br>
+→ Two completely separate AWS accounts now exist:</p>
+<table><thead><tr><th>Entity</th><th>AWS Account ID</th><th>Alias</th><th>Region</th></tr></thead><tbody><tr><td>ShopNow HQ (India)</td><td><code>111111111111</code></td><td><code>shopnow-hq</code></td><td><code>ap-south-1</code></td></tr><tr><td>ShopNow Europe (Ireland)</td><td><code>222222222222</code></td><td><code>shopnow-eu</code></td><td><code>eu-west-1</code></td></tr></tbody></table>
+<p>→ These accounts are COMPLETELY ISOLATED by default<br>
+→ No resource in Account <code>222222222222</code> can see, list, read, or write any resource in Account <code>111111111111</code><br>
+→ This is the fundamental AWS security model — account boundary is the strongest isolation boundary</p>
+<p><strong>The Business Need:</strong></p>
+<p>→ ShopNow HQ has a curated data lake in S3 (built across Projects 1, 12, 17, 21, 25)<br>
+→ Bucket: <code>shopnow-datalake-curated</code> in Account <code>111111111111</code>, Region <code>ap-south-1</code><br>
+→ Contains:</p>
+<ul>
+<li>Product catalog (Parquet files) — <code>products/</code></li>
+<li>Pricing data (Parquet files) — <code>pricing/</code></li>
+<li>Customer segments (Parquet files) — <code>segments/</code></li>
+<li>Historical orders (Parquet files) — <code>orders/</code></li>
+</ul>
+<p>→ ShopNow Europe needs:</p>
+<ul>
+<li>READ access to <code>products/</code> and <code>pricing/</code> prefixes — to display correct products and prices on their European storefront</li>
+<li>NO access to <code>segments/</code> — contains HQ-only marketing segmentation data</li>
+<li>NO access to <code>orders/</code> — contains Indian customer PII subject to Indian data regulations</li>
+<li>Their Glue ETL jobs (running in Account <code>222222222222</code>) need to read this data</li>
+<li>Their Athena queries (running in Account <code>222222222222</code>) need to query this data</li>
+<li>They should NEVER be able to write, delete, or modify anything in HQ's bucket</li>
+</ul>
+<p><strong>Current Workaround (Broken):</strong><br>
+→ A cron job on an EC2 instance in HQ's account runs nightly<br>
+→ It copies <code>products/</code> and <code>pricing/</code> data from HQ's bucket to a bucket in Europe's account<br>
+→ Problems:</p>
+<ul>
+<li>Data is always 24 hours stale</li>
+<li>Copy job fails silently sometimes — Europe works with 48-72 hour old data</li>
+<li>Doubles storage cost (same data in two buckets)</li>
+<li>No access audit trail — once copied, HQ loses visibility</li>
+<li>Copy job uses hardcoded AWS access keys (violation found in Project 37)</li>
+</ul>
+<p><strong>The CTO asks:</strong></p>
+<blockquote>
+<p>"Can ShopNow Europe's services read directly from our S3 bucket in real-time,<br>
+without copying data, with fine-grained access control,<br>
+and with full audit trail of who accessed what?"</p>
+</blockquote>
+<p>→ The answer is YES — using two complementary approaches:</p>
+<ul>
+<li><strong>Approach A:</strong> Cross-account S3 Bucket Policy (resource-based)</li>
+<li><strong>Approach B:</strong> Cross-account IAM Role Assumption (identity-based)</li>
+<li><strong>Recommended:</strong> Combination of BOTH for defense-in-depth</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand the TWO fundamentally different ways cross-account access works in AWS</p>
+<p><strong>Method 1 — Resource-Based Policy (Bucket Policy):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account A (HQ) owns the S3 bucket
+</span>        ↓
+Account A adds a BUCKET POLICY that says:
+  "Allow Account B's specific role to perform specific S3 actions"
+        ↓
+Account B's role can now access Account A's bucket DIRECTLY
+        ↓
+The role STAYS in Account B — it does NOT "become" an Account A identity
+        ↓
+Object ownership: Objects uploaded by Account B are owned by Account B
+  (unless bucket ownership settings override — important detail)</code></pre></div>
+<p><strong>Method 2 — Identity-Based (Cross-Account Role Assumption via STS):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account A (HQ) creates an IAM Role with a TRUST POLICY
+</span>        ↓
+Trust Policy says: "Account B's specific role can ASSUME this role"
+        ↓
+Account B's role calls STS AssumeRole → gets TEMPORARY credentials for Account A's role
+        ↓
+Account B's service now ACTS AS Account A's role temporarily
+        ↓
+All actions are performed AS Account A's identity
+        ↓
+Object ownership: Objects uploaded are owned by Account A (because the assumed role is in Account A)</code></pre></div>
+<p><strong>Key Differences:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Bucket Policy (Resource-Based)</th><th>Role Assumption (Identity-Based)</th></tr></thead><tbody><tr><td>Where permission is defined</td><td>On the RESOURCE in Account A</td><td>On the ROLE in Account A + Trust Policy</td></tr><tr><td>Identity of accessor</td><td>Account B's original role</td><td>Account A's assumed role (temporary)</td></tr><tr><td>KMS encrypted objects</td><td>❌ Cannot decrypt CMK-encrypted objects across accounts via bucket policy alone</td><td>✅ Assumed role in Account A can decrypt (if role has KMS permissions)</td></tr><tr><td>Object ownership</td><td>Account B owns uploaded objects</td><td>Account A owns uploaded objects</td></tr><tr><td>Granularity</td><td>Per-bucket, per-prefix, per-action</td><td>Full IAM policy granularity</td></tr><tr><td>Complexity</td><td>Simpler for read-only access</td><td>More complex but more powerful</td></tr><tr><td>Audit trail</td><td>CloudTrail shows Account B's role ARN</td><td>CloudTrail shows assumed role ARN in Account A</td></tr><tr><td>Cross-account KMS</td><td>Requires KMS key policy update separately</td><td>Assumed role inherits Account A's KMS permissions</td></tr></tbody></table>
+<p><strong>For ShopNow's scenario — WHY we need Role Assumption (Method 2):</strong><br>
+→ HQ's S3 bucket is encrypted with SSE-KMS using <code>shopnow-s3-datalake-key</code> (Project 36)<br>
+→ Bucket Policy alone grants S3 access but NOT KMS decryption<br>
+→ Europe's role in Account B cannot call KMS Decrypt on Account A's key via bucket policy alone<br>
+→ With Role Assumption → Europe assumes a role IN Account A → that role has BOTH S3 AND KMS permissions<br>
+→ This is the cleanest, most secure approach</p>
+<p>→ The approach:</p>
+<ul>
+<li>Step 1 — Understand the account topology and trust model</li>
+<li>Step 2 — Create a cross-account IAM role in HQ's account (Account A)</li>
+<li>Step 3 — Configure the trust policy to allow Europe's account (Account B)</li>
+<li>Step 4 — Attach permissions to the cross-account role (S3 + KMS)</li>
+<li>Step 5 — Configure Europe's roles to assume the HQ role</li>
+<li>Step 6 — Also configure bucket policy as defense-in-depth</li>
+<li>Step 7 — Configure KMS key policy for cross-account access</li>
+<li>Step 8 — Verify the complete flow</li>
+<li>Step 9 — Set up audit trail</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND THE ACCOUNT TOPOLOGY AND TRUST MODEL</h3>
+<p><strong>The Trust Chain:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ShopNow Europe Accoun[REDACTED:BANK_ACCOUNT_NUMBER]222)         ShopNow HQ Accoun[REDACTED:BANK_ACCOUNT_NUMBER]111)
+</span>┌─────────────────────────────────────┐       ┌─────────────────────────────────────┐
+│                                     │       │                                     │
+│  ┌──────────────────────────┐      │       │  ┌──────────────────────────┐      │
+│  │ Role: EuropeGlueETLRole  │      │       │  │ Role: CrossAccountReader │      │
+│  │                          │      │  STS  │  │                          │      │
+│  │ IAM Policy:              │──────┼──────►│  │ Trust Policy:            │      │
+│  │   sts:AssumeRole on      │ Assume      │  │   Allow 222222222222     │      │
+│  │   CrossAccountReader ARN │ Role        │  │   EuropeGlueETLRole     │      │
+│  │                          │      │       │  │                          │      │
+│  └──────────────────────────┘      │       │  │ IAM Policy:              │      │
+│                                     │       │  │   s3:GetObject on        │      │
+│  ┌──────────────────────────┐      │       │  │     products/*           │      │
+│  │ Role: EuropeAthenaRole   │      │       │  │     pricing/*            │      │
+│  │                          │──────┼──────►│  │   kms:Decrypt on         │      │
+│  │ IAM Policy:              │ Assume      │  │     datalake KMS key     │      │
+│  │   sts:AssumeRole on      │ Role        │  │                          │      │
+│  │   CrossAccountReader ARN │      │       │  └──────────┬───────────────┘      │
+│  └──────────────────────────┘      │       │             │                       │
+│                                     │       │             │ Has permissions to    │
+└─────────────────────────────────────┘       │             │                       │
+                                              │  ┌──────────▼───────────────┐      │
+                                              │  │ S3: shopnow-datalake-    │      │
+                                              │  │     curated              │      │
+                                              │  │   products/*.parquet     │      │
+                                              │  │   pricing/*.parquet      │      │
+                                              │  │   segments/*.parquet ✗   │      │
+                                              │  │   orders/*.parquet   ✗   │      │
+                                              │  └──────────────────────────┘      │
+                                              │                                     │
+                                              │  ┌──────────────────────────┐      │
+                                              │  │ KMS: shopnow-s3-         │      │
+                                              │  │      datalake-key        │      │
+                                              │  └──────────────────────────┘      │
+                                              └─────────────────────────────────────┘</code></pre></div>
+<p><strong>The Flow:</strong></p>
+<ol>
+<li>Europe's Glue job runs with <code>EuropeGlueETLRole</code> in Accoun[REDACTED:BANK_ACCOUNT_NUMBER]222`</li>
+<li>Glue job calls STS AssumeRole on <code>CrossAccountReader</code> in Accoun[REDACTED:BANK_ACCOUNT_NUMBER]111`</li>
+<li>STS returns temporary credentials (access key, secret key, session token) valid for up to 1 hour</li>
+<li>Glue job uses these temporary credentials to call S3 GetObject on <code>products/</code> and <code>pricing/</code></li>
+<li>S3 calls KMS Decrypt (using the assumed role's identity) to decrypt the Parquet files</li>
+<li>Decrypted data flows to Europe's Glue job</li>
+<li>Temporary credentials expire — no persistent access</li>
+</ol>
+<hr>
+<h3>STEP 2 — CREATE THE CROSS-ACCOUNT IAM ROLE IN HQ'S ACCOUNT</h3>
+<p>→ Sign into Accoun[REDACTED:BANK_ACCOUNT_NUMBER]111` (ShopNow HQ)<br>
+→ Navigate to IAM → Roles → "Create role"</p>
+<p><strong>Page 1 — Select trusted entity:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity type</td><td>"AWS account"</td></tr><tr><td>Account type</td><td>"Another AWS account"</td></tr><tr><td>Account ID</td><td><code>222222222222</code> (ShopNow Europe)</td></tr><tr><td>Options — Require external ID</td><td>✅ Enable (explained below)</td></tr><tr><td>External ID</td><td><code>shopnow-europe-2025-xacct</code></td></tr><tr><td>Options — Require MFA</td><td>❌ No (service roles cannot use MFA)</td></tr></tbody></table>
+<p><strong>Understanding External ID — The Confused Deputy Problem:</strong></p>
+<p>→ Without External ID:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Attacker Account (333333333333)
+</span>        │
+        │ Attacker creates a role in their account
+        │ that assumes CrossAccountReader in 111111111111
+        │
+        │ If Trust Policy only checks Account ID 222222222222 → BLOCKED ✅
+        │
+        │ BUT what if the attacker tricks a service in 222222222222
+        │ to assume the role on the attacker's behalf?
+        │
+        │ This is the "Confused Deputy" attack:
+        │   Attacker uses a legitimate service in 222222222222
+        │   as a proxy to assume the role in 111111111111
+        │   The service doesn't know it's being exploited</code></pre></div>
+<p>→ With External ID:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Trust Policy says: "Allow 222222222222 to assume this role
+</span>                    ONLY IF ExternalId = shopnow-europe-2025-xacct"
+        │
+        │ Legitimate Europe services know the External ID → can assume ✅
+        │ Attacker doesn't know the External ID → cannot assume ❌
+        │ Even if attacker tricks a service in 222222222222 →
+        │   the service would need to pass the correct External ID
+        │   which the attacker doesn't know → BLOCKED ✅</code></pre></div>
+<p>→ External ID is a shared secret between the two parties<br>
+→ It is NOT a security credential — it's a confusion-prevention mechanism<br>
+→ It should be unique, non-guessable, and communicated securely between account owners<br>
+→ Best practice: Use a combination of organization name + date + random string</p>
+<hr>
+<p><strong>Page 2 — Add permissions (IAM Policy):</strong></p>
+<p>→ Create a CUSTOM policy — do not use AWS managed policies</p>
+<p><strong>Policy Name:</strong> <code>CrossAccountS3ReadOnly-ProductsPricing</code></p>
+<p><strong>Policy Configuration:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Action</th><th>Resource</th><th>Purpose</th></tr></thead><tbody><tr><td>Statement 1 — List Bucket</td><td>Allow</td><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated</code></td><td>List objects in the bucket</td></tr><tr><td></td><td></td><td></td><td>Condition: <code>s3:prefix</code> starts with <code>products/</code> OR <code>pricing/</code></td><td>RESTRICT listing to only allowed prefixes</td></tr><tr><td>Statement 2 — Get Objects</td><td>Allow</td><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/products/*</code></td><td>Read product catalog files</td></tr><tr><td></td><td></td><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/pricing/*</code></td><td>Read pricing files</td></tr><tr><td>Statement 3 — KMS Decrypt</td><td>Allow</td><td><code>kms:Decrypt</code></td><td><code>arn:aws:kms:ap-south-1:111111111111:key/&lt;s3-kms-key-id&gt;</code></td><td>Decrypt SSE-KMS encrypted objects</td></tr><tr><td></td><td></td><td><code>kms:DescribeKey</code></td><td>Same key ARN</td><td>Verify key metadata</td></tr></tbody></table>
+<p><strong>CRITICAL — What is NOT in this policy:</strong></p>
+<table><thead><tr><th>Action NOT Granted</th><th>Why</th></tr></thead><tbody><tr><td><code>s3:PutObject</code></td><td>Europe should NEVER write to HQ's bucket</td></tr><tr><td><code>s3:DeleteObject</code></td><td>Europe should NEVER delete from HQ's bucket</td></tr><tr><td><code>s3:GetObject</code> on <code>segments/*</code></td><td>Marketing segmentation is HQ-only data</td></tr><tr><td><code>s3:GetObject</code> on <code>orders/*</code></td><td>Indian customer PII subject to data residency</td></tr><tr><td><code>kms:Encrypt</code></td><td>No need to encrypt — only reading</td></tr><tr><td><code>kms:GenerateDataKey</code></td><td>No need to generate new DEKs — only decrypting existing</td></tr><tr><td><code>kms:CreateGrant</code></td><td>No service-level grants needed for read-only access</td></tr></tbody></table>
+<p>→ This implements LEAST PRIVILEGE at the cross-account boundary<br>
+→ Even if the assumed role is compromised — attacker can only READ products and pricing data</p>
+<p><strong>Understanding the ListBucket Condition for Prefix Restriction:</strong></p>
+<p>→ <code>s3:ListBucket</code> applies to the BUCKET resource (not object)<br>
+→ Without condition → Europe can list ALL objects in the bucket (including segments/, orders/)<br>
+→ Listing doesn't expose DATA but exposes METADATA (object keys, sizes, dates)<br>
+→ The condition restricts listing to only <code>products/</code> and <code>pricing/</code> prefixes</p>
+<p><strong>Condition Configuration:</strong></p>
+<table><thead><tr><th>Condition Key</th><th>Operator</th><th>Values</th></tr></thead><tbody><tr><td><code>s3:prefix</code></td><td><code>StringLike</code></td><td><code>products/*</code>, <code>pricing/*</code></td></tr></tbody></table>
+<p>→ This ensures:</p>
+<ul>
+<li><code>ListObjectsV2(Prefix=products/)</code> → ✅ Allowed</li>
+<li><code>ListObjectsV2(Prefix=pricing/)</code> → ✅ Allowed</li>
+<li><code>ListObjectsV2(Prefix=orders/)</code> → ❌ Denied</li>
+<li><code>ListObjectsV2(Prefix=segments/)</code> → ❌ Denied</li>
+<li><code>ListObjectsV2()</code> (no prefix — list everything) → ❌ Denied</li>
+</ul>
+<hr>
+<p><strong>Page 3 — Name, review, and create:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Role name</td><td><code>CrossAccountReader-ShopNowEurope</code></td></tr><tr><td>Description</td><td><code>Allows ShopNow Europe (222222222222) to read product and pricing data from HQ data lake</code></td></tr><tr><td>Tags — Key: <code>CrossAccountPartner</code></td><td>Value: <code>ShopNowEurope</code></td></tr><tr><td>Tags — Key: <code>AccessLevel</code></td><td>Value: <code>ReadOnly</code></td></tr><tr><td>Tags — Key: <code>AllowedPrefixes</code></td><td>Value: <code>products,pricing</code></td></tr><tr><td>Tags — Key: <code>ExternalID</code></td><td>Value: <code>shopnow-europe-2025-xacct</code></td></tr></tbody></table>
+<p>→ Click "Create role"<br>
+→ Note the Role ARN: <code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></p>
+<hr>
+<h3>STEP 3 — UNDERSTAND THE TRUST POLICY IN DETAIL</h3>
+<p>→ Navigate to the created role → "Trust relationships" tab → "Edit trust policy"</p>
+<p><strong>Trust Policy Structure (What was auto-generated):</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td><code>Allow</code></td><td>Permit assumption</td></tr><tr><td>Principal — AWS</td><td><code>arn:aws:iam::222222222222:root</code></td><td>Allow Account 222222222222</td></tr><tr><td>Action</td><td><code>sts:AssumeRole</code></td><td>The assume role action</td></tr><tr><td>Condition — <code>sts:ExternalId</code></td><td><code>shopnow-europe-2025-xacct</code></td><td>Confused deputy prevention</td></tr></tbody></table>
+<p><strong>Understanding the Principal Options:</strong></p>
+<table><thead><tr><th>Principal Value</th><th>What It Means</th><th>Security Level</th></tr></thead><tbody><tr><td><code>arn:aws:iam::222222222222:root</code></td><td>ANY IAM identity in Account 222222222222 that has <code>sts:AssumeRole</code> permission</td><td>Account-level trust — Account B controls who specifically</td></tr><tr><td><code>arn:aws:iam::222222222222:role/EuropeGlueETLRole</code></td><td>ONLY this specific role in Account 222222222222</td><td>Role-level trust — most restrictive</td></tr><tr><td><code>222222222222</code></td><td>Same as <code>:root</code> — shorthand</td><td>Account-level trust</td></tr></tbody></table>
+<p><strong>Which to choose?</strong></p>
+<table><thead><tr><th>Scenario</th><th>Principal to Use</th></tr></thead><tbody><tr><td>You trust the OTHER account's IAM admin to control who assumes</td><td>Use <code>root</code> (account-level)</td></tr><tr><td>You want to restrict to SPECIFIC roles in the other account</td><td>Use specific role ARNs</td></tr><tr><td>You want maximum security</td><td>Use specific role ARNs + External ID</td></tr></tbody></table>
+<p>→ For ShopNow → Use SPECIFIC role ARNs for maximum control</p>
+<p><strong>Enhanced Trust Policy (Restricting to specific roles):</strong></p>
+<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Principal — AWS (array)</td><td><code>arn:aws:iam::222222222222:role/EuropeGlueETLRole</code></td></tr><tr><td></td><td><code>arn:aws:iam::222222222222:role/EuropeAthenaRole</code></td></tr><tr><td>Action</td><td><code>sts:AssumeRole</code></td></tr><tr><td>Condition — <code>sts:ExternalId</code></td><td><code>shopnow-europe-2025-xacct</code></td></tr></tbody></table>
+<p>→ Now ONLY these two specific roles in Europe's account can assume the HQ role<br>
+→ Even if Europe creates 50 other roles with <code>sts:AssumeRole</code> permission → they are DENIED by the trust policy<br>
+→ This is DUAL-SIDED authorization:</p>
+<ul>
+<li>Trust Policy (Account A) controls WHO can assume</li>
+<li>IAM Policy (Account B) controls WHO is allowed to try</li>
+<li>BOTH must agree</li>
+</ul>
+<hr>
+<h3>STEP 4 — CONFIGURE KMS KEY POLICY FOR CROSS-ACCOUNT ACCESS</h3>
+<p>→ The cross-account role <code>CrossAccountReader-ShopNowEurope</code> needs <code>kms:Decrypt</code><br>
+→ This role exists IN Account A → so it's a normal key user addition</p>
+<p>→ Navigate to KMS → <code>shopnow-s3-datalake-key</code> → Key policy<br>
+→ The role was already granted <code>kms:Decrypt</code> in Step 2's IAM policy<br>
+→ But the KEY POLICY must also allow this role</p>
+<p><strong>Add to Key Policy — Key Users section:</strong></p>
+<table><thead><tr><th>Principal</th><th>Actions</th></tr></thead><tbody><tr><td><code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></td><td><code>kms:Decrypt</code>, <code>kms:DescribeKey</code></td></tr></tbody></table>
+<p>→ This follows the dual-gate model from Project 36:</p>
+<ul>
+<li>IAM Policy on the role → allows <code>kms:Decrypt</code> ✅</li>
+<li>Key Policy on the KMS key → allows the role as key user ✅</li>
+<li>Both agree → decryption works</li>
+</ul>
+<p><strong>ALTERNATIVE: If using Bucket Policy approach (without role assumption):</strong><br>
+→ Europe's role in Account <code>222222222222</code> would need KMS access<br>
+→ The KMS key policy would need to add Account <code>222222222222</code>'s role as a principal<br>
+→ This is MORE complex because:</p>
+<ul>
+<li>Key policy must reference an external account's role ARN</li>
+<li>External role must have <code>kms:Decrypt</code> in its OWN IAM policy</li>
+<li>AND key policy must allow it</li>
+<li>Three-way agreement needed (Bucket Policy + IAM Policy + Key Policy)<br>
+→ This is why Role Assumption is cleaner — the assumed role is IN Account A, so normal dual-gate applies</li>
+</ul>
+<hr>
+<h3>STEP 5 — CONFIGURE EUROPE'S ROLES TO ASSUME THE HQ ROLE</h3>
+<p>→ Sign into Account <code>222222222222</code> (ShopNow Europe)<br>
+→ Navigate to IAM → Roles → Select <code>EuropeGlueETLRole</code></p>
+<p><strong>Add Permission — AssumeRole Policy:</strong></p>
+<p><strong>Policy Name:</strong> <code>AllowAssumeHQCrossAccountReader</code></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td>Allow Assume HQ Role</td><td>Allow</td><td><code>sts:AssumeRole</code></td><td><code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></td></tr></tbody></table>
+<p>→ Attach this policy to <code>EuropeGlueETLRole</code><br>
+→ Repeat for <code>EuropeAthenaRole</code></p>
+<p><strong>What This Permission Grants:</strong><br>
+→ Europe's Glue role can call <code>STS:AssumeRole</code> targeting the HQ role<br>
+→ STS validates:</p>
+<ol>
+<li>Does the CALLING role have <code>sts:AssumeRole</code> permission on the target role ARN? → IAM Policy check in Account B ✅</li>
+<li>Does the TARGET role's trust policy allow the calling role? → Trust Policy check in Account A ✅</li>
+<li>Is the External ID correct? → Condition check ✅</li>
+<li>All three pass → Temporary credentials issued</li>
+</ol>
+<p><strong>Temporary Credentials Returned by STS:</strong></p>
+<table><thead><tr><th>Credential Component</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>AccessKeyId</td><td>Temporary (starts with <code>ASIA...</code>)</td><td>Identifies the session</td></tr><tr><td>SecretAccessKey</td><td>Temporary</td><td>Signs API requests</td></tr><tr><td>SessionToken</td><td>Temporary</td><td>Required for all API calls with temporary credentials</td></tr><tr><td>Expiration</td><td>Default 1 hour (configurable 15 min to 12 hours)</td><td>Auto-expires — no manual revocation needed</td></tr></tbody></table>
+<p>→ These credentials have the permissions of <code>CrossAccountReader-ShopNowEurope</code> role in Account A<br>
+→ They automatically expire — no long-lived credentials to manage<br>
+→ This is fundamentally more secure than cross-account access keys</p>
+<hr>
+<h3>STEP 6 — CONFIGURE BUCKET POLICY AS DEFENSE-IN-DEPTH</h3>
+<p>→ Sign back into Account <code>111111111111</code> (ShopNow HQ)<br>
+→ Navigate to S3 → <code>shopnow-datalake-curated</code> → Permissions → Bucket policy</p>
+<p><strong>Why add a bucket policy when Role Assumption already works?</strong><br>
+→ Defense-in-depth — if someone modifies the IAM role's policy to add <code>s3:DeleteObject</code>, the bucket policy still DENIES it<br>
+→ The bucket policy acts as a GUARDRAIL independent of IAM<br>
+→ Belt AND suspenders approach (same philosophy as KMS key policy + IAM policy from Project 36)</p>
+<p><strong>Bucket Policy Configuration:</strong></p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th><th>Condition</th></tr></thead><tbody><tr><td>Allow Cross-Account Read</td><td>Allow</td><td><code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></td><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/products/*</code>, <code>arn:aws:s3:::shopnow-datalake-curated/pricing/*</code></td><td>None</td></tr><tr><td>Allow Cross-Account List</td><td>Allow</td><td>Same role ARN</td><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated</code></td><td><code>s3:prefix</code> StringLike <code>products/*</code> OR <code>pricing/*</code></td></tr><tr><td>Explicit Deny Write</td><td>Deny</td><td><code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></td><td><code>s3:PutObject</code>, <code>s3:DeleteObject</code>, <code>s3:PutBucketPolicy</code>, <code>s3:PutBucketAcl</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/*</code>, <code>arn:aws:s3:::shopnow-datalake-curated</code></td><td>None</td></tr><tr><td>Explicit Deny Restricted Prefixes</td><td>Deny</td><td><code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></td><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/segments/*</code>, <code>arn:aws:s3:::shopnow-datalake-curated/orders/*</code></td><td>None</td></tr></tbody></table>
+<p><strong>Why EXPLICIT DENY is critical:</strong></p>
+<p>→ AWS policy evaluation: Explicit Deny ALWAYS overrides any Allow<br>
+→ Even if someone accidentally adds <code>s3:PutObject</code> to the cross-account role's IAM policy<br>
+→ The bucket policy's explicit deny on <code>PutObject</code> will BLOCK it<br>
+→ Even if someone adds <code>s3:GetObject</code> for <code>orders/*</code> to the IAM policy<br>
+→ The bucket policy's explicit deny on <code>orders/*</code> will BLOCK it</p>
+<p><strong>Policy Evaluation Order (Comprehensive):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Request arrives (GetObject on orders/data.parquet)
+</span>        ↓
+Step 1: Is there an EXPLICIT DENY in any policy?
+  → Bucket Policy has Deny on orders/* for this role → YES
+  → DENIED immediately — no further evaluation
+        ↓
+(If no explicit deny, evaluation continues:)
+Step 2: Is there an ALLOW in any applicable policy?
+  → IAM Policy? Bucket Policy? Both?
+  → If Allow found → ALLOWED
+  → If no Allow found → IMPLICIT DENY</code></pre></div>
+<p>→ Explicit Deny is the STRONGEST control in AWS — nothing can override it<br>
+→ Use it for cross-account guardrails where you want ABSOLUTE restrictions</p>
+<hr>
+<h3>STEP 7 — CONFIGURE EUROPE'S GLUE JOB TO USE CROSS-ACCOUNT ACCESS</h3>
+<p>→ Sign into Account <code>222222222222</code> (ShopNow Europe)<br>
+→ Two approaches for Glue to use cross-account role:</p>
+<p><strong>Approach A — Glue Job with AssumeRole in Script (Common):</strong><br>
+→ The Glue ETL job script includes logic to:</p>
+<ol>
+<li>Call <code>STS:AssumeRole</code> with the HQ role ARN and External ID</li>
+<li>Get temporary credentials</li>
+<li>Use those credentials to create an S3 client</li>
+<li>Read from HQ's bucket using the temporary credentials</li>
+</ol>
+<p>→ The Glue job runs with <code>EuropeGlueETLRole</code> (which has <code>sts:AssumeRole</code> permission)</p>
+<p><strong>Approach B — Direct S3 Access via Bucket Policy (Simpler but less secure):</strong><br>
+→ If the bucket policy directly allows Europe's role → Glue can access without AssumeRole<br>
+→ But this bypasses the KMS encryption issue (Europe's role cannot decrypt Account A's KMS key)<br>
+→ Only works for SSE-S3 encrypted or unencrypted buckets<br>
+→ Since HQ uses SSE-KMS (Project 36) → Approach A (Role Assumption) is REQUIRED</p>
+<hr>
+<h3>STEP 8 — CONFIGURE EUROPE'S ATHENA TO USE CROSS-ACCOUNT ACCESS</h3>
+<p>→ Athena in Account <code>222222222222</code> needs to query data in Account <code>111111111111</code>'s S3</p>
+<p><strong>Challenge:</strong><br>
+→ Athena uses Glue Data Catalog for table metadata<br>
+→ HQ's Glue Catalog is in Account <code>111111111111</code><br>
+→ Europe's Athena by default only sees Europe's Glue Catalog (Account <code>222222222222</code>)</p>
+<p><strong>Two Solutions:</strong></p>
+<p><strong>Solution 1 — Register HQ's Glue Catalog as a data source (Cross-account Catalog):</strong><br>
+→ This requires Lake Formation cross-account sharing (Project 42 — coming later)<br>
+→ Not configured here — previewed as the advanced approach</p>
+<p><strong>Solution 2 — Create LOCAL Glue Catalog tables pointing to HQ's S3 (Simpler):</strong><br>
+→ In Account <code>222222222222</code>:</p>
+<ul>
+<li>Create a Glue Database: <code>hq_shared_data</code></li>
+<li>Create Glue Tables that point to S3 locations in Account <code>111111111111</code></li>
+<li>Table location: <code>s3://shopnow-datalake-curated/products/</code></li>
+<li>Athena queries these local tables → Athena reads from HQ's S3 using cross-account permissions</li>
+</ul>
+<p><strong>How Athena reads cross-account S3:</strong><br>
+→ Athena runs with <code>EuropeAthenaRole</code> in Account <code>222222222222</code><br>
+→ Athena itself does NOT do AssumeRole — it reads S3 directly<br>
+→ For this to work → the BUCKET POLICY in Account A must directly allow <code>EuropeAthenaRole</code> from Account B<br>
+→ OR → Use a custom approach where Athena queries through a federated connector that does AssumeRole</p>
+<p><strong>Simpler Approach — Bucket Policy for Athena:</strong><br>
+→ Add Europe's Athena role to the bucket policy in Account <code>111111111111</code>:</p>
+<table><thead><tr><th>Statement</th><th>Effect</th><th>Principal</th><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td>Allow Europe Athena Read</td><td>Allow</td><td><code>arn:aws:iam::222222222222:role/EuropeAthenaRole</code></td><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/products/*</code>, <code>arn:aws:s3:::shopnow-datalake-curated/pricing/*</code></td></tr><tr><td>Allow Europe Athena List</td><td>Allow</td><td>Same</td><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated</code> with prefix condition</td></tr></tbody></table>
+<p><strong>BUT — KMS Problem Again:</strong><br>
+→ Athena calls S3 → S3 calls KMS Decrypt → KMS checks the CALLER's identity<br>
+→ The caller is <code>EuropeAthenaRole</code> in Account <code>222222222222</code><br>
+→ KMS key is in Account <code>111111111111</code><br>
+→ KMS key policy must ALSO allow Account <code>222222222222</code>'s Athena role</p>
+<p><strong>KMS Key Policy Addition for Direct Cross-Account Access:</strong></p>
+<table><thead><tr><th>Principal</th><th>Actions</th><th>Why</th></tr></thead><tbody><tr><td><code>arn:aws:iam::222222222222:role/EuropeAthenaRole</code></td><td><code>kms:Decrypt</code>, <code>kms:DescribeKey</code></td><td>Allow Athena to decrypt S3 objects</td></tr></tbody></table>
+<p><strong>AND — Europe's Athena role IAM policy must include:</strong></p>
+<table><thead><tr><th>Action</th><th>Resource</th></tr></thead><tbody><tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated/products/*</code> and <code>pricing/*</code></td></tr><tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::shopnow-datalake-curated</code></td></tr><tr><td><code>kms:Decrypt</code></td><td><code>arn:aws:kms:ap-south-1:111111111111:key/&lt;key-id&gt;</code></td></tr></tbody></table>
+<p>→ This is the THREE-WAY agreement mentioned earlier:</p>
+<ol>
+<li>Bucket Policy allows the external role ✅</li>
+<li>KMS Key Policy allows the external role ✅</li>
+<li>IAM Policy on the external role allows the S3 + KMS actions ✅</li>
+</ol>
+<p>→ ALL THREE must agree — if any one denies or doesn't explicitly allow → Access Denied</p>
+<hr>
+<h3>STEP 9 — COMPLETE CROSS-ACCOUNT ACCESS MATRIX</h3>
+<p><strong>Summary of All Configurations Made:</strong></p>
+<p><strong>In Account <code>111111111111</code> (HQ):</strong></p>
+<table><thead><tr><th>Resource</th><th>Configuration</th><th>Allows</th></tr></thead><tbody><tr><td>IAM Role: <code>CrossAccountReader-ShopNowEurope</code></td><td>Trust Policy → Account[REDACTED:BANK_ACCOUNT_NUMBER]222` specific roles</td><td>Europe's Glue role to assume</td></tr><tr><td></td><td>IAM Policy → <code>s3:GetObject</code>, <code>s3:ListBucket</code>, <code>kms:Decrypt</code></td><td>Read products/ and pricing/</td></tr><tr><td>S3 Bucket Policy</td><td>Allow statements for cross-account role + Europe's Athena role</td><td>Direct S3 access</td></tr><tr><td></td><td>Explicit Deny for write operations</td><td>Guardrail</td></tr><tr><td></td><td>Explicit Deny for restricted prefixes</td><td>Guardrail</td></tr><tr><td>KMS Key Policy</td><td><code>CrossAccountReader-ShopNowEurope</code> as key user</td><td>Decrypt via assumed role</td></tr><tr><td></td><td><code>EuropeAthenaRole</code> (222222222222) as key user</td><td>Decrypt for direct Athena access</td></tr></tbody></table>
+<p><strong>In Account <code>222222222222</code> (Europe):</strong></p>
+<table><thead><tr><th>Resource</th><th>Configuration</th><th>Allows</th></tr></thead><tbody><tr><td>IAM Role: <code>EuropeGlueETLRole</code></td><td>IAM Policy → <code>sts:AssumeRole</code> on HQ's cross-account role ARN</td><td>Glue to assume HQ role</td></tr><tr><td>IAM Role: <code>EuropeAthenaRole</code></td><td>IAM Policy → <code>s3:GetObject</code>, <code>s3:ListBucket</code> on HQ's bucket</td><td>Direct Athena S3 access</td></tr><tr><td></td><td>IAM Policy → <code>kms:Decrypt</code> on HQ's KMS key ARN</td><td>Decrypt HQ's encrypted objects</td></tr><tr><td>Glue Catalog</td><td>Database + Tables pointing to HQ's S3 locations</td><td>Athena metadata</td></tr></tbody></table>
+<hr>
+<h3>STEP 10 — SET UP CROSS-ACCOUNT AUDIT TRAIL</h3>
+<p>→ CloudTrail in BOTH accounts captures the access:</p>
+<p><strong>In Account <code>111111111111</code> (HQ) CloudTrail:</strong></p>
+<table><thead><tr><th>Event</th><th>What It Shows</th></tr></thead><tbody><tr><td><code>AssumeRole</code></td><td>Europe's role assumed <code>CrossAccountReader-ShopNowEurope</code> — timestamp, source IP, session duration</td></tr><tr><td><code>GetObject</code></td><td>Assumed role read specific objects from S3 — bucket, key, timestamp</td></tr><tr><td><code>Decrypt</code></td><td>KMS key was used to decrypt — by which principal, when</td></tr></tbody></table>
+<p><strong>In Account <code>222222222222</code> (Europe) CloudTrail:</strong></p>
+<table><thead><tr><th>Event</th><th>What It Shows</th></tr></thead><tbody><tr><td><code>AssumeRole</code></td><td>Europe's role called STS to assume HQ's role — target role ARN, success/failure</td></tr><tr><td><code>GetObject</code> (via assumed role)</td><td>May also appear here depending on CloudTrail configuration</td></tr></tbody></table>
+<p>→ For comprehensive audit → Enable CloudTrail in BOTH accounts<br>
+→ For centralized audit → Send both accounts' CloudTrail logs to a central S3 bucket (Project 54 preview)</p>
+<p><strong>EventBridge Integration (from Project 38):</strong><br>
+→ Create EventBridge rule in Account <code>111111111111</code>:</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>shopnow-cross-account-access-monitor</code></td></tr><tr><td>Event pattern source</td><td><code>aws.s3</code></td></tr><tr><td>detail-type</td><td><code>AWS API Call via CloudTrail</code></td></tr><tr><td>detail.userIdentity.arn</td><td>Contains <code>CrossAccountReader-ShopNowEurope</code></td></tr><tr><td>Target</td><td>CloudWatch Log Group → <code>/shopnow/events/cross-account-access</code></td></tr></tbody></table>
+<p>→ Every cross-account access is logged in a dedicated log group for security review</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use Cross-Account IAM Role Assumption for KMS-encrypted resources — bucket policy alone is insufficient<br>
+→ Always use External ID in trust policies — prevents confused deputy attacks<br>
+→ Always restrict trust policy to SPECIFIC role ARNs — not entire accounts when possible<br>
+→ Always add EXPLICIT DENY in bucket policy for actions the cross-account role should NEVER perform (write, delete)<br>
+→ Always add EXPLICIT DENY for prefixes the cross-account role should NEVER access (segments, orders)<br>
+→ Always use TEMPORARY credentials (STS) — never create IAM users with permanent access keys for cross-account<br>
+→ Always configure the cross-account role with MINIMUM necessary permissions — read-only if only reading<br>
+→ Always enable CloudTrail in BOTH accounts to audit cross-account access<br>
+→ Always use descriptive role names indicating the cross-account purpose and partner<br>
+→ Always tag cross-account roles with partner account ID, access level, and allowed resources<br>
+→ Always document the External ID securely — share via encrypted channel, not email or wiki<br>
+→ Always set session duration appropriately — 1 hour default, increase only if needed</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never create IAM users with permanent access keys for cross-account access — use roles + STS<br>
+→ Never trust an entire account (<code>root</code>) in trust policy without External ID — confused deputy risk<br>
+→ Never grant write permissions in cross-account roles unless absolutely required — read-only by default<br>
+→ Never skip bucket policy explicit deny — IAM policies can be modified, bucket policy is the guardrail<br>
+→ Never share External ID via unencrypted channels (plain email, wiki, Slack) — treat as sensitive<br>
+→ Never grant <code>s3:*</code> or <code>kms:*</code> in cross-account roles — always enumerate specific actions<br>
+→ Never use the same cross-account role for multiple partner accounts — one role per partner for isolation<br>
+→ Never forget KMS key policy update when S3 is SSE-KMS encrypted — most common cause of cross-account "Access Denied"<br>
+→ Never assume bucket policy alone handles KMS — it does NOT (separate authorization)<br>
+→ Never grant <code>iam:*</code> or <code>sts:*</code> beyond <code>AssumeRole</code> in cross-account scenarios — prevents privilege escalation<br>
+→ Never configure cross-account access without CloudTrail auditing — you lose visibility<br>
+→ Never skip prefix-level restrictions in bucket policy — granting access to entire bucket when only specific prefixes needed violates least privilege</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Approach</th><th>Why</th></tr></thead><tbody><tr><td>Cross-account READ of S3 with SSE-S3 encryption</td><td>Bucket Policy alone is sufficient</td><td>No KMS complexity</td></tr><tr><td>Cross-account READ of S3 with SSE-KMS encryption</td><td>Role Assumption + KMS key policy</td><td>Assumed role can decrypt in Account A</td></tr><tr><td>Cross-account WRITE to S3</td><td>Role Assumption preferred</td><td>Object ownership stays with Account A</td></tr><tr><td>Cross-account Athena query</td><td>Bucket Policy + KMS Key Policy + IAM Policy (three-way)</td><td>Athena doesn't natively do AssumeRole</td></tr><tr><td>Cross-account Glue ETL</td><td>Role Assumption (Glue script does AssumeRole)</td><td>Most flexible, handles KMS</td></tr><tr><td>Cross-account Redshift COPY</td><td>Role Assumption (Redshift assumes a role that chains to cross-account role)</td><td>Handles KMS + large data volumes</td></tr><tr><td>Temporary, one-time access</td><td>Role Assumption with short session duration (15 min)</td><td>Auto-expires quickly</td></tr><tr><td>Permanent, ongoing data sharing</td><td>Role Assumption with standard session (1 hour) + bucket policy guardrails</td><td>Secure long-term pattern</td></tr><tr><td>Many accounts needing same access</td><td>AWS Organizations + SCPs (Project 54) + Organization-based conditions</td><td>Scalable governance</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use cross-account S3 access when data must NEVER leave the source account — use compute in the source account instead<br>
+→ Do NOT use cross-account access for data subject to strict data residency regulations that prohibit cross-account data flow — consult legal<br>
+→ Do NOT use bucket policy cross-account access for SSE-KMS encrypted data without also updating KMS key policy — will fail silently<br>
+→ Do NOT use cross-account IAM users — always use cross-account IAM roles with STS<br>
+→ Do NOT use cross-account access when the data should be independently managed — replicate instead (Project 30)<br>
+→ Do NOT use this pattern when the accounts are in different AWS Organizations with no trust relationship — use formal data sharing agreements + Lake Formation (Project 42)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>MECHANIC 1 — STS ASSUMEROLE FLOW</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Europe's Glue Job (Account 222222222222)
+</span>  Running with: EuropeGlueETLRole
+        │
+        ▼
+Calls: STS AssumeRole(
+    RoleArn = arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope
+    RoleSessionName = "europe-glue-session-20250115"
+    ExternalId = "shopnow-europe-2025-xacct"
+    DurationSeconds = 3600
+)
+        │
+        ▼
+STS Service receives request
+        │
+        ├── Check 1: Does EuropeGlueETLRole have sts:AssumeRole 
+        │            permission on the target role ARN?
+        │            → Check IAM Policy in Account 222222222222
+        │            → YES ✅
+        │
+        ├── Check 2: Does CrossAccountReader-ShopNowEurope's trust policy
+        │            allow EuropeGlueETLRole?
+        │            → Check Trust Policy in Account 111111111111
+        │            → YES ✅
+        │
+        ├── Check 3: Is the ExternalId correct?
+        │            → Trust Policy condition: sts:ExternalId = "shopnow-europe-2025-xacct"
+        │            → Request includes: ExternalId = "shopnow-europe-2025-xacct"
+        │            → MATCH ✅
+        │
+        ├── Check 4: Is there any SCP (Service Control Policy) blocking this?
+        │            → If accounts are in AWS Organizations (Project 54)
+        │            → SCP may allow or deny
+        │            → For now: No SCP → ALLOWED ✅
+        │
+        └── All checks pass → STS issues temporary credentials
+                │
+                ▼
+STS Returns:
+  AccessKeyId: ASIA...temporary...
+  SecretAccessKey: temporary-secret...
+  SessionToken: FwoGZX...long-token...
+  Expiration: 2025-01-15T03:00:00Z (1 hour from now)
+        │
+        ▼
+Glue Job uses these credentials for all subsequent S3 and KMS calls
+        │
+        ▼
+After 1 hour → credentials expire → any further calls FAIL
+  → Glue must call AssumeRole again for fresh credentials</code></pre></div>
+<hr>
+<h3>MECHANIC 2 — S3 CROSS-ACCOUNT REQUEST EVALUATION</h3>
+<p>→ When the assumed role makes an S3 GetObject request:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Request: GetObject(Bucket=shopnow-datalake-curated, Key=products/catalog.parquet)
+</span>Caller: arn:aws:sts::111111111111:assumed-role/CrossAccountReader-ShopNowEurope/europe-glue-session
+        │
+        ▼
+S3 evaluates access:
+        │
+        ├── Step 1: Check for EXPLICIT DENY in any policy
+        │     Bucket Policy: Deny on PutObject, DeleteObject → not relevant (this is GetObject)
+        │     Bucket Policy: Deny on segments/*, orders/* → not relevant (this is products/)
+        │     IAM Policy: No deny statements
+        │     → No explicit deny found → continue
+        │
+        ├── Step 2: Check for ALLOW
+        │     Bucket Policy: Allow GetObject on products/* for this role → ALLOW ✅
+        │     IAM Policy: Allow GetObject on products/* → ALLOW ✅
+        │     → Allow found → ACCESS GRANTED
+        │
+        ▼
+S3 retrieves the encrypted object
+        │
+        ├── Object encrypted with SSE-KMS
+        │     S3 needs to call KMS Decrypt
+        │     S3 calls KMS using the CALLER's identity
+        │     Caller = assumed role CrossAccountReader-ShopNowEurope
+        │
+        ├── KMS evaluates:
+        │     Key Policy: CrossAccountReader-ShopNowEurope listed as key user? → YES ✅
+        │     IAM Policy: Role has kms:Decrypt on this key? → YES ✅
+        │     → KMS returns decrypted DEK
+        │
+        ▼
+S3 decrypts the Parquet file → returns to Glue Job</code></pre></div>
+<hr>
+<h3>MECHANIC 3 — CROSS-ACCOUNT IDENTITY IN CLOUDTRAIL</h3>
+<p>→ When cross-account access occurs, CloudTrail in Account A records a specific identity format:</p>
+<p><strong>For Role Assumption (Method 2):</strong></p>
+<table><thead><tr><th>CloudTrail Field</th><th>Value</th></tr></thead><tbody><tr><td><code>userIdentity.type</code></td><td><code>AssumedRole</code></td></tr><tr><td><code>userIdentity.arn</code></td><td><code>arn:aws:sts::111111111111:assumed-role/CrossAccountReader-ShopNowEurope/europe-glue-session</code></td></tr><tr><td><code>userIdentity.accountId</code></td><td><code>111111111111</code> (Account A — because the assumed role is IN Account A)</td></tr><tr><td><code>userIdentity.sessionContext.sessionIssuer.arn</code></td><td><code>arn:aws:iam::111111111111:role/CrossAccountReader-ShopNowEurope</code></td></tr></tbody></table>
+<p>→ Notice: The CloudTrail event shows Account A's identity — NOT Account B's<br>
+→ The <code>RoleSessionName</code> (<code>europe-glue-session</code>) is the only indicator of the external origin<br>
+→ This is why descriptive session names are important — they provide cross-account traceability</p>
+<p><strong>For Bucket Policy Direct Access (Method 1):</strong></p>
+<table><thead><tr><th>CloudTrail Field</th><th>Value</th></tr></thead><tbody><tr><td><code>userIdentity.type</code></td><td><code>AssumedRole</code> or <code>IAMUser</code></td></tr><tr><td><code>userIdentity.arn</code></td><td><code>arn:aws:iam::222222222222:role/EuropeAthenaRole</code> (Account B's role directly)</td></tr><tr><td><code>userIdentity.accountId</code></td><td><code>222222222222</code> (Account B — external account visible)</td></tr></tbody></table>
+<p>→ With bucket policy method → Account B's identity is directly visible in CloudTrail<br>
+→ This can be both advantage (clear origin) and disadvantage (foreign account ID in logs)</p>
+<hr>
+<h3>MECHANIC 4 — SESSION POLICY (Scoping Down Assumed Role)</h3>
+<p>→ When calling <code>STS:AssumeRole</code>, the caller can pass a SESSION POLICY<br>
+→ This FURTHER restricts the permissions of the assumed role for this specific session</p>
+<code>Assumed Role Permissions = INTERSECTION of (Role IAM Policy ∩ Session Policy)</code>
+<p><strong>Example:</strong><br>
+→ <code>CrossAccountReader-ShopNowEurope</code> allows <code>GetObject</code> on <code>products/*</code> AND <code>pricing/*</code><br>
+→ Europe's Glue job only needs <code>products/*</code> for this specific job run<br>
+→ Glue passes a session policy that only allows <code>GetObject</code> on <code>products/*</code><br>
+→ Result: This session can ONLY access <code>products/*</code> — even though the role allows <code>pricing/*</code> too</p>
+<p><strong>Why use Session Policies?</strong></p>
+<table><thead><tr><th>Benefit</th><th>Explanation</th></tr></thead><tbody><tr><td>Principle of least privilege per session</td><td>Different jobs need different subsets of the role's permissions</td></tr><tr><td>Defense against compromised session</td><td>If temporary credentials are stolen, they have minimal permissions</td></tr><tr><td>Audit clarity</td><td>Session policy shows EXACTLY what each session was scoped to</td></tr></tbody></table>
+<p><strong>Session Policy Limits:</strong><br>
+→ Maximum session policy size: 2048 characters (URL-encoded)<br>
+→ Session policy can ONLY restrict — it CANNOT grant permissions beyond the role's IAM policy<br>
+→ It acts as a CEILING, not a floor</p>
+<hr>
+<h3>MECHANIC 5 — ROLE CHAINING</h3>
+<p>→ What if Europe's Glue role assumes HQ's <code>CrossAccountReader-ShopNowEurope</code> role<br>
+→ And THAT role tries to assume ANOTHER role?</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EuropeGlueETLRole (Account B)
+</span>    → assumes CrossAccountReader-ShopNowEurope (Account A)
+        → attempts to assume AnotherRole (Account A or C)</code></pre></div>
+<p>→ This is called ROLE CHAINING<br>
+→ AWS ALLOWS role chaining but with restrictions:</p>
+<table><thead><tr><th>Restriction</th><th>Detail</th></tr></thead><tbody><tr><td>Maximum session duration</td><td>Chained role sessions are limited to 1 HOUR maximum (cannot extend)</td></tr><tr><td>Trust policy</td><td>Each role in the chain must trust the PREVIOUS role</td></tr><tr><td>Permissions</td><td>Each hop can only NARROW permissions — not expand</td></tr><tr><td>CloudTrail</td><td>Each AssumeRole call is logged separately</td></tr></tbody></table>
+<p>→ For ShopNow → Role chaining is NOT needed (one hop is sufficient)<br>
+→ Awareness is important for Project 40 where more complex trust patterns are explored</p>
+<hr>
+<h3>MECHANIC 6 — COST MODEL FOR CROSS-ACCOUNT ACCESS</h3>
+<table><thead><tr><th>Component</th><th>Cost</th><th>Notes</th></tr></thead><tbody><tr><td>STS AssumeRole API calls</td><td>FREE</td><td>No charge for STS</td></tr><tr><td>S3 GetObject from different account (same region)</td><td>Standard S3 request pricing</td><td>Per 1,000 requests</td></tr><tr><td>S3 data transfer (same region, cross-account)</td><td>FREE</td><td>No cross-account transfer fee within same region</td></tr><tr><td>S3 data transfer (cross-region, cross-account)</td><td>Per GB data transfer</td><td>Standard cross-region pricing</td></tr><tr><td>KMS Decrypt calls</td><td>$0.03 per 10,000</td><td>Standard KMS pricing</td></tr><tr><td>IAM role creation</td><td>FREE</td><td>No charge for roles</td></tr><tr><td>CloudTrail logging</td><td>Standard CloudTrail pricing</td><td>Per event (if data events enabled)</td></tr></tbody></table>
+<p><strong>ShopNow's cross-region consideration:</strong><br>
+→ HQ's bucket is in <code>ap-south-1</code> (Mumbai)<br>
+→ Europe's Glue/Athena runs in <code>eu-west-1</code> (Ireland)<br>
+→ Data transfer from <code>ap-south-1</code> to <code>eu-west-1</code> = $0.09/GB<br>
+→ If Europe reads 100 GB/day → $9/day → $270/month in transfer costs alone</p>
+<p><strong>Cost Optimization:</strong><br>
+→ Option 1: Use S3 Cross-Region Replication (Project 30) to maintain a copy in <code>eu-west-1</code><br>
+→ Option 2: Accept the transfer cost for real-time access<br>
+→ Option 3: Replicate only frequently-accessed data, cross-account access for infrequent queries<br>
+→ The CTO must decide: Freshness (cross-account) vs Cost (replication)</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead><tbody><tr><td>1</td><td>"Access Denied" when assuming role</td><td><code>STS:AssumeRole</code> returns <code>AccessDenied</code></td><td>Trust policy doesn't include the calling role ARN, OR External ID mismatch, OR calling role missing <code>sts:AssumeRole</code> permission</td><td>Verify all three: Trust policy, IAM policy, External ID</td></tr><tr><td>2</td><td>S3 GetObject succeeds but KMS Decrypt fails</td><td><code>KMS.AccessDeniedException</code> when reading encrypted objects</td><td>KMS key policy doesn't include the cross-account role as key user</td><td>Add role to KMS key policy + verify IAM policy has <code>kms:Decrypt</code></td></tr><tr><td>3</td><td>Bucket policy allows but IAM denies</td><td><code>Access Denied</code> despite correct bucket policy</td><td>For cross-account via bucket policy → BOTH bucket policy AND calling role's IAM policy must allow</td><td>Add S3 permissions to calling role's IAM policy in Account B</td></tr><tr><td>4</td><td>Can read products/ but also accidentally read orders/</td><td>Data leak — unauthorized prefix access</td><td>IAM policy on cross-account role grants <code>s3:GetObject</code> on <code>*</code> instead of specific prefixes</td><td>Restrict IAM policy to specific prefixes + add explicit deny in bucket policy</td></tr><tr><td>5</td><td>External ID not matching</td><td><code>STS:AssumeRole</code> fails with "The request included a non-valid ExternalId"</td><td>Typo in External ID, or External ID not passed in the call</td><td>Verify exact string match — case sensitive</td></tr><tr><td>6</td><td>Temporary credentials expired mid-job</td><td>Glue job fails after 1 hour</td><td>Default session duration is 1 hour — long ETL job exceeds this</td><td>Increase <code>DurationSeconds</code> in AssumeRole (max 12 hours) OR implement credential refresh logic</td></tr><tr><td>7</td><td>Cross-region data transfer cost surprise</td><td>$500 monthly bill for cross-account S3 access</td><td>Bucket in ap-south-1, consumer in eu-west-1 — cross-region transfer at $0.09/GB</td><td>Use S3 replication (Project 30) or accept cost</td></tr><tr><td>8</td><td>Trust policy uses account root but no IAM policy in Account B</td><td>AssumeRole fails</td><td>Trust policy allows <code>222222222222:root</code> but no role in Account B has <code>sts:AssumeRole</code> permission</td><td>Add <code>sts:AssumeRole</code> permission to specific roles in Account B</td></tr><tr><td>9</td><td>Created cross-account role with admin permissions</td><td>Security risk — Europe can access everything in HQ</td><td>Role policy is <code>AdministratorAccess</code> instead of custom restricted policy</td><td>ALWAYS use custom minimum-permission policy for cross-account roles</td></tr><tr><td>10</td><td>Object ownership confusion</td><td>Europe writes objects to HQ's bucket — HQ cannot read them</td><td>Without bucket owner enforced setting → objects uploaded by Account B are owned by Account B</td><td>Enable "Bucket owner enforced" in S3 Object Ownership settings</td></tr><tr><td>11</td><td>Athena in Account B cannot query Account A's Glue Catalog</td><td>Athena shows no databases from Account A</td><td>Glue Catalog is account-scoped — cross-account catalog sharing requires Lake Formation (Project 42)</td><td>Create local Glue tables in Account B pointing to Account A's S3 locations</td></tr><tr><td>12</td><td>SCP in Organization blocks cross-account AssumeRole</td><td>STS calls fail despite correct trust policy and IAM policy</td><td>AWS Organizations SCP denies <code>sts:AssumeRole</code> to external accounts</td><td>Review and update SCPs (Project 54)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Number of Cross-Account Roles Scaling</strong></p>
+<ul>
+<li>No hard limit on cross-account roles per account</li>
+<li>Best practice: One role per partner account per access pattern</li>
+<li>Example: <code>CrossAccountReader-ShopNowEurope</code>, <code>CrossAccountReader-ShopNowUS</code>, <code>CrossAccountReader-PartnerXYZ</code></li>
+<li>If you have 50 partner accounts → 50 cross-account roles → manageable</li>
+<li>If you have 500+ partner accounts → Use AWS Organizations with organizational conditions (Project 54)</li>
+</ul>
+<p>→ <strong>STS API Scaling</strong></p>
+<ul>
+<li>STS AssumeRole: No hard rate limit — designed for high-volume use</li>
+<li>Each AssumeRole call takes ~100-200ms</li>
+<li>Temporary credentials cached → no need to call AssumeRole for every S3 request</li>
+<li>One AssumeRole → use credentials for up to 12 hours of S3 access</li>
+</ul>
+<p>→ <strong>Bucket Policy Size Scaling</strong></p>
+<ul>
+<li>Maximum bucket policy size: 20 KB</li>
+<li>Each cross-account principal statement adds ~200-500 bytes</li>
+<li>With 10 partner accounts → ~5 KB → within limits</li>
+<li>With 50+ partner accounts → approaching limit</li>
+<li>Solution: Use IAM conditions with <code>aws:PrincipalOrgID</code> (Project 54) instead of listing every account</li>
+</ul>
+<p>→ <strong>KMS Key Policy Scaling</strong></p>
+<ul>
+<li>Maximum key policy size: 32 KB</li>
+<li>Each cross-account principal adds ~200 bytes</li>
+<li>Practical limit: ~100 cross-account principals per key</li>
+<li>For more → Use KMS Grants instead of key policy entries (grants have no policy size limit)</li>
+</ul>
+<p>→ <strong>Cross-Region Access Scaling</strong></p>
+<ul>
+<li>Data transfer costs scale linearly with volume</li>
+<li>For high-volume cross-region access → S3 Replication (Project 30) is more cost-effective</li>
+<li>For low-volume ad-hoc queries → Cross-account direct access is fine</li>
+<li>Transfer Acceleration can improve speed for large cross-region transfers</li>
+</ul>
+<p>→ <strong>Multi-Account Architecture Scaling</strong></p>
+<ul>
+<li>2-5 accounts → Individual cross-account roles work fine</li>
+<li>5-20 accounts → Use naming conventions and standardized role templates</li>
+<li>20-100 accounts → Use AWS Organizations + SCPs + organizational conditions (Project 54)</li>
+<li>100+ accounts → Use AWS RAM (Resource Access Manager) for sharing + Lake Formation (Project 42)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify cross-account access is working:</strong></p>
+<table><thead><tr><th>Verification Step</th><th>Where</th><th>Expected Result</th></tr></thead><tbody><tr><td>Trust policy is correct</td><td>Account A → IAM → CrossAccountReader role → Trust relationships</td><td>Shows Account B's role ARNs with External ID condition</td></tr><tr><td>IAM policy is restrictive</td><td>Account A → IAM → CrossAccountReader role → Permissions</td><td>Only <code>s3:GetObject</code>, <code>s3:ListBucket</code>, <code>kms:Decrypt</code> on specific resources</td></tr><tr><td>Bucket policy has explicit deny</td><td>Account A → S3 → Bucket → Permissions → Bucket policy</td><td>Deny statements for write operations and restricted prefixes</td></tr><tr><td>KMS key policy includes cross-account role</td><td>Account A → KMS → Key → Key policy</td><td>CrossAccountReader listed as key user</td></tr><tr><td>Account B can assume the role</td><td>Account B → test AssumeRole call</td><td>Returns temporary credentials</td></tr><tr><td>Account B can read allowed prefixes</td><td>Account B → use temp credentials → GetObject on products/</td><td>Object returned successfully</td></tr><tr><td>Account B CANNOT read restricted prefixes</td><td>Account B → use temp credentials → GetObject on orders/</td><td>Access Denied</td></tr><tr><td>Account B CANNOT write</td><td>Account B → use temp credentials → PutObject</td><td>Access Denied</td></tr><tr><td>CloudTrail shows the access</td><td>Account A → CloudTrail → Event history</td><td>AssumeRole and GetObject events with cross-account identity</td></tr></tbody></table>
+<p>→ <strong>How to monitor ongoing cross-account access:</strong></p>
+<table><thead><tr><th>Metric / Log</th><th>Where</th><th>What to Look For</th></tr></thead><tbody><tr><td>AssumeRole events</td><td>CloudTrail in Account A</td><td>Frequency, source IP, session names</td></tr><tr><td>S3 data access events</td><td>CloudTrail S3 data events in Account A</td><td>Which objects are being accessed, how often</td></tr><tr><td>KMS Decrypt events</td><td>CloudTrail in Account A</td><td>Decryption frequency — correlates with S3 access</td></tr><tr><td>Failed AssumeRole attempts</td><td>CloudTrail → filter <code>errorCode</code></td><td>Unauthorized assumption attempts — potential attack</td></tr><tr><td>Failed S3 access after assumption</td><td>CloudTrail → filter <code>errorCode = AccessDenied</code></td><td>Misconfiguration or unauthorized access attempt</td></tr><tr><td>Data transfer volume</td><td>AWS Cost Explorer → filter by S3 data transfer</td><td>Monitor cross-region transfer costs</td></tr></tbody></table>
+<p>→ <strong>EventBridge alerts for cross-account security (from Project 38):</strong></p>
+<table><thead><tr><th>Rule</th><th>Pattern</th><th>Target</th></tr></thead><tbody><tr><td>Unauthorized AssumeRole attempt</td><td><code>source: aws.sts</code>, <code>detail.errorCode: AccessDenied</code>, <code>detail.requestParameters.roleArn: CrossAccountReader*</code></td><td>SNS → Security team</td></tr><tr><td>Access to denied prefix</td><td><code>source: aws.s3</code>, <code>detail.errorCode: AccessDenied</code>, <code>detail.requestParameters.key: orders/*</code></td><td>SNS → Security team + CloudWatch Log</td></tr><tr><td>Unusual volume of cross-account reads</td><td>Custom metric alarm on GetObject count by assumed role</td><td>SNS → Operations team</td></tr></tbody></table>
+<p>→ <strong>How to present to the auditor:</strong></p>
+<table><thead><tr><th>Auditor Question</th><th>Your Evidence</th></tr></thead><tbody><tr><td>"Who has cross-account access?"</td><td>Show trust policy — lists specific external role ARNs</td></tr><tr><td>"What can they access?"</td><td>Show IAM policy — only products/ and pricing/ with specific S3 actions</td></tr><tr><td>"What can they NOT access?"</td><td>Show bucket policy explicit deny — orders/, segments/, write operations</td></tr><tr><td>"How are credentials managed?"</td><td>Show STS temporary credentials — auto-expire, no permanent keys</td></tr><tr><td>"Is there an audit trail?"</td><td>Show CloudTrail — every AssumeRole, GetObject, KMS Decrypt logged</td></tr><tr><td>"Can access be revoked instantly?"</td><td>Demonstrate: Remove role from trust policy → immediate denial</td></tr><tr><td>"Is the confused deputy problem addressed?"</td><td>Show External ID in trust policy condition</td></tr><tr><td>"Is encrypted data protected?"</td><td>Show KMS key policy — only cross-account role has Decrypt, not entire Account B</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Cross-account access is the MOST CRITICAL skill for enterprise AWS — real organizations have multiple accounts<br>
+→ AWS accounts are the STRONGEST isolation boundary — cross-account access must be EXPLICITLY granted from BOTH sides<br>
+→ Two methods exist: Bucket Policy (resource-based) and Role Assumption (identity-based) — Role Assumption is preferred for KMS-encrypted resources<br>
+→ The trust chain requires DUAL authorization: Trust Policy in Account A + IAM Policy in Account B — both must agree<br>
+→ External ID prevents confused deputy attacks — always use it for cross-account role assumption<br>
+→ For SSE-KMS encrypted S3 objects → THREE policies must align: Bucket Policy + KMS Key Policy + IAM Policy<br>
+→ EXPLICIT DENY in bucket policy is the strongest guardrail — overrides any Allow in any other policy<br>
+→ Temporary credentials from STS auto-expire — fundamentally more secure than permanent access keys<br>
+→ CloudTrail in BOTH accounts provides the complete audit trail of cross-account activity<br>
+→ Cross-region cross-account access incurs data transfer costs — evaluate replication vs direct access</p>
+<p><strong>Connection to previous projects:</strong><br>
+→ Project 1 created the S3 bucket — now accessed cross-account<br>
+→ Project 2 introduced IAM policies — now extended across account boundaries<br>
+→ Project 10 introduced bucket policies — now used for cross-account principals<br>
+→ Project 11 introduced IAM roles for EC2 — same role concept extended to cross-account trust<br>
+→ Project 36 introduced KMS encryption — key policy now includes cross-account role<br>
+→ Project 37 introduced Secrets Manager — External ID concept is similar (shared secret for trust)<br>
+→ Project 38 introduced EventBridge — now used for cross-account access monitoring</p>
+<p><strong>Connection to future projects:</strong><br>
+→ Project 40 (next) DEEPENS cross-account IAM role assumption with STS — covers role chaining, session policies, duration management, and multi-account governance patterns<br>
+→ Project 41 will implement cross-account SNS → SQS messaging — same trust model applied to messaging services<br>
+→ Project 42 will implement cross-account Glue Catalog sharing via Lake Formation — solving the Athena catalog visibility problem mentioned in Step 8<br>
+→ Project 44 will implement cross-account VPC Peering — network-level cross-account connectivity<br>
+→ Project 54 will introduce AWS Organizations + SCPs — replacing individual trust policies with organizational governance</p>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ Cross-account S3 access is working between HQ and Europe<br>
+→ But the DevOps lead raises a concern:</p>
+<blockquote>
+<p>"We now have 5 AWS accounts — HQ India, Europe, US, Japan, and a shared-services account.<br>
+Each account has different roles that need different levels of cross-account access.<br>
+We're creating individual cross-account roles manually for each pair of accounts.<br>
+That's 5 × 4 = 20 potential cross-account role pairs to manage.<br>
+Some roles need to chain through intermediate accounts.<br>
+Some sessions need to be scoped down for specific tasks.<br>
+Some roles need longer session durations for batch jobs.<br>
+We need a systematic approach to cross-account role management."</p>
+</blockquote>
+<p>→ The current project established the BASIC pattern: One trust relationship between two accounts<br>
+→ But scaling this to 5+ accounts with varying trust levels requires deeper STS understanding</p>
+<p>→ <strong>This is the exact problem Project 40 solves</strong><br>
+→ Project 40 dives deep into STS AssumeRole mechanics — role chaining, session policies, external ID management, duration configuration, and the confused deputy problem at scale<br>
+→ It establishes the GOVERNANCE patterns that make multi-account IAM manageable before AWS Organizations (Project 54) adds the organizational layer</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 40: "The DevOps Team That Managed 5 AWS Accounts — Cross-Account IAM Role Assumption (STS)"?</strong></p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-38.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 4 &bull; 39/60</span></div><a class="nav-btn next" href="project-40.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 30: THE COMPLIANCE TEAM THAT DEMANDED GEO-REDUNDANCY — Cross-Region S3 R — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 30: THE COMPLIANCE TEAM THAT DEMANDED GEO-REDUNDANCY — Cross-Region S3 Replication</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow's data infrastructure has matured significantly:</p>
+<ul>
+<li>S3 data lake: 8 TB of Parquet data across raw, transformed, operational, curated zones</li>
+<li>RDS MariaDB: Multi-AZ with Read Replicas (Project 29) — database tier is resilient</li>
+<li>Redshift: Loaded with optimized warehouse data (Project 22)</li>
+<li>All infrastructure runs in <code>ap-south-1</code> (Mumbai)</li>
+</ul>
+<p>→ Then the compliance team drops a bombshell:</p>
+<p>→ <strong>Problem 1: Regulatory Requirement — Geographic Data Redundancy</strong></p>
+<ul>
+<li>ShopNow processes payments → falls under PCI-DSS compliance</li>
+<li>The compliance audit finding states:
+<ul>
+<li>"Critical business data must be stored in at least TWO geographically separate locations"</li>
+<li>"Recovery from a regional disaster must be possible within 4 hours (RTO)"</li>
+<li>"Maximum acceptable data loss in a regional disaster: 15 minutes (RPO)"</li>
+</ul>
+</li>
+<li>Currently: ALL S3 data exists ONLY in <code>ap-south-1</code></li>
+<li>S3's 11 9s durability is within ONE region — if the entire region is unavailable, data is inaccessible</li>
+<li>The auditor's question: "If Mumbai experiences a catastrophic event — earthquake, widespread power failure, or regional AWS outage — how do you recover?"</li>
+<li>ShopNow's answer today: "We can't."</li>
+</ul>
+<p>→ <strong>Problem 2: The Accidental Deletion Incident</strong></p>
+<ul>
+<li>A junior engineer was cleaning up old test data in S3</li>
+<li>They intended to delete: <code>s3://shopnow-data-lake/raw/test-data/</code></li>
+<li>They accidentally deleted: <code>s3://shopnow-data-lake/raw/orders/</code> (3 months of raw order files)</li>
+<li>Versioning (Project 12 concept) was enabled → delete markers were placed → objects still recoverable</li>
+<li>But restoring 3 months of versioned objects was a manual, tedious process (90,000 files)</li>
+<li>Recovery took 8 hours of engineering time</li>
+<li>If versioning had NOT been enabled → data would be permanently lost</li>
+<li>The CTO asks: "What if versioning was off? What if the entire BUCKET was deleted?"</li>
+</ul>
+<p>→ <strong>Problem 3: Global Analyst Access</strong></p>
+<ul>
+<li>ShopNow expanded to the US market — 5 analysts now work from New York</li>
+<li>They query the data lake via Athena (Project 25)</li>
+<li>Every Athena query from US analysts scans S3 data in Mumbai</li>
+<li>Latency: 200-300ms round-trip per S3 request</li>
+<li>Large analytical queries that make thousands of S3 requests are noticeably slower</li>
+<li>Cross-region data transfer: $0.09/GB from ap-south-1 to US</li>
+<li>US analysts scanning 50 GB/day = $4.50/day = $135/month in cross-region transfer</li>
+</ul>
+<p>→ <strong>Problem 4: Business Continuity Plan Gap</strong></p>
+<ul>
+<li>The board requires a documented Business Continuity Plan (BCP)</li>
+<li>The BCP must include:
+<ul>
+<li>Where backup data is stored</li>
+<li>How quickly data can be recovered</li>
+<li>How operations resume in a disaster</li>
+</ul>
+</li>
+<li>Currently the BCP says: "S3 data is durable within the Mumbai region"</li>
+<li>The board says: "That's not a plan — that's a hope"</li>
+</ul>
+<p>→ <strong>Problem 5: Data Sovereignty Complexity</strong></p>
+<ul>
+<li>Indian customer data must remain in India (data residency requirement)</li>
+<li>But the BCP requires a copy OUTSIDE India for disaster recovery</li>
+<li>Contradiction? Not quite — the DR copy can exist in another region IF:
+<ul>
+<li>Access is restricted to DR scenarios only</li>
+<li>Encryption is maintained</li>
+<li>Proper legal agreements are in place</li>
+</ul>
+</li>
+<li>The replication target must be carefully chosen: Singapore (<code>ap-southeast-1</code>) — closest region, similar regulatory environment</li>
+</ul>
+<p>→ The CISO says: "I need automated, continuous replication of our entire data lake to a second AWS region — encrypted in transit and at rest, with monitoring that guarantees RPO &lt; 15 minutes, and the ability to fail over our analytics operations within 4 hours"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ First — understand what S3 Cross-Region Replication (CRR) is and isn't</p>
+<table><thead><tr><th>Aspect</th><th>What CRR IS</th><th>What CRR IS NOT</th></tr></thead><tbody><tr><td>Purpose</td><td>Automatic, asynchronous copy of objects to another region</td><td>Real-time synchronous replication</td></tr><tr><td>Trigger</td><td>Every new object uploaded → automatically replicated</td><td>Retroactive — existing objects NOT replicated by default</td></tr><tr><td>Granularity</td><td>Per-object replication</td><td>Bucket-level snapshot</td></tr><tr><td>Direction</td><td>Source bucket → destination bucket</td><td>NOT bidirectional (by default)</td></tr><tr><td>Latency</td><td>Most objects replicated within 15 minutes</td><td>NOT instant — asynchronous</td></tr><tr><td>Scope</td><td>New objects after rule is enabled</td><td>Existing objects require separate "Existing Object Replication" job</td></tr><tr><td>Versioning</td><td>REQUIRED on both source and destination</td><td>Cannot work without versioning</td></tr></tbody></table>
+<p>→ Prerequisites that must be in place BEFORE configuring CRR:</p>
+<ol>
+<li>Versioning enabled on SOURCE bucket (Project 12)</li>
+<li>Versioning enabled on DESTINATION bucket</li>
+<li>IAM Role for S3 to perform replication</li>
+<li>Destination bucket in a DIFFERENT region</li>
+</ol>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Enable versioning on source bucket (if not already — Project 12)</li>
+<li>Step 2 — Create destination bucket in target region</li>
+<li>Step 3 — Create IAM Role for replication</li>
+<li>Step 4 — Configure replication rules</li>
+<li>Step 5 — Handle existing objects (Batch Replication)</li>
+<li>Step 6 — Configure Replication Time Control (RTC) for SLA compliance</li>
+<li>Step 7 — Configure replication metrics and monitoring</li>
+<li>Step 8 — Configure encryption in replication</li>
+<li>Step 9 — Test replication and verify</li>
+<li>Step 10 — Plan for failover scenarios</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — ENABLE VERSIONING ON SOURCE BUCKET</h3>
+<p>→ From Project 12: Versioning may already be enabled on <code>shopnow-data-lake</code><br>
+→ If not → enable it now (CRR REQUIRES versioning on both buckets)</p>
+<p>→ Navigate to S3 Console → <code>shopnow-data-lake</code> → Properties → Bucket Versioning</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Bucket Versioning</td><td>Enabled</td></tr></tbody></table>
+<p>→ Once enabled → CANNOT be disabled (can only be "suspended")<br>
+→ Suspended versioning: New objects don't get versions, existing versions preserved</p>
+<p><strong>Why versioning is required for CRR:</strong><br>
+→ CRR replicates specific VERSION IDs of objects<br>
+→ Without versioning → S3 can't track which version has been replicated<br>
+→ Version ID is the replication "cursor" — S3 knows "I've replicated up to version X"</p>
+<hr>
+<h3>STEP 2 — CREATE DESTINATION BUCKET IN TARGET REGION</h3>
+<p>→ Navigate to S3 Console → Create Bucket</p>
+<p><strong>Destination Bucket Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Bucket name</td><td><code>shopnow-data-lake-dr-sgp</code></td><td>DR copy in Singapore; naming convention includes region hint</td></tr><tr><td>Region</td><td><code>ap-southeast-1</code> (Singapore)</td><td>Closest region to Mumbai for low replication latency</td></tr><tr><td>Bucket Versioning</td><td><strong>Enabled</strong></td><td>REQUIRED for CRR destination</td></tr><tr><td>Block Public Access</td><td>All blocked</td><td>Same security as source (Project 1, 10)</td></tr><tr><td>Default Encryption</td><td>SSE-KMS</td><td>Using KMS key in Singapore region</td></tr><tr><td>Tags</td><td><code>Purpose: disaster-recovery</code>, <code>Source: shopnow-data-lake</code></td><td>Identify as DR bucket</td></tr></tbody></table>
+<p><strong>Why Singapore?</strong></p>
+<table><thead><tr><th>Region Candidate</th><th>Distance from Mumbai</th><th>Latency</th><th>Rationale</th></tr></thead><tbody><tr><td><code>ap-southeast-1</code> (Singapore)</td><td>~3,800 km</td><td>~40ms</td><td>✅ Closest, similar regulatory environment</td></tr><tr><td><code>ap-southeast-2</code> (Sydney)</td><td>~8,500 km</td><td>~120ms</td><td>Good but farther</td></tr><tr><td><code>ap-northeast-1</code> (Tokyo)</td><td>~6,700 km</td><td>~90ms</td><td>Good but data sovereignty concerns with Japan</td></tr><tr><td><code>us-east-1</code> (Virginia)</td><td>~14,000 km</td><td>~200ms</td><td>Too far, different regulatory jurisdiction</td></tr><tr><td><code>eu-west-1</code> (Ireland)</td><td>~7,800 km</td><td>~130ms</td><td>GDPR complexity</td></tr></tbody></table>
+<p>→ Singapore: Lowest latency + regulatory compatibility + geographic separation from Mumbai</p>
+<p><strong>Destination Bucket Encryption:</strong></p>
+<p>→ The source bucket uses SSE-S3 or SSE-KMS in <code>ap-south-1</code><br>
+→ The destination bucket needs its OWN encryption key in <code>ap-southeast-1</code><br>
+→ KMS keys are REGIONAL — a key in Mumbai cannot be used in Singapore</p>
+<table><thead><tr><th>Source Bucket</th><th>Source Encryption</th><th>Destination Bucket</th><th>Destination Encryption</th></tr></thead><tbody><tr><td><code>shopnow-data-lake</code> (ap-south-1)</td><td>SSE-KMS (Mumbai KMS key)</td><td><code>shopnow-data-lake-dr-sgp</code> (ap-southeast-1)</td><td>SSE-KMS (Singapore KMS key)</td></tr></tbody></table>
+<p>→ Create a KMS key in <code>ap-southeast-1</code>:<br>
+→ Navigate to KMS Console → Switch region to Singapore → Create Key</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Key type</td><td>Symmetric</td></tr><tr><td>Key usage</td><td>Encrypt and decrypt</td></tr><tr><td>Alias</td><td><code>shopnow-data-lake-dr-key</code></td></tr><tr><td>Key administrators</td><td>Data engineering team</td></tr><tr><td>Key users</td><td>S3 replication role (created in Step 3)</td></tr></tbody></table>
+<hr>
+<h3>STEP 3 — CREATE IAM ROLE FOR REPLICATION</h3>
+<p>→ S3 needs an IAM Role to perform replication on your behalf<br>
+→ This role allows S3 to READ from source bucket and WRITE to destination bucket</p>
+<p>→ Navigate to IAM Console → Create Role</p>
+<p><strong>Trust Relationship:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Trusted entity type</td><td>AWS Service</td></tr><tr><td>Service</td><td>S3</td></tr></tbody></table>
+<p>→ Trust policy: <code>"Service": "s3.amazonaws.com"</code> can AssumeRole</p>
+<p><strong>Permissions Required:</strong></p>
+<p><strong>Source Bucket Permissions (Read):</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td><td></td></tr><tr><td>Action</td><td><code>s3:GetReplicationConfiguration</code>, <code>s3:ListBucket</code></td><td>Read replication rules</td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake</code></td><td>Source bucket</td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td><td></td></tr><tr><td>Action</td><td><code>s3:GetObjectVersionForReplication</code>, <code>s3:GetObjectVersionAcl</code>, <code>s3:GetObjectVersionTagging</code></td><td>Read object versions for replication</td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake/*</code></td><td>Source objects</td></tr></tbody></table>
+<p><strong>Destination Bucket Permissions (Write):</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td><td></td></tr><tr><td>Action</td><td><code>s3:ReplicateObject</code>, <code>s3:ReplicateDelete</code>, <code>s3:ReplicateTags</code></td><td>Write replicated objects</td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake-dr-sgp/*</code></td><td>Destination objects</td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td><td></td></tr><tr><td>Action</td><td><code>s3:ObjectOwnerOverrideToBucketOwner</code></td><td>Ensure destination account owns the objects</td></tr><tr><td>Resource</td><td><code>arn:aws:s3:::shopnow-data-lake-dr-sgp/*</code></td><td>Destination objects</td></tr></tbody></table>
+<p><strong>KMS Permissions (for encrypted objects):</strong></p>
+<table><thead><tr><th>Element</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td><td></td></tr><tr><td>Action</td><td><code>kms:Decrypt</code></td><td>Decrypt source objects (Mumbai KMS key)</td></tr><tr><td>Resource</td><td><code>arn:aws:kms:ap-south-1:123456789012:key/source-key-id</code></td><td>Source KMS key</td></tr></tbody></table>
+<table><thead><tr><th>Element</th><th>Value</th><th>Purpose</th></tr></thead><tbody><tr><td>Effect</td><td>Allow</td><td></td></tr><tr><td>Action</td><td><code>kms:Encrypt</code></td><td>Encrypt destination objects (Singapore KMS key)</td></tr><tr><td>Resource</td><td><code>arn:aws:kms:ap-southeast-1:123456789012:key/dest-key-id</code></td><td>Destination KMS key</td></tr></tbody></table>
+<p><strong>Role Name:</strong> <code>S3-CrossRegion-Replication-Role</code></p>
+<hr>
+<h3>STEP 4 — CONFIGURE REPLICATION RULES</h3>
+<p>→ Navigate to S3 Console → <code>shopnow-data-lake</code> → Management → Replication Rules → Create Rule</p>
+<p><strong>Rule 1: Replicate Entire Data Lake</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Rule name</td><td><code>full-data-lake-replication</code></td><td>Descriptive name</td></tr><tr><td>Status</td><td>Enabled</td><td>Active immediately</td></tr><tr><td>Priority</td><td>1</td><td>Higher number = higher priority when rules overlap</td></tr><tr><td>Source bucket</td><td><code>shopnow-data-lake</code></td><td>This bucket</td></tr><tr><td>Source scope</td><td>Apply to all objects in the bucket</td><td>Replicate everything</td></tr><tr><td>Destination bucket</td><td><code>shopnow-data-lake-dr-sgp</code></td><td>DR bucket in Singapore</td></tr><tr><td>Destination region</td><td><code>ap-southeast-1</code></td><td>Singapore</td></tr><tr><td>IAM Role</td><td><code>S3-CrossRegion-Replication-Role</code></td><td>Role from Step 3</td></tr></tbody></table>
+<p><strong>OR: Granular Rules Per Prefix</strong></p>
+<p>→ Instead of one rule for everything → create specific rules per data zone:</p>
+<p><strong>Rule 1: Raw Data</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>replicate-raw-data</code></td></tr><tr><td>Source prefix filter</td><td><code>raw/</code></td></tr><tr><td>Destination</td><td><code>shopnow-data-lake-dr-sgp</code></td></tr><tr><td>Priority</td><td>1</td></tr><tr><td>Storage class override</td><td>S3 Standard-IA (raw data in DR is rarely accessed)</td></tr></tbody></table>
+<p><strong>Rule 2: Transformed Data</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>replicate-transformed-data</code></td></tr><tr><td>Source prefix filter</td><td><code>transformed/</code></td></tr><tr><td>Destination</td><td><code>shopnow-data-lake-dr-sgp</code></td></tr><tr><td>Priority</td><td>2</td></tr><tr><td>Storage class override</td><td>S3 Standard (transformed data may be actively queried in DR)</td></tr></tbody></table>
+<p><strong>Rule 3: Curated Data (Critical)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>replicate-curated-data</code></td></tr><tr><td>Source prefix filter</td><td><code>curated/</code></td></tr><tr><td>Destination</td><td><code>shopnow-data-lake-dr-sgp</code></td></tr><tr><td>Priority</td><td>3 (highest)</td></tr><tr><td>Replication Time Control</td><td>Enabled (SLA: 99.99% within 15 minutes)</td></tr><tr><td>Storage class override</td><td>S3 Standard</td></tr></tbody></table>
+<p><strong>Rule 4: Analytics Pre-Computed (Optional)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>replicate-analytics</code></td></tr><tr><td>Source prefix filter</td><td><code>analytics/</code></td></tr><tr><td>Destination</td><td><code>shopnow-data-lake-dr-sgp</code></td></tr><tr><td>Priority</td><td>4</td></tr><tr><td>Storage class override</td><td>S3 Standard-IA</td></tr></tbody></table>
+<p><strong>Why granular rules?</strong></p>
+<table><thead><tr><th>Benefit</th><th>Explanation</th></tr></thead><tbody><tr><td>Different storage classes per zone</td><td>Raw data in DR uses cheaper IA; curated stays Standard</td></tr><tr><td>Different SLAs per zone</td><td>Curated data gets RTC (guaranteed 15-min); raw data is best-effort</td></tr><tr><td>Selective replication</td><td>Can exclude test/temp prefixes from replication</td></tr><tr><td>Cost optimization</td><td>Don't replicate data that can be regenerated (e.g., Athena query results)</td></tr><tr><td>Monitoring granularity</td><td>Track replication metrics per rule</td></tr></tbody></table>
+<hr>
+<p><strong>Additional Rule Settings:</strong></p>
+<p><strong>Delete Marker Replication:</strong></p>
+<table><thead><tr><th>Setting</th><th>Options</th><th>Recommendation</th></tr></thead><tbody><tr><td>Delete marker replication</td><td>Enabled / Disabled</td><td><strong>Enabled</strong> — when you delete in source, delete in destination too</td></tr></tbody></table>
+<p>→ If enabled: Deleting an object in source → delete marker replicated to destination → object "deleted" in both<br>
+→ If disabled: Deleting in source does NOT affect destination → destination retains the object<br>
+→ For DR purposes: <strong>Enable</strong> — keeps source and destination in sync<br>
+→ For protection against accidental deletion: <strong>Disable</strong> — destination retains objects even if source is deleted</p>
+<p>→ ShopNow's choice: <strong>Disable delete marker replication</strong><br>
+→ Rationale: If someone accidentally deletes objects in source (Problem 2), the DR copy is preserved<br>
+→ This provides an additional safety net beyond versioning</p>
+<p><strong>Replica Modifications Sync:</strong></p>
+<table><thead><tr><th>Setting</th><th>Options</th><th>Recommendation</th></tr></thead><tbody><tr><td>Replica modifications sync</td><td>Enabled / Disabled</td><td>Disabled (default)</td></tr></tbody></table>
+<p>→ If enabled: Changes made to the REPLICA are synced BACK to the source<br>
+→ This enables bidirectional replication<br>
+→ For DR (one-way): <strong>Disabled</strong> — destination is a passive copy</p>
+<p><strong>Storage Class Override:</strong></p>
+<table><thead><tr><th>Setting</th><th>Options</th><th>Purpose</th></tr></thead><tbody><tr><td>Change storage class for replicated objects</td><td>Same as source / Override to specific class</td><td>Override for cost savings</td></tr></tbody></table>
+<p>→ Override options:</p>
+<table><thead><tr><th>Source Class</th><th>Destination Override</th><th>Monthly Cost Savings</th></tr></thead><tbody><tr><td>S3 Standard</td><td>S3 Standard-IA</td><td>~45% cheaper storage</td></tr><tr><td>S3 Standard</td><td>S3 Glacier Instant Retrieval</td><td>~68% cheaper storage</td></tr><tr><td>S3 Standard</td><td>S3 One Zone-IA</td><td>~60% cheaper (but single AZ — less resilient)</td></tr></tbody></table>
+<p>→ For DR data that's rarely accessed: S3 Standard-IA is the sweet spot<br>
+→ For compliance archives: S3 Glacier Instant Retrieval<br>
+→ Never use One Zone-IA for DR — defeats the purpose of geographic redundancy</p>
+<hr>
+<h3>STEP 5 — HANDLE EXISTING OBJECTS (BATCH REPLICATION)</h3>
+<p>→ <strong>Critical understanding</strong>: CRR only replicates objects uploaded AFTER the rule is enabled<br>
+→ The 8 TB of existing data in the data lake is NOT automatically replicated</p>
+<p><strong>Before CRR enabled:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Source: 8 TB of existing objects (NOT replicated)
+</span>Destination: Empty
+
+After CRR enabled:
+Source: 8 TB existing + new objects
+Destination: ONLY new objects replicated</code></pre></div>
+<p>→ To replicate existing objects → use S3 Batch Replication</p>
+<p>→ Navigate to S3 Console → <code>shopnow-data-lake</code> → Management → Replication Rules<br>
+→ After creating rules → S3 prompts: "Do you want to replicate existing objects?"</p>
+<table><thead><tr><th>Option</th><th>Behavior</th></tr></thead><tbody><tr><td>Yes, replicate existing objects</td><td>Creates a Batch Replication job</td></tr><tr><td>No, do not replicate existing objects</td><td>Only new objects going forward</td></tr></tbody></table>
+<p>→ Choose: <strong>Yes, replicate existing objects</strong></p>
+<p><strong>Batch Replication Job Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Scope</td><td>All existing objects</td><td>Replicate everything</td></tr><tr><td>Priority</td><td>Normal</td><td>Background processing</td></tr><tr><td>IAM Role</td><td><code>S3-CrossRegion-Replication-Role</code></td><td>Same role as CRR</td></tr><tr><td>Completion report</td><td>Enabled</td><td>Generate report of replicated objects</td></tr><tr><td>Report destination</td><td><code>s3://shopnow-ops-reports/replication/</code></td><td>Where to store the report</td></tr></tbody></table>
+<p><strong>Batch Replication Timeline:</strong></p>
+<table><thead><tr><th>Data Volume</th><th>Estimated Time</th><th>Cost</th></tr></thead><tbody><tr><td>1 TB</td><td>4-8 hours</td><td>S3 request costs + cross-region transfer</td></tr><tr><td>8 TB</td><td>24-48 hours</td><td>~$720 cross-region transfer ($0.09/GB)</td></tr><tr><td>50 TB</td><td>5-10 days</td><td>~$4,500 cross-region transfer</td></tr></tbody></table>
+<p>→ ShopNow's 8 TB: ~$720 one-time cost + 24-48 hours<br>
+→ After batch replication completes → destination has full copy<br>
+→ Ongoing CRR handles all new objects automatically</p>
+<p><strong>Cross-Region Data Transfer Cost (Ongoing):</strong></p>
+<table><thead><tr><th>Daily New Data</th><th>Monthly Volume</th><th>Monthly CRR Transfer Cost</th></tr></thead><tbody><tr><td>5 GB/day</td><td>150 GB</td><td>$13.50 ($0.09/GB)</td></tr><tr><td>10 GB/day</td><td>300 GB</td><td>$27.00</td></tr><tr><td>20 GB/day</td><td>600 GB</td><td>$54.00</td></tr></tbody></table>
+<p>→ ShopNow adds ~10 GB/day to the data lake → $27/month ongoing replication cost<br>
+→ Plus destination storage: 8 TB × $0.025/GB (Standard-IA) = ~$200/month<br>
+→ Total DR cost: ~$227/month for complete geographic redundancy of 8 TB data lake</p>
+<hr>
+<h3>STEP 6 — CONFIGURE REPLICATION TIME CONTROL (RTC)</h3>
+<p>→ Standard CRR is "best effort" — most objects replicate within minutes, but no SLA<br>
+→ Replication Time Control (RTC) provides a guaranteed SLA:</p>
+<ul>
+<li><strong>99.99% of objects replicated within 15 minutes</strong></li>
+<li>Backed by S3 SLA</li>
+</ul>
+<p>→ Navigate to Replication Rule → Edit → Enable Replication Time Control</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Replication Time Control</td><td>Enabled</td><td>SLA-backed replication</td></tr><tr><td>Replication Metrics</td><td>Enabled (required with RTC)</td><td>Track replication progress</td></tr></tbody></table>
+<p><strong>RTC Pricing:</strong></p>
+<table><thead><tr><th>Component</th><th>Cost</th></tr></thead><tbody><tr><td>RTC per-GB charge</td><td>$0.015 per GB replicated</td></tr><tr><td>Standard CRR (without RTC)</td><td>$0.00 (no additional charge beyond transfer)</td></tr></tbody></table>
+<p>→ RTC adds $0.015/GB on TOP of cross-region transfer ($0.09/GB)<br>
+→ Total with RTC: $0.105/GB vs $0.09/GB without RTC</p>
+<p><strong>When to use RTC:</strong></p>
+<table><thead><tr><th>Data</th><th>RTC?</th><th>Rationale</th></tr></thead><tbody><tr><td>Curated business data</td><td>✅ Yes</td><td>RPO &lt; 15 minutes required by compliance</td></tr><tr><td>Raw ingestion data</td><td>❌ No</td><td>Can be re-ingested; best-effort is sufficient</td></tr><tr><td>Transformed Parquet</td><td>⚠️ Optional</td><td>Can be regenerated from raw; but faster DR with RTC</td></tr><tr><td>Analytics pre-computed</td><td>❌ No</td><td>Can be recomputed; not critical for DR</td></tr></tbody></table>
+<p>→ ShopNow: Enable RTC only for <code>curated/</code> prefix (Rule 3) — balance cost and compliance</p>
+<hr>
+<h3>STEP 7 — CONFIGURE REPLICATION METRICS AND MONITORING</h3>
+<p>→ When replication rules are created with metrics enabled:</p>
+<p><strong>S3 Replication Metrics (CloudWatch):</strong></p>
+<table><thead><tr><th>Metric</th><th>Meaning</th><th>Healthy Value</th></tr></thead><tbody><tr><td><code>ReplicationLatency</code></td><td>Time between object creation in source and replication completion</td><td>&lt; 900 seconds (15 min) for RTC</td></tr><tr><td><code>BytesPendingReplication</code></td><td>Total bytes waiting to be replicated</td><td>Should trend toward 0</td></tr><tr><td><code>OperationsPendingReplication</code></td><td>Number of objects waiting to be replicated</td><td>Should trend toward 0</td></tr><tr><td><code>OperationsFailedReplication</code></td><td>Number of objects that FAILED to replicate</td><td>Should be 0</td></tr></tbody></table>
+<p><strong>CloudWatch Alarms:</strong></p>
+<p><strong>Alarm 1: Replication Latency Exceeding SLA</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>S3</code> → <code>ReplicationLatency</code></td></tr><tr><td>Source bucket dimension</td><td><code>shopnow-data-lake</code></td></tr><tr><td>Rule dimension</td><td><code>replicate-curated-data</code></td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>300 seconds</td></tr><tr><td>Threshold</td><td>&gt; 900 seconds (15 minutes)</td></tr><tr><td>Alarm Action</td><td>SNS <code>shopnow-ops-critical</code></td></tr></tbody></table>
+<p><strong>Alarm 2: Failed Replication Operations</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>OperationsFailedReplication</code></td></tr><tr><td>Statistic</td><td>Sum</td></tr><tr><td>Period</td><td>300 seconds</td></tr><tr><td>Threshold</td><td>&gt; 0</td></tr><tr><td>Alarm Action</td><td>SNS <code>shopnow-ops-critical</code></td></tr></tbody></table>
+<p><strong>Alarm 3: Replication Backlog Growing</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Metric</td><td><code>BytesPendingReplication</code></td></tr><tr><td>Statistic</td><td>Maximum</td></tr><tr><td>Period</td><td>900 seconds (15 minutes)</td></tr><tr><td>Threshold</td><td>&gt; 10 GB (growing backlog)</td></tr><tr><td>Alarm Action</td><td>SNS <code>shopnow-ops-alerts</code></td></tr></tbody></table>
+<p>→ Pending bytes &gt; 0 is NORMAL during active ingestion<br>
+→ Pending bytes GROWING over time indicates replication is falling behind → investigate</p>
+<p><strong>Monitoring Dashboard:</strong></p>
+<table><thead><tr><th>Widget</th><th>Metric</th><th>Purpose</th></tr></thead><tbody><tr><td>Replication Latency (line chart)</td><td>ReplicationLatency per rule</td><td>Verify SLA compliance</td></tr><tr><td>Pending Bytes (area chart)</td><td>BytesPendingReplication</td><td>Replication backlog visibility</td></tr><tr><td>Pending Operations (number)</td><td>OperationsPendingReplication</td><td>Current queue depth</td></tr><tr><td>Failed Operations (number)</td><td>OperationsFailedReplication</td><td>Error indicator — should be 0</td></tr><tr><td>Bytes replicated (daily sum)</td><td>Custom calculation from S3 metrics</td><td>Track daily replication volume</td></tr></tbody></table>
+<hr>
+<h3>STEP 8 — CONFIGURE ENCRYPTION IN REPLICATION</h3>
+<p>→ ShopNow uses SSE-KMS encryption (Project 36 concept)<br>
+→ CRR must handle the encryption transition between regions</p>
+<p><strong>Encryption Flow During Replication:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOURCE (ap-south-1):
+</span>  Object stored encrypted with Mumbai KMS key
+       ↓
+S3 Replication:
+  ├── S3 decrypts object using Mumbai KMS key
+  │     (Replication role needs kms:Decrypt on Mumbai key)
+  ├── S3 transfers decrypted data over TLS (encrypted in transit)
+  └── S3 encrypts object using Singapore KMS key
+        (Replication role needs kms:Encrypt on Singapore key)
+       ↓
+DESTINATION (ap-southeast-1):
+  Object stored encrypted with Singapore KMS key</code></pre></div>
+<p>→ Key point: Objects are RE-ENCRYPTED with the destination region's KMS key<br>
+→ The source key CANNOT be used in the destination region (KMS keys are regional)</p>
+<p><strong>Replication Rule Encryption Configuration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Replicate objects encrypted with KMS</td><td>Enabled</td><td>Required for SSE-KMS objects</td></tr><tr><td>Source KMS key</td><td><code>arn:aws:kms:ap-south-1:…:key/source-key-id</code></td><td>Key used to encrypt source objects</td></tr><tr><td>Destination KMS key</td><td><code>arn:aws:kms:ap-southeast-1:…:key/dest-key-id</code></td><td>Key to encrypt destination objects</td></tr></tbody></table>
+<p>→ If this setting is NOT enabled → SSE-KMS encrypted objects are SKIPPED (not replicated!)<br>
+→ This is a common mistake: CRR appears to work but KMS-encrypted objects silently fail to replicate</p>
+<p><strong>What about SSE-S3 encrypted objects?</strong><br>
+→ SSE-S3 objects replicate automatically — no special configuration needed<br>
+→ S3 manages the keys in both regions transparently</p>
+<p><strong>Encryption summary:</strong></p>
+<table><thead><tr><th>Source Encryption</th><th>CRR Configuration Needed</th><th>Destination Encryption</th></tr></thead><tbody><tr><td>SSE-S3</td><td>None (automatic)</td><td>SSE-S3 (destination default)</td></tr><tr><td>SSE-KMS</td><td>Must enable KMS replication + specify keys</td><td>SSE-KMS (destination KMS key)</td></tr><tr><td>SSE-C (customer-provided)</td><td>NOT supported by CRR</td><td>Cannot replicate</td></tr><tr><td>No encryption</td><td>None</td><td>Destination default encryption applies</td></tr></tbody></table>
+<hr>
+<h3>STEP 9 — TEST REPLICATION AND VERIFY</h3>
+<p><strong>Test 1: New Object Replication</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Upload test file to source: <code>s3://shopnow-data-lake/test/replication-test.txt</code></td><td>File appears in source</td></tr><tr><td>2</td><td>Wait 5 minutes</td><td>—</td></tr><tr><td>3</td><td>Check destination: <code>s3://shopnow-data-lake-dr-sgp/test/replication-test.txt</code></td><td>File appears in destination</td></tr><tr><td>4</td><td>Compare file size and metadata</td><td>Identical</td></tr><tr><td>5</td><td>Check replication status on source object</td><td>Properties → Replication Status: COMPLETED</td></tr></tbody></table>
+<p><strong>Replication Status Values:</strong></p>
+<table><thead><tr><th>Status</th><th>Meaning</th></tr></thead><tbody><tr><td>PENDING</td><td>Object queued for replication</td></tr><tr><td>COMPLETED</td><td>Successfully replicated to destination</td></tr><tr><td>FAILED</td><td>Replication failed — check permissions, encryption config</td></tr><tr><td>REPLICA</td><td>This object IS a replica (on the destination side)</td></tr></tbody></table>
+<p><strong>Test 2: Large File Replication Timing</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Upload 1 GB test file to source</td><td>Note upload completion time</td></tr><tr><td>2</td><td>Monitor CloudWatch ReplicationLatency</td><td>Track replication progress</td></tr><tr><td>3</td><td>Check destination for the file</td><td>Note when file appears</td></tr><tr><td>4</td><td>Calculate replication time</td><td>Should be &lt; 15 minutes (with RTC)</td></tr></tbody></table>
+<p><strong>Test 3: Delete Marker Behavior</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Delete <code>replication-test.txt</code> from source</td><td>Delete marker created in source</td></tr><tr><td>2</td><td>Check destination</td><td>File should STILL exist (delete markers not replicated per our config)</td></tr><tr><td>3</td><td>Verify this is desired behavior</td><td>DR copy preserved even after source deletion ✅</td></tr></tbody></table>
+<p><strong>Test 4: Batch Replication Verification</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Check Batch Replication job status</td><td>S3 Console → Batch Operations</td></tr><tr><td>2</td><td>Download completion report</td><td>CSV listing all replicated objects</td></tr><tr><td>3</td><td>Compare object counts: source vs destination</td><td>Counts should match</td></tr><tr><td>4</td><td>Spot-check: randomly select 10 objects → verify in destination</td><td>All 10 present with correct size</td></tr></tbody></table>
+<p><strong>Test 5: Encryption Verification</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th></tr></thead><tbody><tr><td>1</td><td>Upload SSE-KMS encrypted file to source</td><td>Encrypted with Mumbai key</td></tr><tr><td>2</td><td>Check destination after replication</td><td>File exists</td></tr><tr><td>3</td><td>Check destination file encryption</td><td>Encrypted with Singapore key (NOT Mumbai key)</td></tr><tr><td>4</td><td>Verify decryptable in Singapore</td><td>Download from destination → content intact</td></tr></tbody></table>
+<hr>
+<h3>STEP 10 — PLAN FOR FAILOVER SCENARIOS</h3>
+<p><strong>Scenario A: Source Region Temporarily Unavailable (Hours)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ap-south-1 (Mumbai) becomes unavailable
+</span>       ↓
+Analysts cannot access source bucket
+       ↓
+FAILOVER STEPS:
+  1. Verify destination bucket is accessible
+  2. Update Athena workgroup → point to destination bucket
+       ├── Create Glue Catalog in ap-southeast-1
+       ├── Run Crawler on destination bucket
+       └── Configure Athena in Singapore region
+  3. Analysts query destination data via Athena in Singapore
+  4. RPO: Up to 15 minutes of data loss (last unreplicated objects)
+  5. RTO: ~2-4 hours (time to set up Athena in Singapore)
+       ↓
+WHEN SOURCE RECOVERS:
+  1. Verify source data integrity
+  2. Switch analysts back to source
+  3. Any objects created in destination during outage → replicate back (manual)</code></pre></div>
+<p><strong>Scenario B: Source Bucket Accidentally Deleted</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Someone deletes shopnow-data-lake bucket entirely
+</span>       ↓
+RECOVERY STEPS:
+  1. Destination bucket still has ALL data (delete markers not replicated)
+  2. Create new source bucket with same name
+  3. Enable versioning on new bucket
+  4. Copy data from destination back to source
+     (S3 Batch Copy or S3 Sync via CLI)
+  5. Re-enable CRR rules
+  6. RPO: Up to 15 minutes (RTC) or potentially longer for non-RTC prefixes
+  7. RTO: 4-24 hours depending on data volume</code></pre></div>
+<p><strong>Scenario C: Data Corruption in Source</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ETL bug corrupts Parquet files in transformed/ prefix
+</span>       ↓
+RECOVERY STEPS:
+  1. Identify corruption timeframe
+  2. In destination bucket:
+     ├── Corrupted files were replicated (replication doesn't validate content)
+     ├── BUT versioning preserves pre-corruption versions
+     └── Retrieve previous versions of corrupted files from DESTINATION
+  3. Copy correct versions back to source
+  4. Re-run ETL on corrected data
+  5. RPO: Depends on when corruption was detected</code></pre></div>
+<p>→ Key insight: CRR + Versioning provides the strongest protection:</p>
+<ul>
+<li>CRR protects against regional failure</li>
+<li>Versioning protects against corruption and accidental deletion</li>
+<li>Together they cover almost every data loss scenario</li>
+</ul>
+<p><strong>Failover Readiness Checklist:</strong></p>
+<table><thead><tr><th>Item</th><th>Status</th><th>Verified Date</th></tr></thead><tbody><tr><td>Destination bucket exists and is accessible</td><td>✅</td><td>2025-01-15</td></tr><tr><td>All replication rules active</td><td>✅</td><td>2025-01-15</td></tr><tr><td>Batch replication of existing objects complete</td><td>✅</td><td>2025-01-17</td></tr><tr><td>RTC enabled for curated data</td><td>✅</td><td>2025-01-15</td></tr><tr><td>Replication metrics show healthy</td><td>✅</td><td>Daily monitoring</td></tr><tr><td>Failed operations = 0</td><td>✅</td><td>Daily monitoring</td></tr><tr><td>Athena configuration documented for Singapore</td><td>✅</td><td>2025-01-20</td></tr><tr><td>Failover runbook documented</td><td>✅</td><td>2025-01-22</td></tr><tr><td>Failover test completed</td><td>✅</td><td>Quarterly test</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable versioning on BOTH source and destination buckets — CRR requires it<br>
+→ Always create granular replication rules per prefix — different SLAs and storage classes per data zone<br>
+→ Always disable delete marker replication for DR buckets — preserves data even if source is accidentally deleted<br>
+→ Always enable RTC for compliance-critical data — guarantees 15-minute RPO<br>
+→ Always configure replication metrics and CloudWatch alarms — detect failures immediately<br>
+→ Always handle existing objects via Batch Replication — CRR only covers new objects<br>
+→ Always test replication with actual files — verify end-to-end before relying on it<br>
+→ Always document the failover runbook — step-by-step instructions for regional disaster<br>
+→ Always test failover quarterly — an untested DR plan is not a DR plan<br>
+→ Always use a restrictive endpoint policy on the destination bucket — DR data should not be casually accessed<br>
+→ Always configure KMS replication settings for SSE-KMS encrypted objects — otherwise they silently fail to replicate<br>
+→ Always monitor <code>OperationsFailedReplication</code> — even one failure means data gap in DR</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never assume CRR replicates existing objects — only NEW objects after rule creation<br>
+→ Never forget to enable versioning on both buckets — CRR will fail without it<br>
+→ Never enable delete marker replication for DR — accidental source deletion propagates to DR<br>
+→ Never skip KMS encryption configuration — SSE-KMS objects silently fail to replicate<br>
+→ Never use the same KMS key for source and destination — KMS keys are regional<br>
+→ Never rely on CRR without monitoring — silent failures create false sense of security<br>
+→ Never set RTC on ALL prefixes — RTC costs $0.015/GB; use only for critical data<br>
+→ Never use One Zone-IA for DR destination — single AZ storage defeats geographic redundancy<br>
+→ Never treat CRR as a backup solution alone — it replicates deletions too (unless delete markers disabled)<br>
+→ Never skip batch replication for existing data — your DR copy is incomplete<br>
+→ Never forget cross-region transfer costs — $0.09/GB adds up for large datasets<br>
+→ Never store DR bucket credentials or access in the same region as source — if source region fails, you need independent access</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE CROSS-REGION REPLICATION</h2>
+<table><thead><tr><th>Scenario</th><th>Use CRR?</th><th>Why</th></tr></thead><tbody><tr><td>Compliance requires geographic data redundancy</td><td>✅ Yes</td><td>Primary use case</td></tr><tr><td>Disaster recovery for critical data</td><td>✅ Yes</td><td>Regional failure protection</td></tr><tr><td>Global user access (reduce latency for remote users)</td><td>✅ Yes</td><td>Data closer to users</td></tr><tr><td>Protection against accidental deletion (with delete markers disabled)</td><td>✅ Yes</td><td>DR copy preserved</td></tr><tr><td>Cross-region analytics (Athena in multiple regions)</td><td>✅ Yes</td><td>Local data access in each region</td></tr><tr><td>Same-region redundancy</td><td>❌ No</td><td>Use Same-Region Replication (SRR) instead</td></tr><tr><td>Real-time synchronization requirement</td><td>❌ No</td><td>CRR is asynchronous (seconds to minutes lag)</td></tr><tr><td>Backup of transactional database</td><td>❌ No</td><td>Use RDS automated backups, snapshots, or DMS</td></tr><tr><td>Cost-constrained environment with no compliance requirement</td><td>❌ No</td><td>S3 durability (11 9s) within region may be sufficient</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE CROSS-REGION REPLICATION</h2>
+<p>→ When compliance doesn't require geographic redundancy AND budget is tight → S3's within-region durability is sufficient<br>
+→ When data can be easily regenerated → replicating derived data (CTAS tables, Athena results) may not be worth the cost<br>
+→ When real-time sync is required → CRR lag (seconds to minutes) may be too high → consider DynamoDB Global Tables or Aurora Global Database<br>
+→ When data volume is enormous (100+ TB) and budget is constrained → cross-region transfer at $0.09/GB = $9,000+ one-time + ongoing costs</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → CRR REPLICATION ENGINE</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Object uploaded to source bucket:
+</span>  PutObject → s3://shopnow-data-lake/transformed/orders/year=2025/month=01/day=16/part-00000.parquet
+       ↓
+S3 assigns Version ID: v_abc123
+       ↓
+S3 checks replication rules:
+  ├── Rule: "replicate-transformed-data"
+  ├── Prefix filter: "transformed/" → MATCHES ✅
+  ├── Status: Enabled ✅
+  └── Object eligible for replication
+       ↓
+S3 Replication Engine (AWS-managed):
+  ├── Queues object for replication
+  ├── Priority: Based on rule priority and RTC status
+  │
+  ├── READ PHASE:
+  │     ├── Assume IAM Role: S3-CrossRegion-Replication-Role
+  │     ├── Read object from source bucket
+  │     ├── If SSE-KMS: Decrypt using source KMS key (kms:Decrypt)
+  │     └── Object content in memory/buffer
+  │
+  ├── TRANSFER PHASE:
+  │     ├── Establish TLS connection to destination region
+  │     ├── Transfer object over AWS backbone network
+  │     ├── NOT over public internet — AWS private infrastructure
+  │     └── Transfer is encrypted in transit (TLS)
+  │
+  └── WRITE PHASE:
+        ├── If SSE-KMS: Encrypt using destination KMS key (kms:Encrypt)
+        ├── Write object to destination bucket
+        ├── Preserve: object key, metadata, tags, ACL
+        ├── Version ID in destination: NEW (different from source)
+        └── Replication Status on source: COMPLETED
+       ↓
+CloudWatch Metrics updated:
+  ├── ReplicationLatency: Time from upload to replication completion
+  ├── BytesPendingReplication: Decremented
+  └── OperationsPendingReplication: Decremented</code></pre></div>
+<hr>
+<h3>2 → REPLICATION TIME CONTROL (RTC) INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT RTC (Best Effort):
+</span>  ├── Objects queued in standard replication pipeline
+  ├── Most objects replicate within minutes
+  ├── No guarantee — could take hours during S3 service degradation
+  └── No SLA or financial backing
+
+WITH RTC:
+  ├── Objects enter PRIORITY replication pipeline
+  ├── S3 commits to 99.99% of objects replicated within 15 minutes
+  ├── RTC objects get dedicated replication bandwidth
+  ├── S3 monitors per-rule compliance
+  │     ├── If approaching 15-minute threshold → escalate priority
+  │     └── CloudWatch metric: ReplicationLatency tracks actual time
+  └── Backed by S3 SLA — credits if commitment missed</code></pre></div>
+<p><strong>RTC SLA breakdown:</strong><br>
+→ 99.99% within 15 minutes means:</p>
+<ul>
+<li>Out of 10,000 objects → 9,999 replicate within 15 minutes</li>
+<li>1 object MAY take longer (but typically still within 30 minutes)</li>
+<li>This meets ShopNow's RPO requirement of 15 minutes</li>
+</ul>
+<hr>
+<h3>3 → VERSIONING AND REPLICATION INTERACTION</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOURCE BUCKET:
+</span>  Object: transformed/orders/part-00000.parquet
+    ├── Version 1 (v_001): Original upload → REPLICATED
+    ├── Version 2 (v_002): Overwrite (new ETL run) → REPLICATED
+    └── Delete Marker (v_003): Object deleted → NOT replicated (disabled)
+
+DESTINATION BUCKET:
+  Object: transformed/orders/part-00000.parquet
+    ├── Version 1 (v_abc): Replica of source v_001
+    └── Version 2 (v_def): Replica of source v_002
+    (No delete marker — object still accessible in destination!)</code></pre></div>
+<p>→ Each source version is replicated as a NEW version in the destination<br>
+→ Version IDs differ between source and destination (they're independent)<br>
+→ Delete marker replication disabled → destination retains all versions even after source deletion</p>
+<p><strong>Version lifecycle with replication:</strong></p>
+<table><thead><tr><th>Source Action</th><th>Source State</th><th>Destination State (delete markers disabled)</th></tr></thead><tbody><tr><td>Upload file</td><td>v1 created</td><td>v1 replicated</td></tr><tr><td>Overwrite file</td><td>v2 created (v1 retained)</td><td>v2 replicated (v1 retained)</td></tr><tr><td>Delete file</td><td>Delete marker (v1, v2 still exist under versions)</td><td>NO delete marker — v1, v2 still directly accessible</td></tr><tr><td>Permanently delete v1</td><td>v1 removed from source</td><td>v1 STILL exists in destination</td></tr></tbody></table>
+<p>→ This makes the destination a SUPERSET of the source in terms of data retention<br>
+→ Even permanent deletions in source don't affect destination</p>
+<hr>
+<h3>4 → CROSS-REGION DATA TRANSFER PATH</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Source: ap-south-1 (Mumbai)
+</span>Destination: ap-southeast-1 (Singapore)
+
+Transfer path:
+  S3 Mumbai data center
+    → AWS Mumbai backbone router
+      → AWS inter-region backbone fiber
+        (Mumbai → Singapore: ~3,800 km undersea cable)
+      → AWS Singapore backbone router
+    → S3 Singapore data center
+  
+  Characteristics:
+  ├── PRIVATE AWS network — never touches public internet
+  ├── Encrypted in transit (TLS)
+  ├── Latency: ~40ms one-way
+  ├── Bandwidth: AWS manages — scales with volume
+  └── Cost: $0.09/GB (Mumbai → Singapore)</code></pre></div>
+<p>→ The transfer is over AWS's PRIVATE global backbone<br>
+→ Not the public internet — higher bandwidth, lower latency, more reliable<br>
+→ This is why CRR is faster and more reliable than manual cross-region copy</p>
+<hr>
+<h3>5 → BATCH REPLICATION INTERNALS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Batch Replication job initiated
+</span>       ↓
+S3 generates INVENTORY of all existing objects in source bucket
+  ├── Lists all objects across all prefixes
+  ├── Checks each object's replication status
+  └── Identifies objects NOT yet replicated
+       ↓
+S3 creates a MANIFEST of objects to replicate
+  ├── Each object: key, version ID, size
+  └── Total manifest may contain millions of entries
+       ↓
+S3 Batch Operations processes the manifest:
+  ├── Reads objects from source (in parallel)
+  ├── Transfers to destination region
+  ├── Writes to destination bucket
+  └── Updates replication status on source objects
+       ↓
+Completion report generated:
+  ├── Successful replications
+  ├── Failed replications (with error reasons)
+  └── Total objects/bytes processed
+       ↓
+Ongoing CRR takes over for new objects</code></pre></div>
+<p>→ Batch Replication is a ONE-TIME job to catch up existing objects<br>
+→ After completion → CRR handles everything going forward<br>
+→ If batch replication fails for some objects → review completion report → retry failed objects</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<hr>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>Symptom</th><th>Root Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>1</td><td>Existing objects not replicated</td><td>Destination missing historical data</td><td>CRR only covers new objects; batch replication not run</td><td>Run S3 Batch Replication for existing objects</td></tr><tr><td>2</td><td>SSE-KMS objects not replicating</td><td>Some objects show FAILED replication status</td><td>KMS replication not enabled in rule OR IAM role missing kms:Decrypt/Encrypt</td><td>Enable KMS replication; add KMS permissions to role</td></tr><tr><td>3</td><td>Replication latency exceeding SLA</td><td>ReplicationLatency &gt; 15 minutes</td><td>RTC not enabled OR large object sizes OR S3 service degradation</td><td>Enable RTC for critical prefixes; monitor CloudWatch</td></tr><tr><td>4</td><td>Delete in source deletes DR copy</td><td>Object deleted from destination after source deletion</td><td>Delete marker replication is enabled</td><td>Disable delete marker replication for DR buckets</td></tr><tr><td>5</td><td>Destination bucket costs unexpectedly high</td><td>Storage bill for destination growing</td><td>Versioning enabled (required) → all versions retained in destination</td><td>Apply lifecycle policies on destination to expire old versions</td></tr><tr><td>6</td><td>Replication role permissions insufficient</td><td>OperationsFailedReplication &gt; 0</td><td>IAM role missing required S3 or KMS permissions</td><td>Review and update role policy</td></tr><tr><td>7</td><td>Versioning not enabled on destination</td><td>Replication rule creation fails</td><td>CRR requires versioning on both buckets</td><td>Enable versioning on destination bucket</td></tr><tr><td>8</td><td>Wrong KMS key specified for destination</td><td>Objects fail to replicate with KMS error</td><td>Using source region KMS key ARN for destination</td><td>Use KMS key ARN from destination region</td></tr><tr><td>9</td><td>Batch replication incomplete</td><td>Some objects missing in destination</td><td>Batch job had partial failures</td><td>Check completion report; retry failed objects</td></tr><tr><td>10</td><td>Cross-region transfer costs spike</td><td>Unexpected bill increase</td><td>Large data upload to source → all replicated at $0.09/GB</td><td>Expected behavior — budget for replication transfer costs</td></tr><tr><td>11</td><td>Replication rule prefix overlap</td><td>Objects replicated multiple times</td><td>Two rules with overlapping prefixes (e.g., <code>raw/</code> and <code>raw/orders/</code>)</td><td>Use non-overlapping prefixes or priority to resolve conflicts</td></tr><tr><td>12</td><td>Destination bucket in same region</td><td>Replication rule creation fails</td><td>CRR requires DIFFERENT region</td><td>Use SRR (Same-Region Replication) for same-region or create bucket in different region</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>Data Volume Scaling</strong></p>
+<table><thead><tr><th>Source Data Size</th><th>Batch Replication Time</th><th>Ongoing CRR</th><th>Monthly DR Storage Cost</th></tr></thead><tbody><tr><td>1 TB</td><td>4-8 hours</td><td>Handles easily</td><td>~$25 (Standard-IA)</td></tr><tr><td>10 TB</td><td>2-4 days</td><td>Handles easily</td><td>~$250</td></tr><tr><td>100 TB</td><td>2-3 weeks</td><td>Handles with monitoring</td><td>~$2,500</td></tr><tr><td>1 PB</td><td>2-3 months</td><td>May need throttling management</td><td>~$25,000</td></tr></tbody></table>
+<p>→ CRR scales automatically — AWS manages replication infrastructure<br>
+→ No provisioning needed — more data = S3 scales replication workers</p>
+<p>→ <strong>Cost Scaling</strong></p>
+<table><thead><tr><th>Component</th><th>Scales With</th><th>Cost Model</th></tr></thead><tbody><tr><td>Cross-region transfer</td><td>Volume of new/changed data</td><td>$0.09/GB (Mumbai → Singapore)</td></tr><tr><td>RTC premium</td><td>Volume of RTC-enabled data</td><td>$0.015/GB</td></tr><tr><td>Destination storage</td><td>Total replicated data</td><td>$0.025/GB/month (Standard-IA)</td></tr><tr><td>KMS operations</td><td>Number of encrypted objects</td><td>$0.03/10,000 requests</td></tr><tr><td>Replication requests</td><td>Number of objects replicated</td><td>$0.005/1,000 PUT requests</td></tr></tbody></table>
+<p>→ <strong>Multi-Bucket Replication</strong></p>
+<table><thead><tr><th>Pattern</th><th>Configuration</th></tr></thead><tbody><tr><td>One source → one destination</td><td>Standard CRR (this project)</td></tr><tr><td>One source → multiple destinations</td><td>Multiple replication rules with different destinations</td></tr><tr><td>Multiple sources → one destination</td><td>Configure CRR on each source bucket</td></tr><tr><td>Bidirectional</td><td>Two-way replication rules (use with caution — conflict resolution needed)</td></tr></tbody></table>
+<p>→ <strong>Lifecycle Management on Destination (Cost Optimization)</strong></p>
+<p>→ Destination bucket accumulates ALL versions over time<br>
+→ Apply lifecycle rules on destination to manage costs:</p>
+<table><thead><tr><th>Rule</th><th>Action</th><th>Purpose</th></tr></thead><tbody><tr><td>Expire non-current versions after 90 days</td><td>Delete old versions</td><td>Control version storage growth</td></tr><tr><td>Transition current versions to Glacier after 180 days</td><td>Move to cheaper storage</td><td>Long-term archive</td></tr><tr><td>Expire delete markers</td><td>Clean up orphaned markers</td><td>Reduce metadata overhead</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<hr>
+<p>→ <strong>How to verify CRR is working correctly:</strong></p>
+<table><thead><tr><th>Check</th><th>How to Verify</th><th>Expected</th></tr></thead><tbody><tr><td>Replication rules active?</td><td>S3 → Source bucket → Management → Replication</td><td>Rules listed with "Enabled" status</td></tr><tr><td>New objects replicating?</td><td>Upload test file → check destination after 5 min</td><td>File appears in destination</td></tr><tr><td>Replication status on objects?</td><td>S3 → Source object → Properties → Replication Status</td><td>COMPLETED</td></tr><tr><td>Metrics healthy?</td><td>CloudWatch → S3 → ReplicationLatency</td><td>&lt; 900 seconds (15 min with RTC)</td></tr><tr><td>No failed operations?</td><td>CloudWatch → OperationsFailedReplication</td><td>0</td></tr><tr><td>Pending backlog manageable?</td><td>CloudWatch → BytesPendingReplication</td><td>Trending toward 0</td></tr><tr><td>Batch replication complete?</td><td>S3 → Batch Operations → Job status</td><td>Completed</td></tr><tr><td>Encryption correct?</td><td>Destination object → encryption property</td><td>SSE-KMS with Singapore key</td></tr><tr><td>Delete markers not replicated?</td><td>Delete source object → check destination</td><td>Object still exists in destination</td></tr></tbody></table>
+<p>→ <strong>Quarterly DR Test Procedure:</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Verify</th><th>Duration</th></tr></thead><tbody><tr><td>1</td><td>Confirm destination data is current</td><td>Compare object counts source vs destination</td><td>15 min</td></tr><tr><td>2</td><td>Set up Athena in Singapore region</td><td>Create Glue Catalog, Crawler, Workgroup</td><td>1 hour</td></tr><tr><td>3</td><td>Run sample queries against destination data</td><td>Results match source queries</td><td>30 min</td></tr><tr><td>4</td><td>Simulate source unavailability</td><td>Block access to source bucket via policy</td><td>5 min</td></tr><tr><td>5</td><td>Verify analysts can query destination</td><td>Analysts run reports from Singapore</td><td>30 min</td></tr><tr><td>6</td><td>Restore source access</td><td>Remove blocking policy</td><td>5 min</td></tr><tr><td>7</td><td>Document results and lessons learned</td><td>DR test report</td><td>30 min</td></tr><tr><td><strong>Total DR test time</strong></td><td></td><td></td><td><strong>~3 hours</strong></td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ Cross-Region Replication provides GEOGRAPHIC redundancy — data exists in two separate AWS regions<br>
+→ CRR is ASYNCHRONOUS — objects replicate within seconds to minutes (15-minute SLA with RTC)<br>
+→ Versioning is MANDATORY on both buckets — CRR tracks replication by version ID<br>
+→ Existing objects require BATCH REPLICATION — CRR only covers new objects after rule creation<br>
+→ Disabling delete marker replication protects DR copy from accidental source deletion<br>
+→ RTC provides SLA-backed 15-minute RPO — essential for compliance requirements<br>
+→ The total DR cost for ShopNow's 8 TB data lake: ~$227/month — a fraction of the $45,000 lost in one outage</p>
+<p>→ The data protection strategy is now comprehensive:</p>
+<table><thead><tr><th>Protection Layer</th><th>Mechanism</th><th>Protects Against</th><th>Project</th></tr></thead><tbody><tr><td>S3 durability (11 9s)</td><td>Automatic 3-AZ replication</td><td>Hardware failure, data corruption within region</td><td>Project 1</td></tr><tr><td>S3 versioning</td><td>Version history per object</td><td>Accidental overwrite, accidental deletion</td><td>Project 12</td></tr><tr><td>S3 Cross-Region Replication</td><td>Continuous copy to another region</td><td>Regional outage, regional disaster</td><td>This project</td></tr><tr><td>RDS Multi-AZ</td><td>Synchronous standby in another AZ</td><td>Database AZ failure</td><td>Project 29</td></tr><tr><td>RDS Read Replicas</td><td>Asynchronous copies</td><td>Read scaling, extraction isolation</td><td>Project 29</td></tr><tr><td>S3 Lifecycle Policies</td><td>Automated tier transitions</td><td>Cost management of retained data</td><td>Project 12</td></tr></tbody></table>
+<p>→ This project connects to:</p>
+<table><thead><tr><th>Connection</th><th>How It Relates</th></tr></thead><tbody><tr><td>Project 1 (S3)</td><td>CRR extends S3's within-region durability to cross-region</td></tr><tr><td>Project 10 (Bucket Policies)</td><td>Destination bucket needs its own policies for DR access</td></tr><tr><td>Project 12 (Versioning/Lifecycle)</td><td>Versioning is prerequisite; lifecycle manages destination costs</td></tr><tr><td>Project 2 (IAM)</td><td>Replication IAM Role with cross-region permissions</td></tr><tr><td>Project 36 (KMS)</td><td>KMS keys in both regions for encrypted replication</td></tr><tr><td>Project 29 (Multi-AZ RDS)</td><td>Together with CRR creates comprehensive data protection</td></tr><tr><td>Project 55 (Cross-Region DR)</td><td>CRR is the S3 component of the full cross-region DR strategy</td></tr><tr><td>Project 57 (Security Audit)</td><td>Replication configuration is auditable via CloudTrail</td></tr><tr><td>Project 60 (Data Mesh)</td><td>Multi-region data availability for distributed teams</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ The data lake is now protected with cross-region replication<br>
+→ The database has Multi-AZ and Read Replicas (Project 29)<br>
+→ Individual data pipelines work: Glue ETL, Redshift COPY/UNLOAD, Athena queries</p>
+<p>→ But each pipeline step runs independently — there's no orchestration<br>
+→ In Project 25, we designed the end-to-end pipeline schedule<br>
+→ The schedule was time-based: "ETL runs at 03:00, Crawler at 03:30, CTAS at 03:45"<br>
+→ We noted this was FRAGILE — if one step runs late, downstream steps use stale data</p>
+<p>→ Consider the actual pipeline:</p>
+<ol>
+<li>MariaDB extraction (6 Glue JDBC jobs — Project 24)</li>
+<li>Crawler on extracted data</li>
+<li>CSV-to-Parquet ETL (4 Glue jobs — Project 21)</li>
+<li>Crawler on transformed data</li>
+<li>CTAS refresh in Athena (Project 25)</li>
+</ol>
+<p>→ These steps have DEPENDENCIES:</p>
+<ul>
+<li>Crawler must run AFTER extraction completes</li>
+<li>ETL must run AFTER Crawler updates the catalog</li>
+<li>CTAS must run AFTER ETL produces new data</li>
+</ul>
+<p>→ What's needed: An ORCHESTRATION engine that chains Glue jobs and crawlers with conditional triggers</p>
+<p>→ <strong>This is exactly what Project 31 solves</strong><br>
+→ Project 31 introduces Glue Workflows — the native orchestration engine for Glue jobs and crawlers<br>
+→ You will learn how to create workflows with scheduled triggers, conditional triggers (on success/failure), and parallel execution<br>
+→ This transforms the fragile time-based schedule into a resilient event-driven pipeline</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 31: "The ETL That Had 5 Steps in Sequence — Glue Workflow Orchestration"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-29.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 3 &bull; 30/60</span></div><a class="nav-btn next" href="project-31.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

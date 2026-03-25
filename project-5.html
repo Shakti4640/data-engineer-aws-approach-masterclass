@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 5: THE APPLICATION THAT NEEDED A PRIVATE ROOM — VPC Creation with Public — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 5: THE APPLICATION THAT NEEDED A PRIVATE ROOM — VPC Creation with Public &amp; Private Subnets</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1, 2, 3, 4) now has:</p>
+<ul>
+<li>S3 bucket for product images (Project 1)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instance running the web app (Project 3)</li>
+<li>Security Groups and NACLs configured (Project 4)</li>
+</ul>
+<p>→ Everything runs in the DEFAULT VPC that AWS auto-created<br>
+→ The security consultant audits and finds FIVE critical issues:</p>
+<p>→ Issue 1: The database EC2 instance has a PUBLIC IP address<br>
+→ Even though Security Groups block internet access to port 3306<br>
+→ The consultant says: "Security Groups are software firewalls — they can be misconfigured. The database should have NO public IP at all — that's architectural security"</p>
+<p>→ Issue 2: All instances are in PUBLIC subnets<br>
+→ Every instance has a direct route to the Internet Gateway<br>
+→ If any Security Group is accidentally opened → instant internet exposure</p>
+<p>→ Issue 3: The default VPC uses CIDR <code>172.31.0.0/16</code><br>
+→ This conflicts with ShopNow's office network which also uses <code>172.31.x.x</code><br>
+→ VPN connectivity between office and AWS is impossible due to overlapping IP ranges</p>
+<p>→ Issue 4: The default VPC has only ONE route table shared by all subnets<br>
+→ Cannot have different routing behavior for web tier vs database tier</p>
+<p>→ Issue 5: The database instance needs to download OS security patches<br>
+→ But it should NOT be directly reachable from the internet<br>
+→ The team asks: "How can something access the internet WITHOUT being accessible FROM the internet?"</p>
+<p>→ The CTO mandates: "Build a proper network from scratch — public subnet for web servers, private subnet for databases, and explain every component"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ A VPC (Virtual Private Cloud) is YOUR OWN isolated network within AWS<br>
+→ Think of it as building your own data center — but virtual</p>
+<p>→ Key components to understand:</p>
+<table><thead><tr><th>Component</th><th>Real-World Analogy</th></tr></thead><tbody><tr><td>VPC</td><td>Your private campus/building complex</td></tr><tr><td>CIDR Block</td><td>The address space — how many rooms you can have</td></tr><tr><td>Subnet</td><td>A floor in the building — grouped rooms</td></tr><tr><td>Internet Gateway (IGW)</td><td>The main gate connecting campus to the public road</td></tr><tr><td>NAT Gateway</td><td>A mail room — internal people can send mail out, but outsiders can't walk in</td></tr><tr><td>Route Table</td><td>Signboards telling traffic which direction to go</td></tr><tr><td>Availability Zone</td><td>Separate physical buildings (for redundancy)</td></tr></tbody></table>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Understand CIDR notation (IP address planning)</li>
+<li>Step 2 — Create the VPC</li>
+<li>Step 3 — Create subnets (public and private) across multiple AZs</li>
+<li>Step 4 — Create and attach Internet Gateway</li>
+<li>Step 5 — Create NAT Gateway</li>
+<li>Step 6 — Configure Route Tables</li>
+<li>Step 7 — Configure subnet associations</li>
+<li>Step 8 — Verify the architecture end-to-end</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — UNDERSTAND CIDR NOTATION (IP ADDRESS PLANNING)</h3>
+<p>→ CIDR = Classless Inter-Domain Routing<br>
+→ It defines a RANGE of IP addresses<br>
+→ Format: <code>{base IP}/{prefix length}</code><br>
+→ The prefix length tells how many bits are FIXED (network part) vs VARIABLE (host part)</p>
+<p><strong>How CIDR Works:</strong></p>
+<p>→ An IPv4 address has 32 bits total<br>
+→ The prefix length says: "The first N bits identify the network, the remaining (32-N) bits identify hosts"</p>
+<table><thead><tr><th>CIDR</th><th>Prefix Bits (Fixed)</th><th>Host Bits (Variable)</th><th>Total IPs</th><th>Usable IPs</th></tr></thead><tbody><tr><td><code>/32</code></td><td>32</td><td>0</td><td>1</td><td>1 (single IP)</td></tr><tr><td><code>/28</code></td><td>28</td><td>4</td><td>16</td><td>11 (AWS reserves 5)</td></tr><tr><td><code>/24</code></td><td>24</td><td>8</td><td>256</td><td>251</td></tr><tr><td><code>/20</code></td><td>20</td><td>12</td><td>4,096</td><td>4,091</td></tr><tr><td><code>/16</code></td><td>16</td><td>16</td><td>65,536</td><td>65,531</td></tr></tbody></table>
+<p>→ Formula: Total IPs = 2^(32 - prefix length)<br>
+→ Smaller prefix number = MORE IP addresses<br>
+→ <code>/16</code> is the LARGEST VPC allowed by AWS (65,536 IPs)<br>
+→ <code>/28</code> is the SMALLEST VPC allowed by AWS (16 IPs)</p>
+<p><strong>AWS Reserved IPs in EVERY Subnet:</strong></p>
+<p>→ AWS reserves 5 IP addresses in every subnet — you CANNOT use them</p>
+<table><thead><tr><th>Reserved IP</th><th>Purpose</th><th>Example (for 10.0.1.0/24)</th></tr></thead><tbody><tr><td>First IP (.0)</td><td>Network address</td><td>10.0.1.0</td></tr><tr><td>Second IP (.1)</td><td>VPC Router</td><td>10.0.1.1</td></tr><tr><td>Third IP (.2)</td><td>AWS DNS server</td><td>10.0.1.2</td></tr><tr><td>Fourth IP (.3)</td><td>Reserved for future use</td><td>10.0.1.3</td></tr><tr><td>Last IP (.255)</td><td>Broadcast address (not supported in VPC but reserved)</td><td>10.0.1.255</td></tr></tbody></table>
+<p>→ So a <code>/24</code> subnet with 256 IPs actually gives you 251 usable IPs<br>
+→ A <code>/28</code> subnet with 16 IPs gives you only 11 usable IPs<br>
+→ Always account for these 5 reserved IPs when planning</p>
+<hr>
+<p><strong>Choosing CIDR for ShopNow:</strong></p>
+<p><strong>VPC CIDR Selection Criteria:</strong></p>
+<table><thead><tr><th>Criterion</th><th>Guidance</th></tr></thead><tbody><tr><td>Don't overlap with on-premises network</td><td>ShopNow office uses 172.31.x.x → avoid 172.31.0.0/16</td></tr><tr><td>Don't overlap with other VPCs you might peer with</td><td>If you have dev/staging/prod VPCs → each needs unique CIDR</td></tr><tr><td>Leave room for growth</td><td>Don't use /28 for production VPC — too small</td></tr><tr><td>Use RFC 1918 private ranges</td><td>10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16</td></tr></tbody></table>
+<p><strong>ShopNow VPC CIDR Plan:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VPC CIDR: 10.0.0.0/16 (65,536 IPs — plenty of room)
+</span>
+Subnet breakdown:
+┌─────────────────────────────────────────────────────┐
+│ VPC: 10.0.0.0/16                                    │
+│                                                     │
+│  AZ: ap-south-1a              AZ: ap-south-1b       │
+│  ┌───────────────────┐       ┌───────────────────┐  │
+│  │ Public Subnet A   │       │ Public Subnet B   │  │
+│  │ 10.0.1.0/24       │       │ 10.0.2.0/24       │  │
+│  │ (251 usable IPs)  │       │ (251 usable IPs)  │  │
+│  │ Web servers        │       │ Web servers        │  │
+│  └───────────────────┘       └───────────────────┘  │
+│                                                     │
+│  ┌───────────────────┐       ┌───────────────────┐  │
+│  │ Private Subnet A  │       │ Private Subnet B  │  │
+│  │ 10.0.11.0/24      │       │ 10.0.12.0/24      │  │
+│  │ (251 usable IPs)  │       │ (251 usable IPs)  │  │
+│  │ Databases          │       │ Databases          │  │
+│  └───────────────────┘       └───────────────────┘  │
+│                                                     │
+│  ┌───────────────────┐       ┌───────────────────┐  │
+│  │ Private Subnet C  │       │ Private Subnet D  │  │
+│  │ 10.0.21.0/24      │       │ 10.0.22.0/24      │  │
+│  │ (251 usable IPs)  │       │ (251 usable IPs)  │  │
+│  │ Application tier   │       │ Application tier   │  │
+│  └───────────────────┘       └───────────────────┘  │
+│                                                     │
+└─────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>Why this numbering scheme:</strong><br>
+→ <code>10.0.1.x</code> and <code>10.0.2.x</code> → Public subnets (1-9 range for public)<br>
+→ <code>10.0.11.x</code> and <code>10.0.12.x</code> → Private subnets for data tier (11-19 range)<br>
+→ <code>10.0.21.x</code> and <code>10.0.22.x</code> → Private subnets for app tier (21-29 range)<br>
+→ Gap between ranges allows adding more subnets later without renumbering<br>
+→ This is a professional subnet addressing convention</p>
+<p><strong>Why TWO subnets per tier (across AZs):</strong><br>
+→ Each Availability Zone is a physically separate data center<br>
+→ If AZ <code>ap-south-1a</code> loses power → AZ <code>ap-south-1b</code> continues operating<br>
+→ Distributing subnets across AZs = HIGH AVAILABILITY<br>
+→ RDS Multi-AZ (Project 9) REQUIRES subnets in at least 2 AZs<br>
+→ Auto Scaling (Project 33) distributes instances across AZ subnets</p>
+<hr>
+<h3>STEP 2 — CREATE THE VPC</h3>
+<p>→ VPC Console → "Your VPCs" → "Create VPC"</p>
+<p><strong>Option 1: VPC Only (Manual — We'll use this to understand every component)</strong><br>
+<strong>Option 2: VPC and More (Wizard — Creates subnets, IGW, NAT automatically)</strong></p>
+<p>→ We choose "VPC only" to learn each component individually</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Name tag</td><td><code>shopnow-prod-vpc</code></td><td>Descriptive name</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.0.0/16</code></td><td>Our planned address space</td></tr><tr><td>IPv6 CIDR block</td><td>No IPv6 CIDR block</td><td>Not needed for now</td></tr><tr><td>Tenancy</td><td>Default</td><td>Shared hardware — cheapest</td></tr></tbody></table>
+<p>→ Click "Create VPC"</p>
+<p><strong>What just happened internally:</strong></p>
+<p>→ AWS created an isolated virtual network in <code>ap-south-1</code><br>
+→ A DEFAULT route table was automatically created (called the "Main" route table)<br>
+→ A DEFAULT NACL was automatically created (allows all traffic — Project 4 reference)<br>
+→ A DEFAULT Security Group was automatically created (allows intra-SG traffic — Project 4 reference)<br>
+→ A DHCP options set was automatically associated (provides DNS server + domain name)<br>
+→ NO subnets were created<br>
+→ NO Internet Gateway was created<br>
+→ NO NAT Gateway was created<br>
+→ The VPC is completely ISOLATED — no internet connectivity at all</p>
+<p><strong>DHCP Options Set (Auto-created):</strong></p>
+<table><thead><tr><th>Option</th><th>Default Value</th><th>Purpose</th></tr></thead><tbody><tr><td>domain-name-servers</td><td>AmazonProvidedDNS (10.0.0.2)</td><td>DNS resolution for instances</td></tr><tr><td>domain-name</td><td>ap-south-1.compute.internal</td><td>Default hostname domain</td></tr></tbody></table>
+<p>→ Every instance launched in this VPC will use <code>10.0.0.2</code> for DNS<br>
+→ This is the AWS DNS server (always at VPC CIDR + 2)<br>
+→ <code>10.0.0.0</code> (VPC) + 2 = <code>10.0.0.2</code> (DNS server)</p>
+<hr>
+<p><strong>VPC Settings to Enable After Creation:</strong></p>
+<p>→ Select VPC → Actions → "Edit VPC settings"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead><tbody><tr><td>DNS hostnames</td><td>Enable</td><td>Instances get public DNS names (e.g., ec2-13-234-176-89.ap-south-1.compute.amazonaws.com)</td></tr><tr><td>DNS resolution</td><td>Enable (default)</td><td>Instances can resolve DNS names</td></tr></tbody></table>
+<p>→ Both MUST be enabled for:</p>
+<ul>
+<li>Public DNS names to work</li>
+<li>VPC Endpoints to resolve correctly (Project 27)</li>
+<li>RDS endpoints to resolve (Project 9)</li>
+<li>Private hosted zones to work (Route 53)</li>
+</ul>
+<hr>
+<h3>STEP 3 — CREATE SUBNETS</h3>
+<p>→ VPC Console → "Subnets" → "Create subnet"</p>
+<p><strong>Subnet 1: Public Subnet A</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet name</td><td><code>shopnow-public-subnet-1a</code></td></tr><tr><td>Availability Zone</td><td>ap-south-1a</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.1.0/24</code></td></tr></tbody></table>
+<p><strong>Subnet 2: Public Subnet B</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet name</td><td><code>shopnow-public-subnet-1b</code></td></tr><tr><td>Availability Zone</td><td>ap-south-1b</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.2.0/24</code></td></tr></tbody></table>
+<p><strong>Subnet 3: Private Subnet A (Data tier)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet name</td><td><code>shopnow-private-data-subnet-1a</code></td></tr><tr><td>Availability Zone</td><td>ap-south-1a</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.11.0/24</code></td></tr></tbody></table>
+<p><strong>Subnet 4: Private Subnet B (Data tier)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet name</td><td><code>shopnow-private-data-subnet-1b</code></td></tr><tr><td>Availability Zone</td><td>ap-south-1b</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.12.0/24</code></td></tr></tbody></table>
+<p><strong>Subnet 5: Private Subnet C (App tier)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet name</td><td><code>shopnow-private-app-subnet-1a</code></td></tr><tr><td>Availability Zone</td><td>ap-south-1a</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.21.0/24</code></td></tr></tbody></table>
+<p><strong>Subnet 6: Private Subnet D (App tier)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet name</td><td><code>shopnow-private-app-subnet-1b</code></td></tr><tr><td>Availability Zone</td><td>ap-south-1b</td></tr><tr><td>IPv4 CIDR block</td><td><code>10.0.22.0/24</code></td></tr></tbody></table>
+<p>→ Click "Create subnet" (can create all 6 in one operation by clicking "Add new subnet")</p>
+<p><strong>Critical Understanding — Subnet ≠ Public or Private BY DEFAULT:</strong></p>
+<p>→ A subnet is just an IP range in an AZ<br>
+→ What MAKES it public or private is the ROUTE TABLE associated with it<br>
+→ A subnet with a route to an Internet Gateway = PUBLIC subnet<br>
+→ A subnet WITHOUT a route to an Internet Gateway = PRIVATE subnet<br>
+→ The subnet itself doesn't know if it's public or private — the route table determines this</p>
+<p><strong>Enable Auto-assign Public IP for Public Subnets:</strong></p>
+<p>→ Select <code>shopnow-public-subnet-1a</code> → Actions → "Edit subnet settings"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Auto-assign public IPv4 address</td><td>Enable</td></tr></tbody></table>
+<p>→ Repeat for <code>shopnow-public-subnet-1b</code><br>
+→ Do NOT enable for private subnets — they should NEVER have public IPs</p>
+<p>→ This means: Any EC2 instance launched in public subnets automatically gets a public IP<br>
+→ Instances in private subnets do NOT get public IPs — they are invisible to the internet</p>
+<hr>
+<h3>STEP 4 — CREATE AND ATTACH INTERNET GATEWAY (IGW)</h3>
+<p>→ An Internet Gateway is the door between your VPC and the public internet<br>
+→ Without an IGW → nothing in the VPC can reach the internet and nobody can reach in</p>
+<p>→ VPC Console → "Internet gateways" → "Create internet gateway"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name tag</td><td><code>shopnow-prod-igw</code></td></tr></tbody></table>
+<p>→ Click "Create internet gateway"<br>
+→ State shows: "Detached" — it exists but isn't connected to any VPC</p>
+<p><strong>Attach to VPC:</strong><br>
+→ Select the IGW → Actions → "Attach to VPC"<br>
+→ Select: <code>shopnow-prod-vpc</code><br>
+→ Click "Attach"<br>
+→ State changes to: "Attached"</p>
+<p><strong>Internet Gateway Properties:</strong></p>
+<table><thead><tr><th>Property</th><th>Detail</th></tr></thead><tbody><tr><td>Highly available</td><td>Automatically redundant across all AZs — no single point of failure</td></tr><tr><td>Horizontally scaled</td><td>Handles any bandwidth — no capacity planning needed</td></tr><tr><td>One per VPC</td><td>A VPC can have only ONE IGW attached</td></tr><tr><td>No cost</td><td>IGW itself is free — you pay for data transfer through it</td></tr><tr><td>Performs NAT</td><td>For instances with public IPs — translates between public and private IP</td></tr></tbody></table>
+<p><strong>How IGW Performs NAT:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Instance private IP: 10.0.1.50
+</span>Instance public IP: 13.234.176.89
+
+OUTBOUND (instance → internet):
+  Packet leaves instance: Source = 10.0.1.50
+  Reaches IGW: Source translated to 13.234.176.89
+  Packet sent to internet with public source IP
+
+INBOUND (internet → instance):
+  Packet arrives at IGW: Destination = 13.234.176.89
+  IGW translates: Destination changed to 10.0.1.50
+  Packet delivered to instance at private IP</code></pre></div>
+<p>→ The instance NEVER knows its own public IP at the OS level<br>
+→ Running <code>ifconfig</code> or <code>ip addr</code> inside the instance shows ONLY <code>10.0.1.50</code><br>
+→ The public IP exists ONLY at the IGW level<br>
+→ This is why Instance Metadata (Project 3) is needed to discover the public IP</p>
+<hr>
+<h3>STEP 5 — CREATE NAT GATEWAY</h3>
+<p>→ This solves Issue 5: "How can the database access the internet WITHOUT being accessible FROM the internet?"</p>
+<p><strong>What is a NAT Gateway?</strong></p>
+<p>→ NAT = Network Address Translation<br>
+→ A NAT Gateway allows instances in PRIVATE subnets to initiate OUTBOUND connections to the internet<br>
+→ But it does NOT allow INBOUND connections from the internet to reach private instances</p>
+<p><strong>How NAT Gateway Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATABASE INSTANCE (Private Subnet — 10.0.11.50)
+</span>wants to download security patches from the internet
+        │
+        ▼
+Packet: Source = 10.0.11.50, Destination = patch.server.com
+        │
+        ▼
+Route table says: "For 0.0.0.0/0 → send to NAT Gateway"
+        │
+        ▼
+NAT GATEWAY (in Public Subnet — has Elastic IP 52.66.100.200)
+        │
+        ├── Records: 10.0.11.50:45678 → 52.66.100.200:45678
+        ├── Replaces source: 10.0.11.50 → 52.66.100.200
+        └── Forwards packet to Internet Gateway
+        │
+        ▼
+INTERNET GATEWAY
+        │
+        ├── Packet goes to patch.server.com
+        ├── Response comes back to 52.66.100.200:45678
+        └── Forwards to NAT Gateway
+        │
+        ▼
+NAT GATEWAY
+        │
+        ├── Looks up mapping: 52.66.100.200:45678 → 10.0.11.50:45678
+        ├── Replaces destination: 52.66.100.200 → 10.0.11.50
+        └── Forwards to database instance
+        │
+        ▼
+DATABASE INSTANCE receives the response
+
+BUT — if someone on the internet tries to INITIATE a connection to 52.66.100.200:
+        │
+        ▼
+NAT GATEWAY: No mapping exists for this unsolicited inbound → DROPPED</code></pre></div>
+<p>→ KEY INSIGHT: NAT Gateway only allows connections that ORIGINATED from inside<br>
+→ It maintains a translation table — only responses to existing connections are forwarded<br>
+→ Unsolicited inbound traffic is dropped — the private instance is unreachable</p>
+<p><strong>Creating NAT Gateway:</strong></p>
+<p>→ VPC Console → "NAT gateways" → "Create NAT gateway"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-nat-gw-1a</code></td><td>Descriptive name with AZ</td></tr><tr><td>Subnet</td><td><code>shopnow-public-subnet-1a</code></td><td>NAT Gateway MUST be in a PUBLIC subnet</td></tr><tr><td>Connectivity type</td><td>Public</td><td>Standard — for internet access</td></tr><tr><td>Elastic IP allocation</td><td>Click "Allocate Elastic IP"</td><td>NAT Gateway needs a static public IP</td></tr></tbody></table>
+<p>→ Click "Create NAT gateway"<br>
+→ State: "Pending" → "Available" (takes 1-3 minutes)</p>
+<p><strong>CRITICAL: NAT Gateway Placement:</strong></p>
+<p>→ NAT Gateway must be in a PUBLIC subnet (with route to IGW)<br>
+→ Private subnet route table points to the NAT Gateway<br>
+→ The traffic flow: Private Instance → NAT GW (public subnet) → IGW → Internet</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────┐
+</span>│ VPC: 10.0.0.0/16                                             │
+│                                                              │
+│  ┌─────────────────────────┐   ┌──────────────────────────┐  │
+│  │ PUBLIC SUBNET (10.0.1.0)│   │ PRIVATE SUBNET (10.0.11.0)│ │
+│  │                         │   │                          │  │
+│  │  ┌──────────┐           │   │  ┌──────────────┐        │  │
+│  │  │ Web EC2  │           │   │  │ Database EC2 │        │  │
+│  │  └──────────┘           │   │  │ 10.0.11.50   │        │  │
+│  │                         │   │  └──────┬───────┘        │  │
+│  │  ┌──────────┐           │   │         │                │  │
+│  │  │ NAT GW   │◄──────────┼───┼─────────┘                │  │
+│  │  │ 10.0.1.100│          │   │  Route: 0.0.0.0/0 → NAT │  │
+│  │  └─────┬────┘           │   │                          │  │
+│  │        │                │   └──────────────────────────┘  │
+│  │  Route: 0.0.0.0/0 → IGW│                                 │
+│  └────────┼────────────────┘                                 │
+│           │                                                  │
+└───────────┼──────────────────────────────────────────────────┘
+            │
+            ▼
+     ┌──────────┐
+     │   IGW    │
+     └─────┬────┘
+           │
+           ▼
+       INTERNET</code></pre></div>
+<p><strong>NAT Gateway Properties:</strong></p>
+<table><thead><tr><th>Property</th><th>Detail</th></tr></thead><tbody><tr><td>Managed service</td><td>AWS manages patching, scaling, availability</td></tr><tr><td>Bandwidth</td><td>Starts at 5 Gbps, auto-scales to 100 Gbps</td></tr><tr><td>AZ-specific</td><td>A NAT Gateway exists in ONE AZ — not cross-AZ redundant</td></tr><tr><td>Cost</td><td>~$0.045/hour + $0.045/GB data processed (expensive!)</td></tr><tr><td>High availability</td><td>For HA → create one NAT Gateway per AZ</td></tr><tr><td>No Security Groups</td><td>NAT Gateways do NOT have Security Groups — use NACLs on subnet</td></tr></tbody></table>
+<p><strong>High Availability NAT Gateway Setup:</strong></p>
+<p>→ For production → create NAT Gateway in EACH public subnet (one per AZ)</p>
+<table><thead><tr><th>NAT Gateway</th><th>Subnet</th><th>AZ</th><th>Used By</th></tr></thead><tbody><tr><td><code>shopnow-nat-gw-1a</code></td><td>shopnow-public-subnet-1a</td><td>ap-south-1a</td><td>Private subnets in 1a</td></tr><tr><td><code>shopnow-nat-gw-1b</code></td><td>shopnow-public-subnet-1b</td><td>ap-south-1b</td><td>Private subnets in 1b</td></tr></tbody></table>
+<p>→ If AZ-a fails → instances in AZ-b still have internet through their own NAT Gateway<br>
+→ Without HA → if the single NAT Gateway's AZ fails → ALL private instances lose internet</p>
+<p><strong>NAT Gateway vs NAT Instance:</strong></p>
+<table><thead><tr><th>Feature</th><th>NAT Gateway</th><th>NAT Instance (EC2)</th></tr></thead><tbody><tr><td>Managed by</td><td>AWS</td><td>You</td></tr><tr><td>Availability</td><td>Redundant within AZ</td><td>You manage failover</td></tr><tr><td>Bandwidth</td><td>Up to 100 Gbps</td><td>Depends on instance type</td></tr><tr><td>Maintenance</td><td>No patching needed</td><td>You patch the OS</td></tr><tr><td>Security Groups</td><td>Not supported</td><td>Supported (it's an EC2 instance)</td></tr><tr><td>Cost</td><td>Higher (managed service premium)</td><td>Lower (just EC2 cost)</td></tr><tr><td>Port forwarding</td><td>Not supported</td><td>Supported</td></tr><tr><td>Bastion host use</td><td>Cannot double as bastion</td><td>Can double as bastion</td></tr></tbody></table>
+<p>→ For production → Always use NAT Gateway (managed, reliable)<br>
+→ NAT Instance is legacy — only for very cost-sensitive dev environments</p>
+<hr>
+<h3>STEP 6 — CONFIGURE ROUTE TABLES</h3>
+<p>→ Route Tables are the SIGNBOARDS that tell traffic where to go<br>
+→ Every subnet MUST be associated with exactly ONE route table<br>
+→ A route table can be associated with MULTIPLE subnets</p>
+<p><strong>Understanding Route Table Entries:</strong></p>
+<table><thead><tr><th>Destination</th><th>Target</th><th>Meaning</th></tr></thead><tbody><tr><td><code>10.0.0.0/16</code></td><td>local</td><td>Traffic within the VPC — handled internally (always present, cannot be removed)</td></tr><tr><td><code>0.0.0.0/0</code></td><td>igw-xxxxxx</td><td>All other traffic → send to Internet Gateway</td></tr><tr><td><code>0.0.0.0/0</code></td><td>nat-xxxxxx</td><td>All other traffic → send to NAT Gateway</td></tr></tbody></table>
+<p>→ The <code>local</code> route is AUTOMATIC and IMMUTABLE — it ensures all VPC internal traffic routes correctly<br>
+→ The <code>0.0.0.0/0</code> route is the "default route" — catches all traffic not matched by more specific routes<br>
+→ More specific routes take precedence (longest prefix match)</p>
+<p><strong>Route Evaluation — Longest Prefix Match:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Route table has:
+</span>  10.0.0.0/16 → local
+  0.0.0.0/0   → igw-xxxxxx
+
+Packet destination: 10.0.11.50
+  → Matches 10.0.0.0/16 (/16 is more specific than /0)
+  → Route: local (stays within VPC)
+
+Packet destination: 8.8.8.8 (Google DNS)
+  → Does NOT match 10.0.0.0/16
+  → Matches 0.0.0.0/0 (default route)
+  → Route: Internet Gateway</code></pre></div>
+<hr>
+<p><strong>Create Route Table 1: Public Route Table</strong></p>
+<p>→ VPC Console → "Route tables" → "Create route table"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-public-rt</code></td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr></tbody></table>
+<p>→ Click "Create route table"</p>
+<p><strong>Add Routes:</strong></p>
+<p>→ Select <code>shopnow-public-rt</code> → Routes tab → "Edit routes" → "Add route"</p>
+<table><thead><tr><th>Destination</th><th>Target</th></tr></thead><tbody><tr><td><code>10.0.0.0/16</code></td><td>local (auto-present)</td></tr><tr><td><code>0.0.0.0/0</code></td><td><code>shopnow-prod-igw</code> (Internet Gateway)</td></tr></tbody></table>
+<p>→ Save changes</p>
+<p>→ This route table says: "For VPC traffic → stay local. For everything else → go to the internet"</p>
+<p><strong>Associate Public Subnets:</strong></p>
+<p>→ Select <code>shopnow-public-rt</code> → "Subnet associations" tab → "Edit subnet associations"<br>
+→ Check:</p>
+<ul>
+<li><code>shopnow-public-subnet-1a</code></li>
+<li><code>shopnow-public-subnet-1b</code><br>
+→ Save associations</li>
+</ul>
+<p>→ Now these subnets are PUBLIC — instances in them can reach the internet directly through the IGW</p>
+<hr>
+<p><strong>Create Route Table 2: Private Route Table (AZ-a)</strong></p>
+<p>→ "Create route table"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-private-rt-1a</code></td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr></tbody></table>
+<p><strong>Add Routes:</strong></p>
+<table><thead><tr><th>Destination</th><th>Target</th></tr></thead><tbody><tr><td><code>10.0.0.0/16</code></td><td>local (auto-present)</td></tr><tr><td><code>0.0.0.0/0</code></td><td><code>shopnow-nat-gw-1a</code> (NAT Gateway in AZ-a)</td></tr></tbody></table>
+<p><strong>Associate Private Subnets in AZ-a:</strong></p>
+<p>→ "Subnet associations" → Check:</p>
+<ul>
+<li><code>shopnow-private-data-subnet-1a</code></li>
+<li><code>shopnow-private-app-subnet-1a</code><br>
+→ Save</li>
+</ul>
+<hr>
+<p><strong>Create Route Table 3: Private Route Table (AZ-b)</strong></p>
+<p>→ "Create route table"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-private-rt-1b</code></td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr></tbody></table>
+<p><strong>Add Routes:</strong></p>
+<table><thead><tr><th>Destination</th><th>Target</th></tr></thead><tbody><tr><td><code>10.0.0.0/16</code></td><td>local (auto-present)</td></tr><tr><td><code>0.0.0.0/0</code></td><td><code>shopnow-nat-gw-1b</code> (NAT Gateway in AZ-b)</td></tr></tbody></table>
+<p><strong>Associate Private Subnets in AZ-b:</strong></p>
+<p>→ "Subnet associations" → Check:</p>
+<ul>
+<li><code>shopnow-private-data-subnet-1b</code></li>
+<li><code>shopnow-private-app-subnet-1b</code><br>
+→ Save</li>
+</ul>
+<hr>
+<p><strong>Why Separate Route Tables per AZ for Private Subnets:</strong></p>
+<p>→ Private subnets in AZ-a use NAT Gateway in AZ-a<br>
+→ Private subnets in AZ-b use NAT Gateway in AZ-b<br>
+→ Traffic stays within the same AZ → lower latency + no cross-AZ data transfer cost<br>
+→ If AZ-a fails → only AZ-a private subnets are affected → AZ-b continues independently</p>
+<hr>
+<p><strong>The Main Route Table:</strong></p>
+<p>→ When the VPC was created → AWS auto-created a "Main" route table<br>
+→ Any subnet NOT explicitly associated with a route table uses the Main route table<br>
+→ The Main route table has ONLY the <code>local</code> route → NO internet access</p>
+<p>→ Best practice: NEVER add an IGW route to the Main route table<br>
+→ Why: Any NEW subnet you create automatically uses the Main route table<br>
+→ If Main route table has IGW route → new subnets are accidentally public<br>
+→ Keep Main route table private → new subnets are private by default → security by default</p>
+<hr>
+<h3>STEP 7 — COMPLETE ARCHITECTURE VERIFICATION</h3>
+<p><strong>Final Component Summary:</strong></p>
+<table><thead><tr><th>Component</th><th>Name</th><th>Purpose</th></tr></thead><tbody><tr><td>VPC</td><td>shopnow-prod-vpc (10.0.0.0/16)</td><td>Isolated network</td></tr><tr><td>Public Subnet 1a</td><td>10.0.1.0/24 (ap-south-1a)</td><td>Web servers</td></tr><tr><td>Public Subnet 1b</td><td>10.0.2.0/24 (ap-south-1b)</td><td>Web servers</td></tr><tr><td>Private Data Subnet 1a</td><td>10.0.11.0/24 (ap-south-1a)</td><td>Databases</td></tr><tr><td>Private Data Subnet 1b</td><td>10.0.12.0/24 (ap-south-1b)</td><td>Databases</td></tr><tr><td>Private App Subnet 1a</td><td>10.0.21.0/24 (ap-south-1a)</td><td>Application logic</td></tr><tr><td>Private App Subnet 1b</td><td>10.0.22.0/24 (ap-south-1b)</td><td>Application logic</td></tr><tr><td>Internet Gateway</td><td>shopnow-prod-igw</td><td>Internet access for public subnets</td></tr><tr><td>NAT Gateway 1a</td><td>shopnow-nat-gw-1a (in public 1a)</td><td>Internet access for private subnets in AZ-a</td></tr><tr><td>NAT Gateway 1b</td><td>shopnow-nat-gw-1b (in public 1b)</td><td>Internet access for private subnets in AZ-b</td></tr><tr><td>Public Route Table</td><td>shopnow-public-rt</td><td>Routes to IGW</td></tr><tr><td>Private RT 1a</td><td>shopnow-private-rt-1a</td><td>Routes to NAT GW 1a</td></tr><tr><td>Private RT 1b</td><td>shopnow-private-rt-1b</td><td>Routes to NAT GW 1b</td></tr><tr><td>Main Route Table</td><td>(default)</td><td>Local only — no internet (safety net)</td></tr></tbody></table>
+<hr>
+<p><strong>Verification Checklist:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CHECK 1: VPC exists with CIDR 10.0.0.0/16
+</span>         VPC Console → Your VPCs → Verify ✓
+
+CHECK 2: DNS hostnames enabled
+         VPC → Details → DNS hostnames: Yes ✓
+
+CHECK 3: 6 subnets created across 2 AZs
+         VPC Console → Subnets → Filter by VPC → Count = 6 ✓
+
+CHECK 4: Public subnets have auto-assign public IP enabled
+         Select public subnet → Details → Auto-assign public IPv4: Yes ✓
+
+CHECK 5: Private subnets do NOT have auto-assign public IP
+         Select private subnet → Details → Auto-assign public IPv4: No ✓
+
+CHECK 6: IGW created and attached to VPC
+         Internet Gateways → State: Attached → VPC: shopnow-prod-vpc ✓
+
+CHECK 7: 2 NAT Gateways in public subnets (one per AZ)
+         NAT Gateways → Subnet: public-1a and public-1b → State: Available ✓
+
+CHECK 8: Public RT has route 0.0.0.0/0 → IGW
+         Route Tables → shopnow-public-rt → Routes → Verify ✓
+
+CHECK 9: Private RTs have route 0.0.0.0/0 → NAT GW
+         Route Tables → shopnow-private-rt-1a → Routes → Target: nat-xxx ✓
+         Route Tables → shopnow-private-rt-1b → Routes → Target: nat-xxx ✓
+
+CHECK 10: Public subnets associated with public RT
+          shopnow-public-rt → Subnet associations → 2 public subnets ✓
+
+CHECK 11: Private subnets associated with private RTs
+          shopnow-private-rt-1a → Subnet associations → 2 subnets in AZ-a ✓
+          shopnow-private-rt-1b → Subnet associations → 2 subnets in AZ-b ✓
+
+CHECK 12: Main RT has NO route to IGW
+          Main RT → Routes → Only local route → No 0.0.0.0/0 ✓</code></pre></div>
+<hr>
+<h3>STEP 8 — LAUNCH INSTANCES IN THE NEW VPC</h3>
+<p>→ Now let's place ShopNow's instances in the correct subnets</p>
+<p><strong>Web Server Launch (Reference Project 3):</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>AMI</td><td>Amazon Linux 2023</td></tr><tr><td>Instance Type</td><td>t3.micro</td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet</td><td>shopnow-public-subnet-1a</td></tr><tr><td>Auto-assign public IP</td><td>Enable (inherited from subnet setting)</td></tr><tr><td>Security Group</td><td>shopnow-web-sg (from Project 4) — create in new VPC</td></tr><tr><td>Key Pair</td><td>shopnow-dev-key-aps1</td></tr></tbody></table>
+<p>→ Web server gets: Private IP <code>10.0.1.x</code> + Public IP (auto-assigned or Elastic IP)</p>
+<p><strong>Database Server Launch:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>AMI</td><td>Amazon Linux 2023</td></tr><tr><td>Instance Type</td><td>t3.small</td></tr><tr><td>VPC</td><td>shopnow-prod-vpc</td></tr><tr><td>Subnet</td><td>shopnow-private-data-subnet-1a</td></tr><tr><td>Auto-assign public IP</td><td>Disable (inherited from subnet setting)</td></tr><tr><td>Security Group</td><td>shopnow-db-sg (from Project 4) — create in new VPC</td></tr><tr><td>Key Pair</td><td>shopnow-dev-key-aps1</td></tr></tbody></table>
+<p>→ Database server gets: ONLY Private IP <code>10.0.11.x</code> — NO public IP<br>
+→ Cannot be reached from the internet — architecturally secure<br>
+→ CAN reach the internet through NAT Gateway (for OS patches)<br>
+→ CAN be reached by web server through SG referencing (Project 4)</p>
+<p><strong>Important: Security Groups are VPC-specific</strong><br>
+→ The SGs created in the default VPC (Project 4) do NOT exist in <code>shopnow-prod-vpc</code><br>
+→ You must recreate them in the new VPC with the same rules<br>
+→ SG referencing works the same way — just use the new SG IDs</p>
+<hr>
+<p><strong>How to SSH into Private Instance (Database):</strong></p>
+<p>→ The database has no public IP → cannot SSH directly from the internet<br>
+→ Three options:</p>
+<table><thead><tr><th>Method</th><th>How It Works</th><th>Pros</th><th>Cons</th></tr></thead><tbody><tr><td>Bastion Host (Jump Box)</td><td>SSH to public EC2 first → then SSH from there to private instance</td><td>Simple concept</td><td>Must manage another EC2 instance</td></tr><tr><td>Session Manager (SSM)</td><td>AWS managed browser-based shell — no SSH needed</td><td>No port 22 needed, logged, no bastion</td><td>Requires IAM Role on instance (Project 11)</td></tr><tr><td>EC2 Instance Connect Endpoint</td><td>AWS managed tunnel — SSH through private endpoint</td><td>No bastion, no public IP needed</td><td>Newer feature, VPC endpoint cost</td></tr></tbody></table>
+<p>→ Session Manager is the RECOMMENDED approach (covered in Project 11)<br>
+→ Bastion Host is the TRADITIONAL approach:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Your laptop → SSH (port 22) → Bastion Host (public subnet)
+</span>                                     │
+                                     └→ SSH (port 22) → Database (private subnet)</code></pre></div>
+<p>→ Bastion Host SG: Allow SSH from your IP only<br>
+→ Database SG: Allow SSH from Bastion Host SG (SG referencing)</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always plan CIDR ranges before creating VPCs — changing CIDR later has limitations<br>
+→ Always use non-overlapping CIDRs if you plan to peer VPCs or connect to on-premises<br>
+→ Always create subnets across at least 2 Availability Zones for high availability<br>
+→ Always put databases and sensitive workloads in private subnets<br>
+→ Always create NAT Gateways in EACH AZ for high availability<br>
+→ Always keep the Main route table without IGW route — security by default<br>
+→ Always enable DNS hostnames and DNS resolution on the VPC<br>
+→ Always use separate route tables for public and private subnets<br>
+→ Always leave gaps in subnet CIDR numbering for future expansion<br>
+→ Always tag every VPC component with Name, Environment, Tier<br>
+→ Always document your VPC architecture with a diagram<br>
+→ Always disable auto-assign public IP on private subnets</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never use the default VPC for production workloads<br>
+→ Never put databases in public subnets — even with restrictive Security Groups<br>
+→ Never add an IGW route to the Main route table — new subnets become accidentally public<br>
+→ Never use overlapping CIDRs between VPCs you might connect later (peering/transit gateway — Projects 44, 50)<br>
+→ Never create a single NAT Gateway for production — AZ failure takes down all private internet access<br>
+→ Never use <code>/28</code> (smallest) for production subnets — only 11 usable IPs<br>
+→ Never forget to create route table entries — subnets without proper routes have no connectivity<br>
+→ Never skip the NAT Gateway for private subnets that need updates — unpatched servers are security risks<br>
+→ Never put the NAT Gateway in a private subnet — it needs IGW access to function<br>
+→ Never assume subnets are public or private by default — the route table determines this<br>
+→ Never use <code>172.31.0.0/16</code> if your office network uses it — VPN/Direct Connect won't work<br>
+→ Never forget AWS reserves 5 IPs per subnet when calculating capacity</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>Web servers needing internet access</td><td>Public subnet + IGW route + public IP</td></tr><tr><td>Databases needing isolation</td><td>Private subnet + NO IGW route + NO public IP</td></tr><tr><td>Private instances needing OS updates</td><td>NAT Gateway in public subnet + private RT points to NAT GW</td></tr><tr><td>Private instances needing AWS service access (S3, DynamoDB)</td><td>VPC Endpoints (Project 27) — cheaper than NAT Gateway</td></tr><tr><td>Multi-tier application (web → app → db)</td><td>Separate subnets per tier with SG referencing between tiers</td></tr><tr><td>Disaster recovery / high availability</td><td>Subnets across multiple AZs + NAT GW per AZ</td></tr><tr><td>Connecting to office network</td><td>Custom CIDR that doesn't overlap + VPN/Direct Connect</td></tr><tr><td>Connecting two VPCs</td><td>VPC Peering (Project 44) — requires non-overlapping CIDRs</td></tr><tr><td>Connecting many VPCs</td><td>Transit Gateway (Project 50)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT create a custom VPC for quick testing/learning → the default VPC is fine for that<br>
+→ Do NOT create excessively large VPCs (<code>/16</code> for 5 instances) unless you plan to grow → but <code>/16</code> is common because it's easy to manage<br>
+→ Do NOT use VPC for serverless-only architectures (Lambda + S3 + DynamoDB) unless Lambda needs VPC resources → Lambda outside VPC has lower cold start<br>
+→ Do NOT create separate VPCs when separate subnets within one VPC suffice → VPC peering adds complexity<br>
+→ Do NOT use NAT Gateway when VPC Endpoints can serve the need → VPC Endpoints are cheaper for S3/DynamoDB traffic (Project 27)</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → VPC IS A SOFTWARE-DEFINED NETWORK</h3>
+<p>→ A VPC is NOT a physical network — it's an OVERLAY network<br>
+→ AWS physical infrastructure runs a massive underlay network<br>
+→ Your VPC is a virtual network MAPPED onto this physical infrastructure</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────┐
+</span>│              AWS PHYSICAL INFRASTRUCTURE              │
+│                                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
+│  │ Physical    │  │ Physical    │  │ Physical    │ │
+│  │ Host A      │  │ Host B      │  │ Host C      │ │
+│  │ (AZ-a)      │  │ (AZ-a)      │  │ (AZ-b)      │ │
+│  │             │  │             │  │             │ │
+│  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │ │
+│  │ │Your VM  │ │  │ │Other    │ │  │ │Your VM  │ │ │
+│  │ │10.0.1.50│ │  │ │Customer │ │  │ │10.0.11.50│ │ │
+│  │ │         │ │  │ │VM       │ │  │ │         │ │ │
+│  │ └─────────┘ │  │ └─────────┘ │  │ └─────────┘ │ │
+│  └─────────────┘  └─────────────┘  └─────────────┘ │
+│                                                     │
+│  UNDERLAY: AWS's physical network fabric            │
+│  OVERLAY: Your VPC 10.0.0.0/16 (encapsulated)      │
+└─────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ Your VMs might be on physical hosts that also run OTHER customers' VMs<br>
+→ But VPC isolation ensures they CANNOT communicate (Nitro security + network encapsulation)<br>
+→ AWS uses packet encapsulation (similar to VXLAN) to keep VPC traffic isolated<br>
+→ Every packet on the physical network is tagged with VPC identifier<br>
+→ Nitro cards ensure packets can ONLY be delivered to the correct VPC</p>
+<hr>
+<h3>2 → HOW ROUTING WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Instance 10.0.1.50 sends packet to 10.0.11.50 (different subnet, same VPC)
+</span>        │
+        ▼
+Step 1: Nitro card on Host A receives the packet
+        │
+        ▼
+Step 2: VPC Router (software-defined — runs on AWS infrastructure)
+        Checks route table for the SOURCE subnet
+        │
+        Route table: 10.0.0.0/16 → local
+        10.0.11.50 matches 10.0.0.0/16 → Route: local
+        │
+        ▼
+Step 3: VPC routing fabric looks up: where is 10.0.11.50?
+        Answer: ENI eni-xyz on Physical Host C in AZ-b
+        │
+        ▼
+Step 4: Packet encapsulated and sent through physical network to Host C
+        │
+        ▼
+Step 5: NACL on destination subnet evaluated (Project 4)
+        │
+        ▼
+Step 6: Security Group on destination ENI evaluated (Project 4)
+        │
+        ▼
+Step 7: Packet delivered to instance 10.0.11.50</code></pre></div>
+<p>→ The VPC Router is NOT a physical device — it's distributed software<br>
+→ It exists at every physical host where your instances run<br>
+→ Route table lookup happens at the SOURCE host before the packet enters the network<br>
+→ This is why routing changes take effect immediately</p>
+<hr>
+<h3>3 → HOW INTERNET GATEWAY WORKS INTERNALLY</h3>
+<p>→ The IGW is NOT a single physical device<br>
+→ It's a distributed, horizontally-scaled service running at the edge of the VPC</p>
+<p><strong>The IGW performs TWO functions:</strong></p>
+<p><strong>Function 1: Static NAT (1-to-1)</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VPC Internal:  10.0.1.50 ←→ Public: 13.234.176.89
+</span>
+Outbound:
+  Instance sends: Src=10.0.1.50, Dst=8.8.8.8
+  IGW translates: Src=13.234.176.89, Dst=8.8.8.8
+  
+Inbound:
+  Internet sends: Src=8.8.8.8, Dst=13.234.176.89
+  IGW translates: Src=8.8.8.8, Dst=10.0.1.50</code></pre></div>
+<p>→ Each instance with a public IP has a 1:1 mapping maintained by the IGW<br>
+→ The IGW knows: Public IP → Private IP (from the Elastic IP or auto-assigned IP association)</p>
+<p><strong>Function 2: Route Target</strong></p>
+<p>→ The IGW appears as a target in route tables<br>
+→ When a packet's route points to the IGW → the IGW handles internet-bound traffic<br>
+→ If the instance has NO public IP and the packet targets the IGW → packet is DROPPED<br>
+→ IGW requires the instance to have a public IP for outbound internet access</p>
+<hr>
+<h3>4 → HOW NAT GATEWAY WORKS INTERNALLY</h3>
+<p>→ NAT Gateway performs PAT (Port Address Translation) — many-to-one NAT</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>100 private instances all using ONE NAT Gateway IP (52.66.100.200)
+</span>
+Instance A (10.0.11.50) connects to server.com from port 45000
+Instance B (10.0.11.51) connects to server.com from port 45000
+
+NAT Gateway Translation Table:
+┌──────────────────┬────────────────────┬───────────────────────┐
+│ Private Address   │ NAT Gateway        │ Destination           │
+├──────────────────┼────────────────────┼───────────────────────┤
+│ 10.0.11.50:45000 │ 52.66.100.200:1024 │ server.com:443        │
+│ 10.0.11.51:45000 │ 52.66.100.200:1025 │ server.com:443        │
+└──────────────────┴────────────────────┴───────────────────────┘</code></pre></div>
+<p>→ NAT Gateway assigns unique source ports on its public IP<br>
+→ Even if two instances use the same source port → NAT GW maps to different ports<br>
+→ This allows up to ~55,000 simultaneous connections per destination per NAT Gateway<br>
+→ If you exceed this → ErrorPortAllocation metric in CloudWatch → need more NAT Gateways or multiple EIPs</p>
+<p><strong>NAT Gateway Limits:</strong></p>
+<table><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody><tr><td>Bandwidth</td><td>5 Gbps base, auto-scales to 100 Gbps</td></tr><tr><td>Packets per second</td><td>10 million</td></tr><tr><td>Connections per destination</td><td>~55,000 (port exhaustion limit)</td></tr><tr><td>Connections total</td><td>~900,000 (all destinations combined)</td></tr><tr><td>Elastic IPs per NAT GW</td><td>Up to 8 (for more source IPs = more ports = more connections)</td></tr></tbody></table>
+<hr>
+<h3>5 → HOW AZ ISOLATION WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ap-south-1a                           ap-south-1b
+</span>┌─────────────────────────┐          ┌─────────────────────────┐
+│ Physical Data Center(s) │          │ Physical Data Center(s) │
+│                         │          │                         │
+│ Independent power       │          │ Independent power       │
+│ Independent cooling     │          │ Independent cooling     │
+│ Independent networking  │          │ Independent networking  │
+│                         │          │                         │
+│ Connected via low-      │◄────────►│ Connected via low-      │
+│ latency private fiber   │          │ latency private fiber   │
+│                         │          │                         │
+│ Failure in 1a does NOT  │          │ Failure in 1b does NOT  │
+│ affect 1b               │          │ affect 1a               │
+└─────────────────────────┘          └─────────────────────────┘</code></pre></div>
+<p>→ Each AZ is one or more discrete data centers<br>
+→ AZs within a region are connected with high-bandwidth, low-latency networking<br>
+→ But they have independent infrastructure → one can fail without affecting others<br>
+→ This is why we create subnets in multiple AZs → true high availability</p>
+<p><strong>AZ Name Mapping (Important Detail):</strong></p>
+<p>→ <code>ap-south-1a</code> in YOUR account might NOT be the same physical data center as <code>ap-south-1a</code> in another account<br>
+→ AWS randomizes AZ name-to-physical-location mapping per account<br>
+→ This prevents everyone from choosing "a" and overloading one data center<br>
+→ To coordinate between accounts → use AZ IDs (e.g., <code>aps1-az1</code>) which are consistent</p>
+<hr>
+<h3>6 → VPC LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Default Limit</th><th>Hard Limit</th></tr></thead><tbody><tr><td>VPCs per region</td><td>5</td><td>Adjustable to 100+</td></tr><tr><td>Subnets per VPC</td><td>200</td><td>Adjustable to 500+</td></tr><tr><td>Internet Gateways per VPC</td><td>1</td><td>1 (hard limit)</td></tr><tr><td>NAT Gateways per AZ</td><td>5</td><td>Adjustable</td></tr><tr><td>Route tables per VPC</td><td>200</td><td>Adjustable</td></tr><tr><td>Routes per route table</td><td>50</td><td>Adjustable to 1,000</td></tr><tr><td>Security Groups per VPC</td><td>2,500</td><td>Adjustable</td></tr><tr><td>NACLs per VPC</td><td>200</td><td>Adjustable</td></tr><tr><td>Elastic IPs per region</td><td>5</td><td>Adjustable to 100+</td></tr><tr><td>IPv4 CIDR blocks per VPC</td><td>5 (secondary CIDRs)</td><td>Can add more CIDRs to existing VPC</td></tr></tbody></table>
+<p>→ The 5 VPC limit per region is often hit quickly in multi-account setups → request increase<br>
+→ The 5 Elastic IP limit is also commonly increased → needed for NAT Gateways + instances</p>
+<p><strong>Secondary CIDRs:</strong></p>
+<p>→ You CAN add additional CIDR blocks to an existing VPC<br>
+→ Example: VPC started with 10.0.0.0/16 → add 10.1.0.0/16 as secondary<br>
+→ Useful when you run out of IPs in the original CIDR<br>
+→ Secondary CIDRs must not overlap with primary or each other<br>
+→ Secondary CIDRs can be from different RFC 1918 ranges</p>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Overlapping CIDR with on-premises or other VPCs</td><td>Cannot create VPC Peering or VPN — connection refused</td><td>Plan CIDR allocation across all networks upfront</td></tr><tr><td>2</td><td>NAT Gateway in private subnet</td><td>NAT GW has no internet access → private instances can't reach internet</td><td>Always place NAT Gateway in a PUBLIC subnet</td></tr><tr><td>3</td><td>Forgot to create route to IGW in public RT</td><td>Public subnet instances can't reach internet despite having public IPs</td><td>Verify route table has 0.0.0.0/0 → IGW</td></tr><tr><td>4</td><td>Forgot to create route to NAT GW in private RT</td><td>Private instances can't download updates</td><td>Verify private RT has 0.0.0.0/0 → NAT GW</td></tr><tr><td>5</td><td>Added IGW route to Main route table</td><td>New subnets automatically become public — security risk</td><td>Keep Main RT private — create separate public RT</td></tr><tr><td>6</td><td>Single NAT Gateway for production</td><td>AZ failure = all private instances lose internet</td><td>Create one NAT GW per AZ</td></tr><tr><td>7</td><td>Wrong subnet association to route table</td><td>Public subnet associated with private RT → no internet</td><td>Verify associations in Route Tables → Subnet Associations tab</td></tr><tr><td>8</td><td>Created SG in wrong VPC</td><td>SG shows in console but instances can't use it — "SG not found"</td><td>Always verify VPC selection when creating SGs</td></tr><tr><td>9</td><td>Auto-assign public IP enabled on private subnet</td><td>Private instances get public IPs — defeats purpose of private subnet</td><td>Disable auto-assign on private subnets</td></tr><tr><td>10</td><td>NAT Gateway costs surprise</td><td>2 NAT GWs × 24/7 = ~$65/month EACH + data processing fees</td><td>Budget for NAT GW costs — consider VPC Endpoints (Project 27) for S3/DynamoDB traffic</td></tr><tr><td>11</td><td>Subnet too small (/28)</td><td>Only 11 usable IPs → quickly exhausted when adding instances</td><td>Use /24 for production subnets (251 usable IPs)</td></tr><tr><td>12</td><td>DNS resolution not enabled on VPC</td><td>RDS endpoints don't resolve, VPC Endpoints fail</td><td>Enable DNS resolution AND DNS hostnames on VPC</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>IP Address Scalability</strong></p>
+<ul>
+<li><code>/16</code> VPC = 65,536 IPs → sufficient for most organizations</li>
+<li>If you outgrow <code>/16</code> → add secondary CIDRs (up to 5 additional blocks)</li>
+<li>Plan subnet sizes based on expected instance count + 50% growth buffer</li>
+<li><code>/24</code> per subnet (251 IPs) is the standard production choice</li>
+<li><code>/20</code> per subnet (4,091 IPs) for very large deployments (EKS, Lambda ENIs)</li>
+</ul>
+<p>→ <strong>AZ Scalability</strong></p>
+<ul>
+<li>Most regions have 3+ AZs — use at least 2 for production</li>
+<li>Some services require 3 AZs (MSK, some EKS configurations)</li>
+<li>More AZs = more NAT Gateways = higher cost → balance HA vs cost</li>
+</ul>
+<p>→ <strong>VPC Scalability</strong></p>
+<ul>
+<li>Single VPC per environment (dev/staging/prod) is common</li>
+<li>Single VPC per team/business unit in larger organizations</li>
+<li>VPC Peering (Project 44) connects VPCs — but doesn't scale beyond ~10-20 VPCs</li>
+<li>Transit Gateway (Project 50) scales to hundreds of VPCs</li>
+</ul>
+<p>→ <strong>NAT Gateway Scalability</strong></p>
+<ul>
+<li>Auto-scales bandwidth to 100 Gbps</li>
+<li>Port exhaustion at ~55,000 connections per destination → add more EIPs to the NAT GW</li>
+<li>For very high traffic → consider multiple NAT Gateways with split routing</li>
+<li>VPC Endpoints (Project 27) bypass NAT Gateway entirely for AWS services → cost + performance benefit</li>
+</ul>
+<p>→ <strong>Route Table Scalability</strong></p>
+<ul>
+<li>50 routes per table (default) → sufficient for most designs</li>
+<li>Can increase to 1,000 for complex routing (VPN, peering, transit gateway)</li>
+<li>Each VPC peering connection adds a route → with many peerings, route limits become a concern</li>
+<li>Transit Gateway (Project 50) reduces route table complexity</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify VPC is correctly configured:</strong></p>
+<table><thead><tr><th>Verification</th><th>How</th></tr></thead><tbody><tr><td>VPC CIDR correct</td><td>VPC Console → Your VPCs → IPv4 CIDR</td></tr><tr><td>DNS settings enabled</td><td>VPC → Details → DNS hostnames: Yes, DNS resolution: Yes</td></tr><tr><td>Subnets in correct AZs</td><td>Subnets → Sort by AZ → Verify distribution</td></tr><tr><td>Public subnets have auto-assign IP</td><td>Select subnet → Details → Auto-assign public IPv4</td></tr><tr><td>IGW attached</td><td>Internet Gateways → State: Attached → VPC ID matches</td></tr><tr><td>NAT GWs in public subnets</td><td>NAT Gateways → Subnet column → Verify public subnet</td></tr><tr><td>Route tables correct</td><td>Select each RT → Routes tab → Verify targets</td></tr><tr><td>Subnet associations correct</td><td>Select each RT → Subnet associations → Verify correct subnets</td></tr><tr><td>Main RT has no IGW route</td><td>Main RT → Routes → Only local route</td></tr></tbody></table>
+<p>→ <strong>How to test connectivity:</strong></p>
+<table><thead><tr><th>Test</th><th>From</th><th>To</th><th>Expected Result</th></tr></thead><tbody><tr><td>Public instance → internet</td><td>EC2 in public subnet</td><td><code>ping 8.8.8.8</code></td><td>Success</td></tr><tr><td>Private instance → internet</td><td>EC2 in private subnet</td><td><code>ping 8.8.8.8</code> (through NAT GW)</td><td>Success</td></tr><tr><td>Internet → public instance</td><td>Your laptop</td><td>SSH to public EC2 public IP</td><td>Success (if SG allows)</td></tr><tr><td>Internet → private instance</td><td>Your laptop</td><td>SSH to private EC2 private IP</td><td>Fail (no public IP, no route)</td></tr><tr><td>Public instance → private instance</td><td>EC2 in public subnet</td><td>SSH to private EC2 private IP</td><td>Success (if SG allows, same VPC)</td></tr></tbody></table>
+<p>→ <strong>Visual Debugging Tool:</strong></p>
+<p>→ VPC Console → "Reachability Analyzer" → Create analysis<br>
+→ Source: Web EC2 instance<br>
+→ Destination: Database EC2 instance<br>
+→ Protocol: TCP, Port: 3306<br>
+→ Click "Analyze" → Shows EXACT path and where it's blocked (if any)<br>
+→ Shows: Route tables evaluated → NACLs evaluated → Security Groups evaluated</p>
+<p>→ <strong>VPC Flow Logs for Network Monitoring:</strong></p>
+<p>→ VPC Console → Select VPC → Flow logs tab → "Create flow log"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Filter</td><td>All (or Reject only — to see blocked traffic)</td></tr><tr><td>Maximum aggregation interval</td><td>1 minute (more granular) or 10 minutes (cheaper)</td></tr><tr><td>Destination</td><td>CloudWatch Logs or S3</td></tr><tr><td>IAM Role</td><td>Role with permissions to publish to destination</td></tr></tbody></table>
+<p>→ Flow logs capture: Source IP, Dest IP, Source Port, Dest Port, Protocol, Packets, Bytes, Action (ACCEPT/REJECT)<br>
+→ Essential for troubleshooting "why can't instance A talk to instance B?"<br>
+→ Analyzed using CloudWatch Logs Insights or Athena (Project 18) if stored in S3</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ A VPC is your isolated virtual network in AWS — you control the ENTIRE network architecture<br>
+→ What makes a subnet PUBLIC is the route to an Internet Gateway — not the subnet itself<br>
+→ What makes a subnet PRIVATE is the ABSENCE of a route to an Internet Gateway<br>
+→ NAT Gateway solves "outbound yes, inbound no" for private instances<br>
+→ Route Tables are the traffic directors — they determine where packets go<br>
+→ CIDR planning is critical — overlapping CIDRs prevent VPC peering and VPN connectivity<br>
+→ Multiple AZs = high availability — always distribute subnets across at least 2 AZs<br>
+→ Main Route Table should NEVER have IGW route — security by default for new subnets</p>
+<p>→ Connection to Project 4: Security Groups and NACLs operate WITHIN this VPC architecture</p>
+<ul>
+<li>SGs protect individual instances</li>
+<li>NACLs protect subnets</li>
+<li>Route Tables determine if traffic can even REACH the SG/NACL<br>
+→ Connection to Project 3: EC2 instances are now launched into specific subnets with specific route tables<br>
+→ Connection to Project 2: IAM policies control who can modify VPC components (<code>ec2:CreateSubnet</code>, <code>ec2:CreateRoute</code>)<br>
+→ Connection to Project 1: S3 access from private subnets goes through NAT Gateway (expensive) — VPC Endpoints (Project 27) are cheaper</li>
+</ul>
+<p>→ This VPC architecture is FOUNDATIONAL for everything that follows:</p>
+<ul>
+<li>Project 9: RDS MariaDB launches in private data subnets with subnet groups</li>
+<li>Project 14: EC2 to RDS connectivity within VPC (cross-subnet, SG referencing)</li>
+<li>Project 16: Redshift cluster placement in VPC</li>
+<li>Project 24: Glue JDBC connections require VPC/subnet/SG configuration</li>
+<li>Project 27: VPC Endpoints eliminate NAT Gateway for S3/DynamoDB traffic</li>
+<li>Project 33: Auto Scaling distributes instances across AZ subnets</li>
+<li>Project 44: VPC Peering connects this VPC to others</li>
+<li>Project 45: Lambda in VPC for private resource access</li>
+<li>Project 50: Transit Gateway connects many VPCs</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has a properly architected VPC with public and private subnets<br>
+→ The web server is in the public subnet → accessible from the internet<br>
+→ The database will go in the private subnet → isolated from the internet<br>
+→ But the marketing team asks: "How do we get notified when new product images are uploaded to S3?"<br>
+→ And the operations team says: "We need automated alerts when something fails"<br>
+→ They need a NOTIFICATION service that can:</p>
+<ul>
+<li>Send emails to multiple team members</li>
+<li>Potentially trigger other services</li>
+<li>Fan out one message to many subscribers</li>
+</ul>
+<p>→ <strong>This is exactly what Project 6 solves</strong><br>
+→ Project 6 introduces SNS (Simple Notification Service) — the pub/sub messaging backbone of AWS<br>
+→ It will be used extensively in later projects for:</p>
+<ul>
+<li>S3 event notifications (Project 15)</li>
+<li>CloudWatch alarm notifications (Project 8)</li>
+<li>SNS-to-SQS fan-out (Project 13)</li>
+<li>Cross-account notifications (Project 41)</li>
+<li>Pipeline success/failure alerts (Project 49)</li>
+</ul>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 6: "The Team That Missed Every Alert — SNS Topic Creation &amp; Email Subscription"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-4.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 5/60</span></div><a class="nav-btn next" href="project-6.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

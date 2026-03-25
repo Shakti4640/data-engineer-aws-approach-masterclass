@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 12: THE STORAGE BILL THAT KEPT GROWING — S3 Versioning &amp; Lifecycle P — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 12: THE STORAGE BILL THAT KEPT GROWING — S3 Versioning &amp; Lifecycle Policies</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1-11) now has:</p>
+<ul>
+<li>S3 bucket with bucket policies and IAM Roles (Projects 1, 10, 11)</li>
+<li>Full VPC architecture with EC2, RDS, monitoring (Projects 3-9)</li>
+<li>Messaging with SNS and SQS (Projects 6, 7)</li>
+</ul>
+<p>→ The S3 bucket <code>shopnow-productimages-prod-aps1</code> has grown to 2 TB over 18 months<br>
+→ Monthly S3 bill: ₹3,500 ($42) — seems small but growing 20% every month</p>
+<p>→ Problem 1: The CFO analyzes the storage breakdown:</p>
+<table><thead><tr><th>Data Category</th><th>Size</th><th>Access Frequency</th><th>Current Storage Class</th><th>Monthly Cost</th></tr></thead><tbody><tr><td>Current product images</td><td>500 GB</td><td>Daily</td><td>S3 Standard</td><td>₹875</td></tr><tr><td>Discontinued product images</td><td>800 GB</td><td>Once/month</td><td>S3 Standard</td><td>₹1,400</td></tr><tr><td>Archived campaign images</td><td>400 GB</td><td>Once/year</td><td>S3 Standard</td><td>₹700</td></tr><tr><td>Old log files</td><td>300 GB</td><td>Never</td><td>S3 Standard</td><td>₹525</td></tr><tr><td><strong>Total</strong></td><td><strong>2 TB</strong></td><td></td><td></td><td><strong>₹3,500</strong></td></tr></tbody></table>
+<p>→ 75% of the data (1.5 TB) is rarely or never accessed but stored in the MOST EXPENSIVE tier<br>
+→ If this data were in appropriate storage classes:</p>
+<ul>
+<li>Discontinued images → Standard-IA: ₹500 (64% savings)</li>
+<li>Archived campaigns → Glacier Instant Retrieval: ₹140 (80% savings)</li>
+<li>Old logs → Glacier Deep Archive: ₹30 (94% savings)</li>
+<li>Potential savings: ₹2,055/month → ₹24,660/year</li>
+</ul>
+<p>→ Problem 2: The marketing team uploaded new Diwali campaign images<br>
+→ They accidentally uploaded with the SAME file names as last year's Diwali campaign<br>
+→ Last year's images were OVERWRITTEN — permanently lost<br>
+→ The team says: "We need those original images for the annual report!"<br>
+→ Without versioning → overwrite = permanent replacement → no recovery possible</p>
+<p>→ Problem 3: <code>arjun-intern</code> accidentally deleted the <code>invoices/2024/</code> folder (200 files)<br>
+→ The finance team needed those invoices for the annual audit<br>
+→ Without versioning → delete = permanent removal → no recovery possible<br>
+→ The only backup was a manual snapshot from 3 months ago → 3 months of invoices lost</p>
+<p>→ Problem 4: Nobody is managing the data lifecycle<br>
+→ Objects uploaded 18 months ago sit in S3 Standard forever<br>
+→ Nobody manually moves objects to cheaper tiers — it's tedious and error-prone<br>
+→ The team tried manual migration once → missed 40% of the objects → inconsistent state</p>
+<p>→ The CTO demands:</p>
+<ul>
+<li>Accidental overwrites must be recoverable — keep previous versions</li>
+<li>Accidental deletions must be recoverable — "undo" capability</li>
+<li>Data must AUTOMATICALLY move to cheaper storage as it ages</li>
+<li>Old logs must be automatically deleted after 90 days</li>
+<li>Zero manual intervention — the system must manage itself</li>
+</ul>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ Two S3 features solve ALL these problems:</p>
+<table><thead><tr><th>Feature</th><th>Solves</th><th>How</th></tr></thead><tbody><tr><td>S3 Versioning</td><td>Overwrite recovery, deletion recovery</td><td>Keeps every version of every object</td></tr><tr><td>S3 Lifecycle Policies</td><td>Cost optimization, automatic cleanup</td><td>Moves/deletes objects based on age rules</td></tr></tbody></table>
+<p>→ These two features work TOGETHER:</p>
+<ul>
+<li>Versioning creates multiple versions of objects</li>
+<li>Lifecycle policies manage BOTH current versions AND previous versions</li>
+<li>Current versions can transition to cheaper storage classes over time</li>
+<li>Previous versions can be deleted after a retention period</li>
+</ul>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WITHOUT Versioning + Lifecycle:
+</span>Day 1: Upload shoe.jpg (Standard) ─────────────────────────────► Standard forever
+Day 30: Overwrite shoe.jpg ──► Old version LOST permanently
+Day 365: Still paying Standard price for rarely accessed data
+
+WITH Versioning + Lifecycle:
+Day 1: Upload shoe.jpg v1 (Standard)
+Day 30: Upload shoe.jpg v2 (Standard) ──► v1 becomes "previous version" (still exists!)
+Day 60: v2 auto-transitions to Standard-IA (lifecycle rule)
+Day 90: v1 (previous) auto-deleted (lifecycle rule for noncurrent versions)
+Day 180: v2 auto-transitions to Glacier Instant Retrieval
+Day 365: v2 auto-transitions to Glacier Deep Archive</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Enable and understand S3 Versioning</li>
+<li>Step 2 — Understand version IDs, current versions, and noncurrent versions</li>
+<li>Step 3 — Understand delete markers</li>
+<li>Step 4 — Create Lifecycle rules for storage class transitions</li>
+<li>Step 5 — Create Lifecycle rules for expiration (auto-deletion)</li>
+<li>Step 6 — Create Lifecycle rules for noncurrent versions</li>
+<li>Step 7 — Understand incomplete multipart upload cleanup</li>
+<li>Step 8 — Cost analysis and optimization</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — ENABLE S3 VERSIONING</h3>
+<p>→ S3 Console → Select bucket <code>shopnow-productimages-prod-aps1</code> → "Properties" tab<br>
+→ "Bucket Versioning" → "Edit" → Enable → "Save changes"</p>
+<p><strong>Versioning States:</strong></p>
+<table><thead><tr><th>State</th><th>Behavior</th><th>Can You Revert?</th></tr></thead><tbody><tr><td>Unversioned (default)</td><td>Objects have no version ID — overwrites replace permanently</td><td>N/A (initial state)</td></tr><tr><td>Enabled</td><td>Every PUT creates a new version — old versions preserved</td><td>Can SUSPEND (not disable)</td></tr><tr><td>Suspended</td><td>New objects get version ID "null" — existing versions preserved</td><td>Can RE-ENABLE</td></tr></tbody></table>
+<p>→ CRITICAL: Once versioning is ENABLED → it can NEVER be fully disabled<br>
+→ You can SUSPEND versioning → new objects get <code>null</code> version ID<br>
+→ But existing versioned objects remain with their version IDs<br>
+→ To truly remove all versions → you must delete each version individually</p>
+<p><strong>What Happens the Moment Versioning is Enabled:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE enabling versioning:
+</span>  shoe.jpg → No version ID (technically version ID = "null")
+
+AFTER enabling versioning:
+  shoe.jpg → Still has version ID "null" (pre-existing objects keep null)
+  
+Upload shoe.jpg again:
+  shoe.jpg → Version ID: "aaaa1111" (NEW version — CURRENT)
+  shoe.jpg → Version ID: "null" (OLD version — NONCURRENT)
+
+Upload shoe.jpg again:
+  shoe.jpg → Version ID: "bbbb2222" (NEWEST — CURRENT)
+  shoe.jpg → Version ID: "aaaa1111" (NONCURRENT)
+  shoe.jpg → Version ID: "null" (NONCURRENT)</code></pre></div>
+<p>→ Each version is a COMPLETE copy of the object — not a diff/delta<br>
+→ Each version is independently stored and billed<br>
+→ 3 versions of a 10 MB file = 30 MB of storage billed</p>
+<hr>
+<h3>STEP 2 — UNDERSTAND VERSION IDs AND VERSION STATES</h3>
+<p><strong>Version ID:</strong></p>
+<p>→ A unique identifier assigned to each version of an object<br>
+→ Format: Random string like <code>3sL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo</code><br>
+→ Generated by S3 — you cannot choose or predict it<br>
+→ Pre-existing objects (before versioning was enabled) have version ID <code>null</code></p>
+<p><strong>Current vs Noncurrent Versions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Object Key: products/images/shoe-001.jpg
+</span>
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│  Version ID: "cccc3333" ← CURRENT VERSION                   │
+│  Uploaded: 2025-01-15                                       │
+│  Size: 12 MB                                                │
+│  This is what you GET when you request the object normally  │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Version ID: "bbbb2222" ← NONCURRENT VERSION                │
+│  Uploaded: 2025-01-10                                       │
+│  Size: 10 MB                                                │
+│  This was the current version until cccc3333 was uploaded   │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Version ID: "aaaa1111" ← NONCURRENT VERSION                │
+│  Uploaded: 2024-12-01                                       │
+│  Size: 8 MB                                                 │
+│  This was the current version until bbbb2222 was uploaded   │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Version ID: "null" ← NONCURRENT VERSION                    │
+│  Uploaded: 2024-06-15 (before versioning was enabled)       │
+│  Size: 5 MB                                                 │
+│  Original upload before versioning                          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+Total storage for this ONE object key: 12 + 10 + 8 + 5 = 35 MB
+(All four versions are stored and billed independently)</code></pre></div>
+<p><strong>Accessing Specific Versions:</strong></p>
+<table><thead><tr><th>Request Type</th><th>What You Get</th></tr></thead><tbody><tr><td><code>GET shoe-001.jpg</code> (no version ID)</td><td>CURRENT version (cccc3333) — latest upload</td></tr><tr><td><code>GET shoe-001.jpg?versionId=bbbb2222</code></td><td>SPECIFIC noncurrent version</td></tr><tr><td><code>GET shoe-001.jpg?versionId=null</code></td><td>The original pre-versioning version</td></tr><tr><td><code>LIST versions</code> (ListObjectVersions API)</td><td>ALL versions with their IDs and timestamps</td></tr></tbody></table>
+<p>→ Normal GET requests always return the CURRENT version<br>
+→ To get a specific older version → must include the version ID in the request<br>
+→ The S3 Console → Object → "Versions" tab → shows all versions → can download any version</p>
+<p><strong>How Overwrite Works with Versioning:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>State BEFORE overwrite:
+</span>  shoe.jpg → Version "aaaa1111" (CURRENT)
+
+Action: Upload new shoe.jpg (overwrite)
+
+State AFTER overwrite:
+  shoe.jpg → Version "bbbb2222" (CURRENT) ← new upload
+  shoe.jpg → Version "aaaa1111" (NONCURRENT) ← old version PRESERVED
+
+The old version is NOT deleted — it becomes noncurrent
+Marketing team can recover last year's Diwali images! ✓</code></pre></div>
+<hr>
+<h3>STEP 3 — UNDERSTAND DELETE MARKERS</h3>
+<p>→ This is the most CONFUSING concept in S3 versioning<br>
+→ When you "delete" an object in a versioned bucket → the object is NOT actually deleted<br>
+→ Instead, S3 places a DELETE MARKER on top of the version stack</p>
+<p><strong>What Happens When You Delete an Object (Simple DELETE):</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>State BEFORE delete:
+</span>  shoe.jpg → Version "bbbb2222" (CURRENT)
+  shoe.jpg → Version "aaaa1111" (NONCURRENT)
+
+Action: DELETE shoe.jpg (without specifying version ID)
+
+State AFTER delete:
+  shoe.jpg → DELETE MARKER (version "dmrk4444") ← NEW — this is the "CURRENT" version
+  shoe.jpg → Version "bbbb2222" (NONCURRENT) ← still exists!
+  shoe.jpg → Version "aaaa1111" (NONCURRENT) ← still exists!
+
+What happens now:
+  GET shoe.jpg → Returns 404 "Not Found" (delete marker makes it appear deleted)
+  GET shoe.jpg?versionId=bbbb2222 → Returns the object! (specific version still exists)
+  LIST objects → shoe.jpg does NOT appear (hidden by delete marker)
+  LIST versions → Shows ALL versions INCLUDING the delete marker</code></pre></div>
+<p>→ A delete marker is a ZERO-SIZE "version" that hides the object<br>
+→ The actual data versions are still there → still stored → still billed<br>
+→ The object APPEARS deleted but is actually RECOVERABLE</p>
+<p><strong>How to Recover a "Deleted" Object:</strong></p>
+<p>→ Method 1: Delete the delete marker</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DELETE shoe.jpg?versionId=dmrk4444 (delete the delete marker specifically)
+</span>
+State AFTER removing delete marker:
+  shoe.jpg → Version "bbbb2222" (CURRENT again!) ← object is back!
+  shoe.jpg → Version "aaaa1111" (NONCURRENT)
+
+GET shoe.jpg → Returns version bbbb2222 ✓
+Object is "undeleted" — recovered!</code></pre></div>
+<p>→ Method 2: Copy a specific version to the same key</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COPY shoe.jpg (source: versionId=aaaa1111) → shoe.jpg (destination — same key)
+</span>
+State AFTER copy:
+  shoe.jpg → Version "eeee5555" (CURRENT — copy of aaaa1111)
+  shoe.jpg → DELETE MARKER (dmrk4444) (NONCURRENT)
+  shoe.jpg → Version "bbbb2222" (NONCURRENT)
+  shoe.jpg → Version "aaaa1111" (NONCURRENT)
+
+GET shoe.jpg → Returns version eeee5555 (which is the content of aaaa1111)
+Object is restored to a previous version ✓</code></pre></div>
+<p><strong>PERMANENT Deletion (Cannot Be Recovered):</strong></p>
+<p>→ To PERMANENTLY delete a specific version:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DELETE shoe.jpg?versionId=bbbb2222
+</span>
+This permanently removes version bbbb2222 — NO recovery possible
+The other versions (aaaa1111, dmrk4444) are unaffected</code></pre></div>
+<p>→ CRITICAL: Only specifying a version ID in the DELETE request causes permanent deletion<br>
+→ A simple DELETE (without version ID) only creates a delete marker → recoverable<br>
+→ This is the safety mechanism that solves Problem 3 (intern's accidental deletion)</p>
+<p><strong>Delete Marker Cost:</strong></p>
+<p>→ Delete markers have ZERO size → no storage cost for the marker itself<br>
+→ BUT the hidden versions underneath still consume storage → still billed<br>
+→ Delete markers accumulate over time → need lifecycle rules to clean them up</p>
+<hr>
+<h3>STEP 4 — CREATE LIFECYCLE RULES FOR STORAGE CLASS TRANSITIONS</h3>
+<p>→ S3 Console → Select bucket → "Management" tab → "Lifecycle rules" → "Create lifecycle rule"</p>
+<hr>
+<p><strong>RULE 1: Transition Current Product Images Based on Age</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>transition-product-images</code></td></tr><tr><td>Rule scope</td><td>Limit to specific prefixes</td></tr><tr><td>Prefix</td><td><code>products/</code></td></tr></tbody></table>
+<p><strong>Transitions for CURRENT versions:</strong></p>
+<table><thead><tr><th>Transition</th><th>Days After Creation</th><th>Storage Class</th><th>Cost Impact</th></tr></thead><tbody><tr><td>Transition 1</td><td>30 days</td><td>Standard-IA</td><td>~40% cheaper than Standard</td></tr><tr><td>Transition 2</td><td>90 days</td><td>Glacier Instant Retrieval</td><td>~68% cheaper than Standard</td></tr><tr><td>Transition 3</td><td>365 days</td><td>Glacier Deep Archive</td><td>~95% cheaper than Standard</td></tr></tbody></table>
+<p><strong>Understanding Storage Class Transitions:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Day 0: Object uploaded → S3 STANDARD
+</span>       Access: Instant | Cost: Highest
+       │
+Day 30: Auto-transition → S3 STANDARD-IA (Infrequent Access)
+        Access: Instant | Cost: Lower storage, per-retrieval fee
+        │
+Day 90: Auto-transition → GLACIER INSTANT RETRIEVAL
+        Access: Instant (milliseconds) | Cost: Much lower storage, higher retrieval fee
+        │
+Day 365: Auto-transition → GLACIER DEEP ARCHIVE
+         Access: 12-48 hours retrieval time | Cost: Lowest storage possible</code></pre></div>
+<p><strong>Transition Rules and Constraints:</strong></p>
+<p>→ Objects can ONLY transition in ONE direction (from hotter to colder tiers)<br>
+→ The transition hierarchy (cannot skip backwards):</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Standard
+</span>    ↓
+S3 Standard-IA  /  S3 Intelligent-Tiering  /  S3 One Zone-IA
+    ↓
+S3 Glacier Instant Retrieval
+    ↓
+S3 Glacier Flexible Retrieval
+    ↓
+S3 Glacier Deep Archive</code></pre></div>
+<p><strong>Minimum Storage Duration Charges:</strong></p>
+<table><thead><tr><th>Storage Class</th><th>Minimum Billable Duration</th><th>What It Means</th></tr></thead><tbody><tr><td>Standard</td><td>None</td><td>No minimum — pay for what you use</td></tr><tr><td>Standard-IA</td><td>30 days</td><td>Object deleted after 15 days → still charged for 30 days</td></tr><tr><td>One Zone-IA</td><td>30 days</td><td>Same as Standard-IA</td></tr><tr><td>Glacier Instant Retrieval</td><td>90 days</td><td>Object deleted after 30 days → charged for 90 days</td></tr><tr><td>Glacier Flexible Retrieval</td><td>90 days</td><td>Same</td></tr><tr><td>Glacier Deep Archive</td><td>180 days</td><td>Object deleted after 30 days → charged for 180 days</td></tr></tbody></table>
+<p>→ CRITICAL: If you transition to Standard-IA at Day 30 and then delete at Day 45<br>
+→ You're charged for Standard-IA for 30 days minimum (not 15 days)<br>
+→ This means: Don't transition objects that will be deleted soon</p>
+<p><strong>Minimum Object Size for Transitions:</strong></p>
+<table><thead><tr><th>Storage Class</th><th>Minimum Size</th></tr></thead><tbody><tr><td>Standard-IA</td><td>128 KB (smaller objects are charged as 128 KB)</td></tr><tr><td>One Zone-IA</td><td>128 KB</td></tr><tr><td>Glacier Instant Retrieval</td><td>128 KB</td></tr><tr><td>Glacier Flexible Retrieval</td><td>40 KB</td></tr><tr><td>Glacier Deep Archive</td><td>40 KB</td></tr></tbody></table>
+<p>→ Transitioning thousands of tiny files (&lt; 128 KB) to IA classes → charged as 128 KB each → may INCREASE cost<br>
+→ Only transition files that are reasonably sized</p>
+<hr>
+<p><strong>RULE 2: Transition Marketing Campaign Images</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>transition-marketing-images</code></td></tr><tr><td>Prefix</td><td><code>marketing/</code></td></tr></tbody></table>
+<p><strong>Transitions:</strong></p>
+<table><thead><tr><th>Days</th><th>Destination</th><th>Rationale</th></tr></thead><tbody><tr><td>7 days</td><td>Standard-IA</td><td>Campaigns are active for about a week</td></tr><tr><td>60 days</td><td>Glacier Instant Retrieval</td><td>Occasional review after campaign ends</td></tr><tr><td>180 days</td><td>Glacier Deep Archive</td><td>Long-term archive for annual reports</td></tr></tbody></table>
+<hr>
+<p><strong>RULE 3: Handle Invoices (Compliance — Must Keep 7 Years)</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>transition-invoices</code></td></tr><tr><td>Prefix</td><td><code>invoices/</code></td></tr></tbody></table>
+<p><strong>Transitions:</strong></p>
+<table><thead><tr><th>Days</th><th>Destination</th><th>Rationale</th></tr></thead><tbody><tr><td>90 days</td><td>Standard-IA</td><td>Invoices accessed during quarter-end</td></tr><tr><td>365 days</td><td>Glacier Instant Retrieval</td><td>Annual audit access</td></tr><tr><td>730 days (2 years)</td><td>Glacier Deep Archive</td><td>Long-term compliance archive</td></tr></tbody></table>
+<p>→ NO expiration rule for invoices — must keep for 7 years (2,555 days)<br>
+→ After 7 years → can add expiration if legal allows</p>
+<hr>
+<h3>STEP 5 — CREATE LIFECYCLE RULES FOR EXPIRATION (AUTO-DELETION)</h3>
+<p><strong>RULE 4: Auto-Delete Old Log Files</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>expire-old-logs</code></td></tr><tr><td>Prefix</td><td><code>logs/</code></td></tr></tbody></table>
+<p><strong>Expiration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Expire current versions</td><td>After 90 days</td></tr></tbody></table>
+<p>→ Log files older than 90 days are PERMANENTLY DELETED<br>
+→ With versioning enabled → "expire" creates a delete marker on the current version<br>
+→ The previous versions still exist until noncurrent version rules handle them (Step 6)</p>
+<p>→ Without versioning → "expire" permanently deletes the object<br>
+→ With versioning → "expire" is equivalent to a simple DELETE → creates delete marker</p>
+<hr>
+<p><strong>RULE 5: Auto-Delete Temporary Upload Files</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>expire-temp-files</code></td></tr><tr><td>Prefix</td><td><code>temp/</code></td></tr></tbody></table>
+<p><strong>Expiration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Expire current versions</td><td>After 1 day</td></tr></tbody></table>
+<p>→ Temp files are cleaned up automatically after 24 hours<br>
+→ No manual cleanup needed</p>
+<hr>
+<h3>STEP 6 — LIFECYCLE RULES FOR NONCURRENT VERSIONS</h3>
+<p>→ This is where versioning and lifecycle work TOGETHER<br>
+→ Without these rules → noncurrent versions accumulate forever → storage costs explode</p>
+<p><strong>RULE 6: Manage Noncurrent Versions for Product Images</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>manage-noncurrent-product-images</code></td></tr><tr><td>Prefix</td><td><code>products/</code></td></tr></tbody></table>
+<p><strong>Noncurrent Version Transitions:</strong></p>
+<table><thead><tr><th>Days After Becoming Noncurrent</th><th>Destination</th><th>Rationale</th></tr></thead><tbody><tr><td>30 days</td><td>Standard-IA</td><td>Keep recent versions accessible but cheaper</td></tr><tr><td>90 days</td><td>Glacier Instant Retrieval</td><td>Older versions rarely needed</td></tr></tbody></table>
+<p><strong>Noncurrent Version Expiration:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Rationale</th></tr></thead><tbody><tr><td>Permanently delete noncurrent versions</td><td>After 180 days</td><td>6 months is enough recovery window</td></tr><tr><td>Number of newer versions to retain</td><td>3</td><td>Always keep at least 3 versions regardless of age</td></tr></tbody></table>
+<p>→ "Number of newer versions to retain" is a SAFETY NET<br>
+→ Even if a version is older than 180 days → if there are fewer than 3 noncurrent versions → it's kept<br>
+→ This ensures you always have SOME version history</p>
+<p><strong>How Noncurrent Version Lifecycle Works:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Day 0: Upload shoe.jpg v1 (CURRENT)
+</span>Day 10: Upload shoe.jpg v2 (CURRENT) → v1 becomes NONCURRENT (Day 0 of noncurrent life)
+Day 40: v1 is 30 days noncurrent → Transitions to Standard-IA
+Day 50: Upload shoe.jpg v3 (CURRENT) → v2 becomes NONCURRENT (Day 0)
+Day 80: v2 is 30 days noncurrent → Transitions to Standard-IA
+Day 100: v1 is 90 days noncurrent → Transitions to Glacier Instant Retrieval
+Day 190: v1 is 180 days noncurrent → PERMANENTLY DELETED
+         (Unless fewer than 3 noncurrent versions remain)</code></pre></div>
+<hr>
+<p><strong>RULE 7: Clean Up Delete Markers</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>cleanup-delete-markers</code></td></tr><tr><td>Scope</td><td>Entire bucket</td></tr></tbody></table>
+<p><strong>Delete Expired Object Delete Markers:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Delete expired object delete markers</td><td>Yes</td></tr></tbody></table>
+<p>→ A delete marker is "expired" when it's the ONLY version remaining for that object key<br>
+→ This happens after all noncurrent versions have been deleted by lifecycle rules<br>
+→ The delete marker serves no purpose when no versions remain → clean it up</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Day 0: shoe.jpg has: delete marker + v2 (noncurrent) + v1 (noncurrent)
+</span>Day 180: v1 permanently deleted by noncurrent expiration rule
+Day 180: v2 permanently deleted by noncurrent expiration rule
+Day 181: Delete marker is now the ONLY version → it's "expired"
+         → Lifecycle rule removes it
+         → Object key completely gone from the bucket</code></pre></div>
+<p>→ Without this rule → orphaned delete markers accumulate → clutter the version listing<br>
+→ They don't cost storage (zero size) but make management confusing</p>
+<hr>
+<h3>STEP 7 — INCOMPLETE MULTIPART UPLOAD CLEANUP</h3>
+<p>→ From Project 1: Large files use multipart upload<br>
+→ If a multipart upload STARTS but never COMPLETES → incomplete parts remain in S3<br>
+→ These parts are INVISIBLE in normal listings but CONSUME STORAGE and COST MONEY<br>
+→ Common cause: Upload interrupted (network failure, application crash, user cancellation)</p>
+<p><strong>RULE 8: Abort Incomplete Multipart Uploads</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Rule name</td><td><code>abort-incomplete-multipart</code></td></tr><tr><td>Scope</td><td>Entire bucket</td></tr></tbody></table>
+<p><strong>Abort Incomplete Multipart Uploads:</strong></p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Days after initiation</td><td>7</td></tr></tbody></table>
+<p>→ If a multipart upload has been "in progress" for more than 7 days → abort it → delete the parts<br>
+→ A legitimate upload should complete within hours — 7 days is extremely generous<br>
+→ This prevents invisible storage waste</p>
+<p><strong>How to Check for Incomplete Multipart Uploads:</strong></p>
+<p>→ S3 Console → Bucket → "Uploads" section (if visible)<br>
+→ Or use AWS CLI: <code>aws s3api list-multipart-uploads --bucket shopnow-productimages-prod-aps1</code><br>
+→ Returns a list of uploads that started but never completed</p>
+<p>→ ShopNow found 50 GB of incomplete multipart uploads → cleaning them saves ₹87/month</p>
+<hr>
+<h3>STEP 8 — COMPLETE LIFECYCLE CONFIGURATION SUMMARY</h3>
+<p><strong>All Rules for ShopNow:</strong></p>
+<table><thead><tr><th>#</th><th>Rule Name</th><th>Prefix</th><th>Current Version Transitions</th><th>Current Version Expiration</th><th>Noncurrent Transitions</th><th>Noncurrent Expiration</th><th>Other</th></tr></thead><tbody><tr><td>1</td><td>transition-product-images</td><td>products/</td><td>30d→IA, 90d→GIR, 365d→GDA</td><td>None</td><td>30d→IA, 90d→GIR</td><td>180d (keep min 3)</td><td></td></tr><tr><td>2</td><td>transition-marketing-images</td><td>marketing/</td><td>7d→IA, 60d→GIR, 180d→GDA</td><td>None</td><td>30d→IA</td><td>90d (keep min 2)</td><td></td></tr><tr><td>3</td><td>transition-invoices</td><td>invoices/</td><td>90d→IA, 365d→GIR, 730d→GDA</td><td>None (7-year retention)</td><td>90d→IA, 365d→GIR</td><td>2555d (7 years)</td><td></td></tr><tr><td>4</td><td>expire-old-logs</td><td>logs/</td><td>None</td><td>90 days</td><td>None</td><td>30 days</td><td></td></tr><tr><td>5</td><td>expire-temp-files</td><td>temp/</td><td>None</td><td>1 day</td><td>None</td><td>1 day</td><td></td></tr><tr><td>6</td><td>cleanup-delete-markers</td><td>Entire bucket</td><td>None</td><td>None</td><td>None</td><td>None</td><td>Delete expired markers</td></tr><tr><td>7</td><td>abort-incomplete-multipart</td><td>Entire bucket</td><td>None</td><td>None</td><td>None</td><td>None</td><td>Abort after 7 days</td></tr></tbody></table>
+<p><strong>Abbreviations:</strong> IA = Standard-IA, GIR = Glacier Instant Retrieval, GDA = Glacier Deep Archive</p>
+<hr>
+<p><strong>Cost Savings Projection:</strong></p>
+<table><thead><tr><th>Data Category</th><th>Before (All Standard)</th><th>After (Lifecycle Applied)</th><th>Annual Savings</th></tr></thead><tbody><tr><td>Current product images (500 GB)</td><td>₹875/mo</td><td>₹440/mo (mix of Standard + IA + GIR)</td><td>₹5,220</td></tr><tr><td>Discontinued product images (800 GB)</td><td>₹1,400/mo</td><td>₹280/mo (mostly GIR + GDA)</td><td>₹13,440</td></tr><tr><td>Archived campaign images (400 GB)</td><td>₹700/mo</td><td>₹56/mo (GDA after 180 days)</td><td>₹7,728</td></tr><tr><td>Old log files (300 GB)</td><td>₹525/mo</td><td>₹0/mo (auto-deleted after 90 days)</td><td>₹6,300</td></tr><tr><td>Noncurrent versions (estimated 200 GB)</td><td>₹350/mo</td><td>₹35/mo (IA → GIR → deleted)</td><td>₹3,780</td></tr><tr><td>Incomplete multipart (50 GB)</td><td>₹87/mo</td><td>₹0/mo (aborted)</td><td>₹1,044</td></tr><tr><td><strong>Total</strong></td><td><strong>₹3,937/mo</strong></td><td><strong>₹811/mo</strong></td><td><strong>₹37,512/year</strong></td></tr></tbody></table>
+<p>→ 79% cost reduction through lifecycle automation<br>
+→ ZERO manual intervention required</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always enable versioning on production buckets — it's the ONLY protection against accidental overwrites and deletions<br>
+→ Always create lifecycle rules for EVERY prefix — unmanaged data grows costs indefinitely<br>
+→ Always include noncurrent version expiration rules — without them, old versions accumulate forever<br>
+→ Always set "number of newer versions to retain" as a safety net — prevents accidental loss of all history<br>
+→ Always include incomplete multipart upload cleanup — invisible storage waste<br>
+→ Always include delete marker cleanup — prevents orphaned markers cluttering the bucket<br>
+→ Always consider minimum storage duration charges before transitioning — transitioning then deleting wastes money<br>
+→ Always consider minimum object size for IA transitions — tiny files cost MORE in IA classes<br>
+→ Always analyze access patterns BEFORE creating lifecycle rules — use S3 Analytics or S3 Storage Lens<br>
+→ Always test lifecycle rules on a non-production bucket first — rules are irreversible once objects are deleted<br>
+→ Always document lifecycle rules and their rationale — future team members need to understand why<br>
+→ Always use S3 Intelligent-Tiering when access patterns are unpredictable</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never leave versioning enabled without noncurrent version expiration rules — storage costs explode<br>
+→ Never transition objects to Glacier classes if they need frequent access — retrieval fees are expensive<br>
+→ Never transition objects smaller than 128 KB to IA classes — charged as 128 KB minimum<br>
+→ Never transition objects that will be deleted within the minimum storage duration — you pay for the full minimum period<br>
+→ Never assume "delete" means permanently gone with versioning enabled — it creates a delete marker<br>
+→ Never rely on lifecycle rules as the ONLY backup — they delete data permanently when expiration triggers<br>
+→ Never set expiration rules without understanding the data's compliance requirements — legal may require 7+ years<br>
+→ Never create overlapping lifecycle rules on the same prefix with conflicting actions — unpredictable behavior<br>
+→ Never suspend versioning expecting old versions to disappear — they persist until manually deleted<br>
+→ Never forget that EVERY version is billed independently — 10 versions of 1 GB = 10 GB billed<br>
+→ Never set lifecycle expiration to 1 day for important data — allow buffer for recovery<br>
+→ Never ignore S3 Storage Lens recommendations — it identifies optimization opportunities</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Solution</th></tr></thead><tbody><tr><td>Protect against accidental overwrites</td><td>Enable Versioning</td></tr><tr><td>Protect against accidental deletions</td><td>Enable Versioning (delete markers are recoverable)</td></tr><tr><td>Reduce storage costs for aging data</td><td>Lifecycle transition rules (Standard → IA → Glacier)</td></tr><tr><td>Auto-delete temporary or log data</td><td>Lifecycle expiration rules</td></tr><tr><td>Clean up old versions to control costs</td><td>Noncurrent version expiration rules</td></tr><tr><td>Unknown access patterns</td><td>S3 Intelligent-Tiering (auto-moves between tiers)</td></tr><tr><td>Compliance: keep data for N years</td><td>Lifecycle transitions to Glacier + S3 Object Lock</td></tr><tr><td>Prevent ANY deletion (legal hold)</td><td>S3 Object Lock (WORM — Write Once Read Many)</td></tr><tr><td>Analyze access patterns before creating rules</td><td>S3 Analytics / S3 Storage Lens (Project 56)</td></tr><tr><td>Cross-region data protection</td><td>Cross-Region Replication (Project 30) — separate from lifecycle</td></tr></tbody></table>
+<p><strong>Storage Class Decision Matrix:</strong></p>
+<table><thead><tr><th>Access Pattern</th><th>Best Storage Class</th><th>Retrieval Time</th><th>Cost Profile</th></tr></thead><tbody><tr><td>Accessed multiple times per day</td><td>S3 Standard</td><td>Instant</td><td>Highest storage, no retrieval fee</td></tr><tr><td>Unpredictable / unknown pattern</td><td>S3 Intelligent-Tiering</td><td>Instant</td><td>Small monitoring fee, auto-optimized</td></tr><tr><td>Accessed &lt; once per month</td><td>S3 Standard-IA</td><td>Instant</td><td>Lower storage, per-GB retrieval fee</td></tr><tr><td>Accessed &lt; once per month, non-critical</td><td>S3 One Zone-IA</td><td>Instant</td><td>20% cheaper than Standard-IA, single AZ</td></tr><tr><td>Accessed &lt; once per quarter</td><td>Glacier Instant Retrieval</td><td>Instant</td><td>Very low storage, higher retrieval fee</td></tr><tr><td>Accessed &lt; once per year, hours acceptable</td><td>Glacier Flexible Retrieval</td><td>1-5 min (expedited) to 3-5 hours (standard)</td><td>Very low storage</td></tr><tr><td>Compliance archive, rarely accessed</td><td>Glacier Deep Archive</td><td>12-48 hours</td><td>Cheapest storage possible</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use versioning for buckets with extremely high write frequency to same keys — version explosion<br>
+→ Do NOT use lifecycle transitions for data that needs instant access at all times — retrieval fees add up<br>
+→ Do NOT use Glacier classes for data accessed daily — retrieval costs will exceed Standard storage costs<br>
+→ Do NOT use S3 Standard-IA for objects smaller than 128 KB — per-object overhead makes it more expensive<br>
+→ Do NOT use lifecycle expiration as your only data deletion mechanism — it runs on a BEST-EFFORT schedule (may have 1-2 day delay)<br>
+→ Do NOT use S3 versioning as a replacement for proper backup strategy — versioning is within the same bucket/region</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → HOW VERSIONING WORKS INTERNALLY</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VERSIONED BUCKET — INTERNAL STRUCTURE:
+</span>
+S3 maintains an INDEX for each object key:
+┌─────────────────────────────────────────────────────────┐
+│ Key: products/images/shoe-001.jpg                       │
+│                                                         │
+│ Version Stack (newest first):                           │
+│                                                         │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Version ID: cccc3333                                │ │
+│ │ Status: CURRENT                                     │ │
+│ │ Size: 12 MB                                         │ │
+│ │ Storage Class: Standard                             │ │
+│ │ Created: 2025-01-15T10:00:00Z                       │ │
+│ │ ETag: "d41d8cd98f00b204e9800998ecf8427e"            │ │
+│ │ Data Location: [internal S3 storage pointer]        │ │
+│ └─────────────────────────────────────────────────────┘ │
+│                                                         │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Version ID: bbbb2222                                │ │
+│ │ Status: NONCURRENT                                  │ │
+│ │ Noncurrent Date: 2025-01-15T10:00:00Z               │ │
+│ │ Size: 10 MB                                         │ │
+│ │ Storage Class: Standard-IA (lifecycle transitioned) │ │
+│ │ Created: 2025-01-10T08:00:00Z                       │ │
+│ │ Data Location: [internal S3 storage pointer]        │ │
+│ └─────────────────────────────────────────────────────┘ │
+│                                                         │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ Type: DELETE MARKER                                 │ │
+│ │ Version ID: dmrk4444                                │ │
+│ │ Status: NONCURRENT                                  │ │
+│ │ Created: 2025-01-12T15:00:00Z                       │ │
+│ │ Size: 0 (markers have no data)                      │ │
+│ │ Is Latest: false                                    │ │
+│ └─────────────────────────────────────────────────────┘ │
+│                                                         │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ S3 maintains a version stack per object key<br>
+→ The CURRENT version is the one at the top (most recent)<br>
+→ Each version has its own metadata, storage class, and data location<br>
+→ Delete markers are special versions with zero data<br>
+→ All versions are stored INDEPENDENTLY — S3 does NOT use deduplication or delta encoding</p>
+<hr>
+<h3>2 → HOW LIFECYCLE EVALUATION WORKS</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>LIFECYCLE EVALUATION ENGINE (runs periodically):
+</span>
+Step 1: S3 scans the bucket for lifecycle-eligible objects
+        (This is NOT instant — runs in batches, typically once per day)
+        │
+        ▼
+Step 2: For each object:
+        │
+        ├── Match lifecycle rules by prefix and tags
+        │
+        ├── For CURRENT versions:
+        │   │
+        │   ├── Check transition rules:
+        │   │   Object age = current_date - creation_date
+        │   │   If age &gt;= transition_days → Transition to specified storage class
+        │   │   Multiple transitions → apply in order (smallest days first)
+        │   │
+        │   └── Check expiration rules:
+        │       If age &gt;= expiration_days → Create delete marker (versioned) or delete (unversioned)
+        │
+        ├── For NONCURRENT versions:
+        │   │
+        │   ├── Check noncurrent transition rules:
+        │   │   Noncurrent age = current_date - date_became_noncurrent
+        │   │   If age &gt;= noncurrent_transition_days → Transition
+        │   │
+        │   └── Check noncurrent expiration rules:
+        │       If age &gt;= noncurrent_expiration_days → Permanently delete
+        │       BUT keep minimum N newer noncurrent versions (if configured)
+        │
+        └── For DELETE MARKERS:
+            Check if expired (only version remaining) → Delete if expired
+        │
+        ▼
+Step 3: Apply actions in batches
+        Actions are applied asynchronously
+        May take 24-48 hours for all objects to be processed</code></pre></div>
+<p><strong>Lifecycle Timing — NOT Instant:</strong></p>
+<p>→ Lifecycle rules are evaluated periodically — NOT continuously<br>
+→ AWS documentation states: "Changes may take up to 24-48 hours to complete"<br>
+→ An object that becomes eligible at Day 30 may not transition until Day 31 or 32<br>
+→ This is NORMAL — lifecycle is designed for cost optimization, not real-time processing<br>
+→ Do NOT rely on lifecycle for time-sensitive operations</p>
+<p><strong>Transition Fees:</strong></p>
+<table><thead><tr><th>Transition</th><th>Cost per 1,000 Objects</th></tr></thead><tbody><tr><td>Standard → Standard-IA</td><td>$0.01</td></tr><tr><td>Standard → Glacier Instant Retrieval</td><td>$0.01</td></tr><tr><td>Standard → Glacier Flexible Retrieval</td><td>$0.03</td></tr><tr><td>Standard → Glacier Deep Archive</td><td>$0.05</td></tr><tr><td>Standard-IA → Glacier Instant Retrieval</td><td>$0.01</td></tr><tr><td>Any → Any (general)</td><td>Per-request fee applies</td></tr></tbody></table>
+<p>→ Transition fees are per-object → transitioning millions of tiny files can be expensive<br>
+→ Factor transition fees into cost analysis</p>
+<hr>
+<h3>3 → HOW RETRIEVAL FROM GLACIER WORKS</h3>
+<p><strong>Glacier Instant Retrieval:</strong></p>
+<p>→ Retrieval: Same as Standard (milliseconds)<br>
+→ No restore process needed — direct GET request works<br>
+→ Higher per-GB retrieval fee than Standard<br>
+→ Best for: Data accessed once per quarter</p>
+<p><strong>Glacier Flexible Retrieval:</strong></p>
+<p>→ Data is NOT directly accessible — must be "restored" first<br>
+→ Restore process:</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Initiate restore request
+</span>        Specify: Number of days to keep restored copy, retrieval tier
+
+Step 2: S3 retrieves data from Glacier storage (background process)
+        
+        Retrieval Tiers:
+        ┌──────────────┬─────────────────┬───────────────┐
+        │ Tier         │ Retrieval Time  │ Cost          │
+        ├──────────────┼─────────────────┼───────────────┤
+        │ Expedited    │ 1-5 minutes     │ Highest       │
+        │ Standard     │ 3-5 hours       │ Medium        │
+        │ Bulk         │ 5-12 hours      │ Lowest        │
+        └──────────────┴─────────────────┴───────────────┘
+
+Step 3: Restored copy placed in S3 Standard (temporarily)
+        Original remains in Glacier
+        Restored copy available for specified number of days
+
+Step 4: After specified days → restored copy is deleted
+        Object reverts to Glacier-only access</code></pre></div>
+<p><strong>Glacier Deep Archive:</strong></p>
+<p>→ Same restore process as Glacier Flexible<br>
+→ Retrieval tiers:</p>
+<table><thead><tr><th>Tier</th><th>Time</th><th>Cost</th></tr></thead><tbody><tr><td>Standard</td><td>12 hours</td><td>Low</td></tr><tr><td>Bulk</td><td>48 hours</td><td>Lowest</td></tr></tbody></table>
+<p>→ No Expedited tier for Deep Archive<br>
+→ Plan ahead — if you need data from Deep Archive, you'll wait 12-48 hours</p>
+<hr>
+<h3>4 → HOW S3 INTELLIGENT-TIERING WORKS</h3>
+<p>→ An alternative to manual lifecycle rules<br>
+→ S3 automatically moves objects between tiers based on ACTUAL access patterns</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 INTELLIGENT-TIERING TIERS:
+</span>
+┌─────────────────────────────────────────────────────────┐
+│ FREQUENT ACCESS TIER (default)                          │
+│ Same pricing as S3 Standard                             │
+│ Objects accessed recently stay here                     │
+└────────────────────────┬────────────────────────────────┘
+                         │ No access for 30 days
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ INFREQUENT ACCESS TIER                                  │
+│ Same pricing as S3 Standard-IA                          │
+│ Auto-moved back to Frequent if accessed                 │
+└────────────────────────┬────────────────────────────────┘
+                         │ No access for 90 days (opt-in)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ ARCHIVE INSTANT ACCESS TIER (opt-in)                    │
+│ Same pricing as Glacier Instant Retrieval               │
+│ Auto-moved back if accessed                             │
+└────────────────────────┬────────────────────────────────┘
+                         │ No access for 90-730 days (opt-in)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ ARCHIVE ACCESS TIER (opt-in)                            │
+│ Same pricing as Glacier Flexible Retrieval              │
+│ 3-5 hour retrieval → then auto-moved back               │
+└────────────────────────┬────────────────────────────────┘
+                         │ No access for 180-730 days (opt-in)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ DEEP ARCHIVE ACCESS TIER (opt-in)                       │
+│ Same pricing as Glacier Deep Archive                    │
+│ 12 hour retrieval → then auto-moved back                │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<p><strong>Intelligent-Tiering vs Lifecycle:</strong></p>
+<table><thead><tr><th>Feature</th><th>Lifecycle Rules</th><th>Intelligent-Tiering</th></tr></thead><tbody><tr><td>Movement trigger</td><td>Fixed age (days after creation)</td><td>Actual access patterns</td></tr><tr><td>Movement direction</td><td>One-way (hot → cold only)</td><td>Bidirectional (hot ↔ cold)</td></tr><tr><td>Configuration</td><td>You define rules</td><td>AWS auto-manages</td></tr><tr><td>Monitoring cost</td><td>None</td><td>$0.0025 per 1,000 objects/month</td></tr><tr><td>Retrieval fees</td><td>Vary by class</td><td>None for Frequent/Infrequent tiers</td></tr><tr><td>Best for</td><td>Known access patterns</td><td>Unknown/variable access patterns</td></tr><tr><td>Minimum object size</td><td>128 KB for IA classes</td><td>128 KB (objects &lt; 128 KB stay in Frequent tier)</td></tr></tbody></table>
+<p>→ For ShopNow's known patterns → Lifecycle rules are better (more predictable costs)<br>
+→ For unpredictable data → Intelligent-Tiering is better (auto-optimizes)<br>
+→ Can use BOTH: Lifecycle transitions objects to Intelligent-Tiering after N days</p>
+<hr>
+<h3>5 → VERSIONING + MFA DELETE</h3>
+<p>→ For ultra-sensitive buckets → enable MFA Delete<br>
+→ MFA Delete requires multi-factor authentication to:</p>
+<ul>
+<li>Permanently delete a specific version</li>
+<li>Change the versioning state of the bucket</li>
+</ul>
+<p>→ This prevents: Even if an attacker has admin credentials → they cannot permanently delete versions without the MFA device</p>
+<p><strong>Enabling MFA Delete:</strong></p>
+<p>→ Can ONLY be enabled by the ROOT account (not IAM users)<br>
+→ Can ONLY be enabled via AWS CLI (not console)<br>
+→ Requires the root account's MFA device serial number and token code</p>
+<p>→ For ShopNow → Enable on the production bucket for maximum protection<br>
+→ Even if <code>rahul-cto</code>'s admin account is compromised → attacker cannot permanently delete versions without root's MFA device</p>
+<hr>
+<h3>6 → LIFECYCLE LIMITS AND QUOTAS</h3>
+<table><thead><tr><th>Resource</th><th>Limit</th></tr></thead><tbody><tr><td>Lifecycle rules per bucket</td><td>1,000</td></tr><tr><td>Transitions per lifecycle rule</td><td>Multiple (different days → different classes)</td></tr><tr><td>Minimum transition age</td><td>0 days (Standard → Intelligent-Tiering) or 30 days (Standard → IA)</td></tr><tr><td>Minimum days between transitions</td><td>30 days</td></tr><tr><td>Noncurrent versions to retain</td><td>0 to any number</td></tr><tr><td>Object tags for filtering</td><td>Up to 10 per rule</td></tr><tr><td>Prefixes per rule</td><td>1 (use multiple rules for multiple prefixes)</td></tr><tr><td>Rule evaluation frequency</td><td>Once per day (approximately)</td></tr></tbody></table>
+<p>→ The 30-day minimum between transitions means:</p>
+<ul>
+<li>Standard → IA at Day 30, IA → Glacier at Day 60 (minimum 30-day gap) ✓</li>
+<li>Standard → IA at Day 30, IA → Glacier at Day 45 ✗ (only 15-day gap — rejected)</li>
+</ul>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Enabling versioning without noncurrent expiration rules</td><td>Storage grows indefinitely — 10 versions of every file</td><td>Always add noncurrent version lifecycle rules</td></tr><tr><td>2</td><td>Assuming "delete" removes data with versioning</td><td>Delete only creates a delete marker — data still exists and is billed</td><td>Understand delete markers — permanently delete specific versions if needed</td></tr><tr><td>3</td><td>Transitioning tiny files to IA classes</td><td>Files &lt; 128 KB charged as 128 KB — costs MORE than Standard</td><td>Only transition files &gt; 128 KB to IA classes</td></tr><tr><td>4</td><td>Transitioning then deleting within minimum duration</td><td>Charged for full minimum period (30/90/180 days)</td><td>Don't transition objects that will be deleted soon</td></tr><tr><td>5</td><td>Expecting lifecycle rules to act instantly</td><td>Rules may take 24-48 hours to process</td><td>Don't rely on lifecycle for time-sensitive operations</td></tr><tr><td>6</td><td>Overlapping rules on same prefix with different actions</td><td>Unpredictable behavior — S3 applies the most restrictive</td><td>Use non-overlapping prefixes or consolidate rules</td></tr><tr><td>7</td><td>Forgetting incomplete multipart cleanup</td><td>Invisible storage waste accumulates</td><td>Always add abort incomplete multipart rule</td></tr><tr><td>8</td><td>Not calculating retrieval costs for Glacier data</td><td>Restoring 1 TB from Glacier Flexible = significant cost</td><td>Factor retrieval fees into total cost analysis</td></tr><tr><td>9</td><td>Suspending versioning thinking versions disappear</td><td>Existing versions remain — only new uploads get null version ID</td><td>Must explicitly delete old versions to reclaim storage</td></tr><tr><td>10</td><td>Lifecycle expiration on compliance data</td><td>Legal requires 7-year retention — lifecycle deletes after 1 year</td><td>Review compliance requirements before setting expiration</td></tr><tr><td>11</td><td>No version retention minimum set</td><td>All noncurrent versions deleted — no recovery possible</td><td>Set "newer versions to retain" as safety net</td></tr><tr><td>12</td><td>Forgetting delete marker cleanup</td><td>Thousands of orphaned delete markers clutter listings</td><td>Add "delete expired object delete markers" rule</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Version Scalability</strong></p>
+<ul>
+<li>No limit on versions per object key</li>
+<li>No limit on total objects/versions per bucket</li>
+<li>Each version is independently stored and accessed</li>
+<li>Lifecycle rules handle cleanup at any scale — millions of objects</li>
+</ul>
+<p>→ <strong>Lifecycle Rule Scalability</strong></p>
+<ul>
+<li>Up to 1,000 rules per bucket</li>
+<li>Rules can use prefix and tag filters for granularity</li>
+<li>S3 processes lifecycle rules in batches — large buckets may take longer</li>
+<li>For buckets with billions of objects → lifecycle still works but may take multiple days for a full pass</li>
+</ul>
+<p>→ <strong>Cost Scalability</strong></p>
+<ul>
+<li>Without lifecycle → costs grow linearly with data volume</li>
+<li>With lifecycle → costs grow sub-linearly (data auto-moves to cheaper tiers)</li>
+<li>For very large datasets (PBs) → lifecycle savings become millions of dollars annually</li>
+<li>Use S3 Storage Lens (Project 56) for bucket-level cost analysis across accounts</li>
+</ul>
+<p>→ <strong>Operational Scalability</strong></p>
+<ul>
+<li>Lifecycle rules require ZERO manual intervention after creation</li>
+<li>No cron jobs, no scripts, no monitoring needed</li>
+<li>Changes to rules take effect on the next evaluation cycle</li>
+<li>New objects automatically matched by existing rules</li>
+</ul>
+<p>→ <strong>Multi-Bucket Scalability</strong></p>
+<ul>
+<li>Each bucket has its own lifecycle rules</li>
+<li>For organizational standards → use AWS Config rules to enforce lifecycle policy existence</li>
+<li>S3 Storage Lens provides cross-bucket, cross-account analytics</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify versioning is working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Versioning enabled</td><td>S3 Console → Bucket → Properties → Bucket Versioning: Enabled</td></tr><tr><td>Versions exist</td><td>S3 Console → Bucket → Object → "Show versions" toggle → Lists all versions</td></tr><tr><td>Delete markers visible</td><td>S3 Console → Object → "Show versions" → Delete markers shown with special icon</td></tr><tr><td>Version IDs present</td><td>Each version shows unique Version ID</td></tr></tbody></table>
+<p>→ <strong>How to verify lifecycle rules are working:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>Rules exist</td><td>S3 Console → Bucket → Management → Lifecycle rules listed</td></tr><tr><td>Rules are enabled</td><td>Each rule shows "Enabled" status</td></tr><tr><td>Transitions happening</td><td>CloudWatch metric: <code>S3/BucketSizeBytes</code> with StorageType filter → see data moving between classes</td></tr><tr><td>Objects in correct class</td><td>S3 Console → Object → Properties → Storage class</td></tr><tr><td>Lifecycle actions logged</td><td>S3 Server Access Logging → shows lifecycle transition/expiration events</td></tr></tbody></table>
+<p>→ <strong>How to monitor lifecycle effectiveness:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Storage Lens Dashboard:
+</span>→ S3 Console → Storage Lens → Default dashboard
+→ Shows: Storage by class, object count, average object size
+→ Trend: Storage in Standard should DECREASE over time
+→ Trend: Storage in IA/Glacier should INCREASE
+→ If Standard stays flat → lifecycle rules may not be working
+
+CloudWatch Metrics:
+→ Namespace: AWS/S3
+→ Metric: BucketSizeBytes
+→ Dimensions: BucketName + StorageType
+→ StorageType values: StandardStorage, StandardIAStorage, GlacierStorage, etc.
+→ Track each storage type over time → verify data is moving
+
+S3 Inventory:
+→ S3 Console → Bucket → Management → "Inventory configurations"
+→ Create inventory → includes: storage class, version ID, last modified
+→ Inventory report delivered to another S3 bucket (CSV/ORC/Parquet)
+→ Analyze with Athena (Project 18) → query: "How many objects are in each storage class?"</code></pre></div>
+<p>→ <strong>How to debug "lifecycle rule not working":</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Is the rule enabled?
+</span>        S3 Console → Management → Lifecycle rules → Status: Enabled?
+
+STEP 2: Does the prefix match?
+        Rule prefix: "products/"
+        Object key: "Products/image.jpg" (capital P)
+        → MISMATCH (S3 keys are case-sensitive) → rule doesn't apply
+
+STEP 3: Are tag filters correct?
+        Rule requires tag: Environment=Production
+        Object doesn't have this tag → rule doesn't apply
+
+STEP 4: Has enough time passed?
+        Rule says: transition after 30 days
+        Object was uploaded 25 days ago → not yet eligible
+        Lifecycle evaluation delay → add 1-2 more days
+
+STEP 5: Is the transition valid?
+        Standard → Standard-IA requires minimum 30-day age
+        Standard → Glacier requires minimum 90-day age (if transitioning via IA)
+        Invalid transitions are silently skipped
+
+STEP 6: Is the object large enough?
+        Objects &lt; 128 KB are transitioned but charged minimum 128 KB
+        Very small objects may not show expected savings
+
+STEP 7: Check S3 Server Access Logs
+        Look for lifecycle-related entries → confirms S3 attempted the action</code></pre></div>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ S3 Versioning protects against accidental overwrites and deletions — the ONLY recovery mechanism for human errors<br>
+→ Delete markers make objects APPEAR deleted but data remains — fully recoverable by removing the marker<br>
+→ Permanent deletion requires specifying a version ID — simple DELETE only creates a marker<br>
+→ Lifecycle policies AUTOMATE storage class transitions and expiration — zero manual intervention<br>
+→ Current version transitions: Standard → IA → Glacier (based on age since creation)<br>
+→ Noncurrent version management: Transition old versions to cheaper tiers → expire after retention period<br>
+→ Incomplete multipart upload cleanup prevents invisible storage waste<br>
+→ Lifecycle rules are NOT instant — expect 24-48 hour processing delays<br>
+→ Cost optimization is dramatic: 70-90% savings by matching storage class to access pattern</p>
+<p>→ Connection to Project 1: Versioning and lifecycle are CONFIGURATIONS on the bucket created in Project 1</p>
+<ul>
+<li>Storage classes were introduced in Project 1 → now automated via lifecycle</li>
+<li>Encryption configured in Project 1 → applies to ALL versions</li>
+</ul>
+<p>→ Connection to Project 10: Bucket policies (Project 10) control WHO can manage versions</p>
+<ul>
+<li><code>s3:GetObjectVersion</code>, <code>s3:DeleteObjectVersion</code> — version-specific actions</li>
+<li>MFA Delete requires root + MFA → strongest deletion protection</li>
+</ul>
+<p>→ Connection to Project 11: IAM Roles access versioned objects</p>
+<ul>
+<li>Role policy can restrict to specific version operations</li>
+<li><code>s3:GetObjectVersion</code> vs <code>s3:GetObject</code> are different permissions</li>
+</ul>
+<p>→ Connection to Project 8: CloudWatch monitors storage metrics</p>
+<ul>
+<li><code>BucketSizeBytes</code> per StorageType → tracks lifecycle effectiveness</li>
+<li>Alarm if Standard storage grows unexpectedly</li>
+</ul>
+<p>→ This project is FOUNDATIONAL for:</p>
+<ul>
+<li>Project 15: S3 Event Notifications (events fire for new versions)</li>
+<li>Project 25: Data lake pipeline (lifecycle manages data lake storage costs)</li>
+<li>Project 30: Cross-Region Replication (requires versioning enabled on both buckets)</li>
+<li>Project 51: Enterprise Data Lake (lifecycle manages raw/curated/refined zones)</li>
+<li>Project 56: Cost optimization with S3 Intelligent-Tiering and Storage Lens</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has versioning protecting their data and lifecycle policies optimizing costs<br>
+→ But the architecture still has isolated services:</p>
+<ul>
+<li>SNS topics exist but only receive manual publishes</li>
+<li>SQS queues exist but are only used by the web application<br>
+→ The CTO asks: "When a customer places an order, we need to:</li>
+</ul>
+<ol>
+<li>Process the payment (one consumer)</li>
+<li>Update inventory (another consumer)</li>
+<li>Send confirmation email (another consumer)</li>
+<li>Update analytics dashboard (another consumer)"<br>
+→ Currently — the web app calls each system sequentially → slow and brittle<br>
+→ If the inventory system is down → the entire order flow fails<br>
+→ They need ONE event → MULTIPLE independent consumers → each processing at their own pace</li>
+</ol>
+<p>→ <strong>This is exactly what Project 13 solves</strong><br>
+→ Project 13 introduces the SNS → SQS Fan-Out Pattern<br>
+→ One SNS message published → multiple SQS queues receive it → independent consumers process<br>
+→ It combines SNS (Project 6) and SQS (Project 7) into the most powerful messaging pattern in AWS<br>
+→ It requires SQS access policies allowing SNS to send messages (Project 7 Step 8 preview)</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 13: "The Notification That Needed Multiple Consumers — SNS to SQS Fan-Out Pattern"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-11.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 2 &bull; 12/60</span></div><a class="nav-btn next" href="project-13.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>

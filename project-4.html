@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PROJECT 4: THE DATABASE THAT NOBODY COULD REACH — Security Groups vs NACLs — AWS Masterclass</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+
+<div class="page-wrapper"><div class="chat-message"><h1>PROJECT 4: THE DATABASE THAT NOBODY COULD REACH — Security Groups vs NACLs</h1>
+<hr>
+<hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<p>→ ShopNow (from Projects 1, 2, 3) now has:</p>
+<ul>
+<li>S3 bucket for product images (Project 1)</li>
+<li>IAM users with proper permissions (Project 2)</li>
+<li>EC2 instance running the product catalog web app (Project 3)</li>
+</ul>
+<p>→ The CTO decides to add a database server (another EC2 instance for now — RDS comes in Project 9)<br>
+→ The database runs MariaDB on port 3306<br>
+→ The web app EC2 instance needs to connect to the database EC2 instance on port 3306</p>
+<p>→ Problem 1: <code>priya-dev</code> configures the database Security Group to allow port 3306 from <code>0.0.0.0/0</code><br>
+→ Within hours — automated bots from the internet start brute-forcing the database login<br>
+→ The security scanner flags: "Database port exposed to the entire internet"</p>
+<p>→ Problem 2: A new developer <code>rohit-dev</code> joins from Bangalore — his IP is different from Priya's<br>
+→ He cannot SSH into the web server — Security Group only allows Priya's IP<br>
+→ They add his IP → next week his ISP changes his IP → locked out again<br>
+→ Managing individual IPs becomes a nightmare</p>
+<p>→ Problem 3: The CTO hears about "NACLs" from a security consultant<br>
+→ The consultant says: "You need BOTH Security Groups AND NACLs for defense in depth"<br>
+→ The team is confused: "Aren't Security Groups enough? What's the difference?"</p>
+<p>→ Problem 4: <code>priya-dev</code> creates a NACL rule to deny traffic from a known malicious IP range<br>
+→ She puts it as rule number 200 — but rule number 100 already allows all traffic<br>
+→ The deny rule NEVER triggers — the malicious traffic gets through<br>
+→ She doesn't understand why</p>
+<p>→ The CTO demands: "Explain to me EXACTLY how network security works in AWS — all of it"</p>
+<hr>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<p>→ AWS has TWO layers of network security:</p>
+<table><thead><tr><th>Layer</th><th>Mechanism</th><th>Operates At</th></tr></thead><tbody><tr><td>Layer 1</td><td>Security Group (SG)</td><td>Instance level (actually ENI level)</td></tr><tr><td>Layer 2</td><td>Network ACL (NACL)</td><td>Subnet level</td></tr></tbody></table>
+<p>→ Think of it as a building:</p>
+<ul>
+<li>NACL = Security guard at the building entrance (checks everyone entering/leaving the building)</li>
+<li>Security Group = Lock on each apartment door (checks everyone entering/leaving each apartment)</li>
+<li>Traffic must pass BOTH to reach the instance</li>
+</ul>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>INTERNET
+</span>    │
+    ▼
+┌─────────────────────────────┐
+│         NACL                │ ◄── Subnet-level firewall
+│   (Building entrance)       │
+│                             │
+│   ┌─────────────────────┐   │
+│   │   Security Group    │   │ ◄── Instance-level firewall
+│   │   (Apartment door)  │   │
+│   │                     │   │
+│   │   ┌─────────────┐   │   │
+│   │   │ EC2 Instance│   │   │
+│   │   └─────────────┘   │   │
+│   │                     │   │
+│   └─────────────────────┘   │
+│                             │
+└─────────────────────────────┘</code></pre></div>
+<p>→ The approach should be:</p>
+<ul>
+<li>Step 1 — Deep-dive into Security Groups (stateful firewall)</li>
+<li>Step 2 — Deep-dive into NACLs (stateless firewall)</li>
+<li>Step 3 — Understand the CRITICAL difference: Stateful vs Stateless</li>
+<li>Step 4 — Understand rule evaluation logic for each</li>
+<li>Step 5 — Design ShopNow's network security architecture</li>
+<li>Step 6 — Understand Security Group referencing (the key to solving Problem 1)</li>
+</ul>
+<hr>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT — Step-by-Step Configuration</h2>
+<hr>
+<h3>STEP 1 — SECURITY GROUPS DEEP DIVE</h3>
+<p>→ A Security Group is a VIRTUAL FIREWALL that controls traffic at the ENI (network interface) level<br>
+→ Every EC2 instance has at least one ENI → every ENI has at least one Security Group</p>
+<p><strong>Creating a Security Group:</strong></p>
+<p>→ EC2 Console → Security Groups (left sidebar under Network &amp; Security) → "Create security group"</p>
+<table><thead><tr><th>Setting</th><th>Value</th><th>Explanation</th></tr></thead><tbody><tr><td>Security group name</td><td><code>shopnow-web-sg</code></td><td>Descriptive name</td></tr><tr><td>Description</td><td>"Allows HTTP, HTTPS, and SSH for web tier"</td><td>Required field — cannot be empty</td></tr><tr><td>VPC</td><td>Default VPC (for now — custom VPC in Project 5)</td><td>SGs are VPC-specific — cannot use across VPCs</td></tr></tbody></table>
+<hr>
+<p><strong>INBOUND RULES (Traffic coming IN to the instance):</strong></p>
+<p>→ Click "Add rule" for each:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port Range</th><th>Source</th><th>Description</th></tr></thead><tbody><tr><td>SSH</td><td>TCP</td><td>22</td><td><code>203.0.113.45/32</code> (Priya's IP)</td><td>SSH from Priya</td></tr><tr><td>SSH</td><td>TCP</td><td>22</td><td><code>198.51.100.78/32</code> (Rohit's IP)</td><td>SSH from Rohit</td></tr><tr><td>HTTP</td><td>TCP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>Web traffic from anywhere</td></tr><tr><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>Secure web traffic from anywhere</td></tr></tbody></table>
+<p>→ HTTP/HTTPS from <code>0.0.0.0/0</code> is CORRECT — web servers should be accessible from the internet<br>
+→ SSH from specific IPs is CORRECT — administrative access should be restricted</p>
+<p><strong>OUTBOUND RULES (Traffic going OUT from the instance):</strong></p>
+<p>→ Default outbound rule:</p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port Range</th><th>Destination</th><th>Description</th></tr></thead><tbody><tr><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>Allow all outbound</td></tr></tbody></table>
+<p>→ By default — Security Groups allow ALL outbound traffic<br>
+→ This means the instance can connect to anything on the internet<br>
+→ For most use cases — this default is acceptable<br>
+→ For high-security environments — restrict outbound to only needed destinations</p>
+<hr>
+<p><strong>Now create the DATABASE Security Group:</strong></p>
+<p>→ "Create security group"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Security group name</td><td><code>shopnow-db-sg</code></td></tr><tr><td>Description</td><td>"Allows MariaDB only from web tier"</td></tr><tr><td>VPC</td><td>Default VPC</td></tr></tbody></table>
+<p><strong>Inbound Rules:</strong></p>
+<table><thead><tr><th>Type</th><th>Protocol</th><th>Port Range</th><th>Source</th><th>Description</th></tr></thead><tbody><tr><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>sg-0abc1234def56789</code> (shopnow-web-sg)</td><td>MariaDB from web tier ONLY</td></tr></tbody></table>
+<p>→ <strong>THIS IS THE KEY INSIGHT — Security Group Referencing</strong><br>
+→ Instead of typing an IP address as the source — we type the Security Group ID of the web server<br>
+→ This means: "Allow port 3306 from ANY instance that has <code>shopnow-web-sg</code> attached"</p>
+<p><strong>Why this solves Problem 1:</strong><br>
+→ The source is NOT <code>0.0.0.0/0</code> (entire internet)<br>
+→ The source is NOT a specific IP (which changes)<br>
+→ The source is a Security Group → only instances WITH that SG can connect<br>
+→ Even if someone knows the database IP → they cannot connect unless their instance has <code>shopnow-web-sg</code><br>
+→ The database is completely invisible to the internet</p>
+<hr>
+<p><strong>Security Group Rules — Fundamental Properties:</strong></p>
+<table><thead><tr><th>Property</th><th>Behavior</th></tr></thead><tbody><tr><td>Default inbound</td><td>DENY ALL (no inbound traffic allowed until you add rules)</td></tr><tr><td>Default outbound</td><td>ALLOW ALL (all outbound traffic permitted)</td></tr><tr><td>Rule type</td><td>ALLOW only — you CANNOT create DENY rules in Security Groups</td></tr><tr><td>Evaluation</td><td>ALL rules evaluated — if ANY rule allows the traffic, it's allowed</td></tr><tr><td>Statefulness</td><td>STATEFUL (explained in Step 3)</td></tr><tr><td>Scope</td><td>Attached to ENI — applies to the specific instance</td></tr><tr><td>Multiple SGs per instance</td><td>Yes — up to 5 SGs per ENI</td></tr><tr><td>Multiple instances per SG</td><td>Yes — one SG can be attached to hundreds of instances</td></tr><tr><td>Cross-VPC</td><td>No — SGs are VPC-bound</td></tr><tr><td>Changes take effect</td><td>Immediately — no "apply" or "save and restart" needed</td></tr></tbody></table>
+<hr>
+<p><strong>The "ALLOW ONLY" Rule — Critical Understanding:</strong></p>
+<p>→ Security Groups can ONLY have ALLOW rules<br>
+→ There is NO way to write a DENY rule in a Security Group<br>
+→ If you want to BLOCK a specific IP → you CANNOT do it with Security Groups<br>
+→ For blocking specific IPs → you need NACLs (Step 2)</p>
+<p>→ The logic is:</p>
+<ul>
+<li>If traffic matches ANY inbound rule → ALLOWED</li>
+<li>If traffic matches NO inbound rule → DENIED (implicit deny)</li>
+<li>There is no explicit deny capability</li>
+</ul>
+<hr>
+<h3>STEP 2 — NETWORK ACLs (NACLs) DEEP DIVE</h3>
+<p>→ A NACL is a firewall at the SUBNET level<br>
+→ Every subnet has exactly ONE NACL associated with it<br>
+→ A NACL can be associated with MULTIPLE subnets<br>
+→ Traffic entering or leaving the subnet passes through the NACL</p>
+<p><strong>Default NACL (created automatically with VPC):</strong></p>
+<p>→ VPC Console → Network ACLs → You see the default NACL</p>
+<p><strong>Default NACL Inbound Rules:</strong></p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port Range</th><th>Source</th><th>Allow/Deny</th></tr></thead><tbody><tr><td>100</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p><strong>Default NACL Outbound Rules:</strong></p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port Range</th><th>Destination</th><th>Allow/Deny</th></tr></thead><tbody><tr><td>100</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p>→ The default NACL allows ALL traffic in and out — effectively transparent<br>
+→ The <code>*</code> rule is the DEFAULT rule — cannot be modified or deleted — catches anything not matched by numbered rules<br>
+→ This is why many people think NACLs "don't do anything" — the default NACL is wide open</p>
+<hr>
+<p><strong>Creating a Custom NACL:</strong></p>
+<p>→ VPC Console → Network ACLs → "Create network ACL"</p>
+<table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Name</td><td><code>shopnow-web-subnet-nacl</code></td></tr><tr><td>VPC</td><td>Default VPC</td></tr></tbody></table>
+<p>→ CRITICAL: A newly created custom NACL DENIES ALL traffic by default<br>
+→ This is the OPPOSITE of the default NACL (which allows all)<br>
+→ If you associate a new custom NACL with a subnet without adding rules → ALL instances in that subnet lose connectivity</p>
+<p><strong>Adding Rules to Custom NACL:</strong></p>
+<p><strong>Inbound Rules:</strong></p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port Range</th><th>Source</th><th>Allow/Deny</th></tr></thead><tbody><tr><td>100</td><td>HTTP</td><td>TCP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>110</td><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>120</td><td>SSH</td><td>TCP</td><td>22</td><td><code>203.0.113.0/24</code></td><td>ALLOW</td></tr><tr><td>130</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>200</td><td>All traffic</td><td>All</td><td>All</td><td><code>198.51.100.0/24</code></td><td>DENY</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p><strong>Outbound Rules:</strong></p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port Range</th><th>Destination</th><th>Allow/Deny</th></tr></thead><tbody><tr><td>100</td><td>HTTP</td><td>TCP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>110</td><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>120</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>130</td><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>10.0.2.0/24</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<hr>
+<p><strong>WAIT — What is Rule 130 Inbound (Ports 1024-65535)?</strong></p>
+<p>→ This is the EPHEMERAL PORT rule — critical for NACLs and confusing for beginners<br>
+→ Because NACLs are STATELESS (explained in Step 3)<br>
+→ When your web server responds to an HTTP request:</p>
+<ul>
+<li>The CLIENT connects FROM a random high port (e.g., port 52431) TO port 80</li>
+<li>The SERVER responds FROM port 80 TO the client's port 52431</li>
+<li>The response traffic is on a port in the range 1024-65535</li>
+</ul>
+<p>→ In a STATEFUL firewall (Security Group) — the response is automatically allowed<br>
+→ In a STATELESS firewall (NACL) — the response is treated as NEW traffic → needs its own rule<br>
+→ Without Rule 130 → responses to HTTP/HTTPS requests are BLOCKED → website appears down</p>
+<p><strong>Ephemeral Port Ranges by OS:</strong></p>
+<table><thead><tr><th>Operating System</th><th>Ephemeral Port Range</th></tr></thead><tbody><tr><td>Amazon Linux / RHEL</td><td>32768-60999</td></tr><tr><td>Windows Server</td><td>49152-65535</td></tr><tr><td>Many older systems</td><td>1024-65535</td></tr><tr><td>Safe catch-all</td><td>1024-65535</td></tr></tbody></table>
+<p>→ Use <code>1024-65535</code> to be safe across all client operating systems</p>
+<hr>
+<p><strong>NACL Rule Evaluation — NUMBERED ORDERING:</strong></p>
+<p>→ This is where Priya's Problem 4 occurred<br>
+→ NACL rules are evaluated IN ORDER from lowest rule number to highest</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Incoming packet arrives at NACL
+</span>        │
+        ▼
+Check Rule 100: Does packet match?
+        │
+        ├── YES → Apply the rule's action (ALLOW or DENY) → STOP evaluating
+        │
+        └── NO → Continue to next rule
+                │
+                ▼
+Check Rule 110: Does packet match?
+        │
+        ├── YES → Apply the rule's action → STOP evaluating
+        │
+        └── NO → Continue to next rule
+                │
+                ▼
+        ... (continue through all numbered rules)
+                │
+                ▼
+Check Rule *: DEFAULT rule → DENY
+        (Always reached if no numbered rule matched)</code></pre></div>
+<p>→ FIRST MATCH WINS — once a rule matches, no further rules are evaluated<br>
+→ This is completely different from Security Groups (where ALL rules are evaluated)</p>
+<p><strong>Priya's Problem Explained:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Rule 100: ALLOW all traffic from 0.0.0.0/0       ← Matches EVERYTHING
+</span>Rule 200: DENY all traffic from 198.51.100.0/24   ← NEVER reached
+
+Traffic from 198.51.100.0/24 arrives
+→ Rule 100 matches (0.0.0.0/0 includes all IPs) → ALLOW → Stop
+→ Rule 200 is never evaluated</code></pre></div>
+<p><strong>The Fix:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Rule 90:  DENY all traffic from 198.51.100.0/24   ← Evaluated FIRST
+</span>Rule 100: ALLOW all traffic from 0.0.0.0/0        ← Evaluated SECOND (for everything else)
+
+Traffic from 198.51.100.0/24 arrives
+→ Rule 90 matches → DENY → Stop
+→ Rule 100 never reached for this traffic
+
+Traffic from any other IP arrives
+→ Rule 90 does NOT match → Continue
+→ Rule 100 matches → ALLOW</code></pre></div>
+<p>→ <strong>DENY rules must have LOWER numbers than ALLOW rules to take effect</strong><br>
+→ Best practice: Leave gaps between rule numbers (100, 110, 120) so you can insert rules later (105, 115)</p>
+<hr>
+<h3>STEP 3 — STATEFUL vs STATELESS — THE CRITICAL DIFFERENCE</h3>
+<p>→ This is the MOST important concept in this project<br>
+→ It explains 90% of NACL-related confusion</p>
+<hr>
+<p><strong>STATEFUL (Security Groups):</strong></p>
+<p>→ "Remembers" the connection<br>
+→ If inbound traffic is ALLOWED → the return (outbound) traffic is AUTOMATICALLY allowed<br>
+→ If outbound traffic is ALLOWED → the return (inbound) traffic is AUTOMATICALLY allowed<br>
+→ You do NOT need to create rules for response traffic</p>
+<p><strong>Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Web client sends request to EC2 on port 80
+</span>        │
+        ▼
+Security Group INBOUND: Rule allows port 80 from 0.0.0.0/0 → ALLOWED
+        │
+        ▼
+EC2 processes request → sends response back to client on ephemeral port
+        │
+        ▼
+Security Group OUTBOUND: No rule needed for this response
+→ SG "remembers" the inbound connection → automatically allows the response
+→ THIS IS STATEFUL BEHAVIOR</code></pre></div>
+<p><strong>What the SG Tracks:</strong></p>
+<table><thead><tr><th>Tracked Attribute</th><th>Purpose</th></tr></thead><tbody><tr><td>Source IP</td><td>Which IP initiated the connection</td></tr><tr><td>Source Port</td><td>Which port the client used</td></tr><tr><td>Destination IP</td><td>Which IP was the target</td></tr><tr><td>Destination Port</td><td>Which port was the target</td></tr><tr><td>Protocol</td><td>TCP/UDP/ICMP</td></tr><tr><td>Connection state</td><td>ESTABLISHED, RELATED</td></tr></tbody></table>
+<p>→ This tracking is maintained in a CONNECTION TRACKING TABLE<br>
+→ The table is maintained per-ENI by the Nitro card (Project 3 reference)</p>
+<hr>
+<p><strong>STATELESS (NACLs):</strong></p>
+<p>→ "Forgets" immediately — treats every packet independently<br>
+→ Inbound traffic allowed does NOT mean return traffic is allowed<br>
+→ You MUST create explicit rules for BOTH directions</p>
+<p><strong>Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Web client sends request to EC2 on port 80
+</span>        │
+        ▼
+NACL INBOUND: Rule 100 allows port 80 from 0.0.0.0/0 → ALLOWED
+        │
+        ▼
+EC2 processes request → sends response back to client on ephemeral port (e.g., 52431)
+        │
+        ▼
+NACL OUTBOUND: Does a rule allow TCP to destination port 52431?
+        │
+        ├── If Rule exists allowing ports 1024-65535 → ALLOWED → Response reaches client
+        │
+        └── If NO such rule → DENIED → Client never gets the response → Connection hangs</code></pre></div>
+<p>→ THIS is why NACL configurations always need ephemeral port rules<br>
+→ THIS is why NACLs are more complex to manage than Security Groups</p>
+<hr>
+<p><strong>Side-by-Side Comparison:</strong></p>
+<table><thead><tr><th>Feature</th><th>Security Group</th><th>NACL</th></tr></thead><tbody><tr><td>Operates at</td><td>ENI (instance) level</td><td>Subnet level</td></tr><tr><td>Statefulness</td><td>STATEFUL</td><td>STATELESS</td></tr><tr><td>Rule types</td><td>ALLOW only</td><td>ALLOW and DENY</td></tr><tr><td>Rule evaluation</td><td>ALL rules evaluated (any match = allow)</td><td>Rules evaluated in NUMBER ORDER (first match wins)</td></tr><tr><td>Default inbound</td><td>DENY all</td><td>Default NACL: ALLOW all, Custom NACL: DENY all</td></tr><tr><td>Default outbound</td><td>ALLOW all</td><td>Default NACL: ALLOW all, Custom NACL: DENY all</td></tr><tr><td>Return traffic</td><td>Automatically allowed</td><td>Must be explicitly allowed (ephemeral ports)</td></tr><tr><td>Applied to</td><td>Specific instances (via ENI)</td><td>All instances in the subnet</td></tr><tr><td>Number per resource</td><td>Up to 5 SGs per ENI</td><td>1 NACL per subnet</td></tr><tr><td>SG/NACL referencing</td><td>Can reference other SGs as source/destination</td><td>Cannot reference SGs — only CIDR blocks</td></tr><tr><td>Changes take effect</td><td>Immediately</td><td>Immediately</td></tr><tr><td>Typical use</td><td>Primary firewall — instance-level access control</td><td>Secondary firewall — subnet-level blocking of IP ranges</td></tr></tbody></table>
+<hr>
+<h3>STEP 4 — SECURITY GROUP REFERENCING (SOLVING THE ARCHITECTURE)</h3>
+<p>→ This is the most POWERFUL feature of Security Groups<br>
+→ And the reason Security Groups are the PRIMARY firewall in AWS</p>
+<p><strong>The Problem Without Referencing:</strong></p>
+<p>→ Web server IP: <code>10.0.1.50</code><br>
+→ Database SG allows port 3306 from <code>10.0.1.50/32</code><br>
+→ Web server gets replaced → new IP: <code>10.0.1.75</code><br>
+→ Database SG still references old IP → connection fails<br>
+→ Must manually update the database SG every time</p>
+<p>→ With Auto Scaling (Project 33) → instances launch/terminate constantly → IPs change every minute<br>
+→ Managing IPs in SG rules is IMPOSSIBLE at scale</p>
+<p><strong>The Solution With Referencing:</strong></p>
+<p>→ Database SG allows port 3306 from <code>shopnow-web-sg</code> (Security Group ID)<br>
+→ ANY instance with <code>shopnow-web-sg</code> attached → can connect to port 3306<br>
+→ New instance launches with <code>shopnow-web-sg</code> → automatically gets database access<br>
+→ Old instance terminates → automatically loses database access<br>
+→ ZERO manual updates needed</p>
+<p><strong>How Referencing Works Internally:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Instance A (Web) has SG: shopnow-web-sg (sg-0abc1234)
+</span>Instance B (DB) has SG: shopnow-db-sg
+
+shopnow-db-sg Inbound Rule:
+  Port 3306, Source: sg-0abc1234
+
+Instance A sends packet to Instance B on port 3306
+        │
+        ▼
+Packet arrives at Instance B's ENI
+        │
+        ▼
+Security Group evaluation:
+  "Is the SOURCE of this packet an ENI that has sg-0abc1234 attached?"
+        │
+        ├── YES (Instance A has sg-0abc1234) → ALLOWED
+        │
+        └── NO → Check other rules → If no match → DENIED</code></pre></div>
+<p>→ AWS resolves the SG reference by checking the source ENI's attached Security Groups<br>
+→ This happens at the Nitro card level — extremely fast</p>
+<hr>
+<p><strong>Multi-Tier Architecture Using SG Referencing:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>INTERNET
+</span>    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ PUBLIC SUBNET                                           │
+│                                                         │
+│  ┌─────────────────┐    shopnow-web-sg                  │
+│  │  Web Server EC2 │    Inbound: 80, 443 from 0.0.0.0/0│
+│  │                 │    Inbound: 22 from admin IPs      │
+│  └────────┬────────┘                                    │
+│           │                                             │
+└───────────┼─────────────────────────────────────────────┘
+            │ Port 3306
+            ▼
+┌─────────────────────────────────────────────────────────┐
+│ PRIVATE SUBNET                                          │
+│                                                         │
+│  ┌─────────────────┐    shopnow-db-sg                   │
+│  │  Database EC2   │    Inbound: 3306 from shopnow-web-sg│
+│  │  (MariaDB)      │    NO SSH from internet            │
+│  └─────────────────┘    NO public IP                    │
+│                                                         │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<p>→ The database has NO public IP and NO internet-facing rules<br>
+→ ONLY the web server (identified by its SG) can reach port 3306<br>
+→ This is called a "Multi-Tier Security Architecture"<br>
+→ This pattern is FOUNDATIONAL — used in every production AWS deployment<br>
+→ VPC with public and private subnets (Project 5) enables this physical separation</p>
+<hr>
+<h3>STEP 5 — DESIGN SHOPNOW'S COMPLETE NETWORK SECURITY</h3>
+<hr>
+<p><strong>Security Group: <code>shopnow-web-sg</code> (Web Tier)</strong></p>
+<p>Inbound:</p>
+<table><thead><tr><th>Rule</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>1</td><td>TCP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>HTTP from internet</td></tr><tr><td>2</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>HTTPS from internet</td></tr><tr><td>3</td><td>TCP</td><td>22</td><td><code>203.0.113.0/24</code></td><td>SSH from office IP range</td></tr></tbody></table>
+<p>Outbound:</p>
+<table><thead><tr><th>Rule</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Purpose</th></tr></thead><tbody><tr><td>1</td><td>TCP</td><td>3306</td><td><code>shopnow-db-sg</code></td><td>Connect to database</td></tr><tr><td>2</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>HTTPS to internet (updates, APIs)</td></tr></tbody></table>
+<p>→ Note: Outbound is RESTRICTED — only database and HTTPS<br>
+→ The web server cannot make arbitrary connections</p>
+<hr>
+<p><strong>Security Group: <code>shopnow-db-sg</code> (Database Tier)</strong></p>
+<p>Inbound:</p>
+<table><thead><tr><th>Rule</th><th>Protocol</th><th>Port</th><th>Source</th><th>Purpose</th></tr></thead><tbody><tr><td>1</td><td>TCP</td><td>3306</td><td><code>shopnow-web-sg</code></td><td>MariaDB from web tier only</td></tr></tbody></table>
+<p>Outbound:</p>
+<table><thead><tr><th>Rule</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Purpose</th></tr></thead><tbody><tr><td>1</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>HTTPS for OS updates (through NAT Gateway — Project 5)</td></tr></tbody></table>
+<p>→ Database accepts connections ONLY from web tier<br>
+→ No SSH, no internet access, no other ports</p>
+<hr>
+<p><strong>NACL: <code>shopnow-web-nacl</code> (Web Subnet)</strong></p>
+<p>Inbound:</p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Action</th></tr></thead><tbody><tr><td>50</td><td>All traffic</td><td>All</td><td>All</td><td><code>198.51.100.0/24</code></td><td>DENY</td></tr><tr><td>100</td><td>HTTP</td><td>TCP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>110</td><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>120</td><td>SSH</td><td>TCP</td><td>22</td><td><code>203.0.113.0/24</code></td><td>ALLOW</td></tr><tr><td>130</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p>Outbound:</p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Action</th></tr></thead><tbody><tr><td>100</td><td>HTTP</td><td>TCP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>110</td><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>120</td><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>10.0.2.0/24</code></td><td>ALLOW</td></tr><tr><td>130</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p>→ Rule 50 DENIES the known malicious IP range BEFORE Rule 100 allows general traffic<br>
+→ Rule 130 (both directions) handles ephemeral ports for stateless return traffic<br>
+→ The <code>*</code> default rule catches everything else → DENY</p>
+<hr>
+<p><strong>NACL: <code>shopnow-db-nacl</code> (Database Subnet)</strong></p>
+<p>Inbound:</p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port</th><th>Source</th><th>Action</th></tr></thead><tbody><tr><td>100</td><td>MySQL/Aurora</td><td>TCP</td><td>3306</td><td><code>10.0.1.0/24</code></td><td>ALLOW</td></tr><tr><td>110</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p>Outbound:</p>
+<table><thead><tr><th>Rule #</th><th>Type</th><th>Protocol</th><th>Port</th><th>Destination</th><th>Action</th></tr></thead><tbody><tr><td>100</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>10.0.1.0/24</code></td><td>ALLOW</td></tr><tr><td>110</td><td>HTTPS</td><td>TCP</td><td>443</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>120</td><td>Custom TCP</td><td>TCP</td><td>1024-65535</td><td><code>0.0.0.0/0</code></td><td>ALLOW</td></tr><tr><td>*</td><td>All traffic</td><td>All</td><td>All</td><td><code>0.0.0.0/0</code></td><td>DENY</td></tr></tbody></table>
+<p>→ Database NACL only allows port 3306 from the web subnet CIDR<br>
+→ NACLs cannot reference Security Groups — must use CIDR blocks<br>
+→ Outbound ephemeral ports allow responses back to the web tier</p>
+<hr>
+<h3>STEP 6 — TRAFFIC FLOW WALKTHROUGH (COMPLETE PATH)</h3>
+<p>→ Understanding exactly what happens when a user accesses ShopNow's website</p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>USER'S BROWSER → http://13.234.176.89 (Elastic IP from Project 3)
+</span>
+STEP 1: Packet reaches VPC
+        Source: User's IP (e.g., 45.67.89.100)
+        Destination: 13.234.176.89 (maps to private IP 10.0.1.50)
+        Port: 80
+
+STEP 2: NACL INBOUND evaluation (shopnow-web-nacl)
+        Rule 50: Source 45.67.89.100 ∈ 198.51.100.0/24? NO → Next rule
+        Rule 100: Port 80, TCP, from 0.0.0.0/0? YES → ALLOW → Stop
+        ✅ Packet enters the subnet
+
+STEP 3: Security Group INBOUND evaluation (shopnow-web-sg)
+        Rule 1: Port 80, TCP, from 0.0.0.0/0? YES → ALLOW
+        ✅ Packet reaches the EC2 instance
+
+STEP 4: Web application processes request
+        App queries database at 10.0.2.100:3306
+
+STEP 5: Security Group OUTBOUND evaluation (shopnow-web-sg)
+        Rule 1: Port 3306, TCP, to shopnow-db-sg? YES → ALLOW
+        ✅ Packet leaves web instance
+
+STEP 6: NACL OUTBOUND evaluation (shopnow-web-nacl)
+        Rule 120: Port 3306, TCP, to 10.0.2.0/24? YES → ALLOW → Stop
+        ✅ Packet leaves web subnet
+
+STEP 7: NACL INBOUND evaluation (shopnow-db-nacl)
+        Rule 100: Port 3306, TCP, from 10.0.1.0/24? YES → ALLOW → Stop
+        ✅ Packet enters database subnet
+
+STEP 8: Security Group INBOUND evaluation (shopnow-db-sg)
+        Rule 1: Port 3306, TCP, from shopnow-web-sg? 
+        Is source ENI attached to shopnow-web-sg? YES → ALLOW
+        ✅ Packet reaches database instance
+
+STEP 9: Database processes query → sends response
+        Response goes to 10.0.1.50 (web server) on ephemeral port (e.g., 45678)
+
+STEP 10: Security Group OUTBOUND evaluation (shopnow-db-sg)
+         STATEFUL: Inbound was allowed → outbound response AUTO-ALLOWED
+         ✅ No outbound rule needed
+
+STEP 11: NACL OUTBOUND evaluation (shopnow-db-nacl)
+         STATELESS: Must match a rule
+         Rule 100: TCP, port 1024-65535, to 10.0.1.0/24? YES → ALLOW → Stop
+         ✅ Response leaves database subnet
+
+STEP 12: NACL INBOUND evaluation (shopnow-web-nacl)
+         STATELESS: Must match a rule
+         Rule 130: TCP, port 1024-65535, from 0.0.0.0/0? YES → ALLOW → Stop
+         ✅ Response enters web subnet
+
+STEP 13: Security Group INBOUND evaluation (shopnow-web-sg)
+         STATEFUL: Outbound to database was allowed → inbound response AUTO-ALLOWED
+         ✅ Response reaches web instance
+
+STEP 14: Web application builds HTTP response → sends back to user
+
+STEP 15: Security Group OUTBOUND evaluation (shopnow-web-sg)
+         STATEFUL: Inbound HTTP was allowed → outbound response AUTO-ALLOWED
+         ✅ Response leaves web instance
+
+STEP 16: NACL OUTBOUND evaluation (shopnow-web-nacl)
+         STATELESS: Must match a rule
+         Rule 130: TCP, port 1024-65535 (user's ephemeral port), to 0.0.0.0/0? YES → ALLOW
+         ✅ Response leaves subnet → reaches user
+
+TOTAL: 16 evaluation steps for ONE HTTP request that queries a database</code></pre></div>
+<p>→ This is why understanding BOTH SGs and NACLs is essential<br>
+→ A failure at ANY step = connection fails<br>
+→ Security Groups handle 4 evaluations (but auto-allow return traffic due to statefulness)<br>
+→ NACLs handle 8 evaluations (must explicitly allow every direction including returns)</p>
+<hr>
+<h3>STEP 7 — SECURITY GROUP LIMITS AND ADVANCED CONFIGURATIONS</h3>
+<p><strong>Limits:</strong></p>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>Security Groups per VPC</td><td>2,500</td></tr><tr><td>Inbound rules per SG</td><td>60</td></tr><tr><td>Outbound rules per SG</td><td>60</td></tr><tr><td>SGs per ENI</td><td>5</td></tr><tr><td>Combined rules (SGs × rules per ENI)</td><td>300 inbound + 300 outbound max when using multiple SGs</td></tr></tbody></table>
+<p>→ If you need more than 60 rules per SG → split across multiple SGs and attach all to the ENI<br>
+→ If you need more than 5 SGs per ENI → consolidate rules into fewer SGs</p>
+<p><strong>Multiple Security Groups on One Instance:</strong></p>
+<p>→ When an ENI has multiple SGs → all inbound rules from ALL SGs are COMBINED<br>
+→ If SG-A allows port 80 and SG-B allows port 443 → the instance allows BOTH 80 and 443<br>
+→ This is an ADDITIVE (union) model — SGs can only ADD permissions, never remove</p>
+<p><strong>Example:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Instance has: SG-A and SG-B attached
+</span>
+SG-A Inbound: Allow port 80 from 0.0.0.0/0
+SG-B Inbound: Allow port 22 from 10.0.0.0/8
+
+Effective Inbound: 
+  Allow port 80 from 0.0.0.0/0  (from SG-A)
+  Allow port 22 from 10.0.0.0/8  (from SG-B)</code></pre></div>
+<p>→ You CANNOT use SG-B to "override" or "deny" what SG-A allows<br>
+→ Once allowed by any SG → it's allowed → period</p>
+<hr>
+<h3>STEP 8 — NACL LIMITS AND ADVANCED CONFIGURATIONS</h3>
+<p><strong>Limits:</strong></p>
+<table><thead><tr><th>Resource</th><th>Default Limit</th></tr></thead><tbody><tr><td>NACLs per VPC</td><td>200</td></tr><tr><td>Rules per NACL (inbound + outbound)</td><td>20 each (can increase to 40 — but impacts network performance)</td></tr><tr><td>NACLs per subnet</td><td>Exactly 1</td></tr><tr><td>Subnets per NACL</td><td>Unlimited (one NACL can serve many subnets)</td></tr></tbody></table>
+<p>→ The 20 rule limit per direction is quite restrictive<br>
+→ This is why NACLs are used for BROAD rules (block IP ranges) not fine-grained control<br>
+→ Fine-grained control belongs to Security Groups</p>
+<p><strong>NACL Association:</strong></p>
+<p>→ Every subnet MUST have a NACL<br>
+→ If you don't explicitly associate one → the DEFAULT NACL (allows all) is used<br>
+→ When you associate a custom NACL → the previous NACL is automatically disassociated<br>
+→ One subnet = one NACL at a time (always)</p>
+<hr>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<p>→ Always use Security Groups as your PRIMARY firewall — they are easier and more powerful<br>
+→ Always use SG referencing instead of IP addresses when resources communicate within AWS<br>
+→ Always use NACLs as a SECONDARY defense layer for subnet-level blocking<br>
+→ Always put DENY rules at LOWER rule numbers than ALLOW rules in NACLs<br>
+→ Always include ephemeral port rules (1024-65535) in NACLs for return traffic<br>
+→ Always leave gaps between NACL rule numbers (10, 20, 30 or 100, 110, 120) for future insertions<br>
+→ Always restrict SSH/RDP to specific IP ranges — never <code>0.0.0.0/0</code><br>
+→ Always restrict database ports to only the application tier SG — never the internet<br>
+→ Always restrict outbound SG rules for sensitive tiers (database should not reach arbitrary internet)<br>
+→ Always document which SGs reference which other SGs — this becomes complex in large environments<br>
+→ Always use descriptive SG names and descriptions — debugging at 3 AM requires clarity</p>
+<hr>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<p>→ Never open database ports (3306, 5432, 1433, 6379) to <code>0.0.0.0/0</code><br>
+→ Never open SSH (22) or RDP (3389) to <code>0.0.0.0/0</code><br>
+→ Never rely ONLY on NACLs — they are harder to manage due to stateless nature<br>
+→ Never put a DENY rule at a HIGHER number than a matching ALLOW rule in NACLs — it will never trigger<br>
+→ Never forget ephemeral port rules in NACLs — your connections will appear to "hang"<br>
+→ Never use the default NACL for production — it allows everything<br>
+→ Never create NACLs with too many rules — 20 per direction is the default limit and performance degrades beyond that<br>
+→ Never assume Security Groups can DENY traffic — they can only ALLOW<br>
+→ Never reference NACLs from Security Groups or vice versa — they are independent systems<br>
+→ Never use individual IPs in SG rules when SG referencing is possible — IPs change, SGs don't</p>
+<hr>
+<hr>
+<h2>🔵 WHEN TO USE WHAT</h2>
+<table><thead><tr><th>Scenario</th><th>Use Security Group</th><th>Use NACL</th></tr></thead><tbody><tr><td>Allow web traffic to application</td><td>✅ Port 80/443 from 0.0.0.0/0</td><td>✅ Same rules (defense in depth)</td></tr><tr><td>Allow app tier to talk to DB tier</td><td>✅ SG referencing (best approach)</td><td>✅ CIDR-based allow (secondary)</td></tr><tr><td>Block a specific malicious IP</td><td>❌ Cannot deny in SG</td><td>✅ DENY rule with low number</td></tr><tr><td>Block an entire IP range (country block)</td><td>❌ Cannot deny in SG</td><td>✅ DENY rule for CIDR range</td></tr><tr><td>Dynamic instance-to-instance access</td><td>✅ SG referencing (auto-adjusts)</td><td>❌ Cannot reference SGs</td></tr><tr><td>Restrict outbound from sensitive tier</td><td>✅ Custom outbound rules</td><td>✅ Custom outbound rules</td></tr><tr><td>Compliance requirement: subnet-level isolation</td><td>❌ SGs don't operate at subnet level</td><td>✅ NACL per subnet</td></tr><tr><td>Quick troubleshooting — disable all rules temporarily</td><td>❌ Must delete each rule</td><td>✅ Associate default NACL (allows all)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🔴 WHEN NOT TO USE</h2>
+<p>→ Do NOT use NACLs as your only firewall — their stateless nature makes management error-prone<br>
+→ Do NOT use Security Groups for IP-based blocking — they lack deny rules<br>
+→ Do NOT use NACLs for fine-grained per-instance control — they apply to entire subnets<br>
+→ Do NOT use either for application-layer filtering (SQL injection, XSS) → Use AWS WAF<br>
+→ Do NOT use either for DDoS protection → Use AWS Shield<br>
+→ Do NOT use either for DNS-based filtering → Use Route 53 Resolver DNS Firewall<br>
+→ Do NOT use either for deep packet inspection → Use AWS Network Firewall</p>
+<hr>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<hr>
+<h3>1 → WHERE SG AND NACL ENFORCEMENT HAPPENS</h3>
+<p><strong>Security Groups — Enforced at the Nitro Card:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────┐
+</span>│           Physical Host                   │
+│                                           │
+│  ┌────────────┐    ┌────────────────────┐ │
+│  │ EC2 VM     │    │ Nitro Network Card │ │
+│  │            │◄──►│                    │ │
+│  │ Guest OS   │    │ SG rules loaded    │ │
+│  │ Application│    │ Connection tracking│ │
+│  └────────────┘    │ table maintained   │ │
+│                    │                    │ │
+│                    │ ENFORCEMENT POINT  │ │
+│                    └────────┬───────────┘ │
+│                             │             │
+└─────────────────────────────┼─────────────┘
+                              │
+                              ▼
+                        VPC Network Fabric</code></pre></div>
+<p>→ SG rules are pushed to the Nitro card when you modify them<br>
+→ The Nitro card evaluates every packet BEFORE it reaches the VM<br>
+→ The guest OS (Linux/Windows) never sees blocked traffic<br>
+→ Connection tracking table is maintained on the Nitro card → this is what makes SGs stateful<br>
+→ Changes are INSTANT because Nitro cards update in real-time</p>
+<hr>
+<p><strong>NACLs — Enforced at the VPC Network Fabric:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>        INTERNET
+</span>            │
+            ▼
+    ┌───────────────┐
+    │  VPC Router   │
+    │               │
+    │  Route Table  │
+    │  evaluation   │
+    └───────┬───────┘
+            │
+            ▼
+    ┌───────────────┐
+    │  NACL         │ ◄── ENFORCEMENT POINT
+    │  Engine       │
+    │               │
+    │  Stateless    │
+    │  per-packet   │
+    │  evaluation   │
+    └───────┬───────┘
+            │
+            ▼
+    ┌───────────────┐
+    │  Subnet       │
+    │  (instances)  │
+    └───────────────┘</code></pre></div>
+<p>→ NACLs are enforced by AWS network infrastructure at the subnet boundary<br>
+→ Every packet entering or leaving the subnet is evaluated against NACL rules<br>
+→ No connection state is tracked → every packet is independent<br>
+→ This happens BEFORE Security Group evaluation for inbound traffic<br>
+→ This happens AFTER Security Group evaluation for outbound traffic</p>
+<hr>
+<h3>2 → CONNECTION TRACKING DEEP DIVE (SECURITY GROUPS)</h3>
+<p>→ The Nitro card maintains a connection tracking table:</p>
+<table><thead><tr><th>Field</th><th>Example</th></tr></thead><tbody><tr><td>Protocol</td><td>TCP</td></tr><tr><td>Source IP</td><td>45.67.89.100</td></tr><tr><td>Source Port</td><td>52431</td></tr><tr><td>Destination IP</td><td>10.0.1.50</td></tr><tr><td>Destination Port</td><td>80</td></tr><tr><td>State</td><td>ESTABLISHED</td></tr><tr><td>Timeout</td><td>350 seconds (TCP) / 30 seconds (UDP)</td></tr></tbody></table>
+<p>→ When a NEW inbound packet arrives → SG rules are evaluated<br>
+→ If ALLOWED → entry added to connection tracking table<br>
+→ When RESPONSE packet goes outbound → table is checked<br>
+→ Entry found → response automatically allowed WITHOUT checking outbound rules<br>
+→ This is the mechanics of "stateful" behavior</p>
+<p><strong>Connection Tracking Limits:</strong></p>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td>Maximum tracked connections per ENI</td><td>~130,000 (varies by instance type)</td></tr><tr><td>Timeout for established TCP connections</td><td>350 seconds of idle</td></tr><tr><td>Timeout for UDP</td><td>30 seconds</td></tr><tr><td>Timeout for ICMP</td><td>30 seconds</td></tr></tbody></table>
+<p>→ If connection tracking table is FULL → new connections are DROPPED<br>
+→ Symptoms: Random connection failures under very high connection counts<br>
+→ Monitoring: CloudWatch metric <code>ConnTrackAllowanceExceeded</code> (available on Nitro instances)</p>
+<p><strong>Untracked Connections:</strong></p>
+<p>→ When a Security Group rule allows ALL traffic (protocol: all, port: all, source: 0.0.0.0/0)<br>
+→ Both inbound and outbound → connections become UNTRACKED<br>
+→ This means: No connection tracking table entry → slightly better performance<br>
+→ But: Response traffic is also not tracked → works because everything is allowed anyway<br>
+→ Relevant for high-performance scenarios (hundreds of thousands of connections)</p>
+<hr>
+<h3>3 → PACKET EVALUATION ORDER (COMPLETE)</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>INBOUND TRAFFIC (from internet to instance):
+</span>1. Route Table → determines which subnet to send to
+2. NACL Inbound → stateless evaluation (first matching rule)
+3. Security Group Inbound → stateful evaluation (all rules checked)
+4. Traffic reaches instance
+
+OUTBOUND TRAFFIC (from instance to internet):
+1. Security Group Outbound → stateful evaluation (all rules checked)
+   OR auto-allowed if response to tracked inbound connection
+2. NACL Outbound → stateless evaluation (first matching rule)
+3. Route Table → determines where to send
+4. Traffic leaves VPC</code></pre></div>
+<p>→ For INBOUND: NACL is checked FIRST, then SG<br>
+→ For OUTBOUND: SG is checked FIRST, then NACL<br>
+→ Traffic must pass BOTH → failure at either = blocked</p>
+<hr>
+<h3>4 → DEFAULT VS CUSTOM — BEHAVIOR DIFFERENCES</h3>
+<p><strong>Security Groups:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Behavior</th></tr></thead><tbody><tr><td>New SG default inbound</td><td>DENY all (empty ruleset)</td></tr><tr><td>New SG default outbound</td><td>ALLOW all (one rule: all traffic to 0.0.0.0/0)</td></tr><tr><td>Cannot delete</td><td>Default SG of VPC (but can modify its rules)</td></tr><tr><td>Default SG special behavior</td><td>Allows inbound from other instances with the same default SG attached</td></tr></tbody></table>
+<p>→ The default SG has a special inbound rule: source = itself<br>
+→ Any instance with the default SG can talk to any other instance with the default SG<br>
+→ This is why instances in the default VPC can communicate by default</p>
+<p><strong>NACLs:</strong></p>
+<table><thead><tr><th>Aspect</th><th>Default NACL</th><th>Custom NACL</th></tr></thead><tbody><tr><td>Default inbound</td><td>ALLOW all</td><td>DENY all</td></tr><tr><td>Default outbound</td><td>ALLOW all</td><td>DENY all</td></tr><tr><td>Created when</td><td>VPC is created</td><td>You create manually</td></tr><tr><td>Can be deleted</td><td>No</td><td>Yes (subnets revert to default NACL)</td></tr><tr><td>Subnets auto-associated</td><td>Yes (all subnets without explicit NACL)</td><td>No (must explicitly associate)</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>🚨 COMMON PITFALLS AND FAILURE MODES</h2>
+<table><thead><tr><th>#</th><th>Pitfall</th><th>What Happens</th><th>How to Avoid</th></tr></thead><tbody><tr><td>1</td><td>Opening database port to 0.0.0.0/0</td><td>Bots brute-force database within hours</td><td>Use SG referencing — only allow from app tier SG</td></tr><tr><td>2</td><td>Forgetting ephemeral ports in NACL</td><td>Connections hang — request sent but response blocked</td><td>Always add TCP 1024-65535 rule in both directions</td></tr><tr><td>3</td><td>NACL deny rule number higher than allow</td><td>Deny rule never triggers — malicious traffic gets through</td><td>Put deny rules at lower numbers than allow rules</td></tr><tr><td>4</td><td>Using custom NACL without adding rules</td><td>All traffic blocked — all instances in subnet unreachable</td><td>Always add explicit allow rules before associating custom NACL</td></tr><tr><td>5</td><td>Debugging with SG when problem is NACL</td><td>Hours wasted checking SG rules when NACL is blocking</td><td>Check BOTH SG and NACL when troubleshooting connectivity</td></tr><tr><td>6</td><td>Using IPs in SG rules instead of SG references</td><td>Rules break when instances are replaced or scaled</td><td>Always use SG references for AWS-internal communication</td></tr><tr><td>7</td><td>Multiple SGs — thinking one SG can deny what another allows</td><td>SGs are additive — cannot deny</td><td>If you need deny → use NACL</td></tr><tr><td>8</td><td>Restricting SG outbound too aggressively</td><td>Instance can't download updates, reach AWS APIs, resolve DNS</td><td>Always allow port 443 outbound + port 53 (DNS) if restricting outbound</td></tr><tr><td>9</td><td>Not allowing DNS (port 53) in restricted NACL</td><td>All hostname resolution fails — everything breaks</td><td>Include UDP/TCP port 53 to VPC DNS server (x.x.x.2 of VPC CIDR)</td></tr><tr><td>10</td><td>Connection tracking table full on busy instances</td><td>Random connection drops under high load</td><td>Monitor ConnTrackAllowanceExceeded metric, use larger instance type</td></tr><tr><td>11</td><td>Changing SG on wrong instance</td><td>Production database suddenly unreachable</td><td>Always verify instance ID before modifying SGs</td></tr><tr><td>12</td><td>Assuming NACL changes need restart</td><td>Waiting for "something to take effect"</td><td>Both SG and NACL changes are IMMEDIATE — no restart needed</td></tr></tbody></table>
+<hr>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<p>→ <strong>Security Group Scalability</strong></p>
+<ul>
+<li>2,500 SGs per VPC (can be increased)</li>
+<li>60 rules per SG (can be increased to 200 but reduces SGs per ENI)</li>
+<li>5 SGs per ENI → maximum 300 combined rules per instance</li>
+<li>At enterprise scale → use SG referencing chains (web-sg → app-sg → db-sg)</li>
+<li>SG changes propagate in seconds to all associated instances</li>
+</ul>
+<p>→ <strong>NACL Scalability</strong></p>
+<ul>
+<li>200 NACLs per VPC</li>
+<li>20 rules per direction per NACL (can increase to 40)</li>
+<li>20 rules is limiting for complex blocking requirements</li>
+<li>For complex IP blocking → use AWS Network Firewall or AWS WAF instead</li>
+<li>NACLs are best for BROAD subnet-level rules, not fine-grained filtering</li>
+</ul>
+<p>→ <strong>Performance Impact</strong></p>
+<ul>
+<li>Security Groups: Minimal — evaluated on Nitro hardware</li>
+<li>NACLs: Minimal — evaluated on network fabric</li>
+<li>Connection tracking: Can become bottleneck at very high connection counts (&gt;100K concurrent)</li>
+<li>More rules = slightly more evaluation time but negligible in practice</li>
+</ul>
+<p>→ <strong>Operational Scalability</strong></p>
+<ul>
+<li>50 instances with same SG → change rule once → all 50 updated instantly</li>
+<li>SG referencing eliminates IP management → scales with Auto Scaling</li>
+<li>Infrastructure as Code (CloudFormation/Terraform) essential for managing SGs at scale</li>
+<li>Tagging SGs with purpose and tier helps organizational management</li>
+</ul>
+<hr>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<p>→ <strong>How to verify Security Groups are correct:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>View effective inbound rules</td><td>EC2 Console → Instance → Security tab → Inbound rules</td></tr><tr><td>View effective outbound rules</td><td>EC2 Console → Instance → Security tab → Outbound rules</td></tr><tr><td>Test connectivity</td><td>VPC Console → Reachability Analyzer → Source/Destination → Analyze</td></tr><tr><td>Check SG references</td><td>Click on SG ID in rules → see which instances are attached</td></tr><tr><td>Audit all SGs</td><td>EC2 Console → Security Groups → Filter by VPC</td></tr></tbody></table>
+<p>→ <strong>How to verify NACLs are correct:</strong></p>
+<table><thead><tr><th>Check</th><th>How</th></tr></thead><tbody><tr><td>View NACL rules</td><td>VPC Console → Network ACLs → Select NACL → Inbound/Outbound tabs</td></tr><tr><td>Check subnet association</td><td>VPC Console → Network ACLs → Select NACL → "Subnet associations" tab</td></tr><tr><td>Verify rule ordering</td><td>Confirm deny rules have lower numbers than allow rules</td></tr><tr><td>Verify ephemeral ports</td><td>Confirm TCP 1024-65535 exists in both inbound and outbound</td></tr></tbody></table>
+<p>→ <strong>How to debug connectivity issues:</strong></p>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>STEP 1: Verify instance is running (Project 3 — status checks)
+</span>STEP 2: Verify instance has public IP or is in correct private subnet
+STEP 3: Check Security Group inbound rules for the destination port
+STEP 4: Check NACL inbound rules for the destination port
+STEP 5: Check NACL outbound rules for ephemeral ports (return traffic)
+STEP 6: Check Security Group outbound rules on the SOURCE instance
+STEP 7: Check route tables (Project 5) — does a route exist?
+STEP 8: Use VPC Flow Logs to see accepted/rejected packets
+STEP 9: Use Reachability Analyzer for automated path analysis</code></pre></div>
+<p>→ <strong>VPC Flow Logs (Preview — detailed in later projects):</strong></p>
+<p>→ Capture information about IP traffic going to/from ENIs<br>
+→ Flow log record shows: source IP, destination IP, source port, destination port, protocol, packets, bytes, ACTION (ACCEPT/REJECT)<br>
+→ If Flow Log shows REJECT → identify which layer rejected (SG or NACL)<br>
+→ SG rejections appear as REJECT on the ENI's flow log<br>
+→ NACL rejections appear as REJECT on the subnet's flow log</p>
+<hr>
+<hr>
+<h2>🎯 KEY TAKEAWAY</h2>
+<hr>
+<p>→ AWS has TWO layers of network firewall: Security Groups (instance-level) and NACLs (subnet-level)<br>
+→ Security Groups are STATEFUL (track connections, auto-allow return traffic)<br>
+→ NACLs are STATELESS (every packet evaluated independently, need ephemeral port rules)<br>
+→ Security Groups can only ALLOW — NACLs can ALLOW and DENY<br>
+→ Security Group rules evaluate ALL rules (any match = allow) — NACL rules evaluate in NUMBER ORDER (first match wins)<br>
+→ Security Group REFERENCING is the most powerful feature — enables dynamic instance-to-instance access<br>
+→ NACLs are best for BROAD blocking (malicious IP ranges) — SGs are best for fine-grained access control<br>
+→ Connection to Project 3: The EC2 instance's connectivity is controlled by SGs we configured here<br>
+→ Connection to Project 2: IAM controls WHO can modify SG and NACL rules (<code>ec2:AuthorizeSecurityGroupIngress</code>, <code>ec2:CreateNetworkAclEntry</code>)<br>
+→ Connection to Project 1: S3 is accessed over HTTPS (port 443) — SG outbound must allow this<br>
+→ This project is ESSENTIAL for:</p>
+<ul>
+<li>Project 5: VPC design with public/private subnets (SGs and NACLs per subnet)</li>
+<li>Project 9: RDS MariaDB Security Group configuration</li>
+<li>Project 14: EC2 to RDS connectivity (SG referencing between compute and database)</li>
+<li>Project 24: Glue JDBC connection to MariaDB (Glue ENI needs SG allowing database port)</li>
+<li>Project 27: VPC Endpoints (SG controls access to endpoint ENIs)</li>
+<li>Project 44: VPC Peering (SG rules must allow cross-VPC CIDR traffic)</li>
+</ul>
+<hr>
+<hr>
+<h2>🔗 BRIDGE TO NEXT PROJECT</h2>
+<p>→ ShopNow now has Security Groups and NACLs protecting their instances<br>
+→ But everything is running in the DEFAULT VPC<br>
+→ The default VPC has all PUBLIC subnets — every instance gets a public IP<br>
+→ The database instance has a public IP even though we blocked internet access via SG<br>
+→ The CTO's security consultant says: "Your database should be in a PRIVATE subnet with NO public IP and NO internet gateway route"<br>
+→ The team asks: "What IS a VPC? What's a subnet? What's an Internet Gateway? What's a NAT Gateway?"<br>
+→ They need to understand the NETWORK ARCHITECTURE that Security Groups and NACLs protect</p>
+<p>→ <strong>This is exactly what Project 5 solves</strong><br>
+→ Project 5 builds a custom VPC from scratch with public and private subnets<br>
+→ It introduces Internet Gateway, NAT Gateway, and Route Tables<br>
+→ It uses Security Groups (this project) and NACLs (this project) within the VPC design<br>
+→ The multi-tier architecture we designed in Step 4 becomes PHYSICALLY separated across subnets</p>
+<hr>
+<blockquote>
+<p><strong>Ready for Project 5: "The Application That Needed a Private Room — VPC Creation with Public &amp; Private Subnets"?</strong><br>
+</p>
+</blockquote></div></div>
+<nav class="bottom-nav"><a class="nav-btn prev" href="project-3.html">&#8592; PREV</a><div class="nav-center"><a class="nav-btn home" href="index.html">&#8962; TOC</a><span class="nav-progress-text">Phase 1 &bull; 4/60</span></div><a class="nav-btn next" href="project-5.html">NEXT &#8594;</a></nav>
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown',function(e){if(e.key==='ArrowRight'){var b=document.querySelector('.nav-btn.next');if(b&&!b.classList.contains('disabled'))b.click();}if(e.key==='ArrowLeft'){var b=document.querySelector('.nav-btn.prev');if(b&&!b.classList.contains('disabled'))b.click();}});
+</script>
+</body>
+</html>
