@@ -1,11 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AWS Masterclass — 60 Projects</title>
-<link rel="icon" type="image/svg+xml" href="favicon.svg">
-<style>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>AWS Masterclass — 60 Projects</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <style>
 body{background:linear-gradient(135deg,#faf8f4,#f0ece4,#e8e4dc);background-attachment:fixed;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;color:#3a3a3a;margin:0;padding:0;}
 .page-wrapper{max-width:1800px;margin:0 auto;padding:36px 50px 100px 40px;}
 .toc-header{text-align:center;padding:48px 40px 36px;background:linear-gradient(135deg,#fff,rgba(0,142,204,0.04));border-radius:16px;border:2px solid rgba(0,142,204,0.2);margin-bottom:32px;}
@@ -19,25 +19,474 @@ table tr:hover td{background:rgba(255,255,255,0.6);}
 ::-webkit-scrollbar{width:8px;} ::-webkit-scrollbar-track{background:#ece8e0;} ::-webkit-scrollbar-thumb{background:#008ECC;border-radius:10px;}
 @media(max-width:768px){.page-wrapper{padding:15px 15px 80px;} .toc-header{padding:28px 20px;} .toc-header h1{font-size:1.8em;}}
 </style>
-</head>
-<body>
-<div id="progress-rail"><div id="progress-fill"></div></div>
-<div id="progress-pct">0%</div>
-<div class="page-wrapper">
-  <div class="toc-header">
-    <h1>☁️ AWS Masterclass</h1>
-    <h2 style="color:#b8600b;margin:0 0 10px;font-size:1.5em;font-weight:800;">60 Scenario-Based Projects</h2>
-    <p>Very Easy → Very Hard &nbsp;|&nbsp; No Code — Pure Configuration &amp; Logic</p>
-    <p style="font-size:.9em;color:#999;margin-top:10px;">Use <strong style="color:#007ab8;">← →</strong> arrow keys to navigate between projects</p>
-  </div>
-  <div style="background:rgba(46,125,50,0.07);border:2px solid rgba(46,125,50,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2 style="margin:0 0 18px;color:#2e7d32;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🟢 PHASE 1: VERY EASY — FOUNDATION THINKING <span style="font-weight:400;font-size:.78em;opacity:.7;">(Projects 1–10)</span></h2><table style="width:100%;border-collapse:collapse;"><tbody><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P1</td><td style="padding:9px 12px;"><a href="project-1.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE STARTUP THAT LOST FILES<br><span style="font-weight:400;font-size:.87em;color:#666;">Understanding S3 Bucket Creation &amp; Object Storage</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P2</td><td style="padding:9px 12px;"><a href="project-2.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE INTERN WHO DELETED PRODUCTION<br><span style="font-weight:400;font-size:.87em;color:#666;">IAM Users, Groups, Policies &amp; Permission Boundaries</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P3</td><td style="padding:9px 12px;"><a href="project-3.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE DEVELOPER WHO COULDN'T ACCESS THE SERVER<br><span style="font-weight:400;font-size:.87em;color:#666;">EC2 Instance Launch &amp; SSH Configuration</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P4</td><td style="padding:9px 12px;"><a href="project-4.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE DATABASE THAT NOBODY COULD REACH<br><span style="font-weight:400;font-size:.87em;color:#666;">Security Groups vs NACLs</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P5</td><td style="padding:9px 12px;"><a href="project-5.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE APPLICATION THAT NEEDED A PRIVATE ROOM<br><span style="font-weight:400;font-size:.87em;color:#666;">VPC Creation with Public &amp; Private Subnets</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P6</td><td style="padding:9px 12px;"><a href="project-6.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE TEAM THAT MISSED EVERY ALERT<br><span style="font-weight:400;font-size:.87em;color:#666;">SNS Topic Creation &amp; Email Subscription</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P7</td><td style="padding:9px 12px;"><a href="project-7.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE ORDERS THAT DISAPPEARED DURING PEAK HOURS<br><span style="font-weight:400;font-size:.87em;color:#666;">SQS Queue &amp; Message Lifecycle</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P8</td><td style="padding:9px 12px;"><a href="project-8.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE SERVER THAT CRASHED AT 3 AM<br><span style="font-weight:400;font-size:.87em;color:#666;">CloudWatch Alarms &amp; Basic Monitoring</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P9</td><td style="padding:9px 12px;"><a href="project-9.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE E-COMMERCE APP THAT NEEDED A DATABASE<br><span style="font-weight:400;font-size:.87em;color:#666;">RDS MariaDB Instance Setup</span></a></td></tr><tr><td style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P10</td><td style="padding:9px 12px;"><a href="project-10.html" style="color:#2e7d32;text-decoration:none;font-weight:600;">THE PUBLIC BUCKET THAT COST $50,000<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 Bucket Policies &amp; Access Control Lists</span></a></td></tr></tbody></table></div><div style="background:rgba(0,122,184,0.07);border:2px solid rgba(0,122,184,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2 style="margin:0 0 18px;color:#007ab8;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🔵 PHASE 2: EASY — CORE PATTERNS <span style="font-weight:400;font-size:.78em;opacity:.7;">(Projects 11–20)</span></h2><table style="width:100%;border-collapse:collapse;"><tbody><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P11</td><td style="padding:9px 12px;"><a href="project-11.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE EC2 APP THAT NEEDED S3 WITHOUT HARDCODED KEYS<br><span style="font-weight:400;font-size:.87em;color:#666;">IAM Roles for EC2</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P12</td><td style="padding:9px 12px;"><a href="project-12.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE STORAGE BILL THAT KEPT GROWING<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 Versioning &amp; Lifecycle Policies</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P13</td><td style="padding:9px 12px;"><a href="project-13.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE NOTIFICATION THAT NEEDED MULTIPLE CONSUMERS<br><span style="font-weight:400;font-size:.87em;color:#666;">SNS to SQS Fan-Out Pattern</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P14</td><td style="padding:9px 12px;"><a href="project-14.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE WEB APP THAT COULDN'T TALK TO ITS DATABASE<br><span style="font-weight:400;font-size:.87em;color:#666;">EC2 to RDS MariaDB Private Connectivity</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P15</td><td style="padding:9px 12px;"><a href="project-15.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE DATA TEAM THAT WANTED REAL-TIME UPLOAD ALERTS<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 Event Notifications to SNS</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P16</td><td style="padding:9px 12px;"><a href="project-16.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE ANALYST WHO NEEDED A DATA WAREHOUSE<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift Single-Node Cluster Setup</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P17</td><td style="padding:9px 12px;"><a href="project-17.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE DATA LAKE THAT NEEDED A CATALOG<br><span style="font-weight:400;font-size:.87em;color:#666;">Glue Crawler Cataloging S3 Data</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P18</td><td style="padding:9px 12px;"><a href="project-18.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE ANALYST WHO DIDN'T WANT TO SPIN UP A SERVER<br><span style="font-weight:400;font-size:.87em;color:#666;">Athena Querying S3 via Glue Catalog</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P19</td><td style="padding:9px 12px;"><a href="project-19.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE APPLICATION LOGS NOBODY COULD FIND<br><span style="font-weight:400;font-size:.87em;color:#666;">CloudWatch Logs from EC2 via Unified Agent</span></a></td></tr><tr><td style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P20</td><td style="padding:9px 12px;"><a href="project-20.html" style="color:#007ab8;text-decoration:none;font-weight:600;">THE FAILED MESSAGES THAT VANISHED FOREVER<br><span style="font-weight:400;font-size:.87em;color:#666;">SQS Dead Letter Queue Configuration</span></a></td></tr></tbody></table></div><div style="background:rgba(184,96,11,0.07);border:2px solid rgba(184,96,11,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2 style="margin:0 0 18px;color:#b8600b;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🟠 PHASE 3: MEDIUM — PROFESSIONAL TECHNIQUES <span style="font-weight:400;font-size:.78em;opacity:.7;">(Projects 21–38)</span></h2><table style="width:100%;border-collapse:collapse;"><tbody><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P21</td><td style="padding:9px 12px;"><a href="project-21.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE CSV FILES THAT SLOWED EVERYTHING DOWN<br><span style="font-weight:400;font-size:.87em;color:#666;">Glue ETL Job for S3 CSV to Parquet Transformation</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P22</td><td style="padding:9px 12px;"><a href="project-22.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE DATA WAREHOUSE THAT NEEDED BULK LOADING<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift COPY from S3</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P23</td><td style="padding:9px 12px;"><a href="project-23.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE ANALYTICS EXPORT NOBODY COULD AUTOMATE<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift UNLOAD to S3</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P24</td><td style="padding:9px 12px;"><a href="project-24.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE OPERATIONAL DATABASE THAT NEEDED A BACKUP IN S3<br><span style="font-weight:400;font-size:.87em;color:#666;">MariaDB to S3 Export via Glue ETL</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P25</td><td style="padding:9px 12px;"><a href="project-25.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE COMPANY THAT WANTED SELF-SERVICE ANALYTICS<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 → Glue Crawler → Glue Catalog → Athena End-to-End Pipeline</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P26</td><td style="padding:9px 12px;"><a href="project-26.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE ORDER PROCESSING SYSTEM THAT NEEDED DECOUPLING<br><span style="font-weight:400;font-size:.87em;color:#666;">SNS → SQS → Lambda Event-Driven Pipeline</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P27</td><td style="padding:9px 12px;"><a href="project-27.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE DATA PIPELINE THAT SHOULDN'T TRAVERSE THE INTERNET<br><span style="font-weight:400;font-size:.87em;color:#666;">VPC Endpoints for S3 &amp; DynamoDB</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P28</td><td style="padding:9px 12px;"><a href="project-28.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE WAREHOUSE THAT NEEDED TO QUERY THE LAKE<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift Spectrum Querying S3</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P29</td><td style="padding:9px 12px;"><a href="project-29.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE DATABASE THAT COULDN'T AFFORD DOWNTIME<br><span style="font-weight:400;font-size:.87em;color:#666;">Multi-AZ RDS MariaDB with Read Replica</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P30</td><td style="padding:9px 12px;"><a href="project-30.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE COMPLIANCE TEAM THAT DEMANDED GEO-REDUNDANCY<br><span style="font-weight:400;font-size:.87em;color:#666;">Cross-Region S3 Replication</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P31</td><td style="padding:9px 12px;"><a href="project-31.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE ETL THAT HAD 5 STEPS IN SEQUENCE<br><span style="font-weight:400;font-size:.87em;color:#666;">Glue Workflow Orchestration</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P32</td><td style="padding:9px 12px;"><a href="project-32.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE PIPELINE THAT NEEDED HUMAN APPROVAL<br><span style="font-weight:400;font-size:.87em;color:#666;">Step Functions Multi-Service Orchestration</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P33</td><td style="padding:9px 12px;"><a href="project-33.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE APPLICATION THAT CRASHED EVERY BLACK FRIDAY<br><span style="font-weight:400;font-size:.87em;color:#666;">EC2 Auto Scaling with CloudWatch Triggers</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P34</td><td style="padding:9px 12px;"><a href="project-34.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE DAILY DATA FEED THAT NEEDED WAREHOUSE INGESTION<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 → Lambda → Redshift Automated Pipeline</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P35</td><td style="padding:9px 12px;"><a href="project-35.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE ANALYST WHO WANTED TO JOIN LAKE AND DATABASE DATA<br><span style="font-weight:400;font-size:.87em;color:#666;">Athena Federated Query to RDS MariaDB</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P36</td><td style="padding:9px 12px;"><a href="project-36.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE AUDITOR WHO FOUND UNENCRYPTED DATA EVERYWHERE<br><span style="font-weight:400;font-size:.87em;color:#666;">KMS Encryption for S3, RDS &amp; Redshift</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P37</td><td style="padding:9px 12px;"><a href="project-37.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE CREDENTIALS HARDCODED IN CONFIG FILES<br><span style="font-weight:400;font-size:.87em;color:#666;">Secrets Manager for Database Credentials</span></a></td></tr><tr><td style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P38</td><td style="padding:9px 12px;"><a href="project-38.html" style="color:#b8600b;text-decoration:none;font-weight:600;">THE SYSTEM THAT NEEDED SMART EVENT ROUTING<br><span style="font-weight:400;font-size:.87em;color:#666;">EventBridge Rule-Based Service Integration</span></a></td></tr></tbody></table></div><div style="background:rgba(198,40,40,0.07);border:2px solid rgba(198,40,40,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2 style="margin:0 0 18px;color:#c62828;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🔴 PHASE 4: HARD — ADVANCED PATTERNS <span style="font-weight:400;font-size:.78em;opacity:.7;">(Projects 39–50)</span></h2><table style="width:100%;border-collapse:collapse;"><tbody><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P39</td><td style="padding:9px 12px;"><a href="project-39.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE SUBSIDIARY THAT NEEDED ACCESS TO HQ'S DATA<br><span style="font-weight:400;font-size:.87em;color:#666;">Inter-Account S3 Access via Bucket Policy &amp; IAM Role</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P40</td><td style="padding:9px 12px;"><a href="project-40.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE DEVOPS TEAM THAT MANAGED 5 AWS ACCOUNTS<br><span style="font-weight:400;font-size:.87em;color:#666;">Cross-Account IAM Role Assumption (STS)</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P41</td><td style="padding:9px 12px;"><a href="project-41.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE CENTRAL ACCOUNT THAT NEEDED ALERTS FROM ALL ACCOUNTS<br><span style="font-weight:400;font-size:.87em;color:#666;">Inter-Account SNS → SQS Notification</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P42</td><td style="padding:9px 12px;"><a href="project-42.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE DATA MESH WHERE TEAMS SHARED CATALOGS<br><span style="font-weight:400;font-size:.87em;color:#666;">Cross-Account Glue Catalog Sharing via Lake Formation</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P43</td><td style="padding:9px 12px;"><a href="project-43.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE WAREHOUSE DATA THAT NEEDED TO FLOW BACK TO OPERATIONS<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift to MariaDB Data Sync via Glue</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P44</td><td style="padding:9px 12px;"><a href="project-44.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE MICROSERVICES ACROSS ACCOUNTS THAT NEEDED TO COMMUNICATE<br><span style="font-weight:400;font-size:.87em;color:#666;">Multi-Account VPC Peering</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P45</td><td style="padding:9px 12px;"><a href="project-45.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE LAMBDA THAT NEEDED PRIVATE DATABASE AND PUBLIC BUCKET<br><span style="font-weight:400;font-size:.87em;color:#666;">Lambda in VPC Accessing RDS + S3</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P46</td><td style="padding:9px 12px;"><a href="project-46.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE ETL THAT SHOULDN'T REPROCESS OLD DATA<br><span style="font-weight:400;font-size:.87em;color:#666;">Glue Job Bookmark &amp; Incremental ETL</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P47</td><td style="padding:9px 12px;"><a href="project-47.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE ORGANIZATION THAT NEEDED GOVERNED DATA ACCESS<br><span style="font-weight:400;font-size:.87em;color:#666;">Data Lake with Lake Formation Permissions</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P48</td><td style="padding:9px 12px;"><a href="project-48.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE REDSHIFT CLUSTER THAT NEEDED LIVE OPERATIONAL DATA<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift Federated Query to RDS MariaDB</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P49</td><td style="padding:9px 12px;"><a href="project-49.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE COMPLEX PIPELINE<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 Upload → EventBridge → Step Functions → Glue ETL → Redshift → SNS Alert</span></a></td></tr><tr><td style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P50</td><td style="padding:9px 12px;"><a href="project-50.html" style="color:#c62828;text-decoration:none;font-weight:600;">THE ORGANIZATION WITH 20 VPCs THAT COULDN'T SCALE PEERING<br><span style="font-weight:400;font-size:.87em;color:#666;">Transit Gateway for Multi-VPC Multi-Account</span></a></td></tr></tbody></table></div><div style="background:rgba(123,45,142,0.07);border:2px solid rgba(123,45,142,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2 style="margin:0 0 18px;color:#7b2d8e;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🟣 PHASE 5: VERY HARD — MASTERY <span style="font-weight:400;font-size:.78em;opacity:.7;">(Projects 51–60)</span></h2><table style="width:100%;border-collapse:collapse;"><tbody><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P51</td><td style="padding:9px 12px;"><a href="project-51.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE ENTERPRISE DATA LAKE<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 + Glue + Athena + Lake Formation + Cross-Account Access</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P52</td><td style="padding:9px 12px;"><a href="project-52.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE REAL-TIME DASHBOARD<br><span style="font-weight:400;font-size:.87em;color:#666;">Kinesis Data Streams → Firehose → S3 → Glue → Athena</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P53</td><td style="padding:9px 12px;"><a href="project-53.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE WAREHOUSE THAT NEEDED ZERO MANAGEMENT<br><span style="font-weight:400;font-size:.87em;color:#666;">Redshift Serverless with Spectrum &amp; Auto-Scaling</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P54</td><td style="padding:9px 12px;"><a href="project-54.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE 50-ACCOUNT ORGANIZATION THAT NEEDED GUARDRAILS<br><span style="font-weight:400;font-size:.87em;color:#666;">AWS Organizations, SCPs &amp; Centralized Governance</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P55</td><td style="padding:9px 12px;"><a href="project-55.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE PLATFORM THAT COULDN'T AFFORD REGIONAL FAILURE<br><span style="font-weight:400;font-size:.87em;color:#666;">Cross-Region DR for MariaDB + S3 + Redshift</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P56</td><td style="padding:9px 12px;"><a href="project-56.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE CFO WHO DEMANDED 40% COST REDUCTION<br><span style="font-weight:400;font-size:.87em;color:#666;">S3 Intelligent Tiering + Redshift RA3 + Reserved Capacity</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P57</td><td style="padding:9px 12px;"><a href="project-57.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE SECURITY AUDIT THAT FOUND 200 VULNERABILITIES<br><span style="font-weight:400;font-size:.87em;color:#666;">Zero-Trust: PrivateLink + Endpoint Policies + KMS + CloudTrail + Config Rules + GuardDuty + Security Hub</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P58</td><td style="padding:9px 12px;"><a href="project-58.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE ON-PREMISES MIGRATION<br><span style="font-weight:400;font-size:.87em;color:#666;">On-Prem MariaDB → DMS → RDS → Glue → Redshift Full Pipeline</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P59</td><td style="padding:9px 12px;"><a href="project-59.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE FULLY SERVERLESS ANALYTICS PLATFORM<br><span style="font-weight:400;font-size:.87em;color:#666;">API Gateway → Lambda → S3 → Glue → Athena → QuickSight</span></a></td></tr><tr><td style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P60</td><td style="padding:9px 12px;"><a href="project-60.html" style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE ENTERPRISE DATA MESH<br><span style="font-weight:400;font-size:.87em;color:#666;">Multi-Account Producer-Consumer Pattern with Full Governance &amp; Observability</span></a></td></tr></tbody></table></div>
-  <p style="text-align:center;color:#aaa;font-size:.88em;padding:20px 0 10px;">AWS Masterclass &bull; 60 Projects &bull; 5 Phases</p>
-</div>
-<a class="start-btn" href="project-0.html">Begin →</a>
-<script>
+  </head>
+  <body>
+    <div id="progress-rail"><div id="progress-fill"></div></div>
+    <div id="progress-pct">0%</div>
+    <div class="page-wrapper">
+      <div class="toc-header">
+        <h1>☁️ AWS Masterclass</h1>
+        <h2
+          style="color:#b8600b;margin:0 0 10px;font-size:1.5em;font-weight:800;">60
+          Scenario-Based Projects</h2>
+        <p>Very Easy → Very Hard &nbsp;|&nbsp; No Code — Pure Configuration
+          &amp; Logic</p>
+        <p style="font-size:.9em;color:#999;margin-top:10px;">Use <strong
+            style="color:#007ab8;">← →</strong> arrow keys to navigate between
+          projects</p>
+      </div>
+      <div
+        style="background:rgba(56,189,248,0.08);border:2px solid rgba(56,189,248,0.35);border-radius:14px;margin:26px 0;padding:22px 26px;">
+        <h2
+          style="margin:0 0 18px;color:#38bdf8;font-size:1.4em;font-weight:800;">🌱
+          PRELUDE: GETTING STARTED <span
+            style="font-weight:400;font-size:.78em;opacity:.7;"></span></h2>
+        <table style="width:100%;border-collapse:collapse;">
+          <tbody>
+            <tr>
+              <td
+                style="color:#38bdf8;font-weight:800;width:55px;padding:9px 12px;">--</td>
+              <td style="padding:9px 12px;">
+                <a href="project-0.html"
+                  style="color:#38bdf8;text-decoration:none;font-weight:600;">🎓 AWS MASTERCLASS<br>
+                  <span style="font-weight:400;font-size:.87em;color:#666;">COMPLETE TABLE OF CONTENTS</span>
+                </a>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div
+        style="background:rgba(46,125,50,0.07);border:2px solid rgba(46,125,50,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2
+          style="margin:0 0 18px;color:#2e7d32;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🟢
+          PHASE 1: VERY EASY — FOUNDATION THINKING <span
+            style="font-weight:400;font-size:.78em;opacity:.7;">(Projects
+            1–10)</span></h2><table
+          style="width:100%;border-collapse:collapse;"><tbody><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P1</td><td
+                style="padding:9px 12px;"><a href="project-1.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  STARTUP THAT LOST FILES<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Understanding
+                    S3 Bucket Creation &amp; Object
+                    Storage</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P2</td><td
+                style="padding:9px 12px;"><a href="project-2.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  INTERN WHO DELETED PRODUCTION<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">IAM
+                    Users, Groups, Policies &amp; Permission
+                    Boundaries</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P3</td><td
+                style="padding:9px 12px;"><a href="project-3.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  DEVELOPER WHO COULDN'T ACCESS THE SERVER<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">EC2
+                    Instance Launch &amp; SSH
+                    Configuration</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P4</td><td
+                style="padding:9px 12px;"><a href="project-4.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  DATABASE THAT NOBODY COULD REACH<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Security
+                    Groups vs NACLs</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P5</td><td
+                style="padding:9px 12px;"><a href="project-5.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  APPLICATION THAT NEEDED A PRIVATE ROOM<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">VPC
+                    Creation with Public &amp; Private
+                    Subnets</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P6</td><td
+                style="padding:9px 12px;"><a href="project-6.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  TEAM THAT MISSED EVERY ALERT<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">SNS
+                    Topic Creation &amp; Email
+                    Subscription</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P7</td><td
+                style="padding:9px 12px;"><a href="project-7.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  ORDERS THAT DISAPPEARED DURING PEAK HOURS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">SQS
+                    Queue &amp; Message Lifecycle</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P8</td><td
+                style="padding:9px 12px;"><a href="project-8.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  SERVER THAT CRASHED AT 3 AM<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">CloudWatch
+                    Alarms &amp; Basic Monitoring</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P9</td><td
+                style="padding:9px 12px;"><a href="project-9.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  E-COMMERCE APP THAT NEEDED A DATABASE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">RDS
+                    MariaDB Instance Setup</span></a></td></tr><tr><td
+                style="color:#2e7d32;font-weight:800;width:55px;padding:9px 12px;">P10</td><td
+                style="padding:9px 12px;"><a href="project-10.html"
+                  style="color:#2e7d32;text-decoration:none;font-weight:600;">THE
+                  PUBLIC BUCKET THAT COST $50,000<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3
+                    Bucket Policies &amp; Access Control
+                    Lists</span></a></td></tr></tbody></table></div><div
+        style="background:rgba(0,122,184,0.07);border:2px solid rgba(0,122,184,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2
+          style="margin:0 0 18px;color:#007ab8;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🔵
+          PHASE 2: EASY — CORE PATTERNS <span
+            style="font-weight:400;font-size:.78em;opacity:.7;">(Projects
+            11–20)</span></h2><table
+          style="width:100%;border-collapse:collapse;"><tbody><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P11</td><td
+                style="padding:9px 12px;"><a href="project-11.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  EC2 APP THAT NEEDED S3 WITHOUT HARDCODED KEYS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">IAM
+                    Roles for EC2</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P12</td><td
+                style="padding:9px 12px;"><a href="project-12.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  STORAGE BILL THAT KEPT GROWING<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3
+                    Versioning &amp; Lifecycle
+                    Policies</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P13</td><td
+                style="padding:9px 12px;"><a href="project-13.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  NOTIFICATION THAT NEEDED MULTIPLE CONSUMERS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">SNS to
+                    SQS Fan-Out Pattern</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P14</td><td
+                style="padding:9px 12px;"><a href="project-14.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  WEB APP THAT COULDN'T TALK TO ITS DATABASE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">EC2 to
+                    RDS MariaDB Private Connectivity</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P15</td><td
+                style="padding:9px 12px;"><a href="project-15.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  DATA TEAM THAT WANTED REAL-TIME UPLOAD ALERTS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3 Event
+                    Notifications to SNS</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P16</td><td
+                style="padding:9px 12px;"><a href="project-16.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  ANALYST WHO NEEDED A DATA WAREHOUSE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    Single-Node Cluster Setup</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P17</td><td
+                style="padding:9px 12px;"><a href="project-17.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  DATA LAKE THAT NEEDED A CATALOG<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Glue
+                    Crawler Cataloging S3 Data</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P18</td><td
+                style="padding:9px 12px;"><a href="project-18.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  ANALYST WHO DIDN'T WANT TO SPIN UP A SERVER<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Athena
+                    Querying S3 via Glue Catalog</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P19</td><td
+                style="padding:9px 12px;"><a href="project-19.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  APPLICATION LOGS NOBODY COULD FIND<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">CloudWatch
+                    Logs from EC2 via Unified Agent</span></a></td></tr><tr><td
+                style="color:#007ab8;font-weight:800;width:55px;padding:9px 12px;">P20</td><td
+                style="padding:9px 12px;"><a href="project-20.html"
+                  style="color:#007ab8;text-decoration:none;font-weight:600;">THE
+                  FAILED MESSAGES THAT VANISHED FOREVER<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">SQS Dead
+                    Letter Queue
+                    Configuration</span></a></td></tr></tbody></table></div><div
+        style="background:rgba(184,96,11,0.07);border:2px solid rgba(184,96,11,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2
+          style="margin:0 0 18px;color:#b8600b;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🟠
+          PHASE 3: MEDIUM — PROFESSIONAL TECHNIQUES <span
+            style="font-weight:400;font-size:.78em;opacity:.7;">(Projects
+            21–38)</span></h2><table
+          style="width:100%;border-collapse:collapse;"><tbody><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P21</td><td
+                style="padding:9px 12px;"><a href="project-21.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  CSV FILES THAT SLOWED EVERYTHING DOWN<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Glue ETL
+                    Job for S3 CSV to Parquet
+                    Transformation</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P22</td><td
+                style="padding:9px 12px;"><a href="project-22.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  DATA WAREHOUSE THAT NEEDED BULK LOADING<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    COPY from S3</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P23</td><td
+                style="padding:9px 12px;"><a href="project-23.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  ANALYTICS EXPORT NOBODY COULD AUTOMATE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    UNLOAD to S3</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P24</td><td
+                style="padding:9px 12px;"><a href="project-24.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  OPERATIONAL DATABASE THAT NEEDED A BACKUP IN S3<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">MariaDB
+                    to S3 Export via Glue ETL</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P25</td><td
+                style="padding:9px 12px;"><a href="project-25.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  COMPANY THAT WANTED SELF-SERVICE ANALYTICS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3 →
+                    Glue Crawler → Glue Catalog → Athena End-to-End
+                    Pipeline</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P26</td><td
+                style="padding:9px 12px;"><a href="project-26.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  ORDER PROCESSING SYSTEM THAT NEEDED DECOUPLING<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">SNS →
+                    SQS → Lambda Event-Driven
+                    Pipeline</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P27</td><td
+                style="padding:9px 12px;"><a href="project-27.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  DATA PIPELINE THAT SHOULDN'T TRAVERSE THE INTERNET<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">VPC
+                    Endpoints for S3 &amp; DynamoDB</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P28</td><td
+                style="padding:9px 12px;"><a href="project-28.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  WAREHOUSE THAT NEEDED TO QUERY THE LAKE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    Spectrum Querying S3</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P29</td><td
+                style="padding:9px 12px;"><a href="project-29.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  DATABASE THAT COULDN'T AFFORD DOWNTIME<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Multi-AZ
+                    RDS MariaDB with Read Replica</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P30</td><td
+                style="padding:9px 12px;"><a href="project-30.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  COMPLIANCE TEAM THAT DEMANDED GEO-REDUNDANCY<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Cross-Region
+                    S3 Replication</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P31</td><td
+                style="padding:9px 12px;"><a href="project-31.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  ETL THAT HAD 5 STEPS IN SEQUENCE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Glue
+                    Workflow Orchestration</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P32</td><td
+                style="padding:9px 12px;"><a href="project-32.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  PIPELINE THAT NEEDED HUMAN APPROVAL<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Step
+                    Functions Multi-Service
+                    Orchestration</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P33</td><td
+                style="padding:9px 12px;"><a href="project-33.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  APPLICATION THAT CRASHED EVERY BLACK FRIDAY<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">EC2 Auto
+                    Scaling with CloudWatch Triggers</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P34</td><td
+                style="padding:9px 12px;"><a href="project-34.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  DAILY DATA FEED THAT NEEDED WAREHOUSE INGESTION<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3 →
+                    Lambda → Redshift Automated
+                    Pipeline</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P35</td><td
+                style="padding:9px 12px;"><a href="project-35.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  ANALYST WHO WANTED TO JOIN LAKE AND DATABASE DATA<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Athena
+                    Federated Query to RDS MariaDB</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P36</td><td
+                style="padding:9px 12px;"><a href="project-36.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  AUDITOR WHO FOUND UNENCRYPTED DATA EVERYWHERE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">KMS
+                    Encryption for S3, RDS &amp;
+                    Redshift</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P37</td><td
+                style="padding:9px 12px;"><a href="project-37.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  CREDENTIALS HARDCODED IN CONFIG FILES<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Secrets
+                    Manager for Database Credentials</span></a></td></tr><tr><td
+                style="color:#b8600b;font-weight:800;width:55px;padding:9px 12px;">P38</td><td
+                style="padding:9px 12px;"><a href="project-38.html"
+                  style="color:#b8600b;text-decoration:none;font-weight:600;">THE
+                  SYSTEM THAT NEEDED SMART EVENT ROUTING<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">EventBridge
+                    Rule-Based Service
+                    Integration</span></a></td></tr></tbody></table></div><div
+        style="background:rgba(198,40,40,0.07);border:2px solid rgba(198,40,40,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2
+          style="margin:0 0 18px;color:#c62828;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🔴
+          PHASE 4: HARD — ADVANCED PATTERNS <span
+            style="font-weight:400;font-size:.78em;opacity:.7;">(Projects
+            39–50)</span></h2><table
+          style="width:100%;border-collapse:collapse;"><tbody><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P39</td><td
+                style="padding:9px 12px;"><a href="project-39.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  SUBSIDIARY THAT NEEDED ACCESS TO HQ'S DATA<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Inter-Account
+                    S3 Access via Bucket Policy &amp; IAM
+                    Role</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P40</td><td
+                style="padding:9px 12px;"><a href="project-40.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  DEVOPS TEAM THAT MANAGED 5 AWS ACCOUNTS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Cross-Account
+                    IAM Role Assumption (STS)</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P41</td><td
+                style="padding:9px 12px;"><a href="project-41.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  CENTRAL ACCOUNT THAT NEEDED ALERTS FROM ALL ACCOUNTS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Inter-Account
+                    SNS → SQS Notification</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P42</td><td
+                style="padding:9px 12px;"><a href="project-42.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  DATA MESH WHERE TEAMS SHARED CATALOGS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Cross-Account
+                    Glue Catalog Sharing via Lake
+                    Formation</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P43</td><td
+                style="padding:9px 12px;"><a href="project-43.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  WAREHOUSE DATA THAT NEEDED TO FLOW BACK TO OPERATIONS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    to MariaDB Data Sync via Glue</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P44</td><td
+                style="padding:9px 12px;"><a href="project-44.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  MICROSERVICES ACROSS ACCOUNTS THAT NEEDED TO
+                  COMMUNICATE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Multi-Account
+                    VPC Peering</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P45</td><td
+                style="padding:9px 12px;"><a href="project-45.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  LAMBDA THAT NEEDED PRIVATE DATABASE AND PUBLIC BUCKET<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Lambda
+                    in VPC Accessing RDS + S3</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P46</td><td
+                style="padding:9px 12px;"><a href="project-46.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  ETL THAT SHOULDN'T REPROCESS OLD DATA<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Glue Job
+                    Bookmark &amp; Incremental ETL</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P47</td><td
+                style="padding:9px 12px;"><a href="project-47.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  ORGANIZATION THAT NEEDED GOVERNED DATA ACCESS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Data
+                    Lake with Lake Formation
+                    Permissions</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P48</td><td
+                style="padding:9px 12px;"><a href="project-48.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  REDSHIFT CLUSTER THAT NEEDED LIVE OPERATIONAL DATA<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    Federated Query to RDS MariaDB</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P49</td><td
+                style="padding:9px 12px;"><a href="project-49.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  COMPLEX PIPELINE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3
+                    Upload → EventBridge → Step Functions → Glue ETL → Redshift
+                    → SNS Alert</span></a></td></tr><tr><td
+                style="color:#c62828;font-weight:800;width:55px;padding:9px 12px;">P50</td><td
+                style="padding:9px 12px;"><a href="project-50.html"
+                  style="color:#c62828;text-decoration:none;font-weight:600;">THE
+                  ORGANIZATION WITH 20 VPCs THAT COULDN'T SCALE PEERING<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Transit
+                    Gateway for Multi-VPC
+                    Multi-Account</span></a></td></tr></tbody></table></div><div
+        style="background:rgba(123,45,142,0.07);border:2px solid rgba(123,45,142,0.3);border-radius:14px;margin:26px 0;padding:22px 26px;"><h2
+          style="margin:0 0 18px;color:#7b2d8e;font-size:1.4em;font-weight:800;border:none;background:none;padding:0;">🟣
+          PHASE 5: VERY HARD — MASTERY <span
+            style="font-weight:400;font-size:.78em;opacity:.7;">(Projects
+            51–60)</span></h2><table
+          style="width:100%;border-collapse:collapse;"><tbody><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P51</td><td
+                style="padding:9px 12px;"><a href="project-51.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  ENTERPRISE DATA LAKE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3 +
+                    Glue + Athena + Lake Formation + Cross-Account
+                    Access</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P52</td><td
+                style="padding:9px 12px;"><a href="project-52.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  REAL-TIME DASHBOARD<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Kinesis
+                    Data Streams → Firehose → S3 → Glue →
+                    Athena</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P53</td><td
+                style="padding:9px 12px;"><a href="project-53.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  WAREHOUSE THAT NEEDED ZERO MANAGEMENT<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Redshift
+                    Serverless with Spectrum &amp;
+                    Auto-Scaling</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P54</td><td
+                style="padding:9px 12px;"><a href="project-54.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  50-ACCOUNT ORGANIZATION THAT NEEDED GUARDRAILS<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">AWS
+                    Organizations, SCPs &amp; Centralized
+                    Governance</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P55</td><td
+                style="padding:9px 12px;"><a href="project-55.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  PLATFORM THAT COULDN'T AFFORD REGIONAL FAILURE<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Cross-Region
+                    DR for MariaDB + S3 + Redshift</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P56</td><td
+                style="padding:9px 12px;"><a href="project-56.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  CFO WHO DEMANDED 40% COST REDUCTION<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">S3
+                    Intelligent Tiering + Redshift RA3 + Reserved
+                    Capacity</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P57</td><td
+                style="padding:9px 12px;"><a href="project-57.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  SECURITY AUDIT THAT FOUND 200 VULNERABILITIES<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Zero-Trust:
+                    PrivateLink + Endpoint Policies + KMS + CloudTrail + Config
+                    Rules + GuardDuty + Security Hub</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P58</td><td
+                style="padding:9px 12px;"><a href="project-58.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  ON-PREMISES MIGRATION<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">On-Prem
+                    MariaDB → DMS → RDS → Glue → Redshift Full
+                    Pipeline</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P59</td><td
+                style="padding:9px 12px;"><a href="project-59.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  FULLY SERVERLESS ANALYTICS PLATFORM<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">API
+                    Gateway → Lambda → S3 → Glue → Athena →
+                    QuickSight</span></a></td></tr><tr><td
+                style="color:#7b2d8e;font-weight:800;width:55px;padding:9px 12px;">P60</td><td
+                style="padding:9px 12px;"><a href="project-60.html"
+                  style="color:#7b2d8e;text-decoration:none;font-weight:600;">THE
+                  ENTERPRISE DATA MESH<br><span
+                    style="font-weight:400;font-size:.87em;color:#666;">Multi-Account
+                    Producer-Consumer Pattern with Full Governance &amp;
+                    Observability</span></a></td></tr></tbody></table></div>
+      <p
+        style="text-align:center;color:#aaa;font-size:.88em;padding:20px 0 10px;">AWS
+        Masterclass &bull; 60 Projects &bull; 5 Phases</p>
+    </div>
+    <a class="start-btn" href="project-0.html">Start from P0 →</a>
+    <script>
 var fill=document.getElementById('progress-fill'),pct=document.getElementById('progress-pct');
 function upd(){var s=window.scrollY,d=document.body.scrollHeight-window.innerHeight,p=d>0?(s/d)*100:0;fill.style.height=p+'%';pct.textContent=Math.round(p)+'%';}
 window.addEventListener('scroll',upd);upd();
 </script>
-</body>
+  </body>
 </html>
